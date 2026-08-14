@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::editor::{Editor, Mode};
 use crate::picker::Picker;
+use crate::syntax::{Span as HlSpan, Syntax};
 
 const TAB_WIDTH: usize = 4;
 
@@ -51,6 +52,77 @@ fn display_col(line: &str, char_col: usize) -> usize {
     col
 }
 
+/// Capture name to colour.
+///
+/// Matches on the part before the first dot, so `function.method` falls back to
+/// `function` without needing an arm of its own. This table is the whole reason
+/// `syntax.rs` emits names rather than styles: a GUI frontend writes its own,
+/// and a theme file eventually replaces it.
+fn style_for(name: &str) -> Style {
+    let base = name.split('.').next().unwrap_or(name);
+    match base {
+        "keyword" => Style::default().fg(Color::Magenta),
+        "function" | "constructor" => Style::default().fg(Color::Blue),
+        "type" => Style::default().fg(Color::Cyan),
+        "string" | "escape" | "character" => Style::default().fg(Color::Green),
+        "comment" => Style::default().fg(Color::DarkGray),
+        "constant" | "number" | "float" | "boolean" => Style::default().fg(Color::Yellow),
+        "attribute" | "label" => Style::default().fg(Color::LightMagenta),
+        "operator" | "punctuation" => Style::default().fg(Color::Gray),
+        _ => Style::default(),
+    }
+}
+
+/// Splits one line into styled pieces, expanding tabs as it goes.
+///
+/// Tab expansion has to happen *inside* the split: expanding first would shift
+/// every byte offset the highlight spans are expressed in.
+fn styled_line(
+    raw: &str,
+    line_start: usize,
+    spans: &[HlSpan],
+    syntax: &Syntax,
+) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    let mut pos = 0usize;
+
+    let mut push = |text: &str, style: Style, col: &mut usize| {
+        if text.is_empty() {
+            return;
+        }
+        let mut expanded = String::with_capacity(text.len());
+        for ch in text.chars() {
+            if ch == '\t' {
+                let n = TAB_WIDTH - (*col % TAB_WIDTH);
+                expanded.extend(std::iter::repeat_n(' ', n));
+                *col += n;
+            } else {
+                expanded.push(ch);
+                *col += 1;
+            }
+        }
+        out.push(Span::styled(expanded, style));
+    };
+
+    for span in spans {
+        let start = span.start_byte.saturating_sub(line_start);
+        let end = span.end_byte.saturating_sub(line_start);
+        if start >= raw.len() {
+            break;
+        }
+        let end = end.min(raw.len());
+        if end <= pos || !raw.is_char_boundary(start) || !raw.is_char_boundary(end) {
+            continue;
+        }
+        push(&raw[pos..start], Style::default(), &mut col);
+        push(&raw[start..end], style_for(syntax.capture_name(span.capture)), &mut col);
+        pos = end;
+    }
+    push(&raw[pos..], Style::default(), &mut col);
+    out
+}
+
 pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     let [text_area, status_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
@@ -64,7 +136,17 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     let mut lines = Vec::with_capacity(text_area.height as usize);
     let mut cursor_screen_col = 0;
 
-    for row in ed.scroll..(ed.scroll + text_area.height as usize).min(total) {
+    // One query for the whole visible range, then partition per line. Bounded
+    // by terminal height, never by file size.
+    let last_row = (ed.scroll + text_area.height as usize).min(total);
+    let highlights = ed.syntax.as_ref().map(|syntax| {
+        let rope = ed.buffer.rope();
+        let from = rope.line_to_byte(ed.scroll.min(rope.len_lines()));
+        let to = rope.line_to_byte(last_row.min(rope.len_lines()));
+        (syntax, syntax.highlights(rope, from..to))
+    });
+
+    for row in ed.scroll..last_row {
         let raw = ed.buffer.rope().line(row).to_string();
         let raw = raw.trim_end_matches(['\n', '\r']);
 
@@ -80,7 +162,21 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
                 Color::DarkGray
             }),
         );
-        lines.push(Line::from(vec![number, Span::raw(expand_tabs(raw))]));
+        let mut spans = vec![number];
+        match &highlights {
+            Some((syntax, all)) => {
+                let line_start = ed.buffer.rope().line_to_byte(row);
+                let line_end = line_start + raw.len();
+                let mine: Vec<HlSpan> = all
+                    .iter()
+                    .copied()
+                    .filter(|s| s.end_byte > line_start && s.start_byte < line_end)
+                    .collect();
+                spans.extend(styled_line(raw, line_start, &mine, syntax));
+            }
+            None => spans.push(Span::raw(expand_tabs(raw))),
+        }
+        lines.push(Line::from(spans));
     }
 
     // Past-the-end rows, so an empty buffer doesn't look like a hang.

@@ -9,6 +9,9 @@ ropey = "1.6"
 # crossterm is re-exported as `ratatui::crossterm` — depending on it directly
 # invites a version skew that shows up as confusing trait mismatches.
 ratatui = "0.29"
+tree-sitter = "0.26.12"
+tree-sitter-rust = "0.24.2"
+streaming-iterator = "0.1.9"
 
 [profile.release]
 lto = true

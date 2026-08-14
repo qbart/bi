@@ -12,6 +12,7 @@ use crate::buffer::Buffer;
 use crate::motion::{Motion, Operator};
 use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{EntryKind, Registers, Sink};
+use crate::syntax::Syntax;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -118,6 +119,12 @@ pub struct Editor {
     /// the point, so they outlive any single buffer.
     pub registers: Registers,
     pub picker: Option<Picker>,
+    /// The parse tree, when the file's extension has a grammar.
+    ///
+    /// Here rather than on `Buffer` because `pending_edits` will have two
+    /// consumers — tree-sitter now, LSP `didChange` later — and whoever drains
+    /// it destroys it for the other. One drain point feeds both.
+    pub syntax: Option<Syntax>,
     pub mode: Mode,
     pub status: String,
     /// First visible row.
@@ -131,7 +138,35 @@ impl Editor {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self::with_buffer(Buffer::open(path)?))
+        let mut editor = Self::with_buffer(Buffer::open(path)?);
+        editor.reload_syntax();
+        Ok(editor)
+    }
+
+    /// Picks a grammar from the file's extension. An unknown one leaves
+    /// `syntax` as `None`, which renders as plain text.
+    fn reload_syntax(&mut self) {
+        let extension = self
+            .buffer
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        self.syntax = Syntax::new(&extension, self.buffer.rope());
+    }
+
+    /// Drains the edit log into the parse tree. Called once per key, after the
+    /// command has been applied and before the frame is drawn.
+    pub fn sync_syntax(&mut self) {
+        let edits = std::mem::take(&mut self.buffer.pending_edits);
+        if edits.is_empty() {
+            return;
+        }
+        if let Some(syntax) = &mut self.syntax {
+            syntax.update(self.buffer.rope(), &edits);
+        }
     }
 
     fn with_buffer(buffer: Buffer) -> Self {
@@ -139,6 +174,7 @@ impl Editor {
             buffer,
             registers: Registers::default(),
             picker: None,
+            syntax: None,
             mode: Mode::Normal,
             status: String::new(),
             scroll: 0,
@@ -376,6 +412,10 @@ impl Editor {
         };
         match result {
             Ok(()) => {
+                // `:w other.rs` can change the language under us.
+                if !path.is_empty() {
+                    self.reload_syntax();
+                }
                 let name = self
                     .buffer
                     .path

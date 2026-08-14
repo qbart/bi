@@ -5,7 +5,8 @@ user actually *sees*, and the reason `Buffer::Edit` has existed since step 1.
 
 ## Status
 
-Not built.
+**Built**, for Rust only. Injections, indent queries and background parsing
+remain deferred — see the end of this file.
 
 ## What is already in place
 
@@ -16,8 +17,8 @@ ordered log of what changed. Undo and redo replay through the same function, so
 history traversal arrives as ordinary incremental edits rather than as a
 special case that forces a full reparse.
 
-`main.rs` currently drains `pending_edits` each frame and drops it. That drain
-becomes the sync point.
+`main.rs` drained `pending_edits` each frame and dropped it. That drain is now
+`Editor::sync_syntax`, and it is where LSP `didChange` will hang too.
 
 So the work is plumbing, not redesign. That was the bet.
 
@@ -50,16 +51,21 @@ change — not before.
 After each command, before rendering:
 
 ```rust
-for edit in buffer.pending_edits.drain(..) {
-    tree.edit(&edit.into());
+let edits = std::mem::take(&mut buffer.pending_edits);
+for edit in &edits {
+    tree.edit(&input_edit(edit));
 }
-parser.parse_with(&mut |byte, _| chunk_at(rope, byte), Some(&tree));
+parser.parse_with_options(&mut |byte, _| chunk_at(rope, byte), Some(&tree), None);
 ```
+
+The edits have to be *taken* before the rope is borrowed, or the two borrows
+overlap. That is why `sync_syntax` is a method on `Editor` rather than a couple
+of inline lines at the call site.
 
 Every edit must reach `Tree::edit` in order before the reparse — batching N
 edits then parsing once is the intended usage, not a shortcut.
 
-`parse_with` reads the rope in chunks rather than materialising a `String`, so
+`parse_with_options` reads the rope in chunks rather than materialising a `String`, so
 the cost stays proportional to the edit and not to file size. Copying the whole
 buffer out on every keystroke would defeat the entire point of incremental
 parsing.
@@ -76,8 +82,10 @@ files, and adding it later does not disturb this interface.
 pub struct Span {
     pub start_byte: usize,
     pub end_byte: usize,
-    /// `keyword`, `string`, `function`, `comment` — the query's capture name.
-    pub name: &'static str,
+    /// Resolved through `Syntax::capture_name` — `keyword`, `string`,
+    /// `comment`. An index rather than a `&str` so a `Span` carries no
+    /// lifetime and no per-frame allocation.
+    pub capture: u32,
 }
 ```
 
@@ -92,8 +100,10 @@ to the rows being drawn. Frame cost stays bounded by terminal height, which is
 the invariant the README's rendering decision commits to — highlighting a
 10,000-line file to draw 40 rows would silently break it.
 
-**Overlapping captures resolve narrowest-wins.** Highlight queries nest, and
-the innermost match is the specific one. Rolling this ourselves over
+**Overlapping captures resolve narrowest-wins**, implemented by painting a
+per-byte array over the visible range widest-first and run-length encoding the
+result. Highlight queries nest, and the innermost match is the specific one.
+The array is bounded by the viewport, so this stays cheap. Rolling this ourselves over
 `QueryCursor` rather than using the `tree-sitter-highlight` crate: that crate
 is stream-oriented and whole-document by design, which fights the viewport
 restriction above. Revisit if injections make it worth it.
@@ -116,8 +126,9 @@ size. An unknown extension means no `Syntax` and plain text — never an error.
 ## Dependencies, and the cost of them
 
 ```toml
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
+streaming-iterator = "0.1"   # QueryCursor::matches is a streaming iterator
 ```
 
 These are the **first non-pure-Rust dependencies**. Grammars are C compiled by

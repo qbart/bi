@@ -3,8 +3,9 @@
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
-Status: **step 1** — the core loop only. See
-[RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is.
+Status: modal editing, undo, registers, and tree-sitter highlighting for Rust.
+See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
+[docs/specs](docs/specs) for the designs behind each piece.
 
 ```sh
 cargo run -- <file>
@@ -129,11 +130,12 @@ afterwards repeats it.
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `picker.rs` | the overlay's state: query, matches, selection |
+| `syntax.rs` | tree-sitter: incremental reparse, highlight spans |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `ui.rs` | viewport-bounded render pass |
 | `main.rs` | terminal lifecycle, event loop |
 
-## The six decisions this step locks in
+## The seven decisions this step locks in
 
 1. **Cursor is a char index.** Byte and UTF-16 conversions happen at the edges
    (`Buffer::point_at`), never inside motion code. LSP wants UTF-16 columns,
@@ -171,8 +173,14 @@ afterwards repeats it.
    mutation — `5x` is one undo step. Insert mode holds the group open until
    `Esc`, so a typing run undoes in one go, along with the `\n` that `o`
    inserted before it.
-6. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
-   not buffer size.
+6. **Highlighting emits capture names, not styles.** `syntax.rs` produces
+   `keyword` / `string` / `comment`; `ui.rs` maps those to colours. A GUI
+   frontend writes its own table, and a theme file eventually replaces both.
+   Producing `ratatui::Style` in the core would weld it to the terminal in the
+   one place that is hardest to unpick.
+7. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
+   not buffer size — including highlighting, which queries only the visible
+   byte range.
 
 ## Known gaps
 
@@ -186,13 +194,24 @@ afterwards repeats it.
 - Single buffer, no window splits.
 - No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
   `docs/specs/registers.md`.
+- Rust is the only grammar. Adding one is a line in `syntax.rs`, but each is a
+  C library that costs build time.
+- No tree-sitter injections, so code fences in markdown and JSX would not
+  highlight. No indent queries, so no auto-indent. See
+  `docs/specs/tree-sitter.md`.
 - No text objects (`diw`, `ci"`, `da(`).
 - `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
   end of the line rather than implementing the full "end in column 1" case.
 
 ## Next
 
-Tree-sitter. `pending_edits`
+LSP, which hangs off the same `pending_edits` drain that tree-sitter now uses —
+`Editor::sync_syntax` is where `textDocument/didChange` goes. Before that, the
+config-language decision (RECOMMENDATION.md, "what actually bites you" #1) is
+still unmade and still cheap: the keymap in `input.rs` and the highlight table
+in `ui.rs` are both waiting for it.
+
+Previously, on tree-sitter: `pending_edits`
 feeds `Tree::edit` + `Parser::parse` with the old tree; highlight queries then
 map to styles in `ui.rs`. Deliberately *not* yet: a config language or a plugin
 system.

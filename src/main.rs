@@ -12,6 +12,7 @@ mod input;
 mod motion;
 mod picker;
 mod registers;
+mod syntax;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -81,8 +82,8 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
                     ed.status.clear();
                     ed.apply(cmd);
                 }
-                // Drop what tree-sitter and LSP will one day consume.
-                ed.buffer.pending_edits.clear();
+                // Feed the parse tree. LSP will hang off the same drain.
+                ed.sync_syntax();
             }
             Event::Resize(_, _) => {}
             _ => {}
