@@ -22,6 +22,9 @@ cargo test
 | `x` | delete char |
 | `d{motion}` `c{motion}` | delete / change over a motion: `dw` `d$` `db` `dj` `dgg` `cw` `c0` |
 | `dd` `cc` | delete / clear whole lines (`3dd` for three) |
+| `y{motion}` `yy` `Y` | yank |
+| `p` `P` | paste after / before, charwise or linewise as taken |
+| `"_` | black hole prefix: `"_dd` deletes without capturing |
 | `u` `Ctrl-R` | undo, redo (accept counts: `3u`) |
 | `Esc` | back to normal mode |
 | `:w` `:w <path>` `:q` `:q!` `:wq` `:{n}` | ex commands |
@@ -32,13 +35,14 @@ cargo test
 |---|---|
 | `buffer.rs` | rope, cursor, motions, the single mutation primitive |
 | `history.rs` | the undo tree: revisions, branching, invertible `Change`s |
+| `registers.rs` | the yank ring: entries, capture, eviction |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `ui.rs` | viewport-bounded render pass |
 | `main.rs` | terminal lifecycle, event loop |
 
-## The five decisions this step locks in
+## The six decisions this step locks in
 
 1. **Cursor is a char index.** Byte and UTF-16 conversions happen at the edges
    (`Buffer::point_at`), never inside motion code. LSP wants UTF-16 columns,
@@ -61,7 +65,13 @@ cargo test
    rather than a field for the same reason an operator needs to ask where a
    motion *would* land without going there — and it is the shape visual mode
    (anchor + head) and split windows (one per view) will need.
-4. **Undo is a tree, not a stack.** Undoing and then typing adds a second child
+4. **Registers are a ring, not named slots.** Vim makes you pick one of 36
+   slots at yank time, which is the wrong moment — you rarely know yet whether
+   a thing is worth keeping. Every `y`/`d`/`c`/`x` captures automatically into
+   a 4096-deep ring, and the choice moves to paste time where a picker can
+   search it. The ring lives on `Editor`, not `Buffer`: yanking in one file and
+   pasting in another is the point.
+5. **Undo is a tree, not a stack.** Undoing and then typing adds a second child
    to the current revision instead of discarding the first, so no keystroke can
    make earlier work unreachable. `u` / `Ctrl-R` walk one branch; the graph
    already stores what `g-` / `g+` would later traverse chronologically.
@@ -70,7 +80,7 @@ cargo test
    mutation — `5x` is one undo step. Insert mode holds the group open until
    `Esc`, so a typing run undoes in one go, along with the `\n` that `o`
    inserted before it.
-5. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
+6. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
    not buffer size.
 
 ## Known gaps
@@ -83,8 +93,9 @@ cargo test
   Needs `unicode-width` and a grapheme walk.
 - No horizontal scrolling — long lines clip.
 - Single buffer, no window splits.
-- No registers, so `d` and `c` discard what they take and there is no `y` or
-  `p`. Undo still gets it back.
+- No fuzzy picker over the ring yet, so only the most recent entry is
+  reachable; `"p` is reserved for it. See `docs/specs/registers.md`.
+- No named registers (`"n`) and no system clipboard (`"+` / `"*`).
 - No text objects (`diw`, `ci"`, `da(`).
 - `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
   end of the line rather than implementing the full "end in column 1" case.

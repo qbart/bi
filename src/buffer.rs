@@ -16,6 +16,7 @@ use ropey::Rope;
 
 use crate::history::{Change, History};
 use crate::motion::{Kind, Motion, Operator};
+use crate::registers::{Entry, EntryKind};
 
 /// A position as (row, byte-column-within-row).
 ///
@@ -303,17 +304,6 @@ impl Buffer {
         self.insert_str(ch.encode_utf8(&mut b));
     }
 
-    /// `x` — delete the char under the cursor, never crossing a line boundary.
-    pub fn delete_char_forward(&mut self) {
-        let row = self.cursor_row();
-        if self.cursor_col() >= self.line_len(row) {
-            return;
-        }
-        self.apply_edit(self.cursor.at, self.cursor.at + 1, "");
-        self.cursor.goal_col = None;
-        self.clamp(false);
-    }
-
     pub fn backspace(&mut self) {
         if self.cursor.at == 0 {
             return;
@@ -494,6 +484,17 @@ impl Buffer {
         Some(i.saturating_sub(1))
     }
 
+    /// The inclusive row span a linewise motion covers.
+    fn linewise_rows(&self, motion: Motion, count: usize) -> (usize, usize) {
+        let start_row = self.cursor_row();
+        let last_row = self.line_count().saturating_sub(1);
+        let target_row = match motion {
+            Motion::CurrentLine => start_row + count.max(1) - 1,
+            _ => self.row_of(self.motion_target(motion, count, self.cursor).at),
+        };
+        (start_row.min(target_row), start_row.max(target_row).min(last_row))
+    }
+
     /// The char range `op` + `motion` covers, and whether it was linewise.
     ///
     /// `None` when the motion goes nowhere — `b` at the start of the buffer,
@@ -504,14 +505,7 @@ impl Buffer {
         let len = self.rope.len_chars();
 
         if motion.kind() == Kind::Linewise {
-            let start_row = self.cursor_row();
-            let last_row = self.line_count().saturating_sub(1);
-            let target_row = match motion {
-                Motion::CurrentLine => start_row + count - 1,
-                _ => self.row_of(self.motion_target(motion, count, self.cursor).at),
-            };
-            let (first, last) = (start_row.min(target_row), start_row.max(target_row).min(last_row));
-
+            let (first, last) = self.linewise_rows(motion, count);
             let content_start = self.rope.line_to_char(first);
             // `cc` empties the lines but leaves them, so insert mode has a line
             // to sit on; `dd` takes the terminator too.
@@ -555,17 +549,93 @@ impl Buffer {
         (hi > lo).then_some((lo, hi))
     }
 
-    /// Applies `op` over `motion`. Returns whether anything changed.
-    pub fn operate(&mut self, op: Operator, motion: Motion, count: usize) -> bool {
-        let Some((start, end)) = self.operator_range(op, motion, count) else {
-            return false;
+    /// Applies `op` over `motion`, returning the text it took.
+    ///
+    /// The caller decides where that goes — the buffer knows nothing about
+    /// registers, which is what makes `"_` a policy at the call site rather
+    /// than a flag threaded through here. `None` means the motion covered
+    /// nothing and the buffer is untouched.
+    pub fn operate(&mut self, op: Operator, motion: Motion, count: usize) -> Option<Entry> {
+        let (start, end) = self.operator_range(op, motion, count)?;
+        let linewise = motion.kind() == Kind::Linewise;
+
+        // A linewise entry is always whole lines ending in a newline, even when
+        // it came from a final line that had none — otherwise pasting it could
+        // not open a line. So capture the *content* span rather than the span
+        // the operator is about to remove, which differs at the buffer's end.
+        let text = if linewise {
+            let (first, last) = self.linewise_rows(motion, count);
+            let from = self.rope.line_to_char(first);
+            let to = self.rope.line_to_char(last) + self.line_len(last);
+            let mut text = self.rope.slice(from..to).to_string();
+            text.push('\n');
+            text
+        } else {
+            self.rope.slice(start..end).to_string()
         };
-        self.apply_edit(start, end, "");
-        self.cursor = Cursor::at(start);
-        // Delete lands back on a char; change leaves the cursor where the text
-        // was, which for `d$` or `cc` is one past the end of what's left.
-        self.clamp(op == Operator::Change);
-        true
+        let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
+
+        if op == Operator::Yank {
+            // Yank moves the cursor to the start of what it took, and nowhere
+            // for the forward motions where that is already the cursor.
+            if start < self.cursor.at {
+                self.cursor = Cursor::at(start);
+                self.clamp(false);
+            }
+        } else {
+            self.apply_edit(start, end, "");
+            self.cursor = Cursor::at(start);
+            // Delete lands back on a char; change leaves the cursor where the
+            // text was, which for `d$` or `cc` is one past what's left.
+            self.clamp(op == Operator::Change);
+        }
+        Some(Entry { text, kind })
+    }
+
+    /// Puts `entry` back, `count` times, as one edit.
+    pub fn paste(&mut self, entry: &Entry, before: bool, count: usize) {
+        let count = count.max(1);
+        match entry.kind {
+            EntryKind::Charwise => {
+                let row = self.cursor_row();
+                let line_end = self.rope.line_to_char(row) + self.line_len(row);
+                // `p` goes after the char under the cursor — but an empty line
+                // has no such char, so it must not step onto the next one.
+                let at = if before {
+                    self.cursor.at
+                } else {
+                    (self.cursor.at + 1).min(line_end)
+                };
+                let text = entry.text.repeat(count);
+                let len = text.chars().count();
+                self.apply_edit(at, at, &text);
+                self.cursor = Cursor::at(at + len.saturating_sub(1));
+                self.clamp(false);
+            }
+            EntryKind::Linewise => {
+                let row = self.cursor_row();
+                let at = if before {
+                    self.rope.line_to_char(row)
+                } else if row + 1 < self.rope.len_lines() {
+                    self.rope.line_to_char(row + 1)
+                } else {
+                    self.rope.len_chars()
+                };
+
+                let mut text = entry.text.repeat(count);
+                // Appending past a final line that has no newline: the entry's
+                // trailing newline has to move to the front, or the text lands
+                // on the end of that line instead of below it.
+                if at == self.rope.len_chars() && at > 0 && self.rope.char(at - 1) != '\n' {
+                    let body = text.strip_suffix('\n').unwrap_or(&text);
+                    text = format!("\n{body}");
+                }
+
+                self.apply_edit(at, at, &text);
+                let landed = if before { row } else { row + 1 };
+                self.cursor = self.at_row(landed, false);
+            }
+        }
     }
 
     // ---- motions, mutating form --------------------------------------------
@@ -656,14 +726,14 @@ mod tests {
     fn x_does_not_eat_the_newline() {
         let mut b = buf("ab\ncd");
         b.cursor = Cursor::at(1);
-        b.delete_char_forward();
+        b.operate(Operator::Delete, Motion::Right, 1);
         assert_eq!(b.rope().to_string(), "a\ncd");
         // Deleting the last char of a line drags the cursor back onto a char.
         assert_eq!(b.cursor_col(), 0);
 
         // On an empty line there is nothing under the cursor to take.
         let mut b = buf("\ncd");
-        b.delete_char_forward();
+        b.operate(Operator::Delete, Motion::Right, 1);
         assert_eq!(b.rope().to_string(), "\ncd");
     }
 
@@ -755,7 +825,7 @@ mod tests {
     fn undo_of_a_multibyte_deletion_puts_the_text_back() {
         let mut b = buf("añb\ncd");
         b.cursor = Cursor::at(1);
-        b.delete_char_forward();
+        b.operate(Operator::Delete, Motion::Right, 1);
         b.commit_undo();
         assert_eq!(b.rope().to_string(), "ab\ncd");
 
@@ -938,7 +1008,137 @@ mod tests {
     fn an_operator_that_moves_nowhere_changes_nothing() {
         let mut b = buf("abc");
         b.cursor = Cursor::at(0);
-        assert!(!b.operate(Operator::Delete, Motion::WordBackward, 1), "b at char 0 has no range");
+        assert!(
+            b.operate(Operator::Delete, Motion::WordBackward, 1).is_none(),
+            "b at char 0 has no range"
+        );
+        assert_eq!(b.rope().to_string(), "abc");
+    }
+
+    // ---- capture -----------------------------------------------------------
+
+    #[test]
+    fn a_charwise_operator_captures_what_it_took() {
+        let mut b = buf("foo bar");
+        let e = b.operate(Operator::Delete, Motion::WordForward, 1).unwrap();
+        assert_eq!(e.text, "foo ");
+        assert_eq!(e.kind, EntryKind::Charwise);
+    }
+
+    #[test]
+    fn a_linewise_operator_captures_a_trailing_newline() {
+        let mut b = buf("one\ntwo");
+        let e = b.operate(Operator::Delete, Motion::CurrentLine, 1).unwrap();
+        assert_eq!(e.text, "one\n");
+        assert_eq!(e.kind, EntryKind::Linewise);
+    }
+
+    /// Even from a final line that has no newline of its own — a linewise entry
+    /// is always a whole line, or pasting it could not open one.
+    #[test]
+    fn a_linewise_capture_from_the_last_line_still_ends_in_a_newline() {
+        let mut b = buf("one\ntwo");
+        b.cursor = Cursor::at(4);
+        let e = b.operate(Operator::Yank, Motion::CurrentLine, 1).unwrap();
+        assert_eq!(e.text, "two\n");
+    }
+
+    #[test]
+    fn yank_captures_without_touching_the_text() {
+        let mut b = buf("foo bar");
+        let e = b.operate(Operator::Yank, Motion::WordForward, 1).unwrap();
+        assert_eq!(e.text, "foo ");
+        assert_eq!(b.rope().to_string(), "foo bar", "yank is not a mutation");
+        assert!(b.pending_edits.is_empty(), "and logs no edit");
+    }
+
+    #[test]
+    fn a_backward_yank_leaves_the_cursor_at_the_start_of_the_range() {
+        let mut b = buf("foo bar");
+        b.cursor = Cursor::at(4);
+        let e = b.operate(Operator::Yank, Motion::WordBackward, 1).unwrap();
+        assert_eq!(e.text, "foo ");
+        assert_eq!(b.cursor.at, 0);
+    }
+
+    // ---- paste -------------------------------------------------------------
+
+    fn pasted(text: &str, at: usize, entry: Entry, before: bool, count: usize) -> String {
+        let mut b = buf(text);
+        b.cursor = Cursor::at(at);
+        b.paste(&entry, before, count);
+        b.rope().to_string()
+    }
+
+    fn chars(text: &str) -> Entry {
+        Entry { text: text.into(), kind: EntryKind::Charwise }
+    }
+
+    fn lines(text: &str) -> Entry {
+        Entry { text: text.into(), kind: EntryKind::Linewise }
+    }
+
+    #[test]
+    fn charwise_p_lands_after_the_cursor_and_big_p_on_it() {
+        assert_eq!(pasted("abc", 0, chars("XY"), false, 1), "aXYbc");
+        assert_eq!(pasted("abc", 0, chars("XY"), true, 1), "XYabc");
+    }
+
+    #[test]
+    fn charwise_paste_leaves_the_cursor_on_the_last_pasted_char() {
+        let mut b = buf("abc");
+        b.paste(&chars("XY"), false, 1);
+        assert_eq!(b.rope().to_string(), "aXYbc");
+        assert_eq!(b.cursor.at, 2);
+    }
+
+    /// There is no char to paste *after* on an empty line, so `p` stays put
+    /// rather than stepping onto the next line.
+    #[test]
+    fn charwise_p_on_an_empty_line_does_not_cross_the_newline() {
+        assert_eq!(pasted("\nabc", 0, chars("X"), false, 1), "X\nabc");
+    }
+
+    #[test]
+    fn linewise_p_opens_a_line_below_and_big_p_above() {
+        assert_eq!(pasted("one\ntwo", 1, lines("NEW\n"), false, 1), "one\nNEW\ntwo");
+        assert_eq!(pasted("one\ntwo", 1, lines("NEW\n"), true, 1), "NEW\none\ntwo");
+    }
+
+    #[test]
+    fn linewise_paste_below_the_final_line_adds_the_newline_it_needs() {
+        assert_eq!(pasted("one\ntwo", 4, lines("NEW\n"), false, 1), "one\ntwo\nNEW");
+    }
+
+    #[test]
+    fn linewise_paste_leaves_the_cursor_on_the_first_pasted_line() {
+        let mut b = buf("one\ntwo");
+        b.paste(&lines("NEW\n"), false, 1);
+        assert_eq!(b.rope().to_string(), "one\nNEW\ntwo");
+        assert_eq!(b.cursor_row(), 1);
+        assert_eq!(b.cursor_col(), 0);
+    }
+
+    #[test]
+    fn a_counted_paste_repeats_the_content() {
+        assert_eq!(pasted("abc", 0, chars("X"), false, 3), "aXXXbc");
+        assert_eq!(pasted("one", 0, lines("NEW\n"), true, 2), "NEW\nNEW\none");
+    }
+
+    /// Repeating a linewise entry must not collapse the blank line inside it.
+    #[test]
+    fn a_repeated_linewise_paste_keeps_its_blank_lines() {
+        assert_eq!(pasted("one", 0, lines("a\n\n"), false, 1), "one\na\n");
+    }
+
+    #[test]
+    fn a_paste_is_a_single_undo_step() {
+        let mut b = buf("abc");
+        b.paste(&chars("XY"), false, 3);
+        b.commit_undo();
+        assert_eq!(b.rope().to_string(), "aXYXYXYbc");
+
+        b.undo();
         assert_eq!(b.rope().to_string(), "abc");
     }
 

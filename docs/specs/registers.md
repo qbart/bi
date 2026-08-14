@@ -8,13 +8,12 @@ time, where a fuzzy picker can search it.
 
 ## Status
 
-Step 1 is the implementable scope: the ring, automatic capture, `p`/`P`, and
-the black hole. Steps 2–4 are recorded here because their decisions shape step
-1's data model, not because they are being built yet.
+Step 1 is **built**. Steps 2–4 are recorded here because their decisions shape
+step 1's data model, not because they are being built yet.
 
 | Step | Scope | Needs |
 |---|---|---|
-| **1** | Ring, auto-capture on `y`/`d`/`c`/`x`, `p`/`P`, `"_` | nothing new |
+| **1** ✅ | Ring, auto-capture on `y`/`d`/`c`/`x`, `p`/`P`, `"_` | nothing new |
 | 2 | Fuzzy picker over the ring, `"p` / `"P` | a general overlay UI |
 | 3 | Named registers, `"n` | step 2 + a name prompt |
 | 4 | System clipboard, `"+` / `"*` | a clipboard backend |

@@ -10,6 +10,7 @@ use anyhow::Result;
 
 use crate::buffer::Buffer;
 use crate::motion::{Motion, Operator};
+use crate::registers::{Registers, Sink};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -43,6 +44,12 @@ pub enum Action {
         motion: Motion,
         /// Already folded — `2d3w` arrives here as 6.
         count: usize,
+        sink: Sink,
+    },
+    /// `p` / `P`. Reads the front of the ring.
+    Paste {
+        before: bool,
+        count: usize,
     },
 
     EnterInsert,
@@ -52,8 +59,6 @@ pub enum Action {
     EnterNormal,
     OpenLineBelow,
     OpenLineAbove,
-
-    DeleteChar,
 
     Undo,
     Redo,
@@ -80,8 +85,7 @@ impl Action {
         }
         matches!(
             self,
-            Action::DeleteChar
-                | Action::InsertChar(_)
+            Action::InsertChar(_)
                 | Action::Undo
                 | Action::Redo
         )
@@ -96,6 +100,9 @@ pub struct Command {
 
 pub struct Editor {
     pub buffer: Buffer,
+    /// Global, not per-buffer: yanking in one file and pasting in another is
+    /// the point, so they outlive any single buffer.
+    pub registers: Registers,
     pub mode: Mode,
     pub status: String,
     /// First visible row.
@@ -115,6 +122,7 @@ impl Editor {
     fn with_buffer(buffer: Buffer) -> Self {
         Self {
             buffer,
+            registers: Registers::default(),
             mode: Mode::Normal,
             status: String::new(),
             scroll: 0,
@@ -142,11 +150,25 @@ impl Editor {
 
         match action {
             Action::Move(m) => self.buffer.apply_motion(*m, eol),
-            Action::Operate { op, motion, count } => {
-                if self.buffer.operate(*op, *motion, *count) && *op == Operator::Change {
-                    self.mode = Mode::Insert;
+            Action::Operate { op, motion, count, sink } => {
+                if let Some(entry) = self.buffer.operate(*op, *motion, *count) {
+                    if *sink == Sink::Ring {
+                        self.registers.push(entry);
+                    }
+                    if *op == Operator::Change {
+                        self.mode = Mode::Insert;
+                    }
                 }
             }
+            Action::Paste { before, count } => match self.registers.front() {
+                // Cloned because pasting borrows the buffer mutably while the
+                // entry is still owned by the ring.
+                Some(entry) => {
+                    let entry = entry.clone();
+                    self.buffer.paste(&entry, *before, *count);
+                }
+                None => self.status = "nothing to paste".into(),
+            },
 
             Action::EnterInsert => self.mode = Mode::Insert,
             Action::EnterInsertAfter => {
@@ -177,7 +199,6 @@ impl Editor {
                 self.buffer.open_line(false);
             }
 
-            Action::DeleteChar => self.buffer.delete_char_forward(),
 
 
             Action::Undo => {
@@ -341,7 +362,7 @@ mod tests {
     #[test]
     fn a_counted_command_undoes_as_one_unit() {
         let mut ed = editor("abcdef");
-        ed.apply(Command { count: 5, action: Action::DeleteChar });
+        ed.apply(operate_n(Operator::Delete, Motion::Right, 5));
         assert_eq!(ed.buffer.rope().to_string(), "f");
 
         ed.apply(cmd(Action::Undo));
@@ -377,7 +398,7 @@ mod tests {
     #[test]
     fn entering_and_leaving_insert_without_typing_is_not_an_undo_step() {
         let mut ed = editor("a");
-        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(cmd(Action::EnterInsert));
         ed.apply(cmd(Action::EnterNormal));
 
@@ -388,9 +409,9 @@ mod tests {
     #[test]
     fn undo_takes_a_count() {
         let mut ed = editor("abcdef");
-        ed.apply(cmd(Action::DeleteChar));
-        ed.apply(cmd(Action::DeleteChar));
-        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
         assert_eq!(ed.buffer.rope().to_string(), "def");
 
         ed.apply(Command { count: 3, action: Action::Undo });
@@ -398,7 +419,12 @@ mod tests {
     }
 
     fn operate(op: Operator, motion: Motion, count: usize) -> Command {
-        cmd(Action::Operate { op, motion, count })
+        cmd(Action::Operate { op, motion, count, sink: Sink::Ring })
+    }
+
+    /// `5x` — one command whose count the operator folded in.
+    fn operate_n(op: Operator, motion: Motion, count: usize) -> Command {
+        operate(op, motion, count)
     }
 
     #[test]
@@ -439,7 +465,7 @@ mod tests {
     #[test]
     fn a_delete_that_matches_nothing_leaves_no_undo_step() {
         let mut ed = editor("abc");
-        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(operate(Operator::Delete, Motion::WordBackward, 1));
         assert_eq!(ed.buffer.rope().to_string(), "bc", "b at char 0 did nothing");
 
@@ -447,10 +473,92 @@ mod tests {
         assert_eq!(ed.buffer.rope().to_string(), "abc", "one undo still reaches the x");
     }
 
+    fn paste(before: bool, count: usize) -> Command {
+        cmd(Action::Paste { before, count })
+    }
+
+    #[test]
+    fn yank_then_paste_round_trips() {
+        let mut ed = editor("foo bar");
+        ed.apply(operate(Operator::Yank, Motion::WordForward, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "foo bar", "yank changed nothing");
+
+        ed.apply(paste(false, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "ffoo oo bar");
+    }
+
+    #[test]
+    fn a_delete_fills_the_ring_so_p_puts_it_back() {
+        let mut ed = editor("one\ntwo");
+        ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "two");
+
+        ed.apply(paste(true, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "one\ntwo", "linewise, so above");
+    }
+
+    /// The whole point of `"_`: the text goes, the ring is untouched.
+    #[test]
+    fn the_black_hole_captures_nothing() {
+        let mut ed = editor("keep\njunk");
+        ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
+
+        ed.buffer.cursor = Cursor::at(5);
+        ed.apply(Command {
+            count: 1,
+            action: Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::BlackHole,
+            },
+        });
+        assert_eq!(ed.buffer.rope().to_string(), "keep", "the junk line is gone");
+
+        ed.apply(paste(false, 1));
+        assert_eq!(
+            ed.buffer.rope().to_string(),
+            "keep\nkeep",
+            "the ring still holds the yank, not the junk"
+        );
+    }
+
+    #[test]
+    fn pasting_from_an_empty_ring_says_so() {
+        let mut ed = editor("abc");
+        ed.apply(paste(false, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "abc");
+        assert_eq!(ed.status, "nothing to paste");
+    }
+
+    #[test]
+    fn a_paste_is_one_undo_step_even_with_a_count() {
+        let mut ed = editor("abc");
+        ed.apply(operate(Operator::Yank, Motion::Right, 1));
+        ed.apply(paste(false, 3));
+        assert_eq!(ed.buffer.rope().to_string(), "aaaabc");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "abc");
+    }
+
+    /// Undo puts the text back in the buffer and leaves the ring alone, as vim
+    /// does — you can undo a delete and still paste what it took.
+    #[test]
+    fn undo_does_not_roll_back_the_ring() {
+        let mut ed = editor("one\ntwo");
+        ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "one\ntwo");
+
+        ed.apply(paste(true, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "one\none\ntwo");
+    }
+
     #[test]
     fn redo_walks_back_forward() {
         let mut ed = editor("abc");
-        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(cmd(Action::Undo));
         ed.apply(cmd(Action::Redo));
         assert_eq!(ed.buffer.rope().to_string(), "bc");

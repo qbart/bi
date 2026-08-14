@@ -31,6 +31,8 @@ pub enum Motion {
 pub enum Operator {
     Delete,
     Change,
+    /// Copies without removing. The only operator that leaves the text alone.
+    Yank,
 }
 
 /// How a motion's endpoints turn into a range.

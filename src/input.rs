@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::editor::{Action, Command, Mode};
 use crate::motion::{Motion, Operator};
+use crate::registers::Sink;
 
 #[derive(Default)]
 pub struct Input {
@@ -21,6 +22,10 @@ pub struct Input {
     motion_count: Option<usize>,
     operator: Option<Operator>,
     g_pending: bool,
+    /// `"` has been typed and is waiting for the register it names.
+    quote_pending: bool,
+    /// Where this command's text goes. Reset with everything else.
+    sink: Sink,
 }
 
 /// The keys that name a motion on their own. `G` is missing because what it
@@ -54,9 +59,16 @@ impl Input {
         if let Some(n) = self.count {
             s.push_str(&n.to_string());
         }
+        if self.quote_pending {
+            s.push('"');
+        }
+        if self.sink == Sink::BlackHole {
+            s.push_str("\"_");
+        }
         match self.operator {
             Some(Operator::Delete) => s.push('d'),
             Some(Operator::Change) => s.push('c'),
+            Some(Operator::Yank) => s.push('y'),
             None => {}
         }
         if let Some(n) = self.motion_count {
@@ -89,11 +101,21 @@ impl Input {
         // `d5G` deletes to line 5 once, not five times.
         let count = if motion.is_absolute() { 1 } else { self.fold_count() };
         let operator = self.operator;
+        let sink = self.sink;
         self.reset();
         Some(match operator {
-            Some(op) => Command { count: 1, action: Action::Operate { op, motion, count } },
+            Some(op) => {
+                Command { count: 1, action: Action::Operate { op, motion, count, sink } }
+            }
             None => Command { count, action: Action::Move(motion) },
         })
+    }
+
+    /// Resolves a motion under an operator the key implies rather than one the
+    /// user typed — `x` is `dl`, `Y` is `yy`.
+    fn resolve_as(&mut self, op: Operator, motion: Motion) -> Option<Command> {
+        self.operator = Some(op);
+        self.resolve(motion)
     }
 
     /// A plain action, with whatever count preceded it.
@@ -131,6 +153,18 @@ impl Input {
     }
 
     fn normal_char(&mut self, c: char) -> Option<Command> {
+        // `"` is holding out for the register it names. Only the black hole
+        // exists so far; the picker and named registers are later steps.
+        if self.quote_pending {
+            self.quote_pending = false;
+            if c == '_' {
+                self.sink = Sink::BlackHole;
+                return None;
+            }
+            self.reset();
+            return None;
+        }
+
         // `g` is holding out for a second key.
         if self.g_pending {
             self.g_pending = false;
@@ -161,7 +195,7 @@ impl Input {
         if let Some(op) = self.operator {
             let doubled = matches!(
                 (op, c),
-                (Operator::Delete, 'd') | (Operator::Change, 'c')
+                (Operator::Delete, 'd') | (Operator::Change, 'c') | (Operator::Yank, 'y')
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
@@ -197,14 +231,43 @@ impl Input {
             'A' => Action::EnterInsertLineEnd,
             'o' => Action::OpenLineBelow,
             'O' => Action::OpenLineAbove,
-            'x' => Action::DeleteChar,
             'u' => Action::Undo,
+            // `x` is `dl` and always was — `Motion::Right` already stops at the
+            // line end, so `5x` clamps there too.
+            'x' => {
+                return self.resolve_as(Operator::Delete, Motion::Right);
+            }
+            'p' | 'P' => {
+                if self.sink == Sink::BlackHole {
+                    // Nothing ever reaches the black hole, so nothing comes out.
+                    self.reset();
+                    return None;
+                }
+                let count = self.fold_count();
+                self.reset();
+                return Some(Command {
+                    count: 1,
+                    action: Action::Paste { before: c == 'P', count },
+                });
+            }
+            // `Y` is `yy`, as in vim.
+            'Y' => {
+                return self.resolve_as(Operator::Yank, Motion::CurrentLine);
+            }
             'd' => {
                 self.operator = Some(Operator::Delete);
                 return None;
             }
             'c' => {
                 self.operator = Some(Operator::Change);
+                return None;
+            }
+            'y' => {
+                self.operator = Some(Operator::Yank);
+                return None;
+            }
+            '"' => {
+                self.quote_pending = true;
                 return None;
             }
             'g' => {
@@ -271,6 +334,7 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registers::Sink;
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -291,6 +355,15 @@ mod tests {
                 assert!(out.is_none(), "{c:?} resolved early in {keys:?}");
             }
             last = out;
+        }
+        last.unwrap_or_else(|| panic!("{keys:?} produced no command"))
+    }
+
+    /// Like `typed`, but on an existing parser so leftover state shows up.
+    fn typed_with(input: &mut Input, keys: &str) -> Command {
+        let mut last = None;
+        for c in keys.chars() {
+            last = input.on_key(key(c), &Mode::Normal);
         }
         last.unwrap_or_else(|| panic!("{keys:?} produced no command"))
     }
@@ -322,7 +395,7 @@ mod tests {
     fn dw_is_an_operator_over_a_motion() {
         assert_eq!(
             typed("dw").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 1 }
+            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 1, sink: Sink::Ring }
         );
     }
 
@@ -330,7 +403,7 @@ mod tests {
     fn cw_carries_the_change_operator() {
         assert_eq!(
             typed("cw").action,
-            Action::Operate { op: Operator::Change, motion: Motion::WordForward, count: 1 }
+            Action::Operate { op: Operator::Change, motion: Motion::WordForward, count: 1, sink: Sink::Ring }
         );
     }
 
@@ -338,11 +411,11 @@ mod tests {
     fn the_doubled_form_is_the_current_line() {
         assert_eq!(
             typed("dd").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::CurrentLine, count: 1 }
+            Action::Operate { op: Operator::Delete, motion: Motion::CurrentLine, count: 1, sink: Sink::Ring }
         );
         assert_eq!(
             typed("cc").action,
-            Action::Operate { op: Operator::Change, motion: Motion::CurrentLine, count: 1 }
+            Action::Operate { op: Operator::Change, motion: Motion::CurrentLine, count: 1, sink: Sink::Ring }
         );
     }
 
@@ -350,7 +423,7 @@ mod tests {
     fn counts_on_both_sides_multiply() {
         assert_eq!(
             typed("2d3w").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 6 }
+            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 6, sink: Sink::Ring }
         );
     }
 
@@ -358,7 +431,7 @@ mod tests {
     fn a_count_after_the_operator_stands_alone() {
         assert_eq!(
             typed("d3w").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 3 }
+            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 3, sink: Sink::Ring }
         );
     }
 
@@ -366,7 +439,7 @@ mod tests {
     fn zero_after_an_operator_is_the_line_start_motion_not_a_count() {
         assert_eq!(
             typed("d0").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::LineStart, count: 1 }
+            Action::Operate { op: Operator::Delete, motion: Motion::LineStart, count: 1, sink: Sink::Ring }
         );
     }
 
@@ -374,7 +447,7 @@ mod tests {
     fn an_operator_reaches_through_the_g_prefix() {
         assert_eq!(
             typed("dgg").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::FirstLine, count: 1 }
+            Action::Operate { op: Operator::Delete, motion: Motion::FirstLine, count: 1, sink: Sink::Ring }
         );
     }
 
@@ -389,7 +462,130 @@ mod tests {
         assert_eq!(typed("5G").action, Action::Move(Motion::Line(5)));
         assert_eq!(
             typed("d5G").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::Line(5), count: 1 }
+            Action::Operate { op: Operator::Delete, motion: Motion::Line(5), count: 1, sink: Sink::Ring }
+        );
+    }
+
+    #[test]
+    fn yank_is_an_operator_like_the_others() {
+        assert_eq!(
+            typed("yw").action,
+            Action::Operate {
+                op: Operator::Yank,
+                motion: Motion::WordForward,
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        assert_eq!(
+            typed("yy").action,
+            Action::Operate {
+                op: Operator::Yank,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+    }
+
+    /// `Y` is `yy`, and `x` is `dl`.
+    #[test]
+    fn the_shorthand_keys_expand_to_operators() {
+        assert_eq!(
+            typed("Y").action,
+            Action::Operate {
+                op: Operator::Yank,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        assert_eq!(
+            typed("x").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::Right,
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        assert_eq!(
+            typed("5x").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::Right,
+                count: 5,
+                sink: Sink::Ring
+            }
+        );
+    }
+
+    #[test]
+    fn p_and_big_p_paste() {
+        assert_eq!(typed("p").action, Action::Paste { before: false, count: 1 });
+        assert_eq!(typed("P").action, Action::Paste { before: true, count: 1 });
+        assert_eq!(typed("3p").action, Action::Paste { before: false, count: 3 });
+    }
+
+    /// The one register that exists so far. This must survive the reset that
+    /// happens when the command resolves.
+    #[test]
+    fn the_black_hole_prefix_reaches_the_operator() {
+        assert_eq!(
+            typed("\"_dd").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::BlackHole
+            }
+        );
+        assert_eq!(
+            typed("\"_dw").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::WordForward,
+                count: 1,
+                sink: Sink::BlackHole
+            }
+        );
+    }
+
+    #[test]
+    fn the_black_hole_does_not_leak_into_the_next_command() {
+        let mut input = Input::default();
+        for c in "\"_dd".chars() {
+            input.on_key(key(c), &Mode::Normal);
+        }
+        assert_eq!(
+            typed_with(&mut input, "dd").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+    }
+
+    #[test]
+    fn nothing_comes_back_out_of_the_black_hole() {
+        assert!(nothing("\"_p").is_none());
+    }
+
+    /// An unknown register name discards the command. Keys after it are fresh
+    /// input, so `"zdd` deletes to the ring — the `"z` is dropped, not the `dd`.
+    #[test]
+    fn a_quote_naming_no_register_cancels() {
+        assert!(nothing("\"z").is_none());
+        assert_eq!(
+            typed_with(&mut Input::default(), "\"zdd").action,
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 

@@ -10,6 +10,7 @@ mod editor;
 mod history;
 mod input;
 mod motion;
+mod registers;
 mod ui;
 
 use std::io::{self, Stdout};
