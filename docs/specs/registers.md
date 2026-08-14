@@ -8,13 +8,17 @@ time, where a fuzzy picker can search it.
 
 ## Status
 
-Step 1 is **built**. Steps 2–4 are recorded here because their decisions shape
-step 1's data model, not because they are being built yet.
+Steps 1 and 2 are **built**. Steps 3–4 are recorded here because their
+decisions shape the data model, not because they are being built yet.
+
+The picker matches by **substring**, not fuzzily: register entries are prose and
+code, where "these letters appear in order" matches nearly everything. Matches
+keep ring order, so recency is the ranking.
 
 | Step | Scope | Needs |
 |---|---|---|
 | **1** ✅ | Ring, auto-capture on `y`/`d`/`c`/`x`, `p`/`P`, `"_` | nothing new |
-| 2 | Fuzzy picker over the ring, `"p` / `"P` | a general overlay UI |
+| **2** ✅ | Picker over the ring, `"p` / `"P` | a general overlay UI |
 | 3 | Named registers, `"n` | step 2 + a name prompt |
 | 4 | System clipboard, `"+` / `"*` | a clipboard backend |
 

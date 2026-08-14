@@ -11,23 +11,113 @@ cargo run -- <file>
 cargo test
 ```
 
-## Keys
+## Key bindings
 
-| | |
+Counts work where vim's do: `5j`, `3dd`, `d3w`, and `2d3w` multiplies to six
+words. `{n}` below means an optional count.
+
+### Normal mode
+
+**Motions** — usable on their own, or as the target of an operator.
+
+| Key | Moves to |
 |---|---|
-| `h j k l` `w b` `0 ^ $` | motions (accept counts: `5j`) |
-| `gg` `G` `{n}G` | first line, last line, line *n* |
-| `i a I A` | insert before/after cursor, at line start/end |
-| `o O` | open line below/above |
-| `x` | delete char |
-| `d{motion}` `c{motion}` | delete / change over a motion: `dw` `d$` `db` `dj` `dgg` `cw` `c0` |
-| `dd` `cc` | delete / clear whole lines (`3dd` for three) |
-| `y{motion}` `yy` `Y` | yank |
-| `p` `P` | paste after / before, charwise or linewise as taken |
-| `"_` | black hole prefix: `"_dd` deletes without capturing |
-| `u` `Ctrl-R` | undo, redo (accept counts: `3u`) |
-| `Esc` | back to normal mode |
-| `:w` `:w <path>` `:q` `:q!` `:wq` `:{n}` | ex commands |
+| `h` `l` | left, right (`Space` also moves right) |
+| `j` `k` | down, up, keeping a goal column through short lines |
+| `w` `b` | start of the next / previous word |
+| `0` `^` | start of the line (`^` is an alias for `0` until a first-non-blank motion exists) |
+| `$` | end of the line |
+| `gg` | first line |
+| `G` | last line, or line `{n}` when counted |
+| arrows, `Home`, `End` | same as the above |
+
+**Operators** — take a motion, or double the key for whole lines.
+
+| Key | Does |
+|---|---|
+| `d{motion}` | delete over the motion: `dw` `d$` `d0` `db` `dj` `dgg` `dG` |
+| `c{motion}` | change — delete, then enter insert mode |
+| `y{motion}` | yank |
+| `dd` `cc` `yy` | the whole line, `{n}` of them when counted |
+| `Y` | `yy` |
+| `x` | delete the char under the cursor — exactly `dl` |
+
+`cw` follows vim and behaves like `ce`: it changes the word without swallowing
+the whitespace after it. `dw` at the end of a line stops there rather than
+pulling the next line up.
+
+**Registers and paste**
+
+| Key | Does |
+|---|---|
+| `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise |
+| `"p` `"P` | open the picker to choose from everything captured, then paste |
+| `"_` | black hole prefix — `"_dd` deletes without capturing |
+
+Every `y`, `d`, `c` and `x` captures automatically into a 4096-deep ring, so
+there is nothing to decide at yank time. A count goes before the quote: `3"p`.
+
+**Entering insert mode**
+
+| Key | Puts the cursor |
+|---|---|
+| `i` `a` | before / after the cursor |
+| `I` `A` | at the start / end of the line |
+| `o` `O` | on a new line below / above |
+
+**Undo**
+
+| Key | Does |
+|---|---|
+| `u` | undo, `{n}` steps when counted |
+| `Ctrl-R` | redo |
+
+One command is one undo step, so `5x` returns in a single `u`. A whole insert
+session is one step, including the newline `o` opened before it. Undo is a
+tree, so undoing and then typing keeps the old branch rather than discarding it
+— though nothing reaches those branches yet.
+
+**Other**
+
+| Key | Does |
+|---|---|
+| `Esc`, `Ctrl-C` | back to normal mode, or cancel a half-typed command |
+| `:` | ex command line |
+
+### Insert mode
+
+Printable keys insert themselves. `Enter`, `Backspace` and `Tab` do the obvious
+thing, arrows and `Home`/`End` move, and `Esc` or `Ctrl-C` returns to normal
+mode with the cursor pulled back onto a character.
+
+### Picker
+
+Opened with `"p` / `"P`. Typing filters by substring — every whitespace-separated
+term must appear somewhere, in any order, case-insensitively. Matches stay in
+ring order, so the most recent is first.
+
+| Key | Does |
+|---|---|
+| any printable | add to the query |
+| `Backspace` | delete a char; on an empty query, cancel |
+| `Ctrl-N`, `Down` | next match |
+| `Ctrl-P`, `Up` | previous match |
+| `Ctrl-A` | show or hide one-character entries, hidden by default |
+| `Enter` | paste the highlighted entry |
+| `Esc`, `Ctrl-C` | cancel |
+
+A `¶` beside a row means the entry is linewise and will open a new line.
+Choosing an entry also moves it to the front of the ring, so a plain `p`
+afterwards repeats it.
+
+### Ex commands
+
+| Command | Does |
+|---|---|
+| `:w` `:w <path>` | write |
+| `:q` `:q!` | quit, refusing if there are unsaved changes unless forced |
+| `:wq` `:x` | write and quit |
+| `:{n}` | go to line *n* |
 
 ## Layout
 
@@ -38,6 +128,7 @@ cargo test
 | `registers.rs` | the yank ring: entries, capture, eviction |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
+| `picker.rs` | the overlay's state: query, matches, selection |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `ui.rs` | viewport-bounded render pass |
 | `main.rs` | terminal lifecycle, event loop |
@@ -93,9 +184,8 @@ cargo test
   Needs `unicode-width` and a grapheme walk.
 - No horizontal scrolling — long lines clip.
 - Single buffer, no window splits.
-- No fuzzy picker over the ring yet, so only the most recent entry is
-  reachable; `"p` is reserved for it. See `docs/specs/registers.md`.
-- No named registers (`"n`) and no system clipboard (`"+` / `"*`).
+- No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
+  `docs/specs/registers.md`.
 - No text objects (`diw`, `ci"`, `da(`).
 - `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
   end of the line rather than implementing the full "end in column 1" case.
