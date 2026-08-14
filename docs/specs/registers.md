@@ -92,11 +92,10 @@ changes no text and must not put an empty string on the ring.
 that is a *display* problem solved in step 2 by hiding short entries behind a
 toggle, not a storage problem solved by dropping data.
 
-`x` currently bypasses the operator path via `Buffer::delete_char_forward`. It
-becomes `Operate { op: Delete, motion: Right, count }`, which is what `x` has
+`x` is `Operate { op: Delete, motion: Right, count }`, which is what it has
 always been — `Motion::Right` already stops at the line end, so `5x` clamps
-there exactly as before. That deletes a special case rather than teaching it
-about registers, and `delete_char_forward` goes away.
+there exactly as before. That deleted a special case rather than teaching it
+about registers; `Buffer::delete_char_forward` is gone.
 
 ### The black hole
 
@@ -175,11 +174,12 @@ count: usize)` takes an entry and knows nothing about where it came from.
 ## New actions
 
 ```rust
-Action::Paste { before: bool }
+Action::Paste { before: bool, count: usize }
 Action::Operate { op, motion, count, sink: Sink }
 ```
 
-`Sink` is `Ring` or `BlackHole` in step 1, and grows a `Named(String)` and
+`Paste` carries its own count rather than repeating through `Editor::apply`, so
+three copies are one edit and one undo step. `Sink` is `Ring` or `BlackHole`, and grows a `Named(String)` and
 `Clipboard` variant later. An enum rather than a `bool` specifically so those
 additions don't rewrite call sites.
 
