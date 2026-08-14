@@ -10,7 +10,8 @@ use anyhow::Result;
 
 use crate::buffer::Buffer;
 use crate::motion::{Motion, Operator};
-use crate::registers::{Registers, Sink};
+use crate::picker::{Item, Picker, PickerKind};
+use crate::registers::{EntryKind, Registers, Sink};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -18,6 +19,9 @@ pub enum Mode {
     Insert,
     /// The `:` line being typed, without the leading colon.
     Command(String),
+    /// The picker overlay is up. Its state lives in `Editor::picker` — a
+    /// `Picker` is far too large to sit inside this enum.
+    Pick,
 }
 
 impl Mode {
@@ -26,6 +30,7 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Command(_) => "COMMAND",
+            Mode::Pick => "PICK",
         }
     }
 
@@ -51,6 +56,15 @@ pub enum Action {
         before: bool,
         count: usize,
     },
+
+    OpenPicker(PickerKind),
+    PickChar(char),
+    PickBackspace,
+    PickNext,
+    PickPrev,
+    PickAccept,
+    PickCancel,
+    PickToggleShort,
 
     EnterInsert,
     EnterInsertAfter,
@@ -103,6 +117,7 @@ pub struct Editor {
     /// Global, not per-buffer: yanking in one file and pasting in another is
     /// the point, so they outlive any single buffer.
     pub registers: Registers,
+    pub picker: Option<Picker>,
     pub mode: Mode,
     pub status: String,
     /// First visible row.
@@ -123,6 +138,7 @@ impl Editor {
         Self {
             buffer,
             registers: Registers::default(),
+            picker: None,
             mode: Mode::Normal,
             status: String::new(),
             scroll: 0,
@@ -169,6 +185,37 @@ impl Editor {
                 }
                 None => self.status = "nothing to paste".into(),
             },
+
+            Action::OpenPicker(kind) => self.open_picker(*kind),
+            Action::PickChar(c) => {
+                if let Some(p) = &mut self.picker {
+                    p.push_char(*c);
+                }
+            }
+            Action::PickBackspace => {
+                // Backspacing off the front cancels, as it does on a `:` line.
+                let empty = self.picker.as_mut().is_some_and(|p| !p.backspace());
+                if empty {
+                    self.close_picker();
+                }
+            }
+            Action::PickNext => {
+                if let Some(p) = &mut self.picker {
+                    p.next();
+                }
+            }
+            Action::PickPrev => {
+                if let Some(p) = &mut self.picker {
+                    p.prev();
+                }
+            }
+            Action::PickToggleShort => {
+                if let Some(p) = &mut self.picker {
+                    p.toggle_short();
+                }
+            }
+            Action::PickCancel => self.close_picker(),
+            Action::PickAccept => self.accept_pick(),
 
             Action::EnterInsert => self.mode = Mode::Insert,
             Action::EnterInsertAfter => {
@@ -240,6 +287,47 @@ impl Editor {
                 };
                 self.mode = Mode::Normal;
                 self.run_ex(&line);
+            }
+        }
+    }
+
+    fn open_picker(&mut self, kind: PickerKind) {
+        if self.registers.is_empty() {
+            // An empty overlay is a worse answer than saying so.
+            self.status = "nothing to paste".into();
+            return;
+        }
+        let items = self
+            .registers
+            .iter()
+            .map(|e| Item {
+                text: e.text.clone(),
+                badge: (e.kind == EntryKind::Linewise).then_some('¶'),
+            })
+            .collect();
+        self.picker = Some(Picker::new(kind, items));
+        self.mode = Mode::Pick;
+    }
+
+    fn close_picker(&mut self) {
+        self.picker = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn accept_pick(&mut self) {
+        let picker = self.picker.take();
+        self.mode = Mode::Normal;
+        let Some(picker) = picker else { return };
+        let Some(entry) = picker.selected().and_then(|i| self.registers.get(i)).cloned() else {
+            return;
+        };
+        match picker.kind {
+            PickerKind::Register { before } => {
+                // Push before pasting: move-to-front makes this the ring's head,
+                // so `.` and a later bare `p` repeat the entry you chose rather
+                // than whatever happened to be most recent.
+                self.registers.push(entry.clone());
+                self.buffer.paste(&entry, before, 1);
             }
         }
     }
@@ -336,6 +424,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::buffer::Cursor;
+    use crate::picker::PickerKind;
 
     /// Text arrives as one committed revision, so a single undo lands back on
     /// it rather than on an empty buffer.
@@ -553,6 +642,128 @@ mod tests {
 
         ed.apply(paste(true, 1));
         assert_eq!(ed.buffer.rope().to_string(), "one\none\ntwo");
+    }
+
+    // ---- picker ------------------------------------------------------------
+
+    fn pick_keys(ed: &mut Editor, actions: &[Action]) {
+        for a in actions {
+            ed.apply(cmd(a.clone()));
+        }
+    }
+
+    fn open_register_picker(before: bool) -> Command {
+        cmd(Action::OpenPicker(PickerKind::Register { before }))
+    }
+
+    /// Fills the ring with three distinct yanks, oldest first.
+    fn ed_with_ring() -> Editor {
+        let mut ed = editor("alpha\nbeta\ngamma");
+        for row in 0..3 {
+            ed.buffer.cursor = ed.buffer.at_row(row, false);
+            ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
+        }
+        ed
+    }
+
+    #[test]
+    fn the_picker_opens_over_the_ring_most_recent_first() {
+        let mut ed = ed_with_ring();
+        ed.apply(open_register_picker(false));
+
+        assert_eq!(ed.mode, Mode::Pick);
+        let p = ed.picker.as_ref().unwrap();
+        assert_eq!(p.items()[p.selected().unwrap()].text, "gamma\n");
+    }
+
+    #[test]
+    fn an_empty_ring_reports_instead_of_opening_an_empty_overlay() {
+        let mut ed = editor("abc");
+        ed.apply(open_register_picker(false));
+
+        assert_eq!(ed.mode, Mode::Normal);
+        assert!(ed.picker.is_none());
+        assert_eq!(ed.status, "nothing to paste");
+    }
+
+    #[test]
+    fn accepting_pastes_the_chosen_entry_not_the_most_recent() {
+        let mut ed = ed_with_ring();
+        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        ed.apply(open_register_picker(true));
+        pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
+
+        assert_eq!(ed.mode, Mode::Normal);
+        assert!(ed.picker.is_none());
+        assert_eq!(
+            ed.buffer.rope().to_string(),
+            "alpha\nalpha\nbeta\ngamma",
+            "the third-newest entry, chosen by moving down twice"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_picker_filters_what_accept_takes() {
+        let mut ed = ed_with_ring();
+        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        ed.apply(open_register_picker(true));
+        pick_keys(
+            &mut ed,
+            &[Action::PickChar('b'), Action::PickChar('e'), Action::PickAccept],
+        );
+        assert_eq!(ed.buffer.rope().to_string(), "beta\nalpha\nbeta\ngamma");
+    }
+
+    /// Choosing promotes the entry, so a plain `p` afterwards repeats it — this
+    /// is what makes `.` work without re-opening the picker.
+    #[test]
+    fn accepting_moves_the_entry_to_the_front_of_the_ring() {
+        let mut ed = ed_with_ring();
+        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        ed.apply(open_register_picker(true));
+        pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
+
+        assert_eq!(ed.registers.front().unwrap().text, "alpha\n");
+        ed.apply(paste(true, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "alpha\nalpha\nalpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn cancelling_leaves_the_buffer_and_the_ring_alone() {
+        let mut ed = ed_with_ring();
+        let before = ed.buffer.rope().to_string();
+        ed.apply(open_register_picker(false));
+        pick_keys(&mut ed, &[Action::PickNext, Action::PickCancel]);
+
+        assert_eq!(ed.mode, Mode::Normal);
+        assert!(ed.picker.is_none());
+        assert_eq!(ed.buffer.rope().to_string(), before);
+        assert_eq!(ed.registers.front().unwrap().text, "gamma\n");
+    }
+
+    #[test]
+    fn backspacing_an_empty_query_closes_the_picker() {
+        let mut ed = ed_with_ring();
+        ed.apply(open_register_picker(false));
+        ed.apply(cmd(Action::PickChar('a')));
+        ed.apply(cmd(Action::PickBackspace));
+        assert_eq!(ed.mode, Mode::Pick, "still open, one char removed");
+
+        ed.apply(cmd(Action::PickBackspace));
+        assert_eq!(ed.mode, Mode::Normal, "nothing left to delete");
+    }
+
+    #[test]
+    fn a_picked_paste_is_one_undo_step() {
+        let mut ed = ed_with_ring();
+        let before = ed.buffer.rope().to_string();
+        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        ed.apply(open_register_picker(true));
+        pick_keys(&mut ed, &[Action::PickNext, Action::PickAccept]);
+        assert_ne!(ed.buffer.rope().to_string(), before);
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), before);
     }
 
     #[test]

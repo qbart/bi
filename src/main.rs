@@ -10,6 +10,7 @@ mod editor;
 mod history;
 mod input;
 mod motion;
+mod picker;
 mod registers;
 mod ui;
 

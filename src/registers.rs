@@ -93,9 +93,23 @@ impl Registers {
         self.ring.front()
     }
 
-    #[allow(dead_code, reason = "the picker lists the ring")]
+    #[allow(dead_code, reason = "tests and, later, the picker's count line")]
     pub fn len(&self) -> usize {
         self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// Most recent first — the order the picker lists them in.
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.ring.iter()
+    }
+
+    /// By position in that same order, which is what the picker hands back.
+    pub fn get(&self, i: usize) -> Option<&Entry> {
+        self.ring.get(i)
     }
 }
 

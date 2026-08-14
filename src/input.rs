@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::editor::{Action, Command, Mode};
 use crate::motion::{Motion, Operator};
+use crate::picker::PickerKind;
 use crate::registers::Sink;
 
 #[derive(Default)]
@@ -50,6 +51,7 @@ impl Input {
             Mode::Normal => self.normal(key),
             Mode::Insert => Self::insert(key),
             Mode::Command(_) => Self::command_line(key),
+            Mode::Pick => Self::pick(key),
         }
     }
 
@@ -160,6 +162,14 @@ impl Input {
             if c == '_' {
                 self.sink = Sink::BlackHole;
                 return None;
+            }
+            // Nothing ever reaches the black hole, so nothing comes out of it.
+            if (c == 'p' || c == 'P') && self.sink != Sink::BlackHole {
+                self.reset();
+                return Some(Command {
+                    count: 1,
+                    action: Action::OpenPicker(PickerKind::Register { before: c == 'P' }),
+                });
             }
             self.reset();
             return None;
@@ -316,6 +326,25 @@ impl Input {
         Some(Command { count: 1, action })
     }
 
+    fn pick(key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        let action = match key.code {
+            KeyCode::Esc => Action::PickCancel,
+            KeyCode::Char('c') if ctrl => Action::PickCancel,
+            KeyCode::Char('n') if ctrl => Action::PickNext,
+            KeyCode::Char('p') if ctrl => Action::PickPrev,
+            KeyCode::Char('a') if ctrl => Action::PickToggleShort,
+            KeyCode::Char(c) => Action::PickChar(c),
+            KeyCode::Enter => Action::PickAccept,
+            KeyCode::Backspace => Action::PickBackspace,
+            KeyCode::Down => Action::PickNext,
+            KeyCode::Up => Action::PickPrev,
+            _ => return None,
+        };
+        Some(Command { count: 1, action })
+    }
+
     fn command_line(key: KeyEvent) -> Option<Command> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -335,6 +364,7 @@ impl Input {
 mod tests {
     use super::*;
     use crate::registers::Sink;
+    use crate::picker::PickerKind;
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -575,6 +605,47 @@ mod tests {
 
     /// An unknown register name discards the command. Keys after it are fresh
     /// input, so `"zdd` deletes to the ring — the `"z` is dropped, not the `dd`.
+    #[test]
+    fn quote_p_opens_the_picker() {
+        assert_eq!(
+            typed("\"p").action,
+            Action::OpenPicker(PickerKind::Register { before: false })
+        );
+        assert_eq!(
+            typed("\"P").action,
+            Action::OpenPicker(PickerKind::Register { before: true })
+        );
+    }
+
+    #[test]
+    fn picker_keys_map_to_pick_actions() {
+        let mut input = Input::default();
+        let mut act = |k: KeyEvent| input.on_key(k, &Mode::Pick).unwrap().action;
+
+        assert_eq!(act(key('a')), Action::PickChar('a'));
+        assert_eq!(act(ctrl('n')), Action::PickNext);
+        assert_eq!(act(ctrl('p')), Action::PickPrev);
+        assert_eq!(act(ctrl('a')), Action::PickToggleShort);
+        assert_eq!(act(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::PickAccept);
+        assert_eq!(act(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::PickCancel);
+        assert_eq!(
+            act(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Action::PickBackspace
+        );
+        assert_eq!(act(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), Action::PickNext);
+        assert_eq!(act(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)), Action::PickPrev);
+    }
+
+    /// `p` is a literal in the picker's query, not the paste key.
+    #[test]
+    fn a_plain_p_in_the_picker_is_a_query_char() {
+        let mut input = Input::default();
+        assert_eq!(
+            input.on_key(key('p'), &Mode::Pick).unwrap().action,
+            Action::PickChar('p')
+        );
+    }
+
     #[test]
     fn a_quote_naming_no_register_cancels() {
         assert!(nothing("\"z").is_none());
