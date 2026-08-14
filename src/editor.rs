@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::Buffer;
+use crate::motion::{Motion, Operator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -35,18 +36,14 @@ impl Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    MoveLeft,
-    MoveRight,
-    MoveUp,
-    MoveDown,
-    MoveWordForward,
-    MoveWordBackward,
-    MoveLineStart,
-    MoveLineEnd,
-    GotoFirstLine,
-    GotoLastLine,
-    /// 1-based, as the user typed it.
-    GotoLine(usize),
+    Move(Motion),
+    /// An operator over the range a motion covers: `dw`, `c$`, `dd`.
+    Operate {
+        op: Operator,
+        motion: Motion,
+        /// Already folded — `2d3w` arrives here as 6.
+        count: usize,
+    },
 
     EnterInsert,
     EnterInsertAfter,
@@ -57,7 +54,6 @@ pub enum Action {
     OpenLineAbove,
 
     DeleteChar,
-    DeleteLine,
 
     Undo,
     Redo,
@@ -77,16 +73,14 @@ impl Action {
     /// Whether a count means "do this N times" as opposed to being part of the
     /// action itself.
     fn repeatable(&self) -> bool {
+        // A motion repeats, unless its count picks a destination instead.
+        // `Operate` never repeats: it folded its counts in already.
+        if let Action::Move(m) = self {
+            return !m.is_absolute();
+        }
         matches!(
             self,
-            Action::MoveLeft
-                | Action::MoveRight
-                | Action::MoveUp
-                | Action::MoveDown
-                | Action::MoveWordForward
-                | Action::MoveWordBackward
-                | Action::DeleteChar
-                | Action::DeleteLine
+            Action::DeleteChar
                 | Action::InsertChar(_)
                 | Action::Undo
                 | Action::Redo
@@ -147,32 +141,27 @@ impl Editor {
         let eol = self.mode.allows_eol();
 
         match action {
-            Action::MoveLeft => self.buffer.move_left(),
-            Action::MoveRight => self.buffer.move_right(eol),
-            Action::MoveUp => self.buffer.move_vertical(-1, eol),
-            Action::MoveDown => self.buffer.move_vertical(1, eol),
-            Action::MoveWordForward => self.buffer.move_word_forward(eol),
-            Action::MoveWordBackward => self.buffer.move_word_backward(eol),
-            Action::MoveLineStart => self.buffer.move_line_start(),
-            Action::MoveLineEnd => self.buffer.move_line_end(eol),
-            Action::GotoFirstLine => self.buffer.goto_row(0, eol),
-            Action::GotoLastLine => self.buffer.goto_row(usize::MAX, eol),
-            Action::GotoLine(n) => self.buffer.goto_row(n.saturating_sub(1), eol),
+            Action::Move(m) => self.buffer.apply_motion(*m, eol),
+            Action::Operate { op, motion, count } => {
+                if self.buffer.operate(*op, *motion, *count) && *op == Operator::Change {
+                    self.mode = Mode::Insert;
+                }
+            }
 
             Action::EnterInsert => self.mode = Mode::Insert,
             Action::EnterInsertAfter => {
                 // `a` may step onto the position just past the last char, which
                 // normal mode forbids — so switch modes first.
                 self.mode = Mode::Insert;
-                self.buffer.move_right(true);
+                self.buffer.apply_motion(Motion::Right, true);
             }
             Action::EnterInsertLineStart => {
                 self.mode = Mode::Insert;
-                self.buffer.move_line_start();
+                self.buffer.apply_motion(Motion::LineStart, true);
             }
             Action::EnterInsertLineEnd => {
                 self.mode = Mode::Insert;
-                self.buffer.move_line_end(true);
+                self.buffer.apply_motion(Motion::LineEnd, true);
             }
             Action::EnterNormal => {
                 self.mode = Mode::Normal;
@@ -189,7 +178,7 @@ impl Editor {
             }
 
             Action::DeleteChar => self.buffer.delete_char_forward(),
-            Action::DeleteLine => self.buffer.delete_line(),
+
 
             Action::Undo => {
                 if !self.buffer.undo() {
@@ -325,6 +314,7 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Cursor;
 
     /// Text arrives as one committed revision, so a single undo lands back on
     /// it rather than on an empty buffer.
@@ -334,7 +324,7 @@ mod tests {
             ed.buffer.insert_str(text);
             ed.buffer.commit_undo();
         }
-        ed.buffer.cursor = 0;
+        ed.buffer.cursor = Cursor::at(0);
         ed
     }
 
@@ -405,6 +395,56 @@ mod tests {
 
         ed.apply(Command { count: 3, action: Action::Undo });
         assert_eq!(ed.buffer.rope().to_string(), "abcdef");
+    }
+
+    fn operate(op: Operator, motion: Motion, count: usize) -> Command {
+        cmd(Action::Operate { op, motion, count })
+    }
+
+    #[test]
+    fn dw_deletes_a_word_and_undoes_in_one_step() {
+        let mut ed = editor("foo bar baz");
+        ed.apply(operate(Operator::Delete, Motion::WordForward, 2));
+        assert_eq!(ed.buffer.rope().to_string(), "baz");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "foo bar baz", "both words, one undo");
+    }
+
+    #[test]
+    fn c_enters_insert_mode_so_you_can_type_the_replacement() {
+        let mut ed = editor("foo bar");
+        ed.apply(operate(Operator::Change, Motion::WordForward, 1));
+        assert_eq!(ed.mode, Mode::Insert);
+        assert_eq!(ed.buffer.rope().to_string(), " bar");
+
+        type_str(&mut ed, "xyz");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "xyz bar");
+    }
+
+    /// The change and everything typed into it are one undo step, the same rule
+    /// that makes `o` plus its text one step.
+    #[test]
+    fn a_change_and_its_typing_undo_together() {
+        let mut ed = editor("foo bar");
+        ed.apply(operate(Operator::Change, Motion::WordForward, 1));
+        type_str(&mut ed, "xyz");
+        ed.apply(cmd(Action::EnterNormal));
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "foo bar");
+    }
+
+    #[test]
+    fn a_delete_that_matches_nothing_leaves_no_undo_step() {
+        let mut ed = editor("abc");
+        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(operate(Operator::Delete, Motion::WordBackward, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "bc", "b at char 0 did nothing");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "abc", "one undo still reaches the x");
     }
 
     #[test]

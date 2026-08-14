@@ -19,7 +19,9 @@ cargo test
 | `gg` `G` `{n}G` | first line, last line, line *n* |
 | `i a I A` | insert before/after cursor, at line start/end |
 | `o O` | open line below/above |
-| `x` `dd` | delete char, delete line |
+| `x` | delete char |
+| `d{motion}` `c{motion}` | delete / change over a motion: `dw` `d$` `db` `dj` `dgg` `cw` `c0` |
+| `dd` `cc` | delete / clear whole lines (`3dd` for three) |
 | `u` `Ctrl-R` | undo, redo (accept counts: `3u`) |
 | `Esc` | back to normal mode |
 | `:w` `:w <path>` `:q` `:q!` `:wq` `:{n}` | ex commands |
@@ -31,11 +33,12 @@ cargo test
 | `buffer.rs` | rope, cursor, motions, the single mutation primitive |
 | `history.rs` | the undo tree: revisions, branching, invertible `Change`s |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
-| `input.rs` | keys → `Command`; counts and the operator-pending slot |
+| `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
+| `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `ui.rs` | viewport-bounded render pass |
 | `main.rs` | terminal lifecycle, event loop |
 
-## The four decisions this step locks in
+## The five decisions this step locks in
 
 1. **Cursor is a char index.** Byte and UTF-16 conversions happen at the edges
    (`Buffer::point_at`), never inside motion code. LSP wants UTF-16 columns,
@@ -51,7 +54,14 @@ cargo test
    by construction — and because history replays *through* `edit_raw`, an undo
    reaches tree-sitter and LSP as an ordinary incremental edit rather than a
    reason to reparse the file.
-3. **Undo is a tree, not a stack.** Undoing and then typing adds a second child
+3. **Motions are data, not actions.** A [`Motion`] describes a destination;
+   `Action::Move` goes there and `Action::Operate` deletes to there. Both
+   resolve it through the same pure `fn(&self, Cursor) -> Cursor` functions on
+   `Buffer`, so `w` and `dw` cannot drift apart. The cursor is a `Cursor` value
+   rather than a field for the same reason an operator needs to ask where a
+   motion *would* land without going there — and it is the shape visual mode
+   (anchor + head) and split windows (one per view) will need.
+4. **Undo is a tree, not a stack.** Undoing and then typing adds a second child
    to the current revision instead of discarding the first, so no keystroke can
    make earlier work unreachable. `u` / `Ctrl-R` walk one branch; the graph
    already stores what `g-` / `g+` would later traverse chronologically.
@@ -60,7 +70,7 @@ cargo test
    mutation — `5x` is one undo step. Insert mode holds the group open until
    `Esc`, so a typing run undoes in one go, along with the `\n` that `o`
    inserted before it.
-4. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
+5. **Rendering is viewport-bounded.** Frame cost scales with terminal height,
    not buffer size.
 
 ## Known gaps
@@ -73,13 +83,15 @@ cargo test
   Needs `unicode-width` and a grapheme walk.
 - No horizontal scrolling — long lines clip.
 - Single buffer, no window splits.
-- `dd` is special-cased in `input.rs` rather than being `d` + a motion. Making
-  the operator-pending slot parse a real motion is what unlocks `dw`, `d$`,
-  `cw`, `yy`.
+- No registers, so `d` and `c` discard what they take and there is no `y` or
+  `p`. Undo still gets it back.
+- No text objects (`diw`, `ci"`, `da(`).
+- `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
+  end of the line rather than implementing the full "end in column 1" case.
 
 ## Next
 
-Tree-sitter, once operator-pending motions are in. `pending_edits`
+Tree-sitter. `pending_edits`
 feeds `Tree::edit` + `Parser::parse` with the old tree; highlight queries then
 map to styles in `ui.rs`. Deliberately *not* yet: a config language or a plugin
 system.
