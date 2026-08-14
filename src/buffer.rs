@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ropey::Rope;
 
+use crate::history::{Change, History};
+
 /// A position as (row, byte-column-within-row).
 ///
 /// Byte columns, not char columns — this is the shape `tree_sitter::Point`
@@ -64,9 +66,9 @@ pub struct Buffer {
     pub cursor: usize,
     /// Sticky column for `j`/`k`, in chars. `None` = recompute from cursor.
     pub goal_col: Option<usize>,
-    pub modified: bool,
     /// Drained by tree-sitter / LSP once those exist.
     pub pending_edits: Vec<Edit>,
+    history: History,
 }
 
 impl Buffer {
@@ -76,8 +78,8 @@ impl Buffer {
             path: None,
             cursor: 0,
             goal_col: None,
-            modified: false,
             pending_edits: Vec::new(),
+            history: History::default(),
         }
     }
 
@@ -100,12 +102,15 @@ impl Buffer {
             .path
             .clone()
             .context("no file name (use `:w <path>`)")?;
+        // What lands on disk has to be a revision, or nothing can be marked as
+        // saved and the buffer stays "modified" straight after a good write.
+        self.commit_undo();
         let file = File::create(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         self.rope
             .write_to(BufWriter::new(file))
             .with_context(|| format!("writing {}", path.display()))?;
-        self.modified = false;
+        self.history.mark_saved();
         Ok(())
     }
 
@@ -116,6 +121,11 @@ impl Buffer {
 
     pub fn rope(&self) -> &Rope {
         &self.rope
+    }
+
+    /// Whether the text differs from the last write.
+    pub fn is_modified(&self) -> bool {
+        self.history.is_modified()
     }
 
     /// Line count as a human sees it: a file ending in `\n` does not get a
@@ -171,8 +181,13 @@ impl Buffer {
         }
     }
 
-    /// The single mutation primitive: replace `start..end` (chars) with `text`.
-    fn apply_edit(&mut self, start: usize, end: usize, text: &str) {
+    /// Replaces `start..end` (chars) with `text`, logging an [`Edit`] for
+    /// incremental reparse. Does **not** touch undo history.
+    ///
+    /// Undo and redo are the only callers that want this directly — replaying
+    /// history must not record itself as new history. Everything else goes
+    /// through [`Buffer::apply_edit`].
+    fn edit_raw(&mut self, start: usize, end: usize, text: &str) -> Change {
         let start = start.min(self.rope.len_chars());
         let end = end.clamp(start, self.rope.len_chars());
 
@@ -181,9 +196,13 @@ impl Buffer {
         let start_point = self.point_at(start);
         let old_end_point = self.point_at(end);
 
-        if end > start {
+        let removed = if end > start {
+            let text = self.rope.slice(start..end).to_string();
             self.rope.remove(start..end);
-        }
+            text
+        } else {
+            String::new()
+        };
         if !text.is_empty() {
             self.rope.insert(start, text);
         }
@@ -197,7 +216,60 @@ impl Buffer {
             old_end_point,
             new_end_point: self.point_at(new_end),
         });
-        self.modified = true;
+
+        Change { start, removed, inserted: text.to_string() }
+    }
+
+    /// The single mutation primitive: replace `start..end` (chars) with `text`
+    /// and record it for undo.
+    fn apply_edit(&mut self, start: usize, end: usize, text: &str) {
+        let change = self.edit_raw(start, end, text);
+        self.history.record(change, self.cursor);
+    }
+
+    // ---- undo --------------------------------------------------------------
+
+    /// Closes the current undo group. A no-op if nothing has changed since the
+    /// last one, so callers can commit at every command boundary blindly.
+    pub fn commit_undo(&mut self) {
+        self.history.commit(self.cursor);
+    }
+
+    /// Replays `changes` through [`Buffer::edit_raw`], so history traversal
+    /// emits [`Edit`]s exactly as ordinary typing does — an undo reaches
+    /// tree-sitter and LSP as just another incremental edit.
+    fn replay(&mut self, changes: Vec<Change>, cursor: usize) {
+        for change in changes {
+            let (start, end) = change.range();
+            self.edit_raw(start, end, &change.inserted);
+        }
+        self.cursor = cursor.min(self.rope.len_chars());
+        self.goal_col = None;
+    }
+
+    /// Steps one revision back. Returns false at the oldest change.
+    pub fn undo(&mut self) -> bool {
+        self.commit_undo();
+        match self.history.undo() {
+            Some((changes, cursor)) => {
+                self.replay(changes, cursor);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Steps one revision forward, along the most recently created branch.
+    /// Returns false at the newest change.
+    pub fn redo(&mut self) -> bool {
+        self.commit_undo();
+        match self.history.redo() {
+            Some((changes, cursor)) => {
+                self.replay(changes, cursor);
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- editing -----------------------------------------------------------
@@ -379,12 +451,11 @@ impl Buffer {
 mod tests {
     use super::*;
 
+    /// Loads `text` the way `open` does — straight into the rope, so the
+    /// fixture leaves no undo history or pending edits behind.
     fn buf(text: &str) -> Buffer {
         let mut b = Buffer::empty();
-        b.insert_str(text);
-        b.cursor = 0;
-        b.pending_edits.clear();
-        b.modified = false;
+        b.rope = Rope::from_str(text);
         b
     }
 
@@ -468,6 +539,143 @@ mod tests {
         b.open_line(true);
         assert_eq!(b.rope().to_string(), "a\n\nc");
         assert_eq!(b.cursor_row(), 1);
+    }
+
+    #[test]
+    fn undo_restores_text_and_cursor() {
+        let mut b = buf("hello");
+        b.cursor = 5;
+        b.insert_str(" world");
+        b.commit_undo();
+        assert_eq!(b.rope().to_string(), "hello world");
+
+        assert!(b.undo());
+        assert_eq!(b.rope().to_string(), "hello");
+        assert_eq!(b.cursor, 5, "back where the change started");
+    }
+
+    #[test]
+    fn redo_reapplies_what_undo_took_back() {
+        let mut b = buf("hello");
+        b.cursor = 5;
+        b.insert_str(" world");
+        b.commit_undo();
+        b.undo();
+
+        assert!(b.redo());
+        assert_eq!(b.rope().to_string(), "hello world");
+        assert_eq!(b.cursor, 11, "where the change left the cursor");
+    }
+
+    #[test]
+    fn undo_and_redo_stop_at_the_ends() {
+        let mut b = buf("x");
+        assert!(!b.undo(), "nothing to undo on a fresh buffer");
+
+        b.cursor = 1;
+        b.insert_str("y");
+        b.commit_undo();
+        assert!(!b.redo(), "nothing to redo until something is undone");
+
+        assert!(b.undo());
+        assert!(!b.undo(), "already at the oldest change");
+        assert!(b.redo());
+        assert!(!b.redo(), "already at the newest change");
+    }
+
+    /// Undoing an *insertion* is the direction that catches char/byte mixups:
+    /// the replayed change has to remove exactly the chars that went in, and
+    /// "ñé" is 2 chars but 4 bytes.
+    #[test]
+    fn undo_of_a_multibyte_insertion_removes_exactly_those_chars() {
+        let mut b = buf("ab\ncd");
+        b.cursor = 1;
+        b.insert_str("ñé");
+        b.commit_undo();
+        assert_eq!(b.rope().to_string(), "añéb\ncd");
+
+        b.undo();
+        assert_eq!(b.rope().to_string(), "ab\ncd");
+        assert_eq!(b.cursor, 1);
+    }
+
+    #[test]
+    fn undo_of_a_multibyte_deletion_puts_the_text_back() {
+        let mut b = buf("añb\ncd");
+        b.cursor = 1;
+        b.delete_char_forward();
+        b.commit_undo();
+        assert_eq!(b.rope().to_string(), "ab\ncd");
+
+        b.undo();
+        assert_eq!(b.rope().to_string(), "añb\ncd");
+        assert_eq!(b.cursor, 1);
+    }
+
+    /// Undo has to reach tree-sitter and LSP as an ordinary incremental edit,
+    /// not as a signal to reparse the world.
+    #[test]
+    fn undo_logs_an_edit_like_any_other_mutation() {
+        let mut b = buf("é\n");
+        b.cursor = 1;
+        b.insert_str("x");
+        b.commit_undo();
+        b.pending_edits.clear();
+
+        b.undo();
+
+        let e = b.pending_edits.last().expect("undo logged no edit");
+        // Taking "x" back out: char 1 is byte 2, and the "x" spanned byte 2..3.
+        assert_eq!(e.start_byte, 2);
+        assert_eq!(e.old_end_byte, 3);
+        assert_eq!(e.new_end_byte, 2);
+        assert_eq!(e.start_point, Point { row: 0, col: 2 });
+        assert_eq!(e.old_end_point, Point { row: 0, col: 3 });
+        assert_eq!(e.new_end_point, Point { row: 0, col: 2 });
+    }
+
+    /// The reason `modified` is derived from history rather than stored: undoing
+    /// your way back to what's on disk means there is nothing to save.
+    #[test]
+    fn undoing_back_to_the_saved_state_clears_modified() {
+        let mut b = buf("hello");
+        assert!(!b.is_modified(), "freshly loaded");
+
+        b.cursor = 5;
+        b.insert_str("!");
+        b.commit_undo();
+        assert!(b.is_modified());
+
+        b.undo();
+        assert!(!b.is_modified(), "back at the state on disk");
+
+        b.redo();
+        assert!(b.is_modified(), "and away from it again");
+    }
+
+    #[test]
+    fn an_uncommitted_edit_still_counts_as_modified() {
+        let mut b = buf("hello");
+        b.cursor = 5;
+        b.insert_str("!");
+        assert!(b.is_modified(), "mid-insert, before the group closes");
+    }
+
+    /// A write has to close the open group, otherwise the text on disk matches
+    /// no revision and the buffer keeps claiming it has unsaved changes.
+    #[test]
+    fn saving_with_an_open_group_marks_the_written_state_as_saved() {
+        let path = std::env::temp_dir().join("bee_save_open_group.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut b = buf("hello");
+        b.cursor = 5;
+        b.insert_str("!");
+        b.save_as(&path).expect("write failed");
+
+        assert!(!b.is_modified(), "the buffer is what's on disk");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello!");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

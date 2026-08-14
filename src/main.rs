@@ -7,6 +7,7 @@
 
 mod buffer;
 mod editor;
+mod history;
 mod input;
 mod ui;
 

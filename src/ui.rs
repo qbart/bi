@@ -133,7 +133,7 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
         Span::styled(format!(" {} ", ed.mode.label()), mode_style),
         Span::raw(format!(" {name}")),
         Span::styled(
-            if ed.buffer.modified { " [+]" } else { "" },
+            if ed.buffer.is_modified() { " [+]" } else { "" },
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),

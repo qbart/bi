@@ -59,6 +59,9 @@ pub enum Action {
     DeleteChar,
     DeleteLine,
 
+    Undo,
+    Redo,
+
     InsertChar(char),
     InsertNewline,
     Backspace,
@@ -85,6 +88,8 @@ impl Action {
                 | Action::DeleteChar
                 | Action::DeleteLine
                 | Action::InsertChar(_)
+                | Action::Undo
+                | Action::Redo
         )
     }
 }
@@ -127,6 +132,14 @@ impl Editor {
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
         for _ in 0..n {
             self.apply_once(&cmd.action);
+        }
+
+        // One command is one undo step, so the group closes here rather than
+        // inside the count loop — `5x` comes back in a single `u`. Insert mode
+        // is the exception: the group stays open until Esc, which is what makes
+        // a typing run (and the `\n` that `o` inserted before it) undo together.
+        if self.mode != Mode::Insert {
+            self.buffer.commit_undo();
         }
     }
 
@@ -177,6 +190,17 @@ impl Editor {
 
             Action::DeleteChar => self.buffer.delete_char_forward(),
             Action::DeleteLine => self.buffer.delete_line(),
+
+            Action::Undo => {
+                if !self.buffer.undo() {
+                    self.status = "already at oldest change".into();
+                }
+            }
+            Action::Redo => {
+                if !self.buffer.redo() {
+                    self.status = "already at newest change".into();
+                }
+            }
 
             Action::InsertChar(c) => self.buffer.insert_char(*c),
             Action::InsertNewline => self.buffer.insert_char('\n'),
@@ -271,7 +295,7 @@ impl Editor {
     }
 
     fn quit(&mut self, force: bool) {
-        if self.buffer.modified && !force {
+        if self.buffer.is_modified() && !force {
             self.status = "unsaved changes (use `:q!` to discard)".into();
         } else {
             self.quit = true;
@@ -295,5 +319,113 @@ impl Editor {
 
         let max_scroll = self.buffer.line_count().saturating_sub(height);
         self.scroll = self.scroll.min(max_scroll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text arrives as one committed revision, so a single undo lands back on
+    /// it rather than on an empty buffer.
+    fn editor(text: &str) -> Editor {
+        let mut ed = Editor::empty();
+        if !text.is_empty() {
+            ed.buffer.insert_str(text);
+            ed.buffer.commit_undo();
+        }
+        ed.buffer.cursor = 0;
+        ed
+    }
+
+    fn cmd(action: Action) -> Command {
+        Command { count: 1, action }
+    }
+
+    fn type_str(ed: &mut Editor, text: &str) {
+        for c in text.chars() {
+            ed.apply(cmd(Action::InsertChar(c)));
+        }
+    }
+
+    #[test]
+    fn a_counted_command_undoes_as_one_unit() {
+        let mut ed = editor("abcdef");
+        ed.apply(Command { count: 5, action: Action::DeleteChar });
+        assert_eq!(ed.buffer.rope().to_string(), "f");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef", "5x is one unit, not five");
+    }
+
+    #[test]
+    fn a_whole_insert_session_undoes_as_one_unit() {
+        let mut ed = editor("");
+        ed.apply(cmd(Action::EnterInsert));
+        type_str(&mut ed, "hello");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "hello");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "", "all five chars, not one");
+    }
+
+    /// `o` edits *and* enters insert mode. The newline it inserts belongs to the
+    /// same undo unit as everything typed after it.
+    #[test]
+    fn open_line_and_what_follows_it_undo_together() {
+        let mut ed = editor("a");
+        ed.apply(cmd(Action::OpenLineBelow));
+        type_str(&mut ed, "bc");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "a\nbc");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "a", "the newline went back too");
+    }
+
+    #[test]
+    fn entering_and_leaving_insert_without_typing_is_not_an_undo_step() {
+        let mut ed = editor("a");
+        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(cmd(Action::EnterInsert));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "a", "one undo reaches the delete");
+    }
+
+    #[test]
+    fn undo_takes_a_count() {
+        let mut ed = editor("abcdef");
+        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(cmd(Action::DeleteChar));
+        assert_eq!(ed.buffer.rope().to_string(), "def");
+
+        ed.apply(Command { count: 3, action: Action::Undo });
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef");
+    }
+
+    #[test]
+    fn redo_walks_back_forward() {
+        let mut ed = editor("abc");
+        ed.apply(cmd(Action::DeleteChar));
+        ed.apply(cmd(Action::Undo));
+        ed.apply(cmd(Action::Redo));
+        assert_eq!(ed.buffer.rope().to_string(), "bc");
+    }
+
+    #[test]
+    fn the_ends_of_the_history_report_themselves() {
+        let mut ed = editor("a");
+        ed.apply(cmd(Action::Undo));
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.status, "already at oldest change");
+
+        ed.status.clear();
+        ed.apply(cmd(Action::Redo));
+        ed.apply(cmd(Action::Redo));
+        assert_eq!(ed.status, "already at newest change");
     }
 }

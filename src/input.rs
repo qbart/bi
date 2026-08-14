@@ -59,6 +59,7 @@ impl Input {
                 self.reset();
                 return None;
             }
+            KeyCode::Char('r') if ctrl => Action::Redo,
             KeyCode::Char(c) => {
                 // An operator is waiting: this key completes or cancels it.
                 if let Some(op) = self.pending.take() {
@@ -94,6 +95,7 @@ impl Input {
                     'o' => Action::OpenLineBelow,
                     'O' => Action::OpenLineAbove,
                     'x' => Action::DeleteChar,
+                    'u' => Action::Undo,
                     'd' | 'g' => {
                         self.pending = Some(c);
                         return None;
@@ -171,5 +173,48 @@ impl Input {
             _ => return None,
         };
         Some(Command { count: 1, action })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn u_undoes_and_ctrl_r_redoes() {
+        let mut input = Input::default();
+        assert_eq!(input.on_key(key('u'), &Mode::Normal).unwrap().action, Action::Undo);
+        assert_eq!(input.on_key(ctrl('r'), &Mode::Normal).unwrap().action, Action::Redo);
+    }
+
+    #[test]
+    fn undo_and_redo_take_a_count() {
+        let mut input = Input::default();
+        assert!(input.on_key(key('3'), &Mode::Normal).is_none(), "3 builds a count");
+        let cmd = input.on_key(key('u'), &Mode::Normal).unwrap();
+        assert_eq!(cmd.count, 3);
+        assert_eq!(cmd.action, Action::Undo);
+
+        assert!(input.on_key(key('2'), &Mode::Normal).is_none());
+        let cmd = input.on_key(ctrl('r'), &Mode::Normal).unwrap();
+        assert_eq!(cmd.count, 2);
+        assert_eq!(cmd.action, Action::Redo);
+    }
+
+    /// `u` is a normal-mode key, not text — typing it while inserting must put
+    /// the letter in the buffer.
+    #[test]
+    fn u_is_just_a_letter_in_insert_mode() {
+        let mut input = Input::default();
+        let cmd = input.on_key(key('u'), &Mode::Insert).unwrap();
+        assert_eq!(cmd.action, Action::InsertChar('u'));
     }
 }
