@@ -332,9 +332,9 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - No tree-sitter injections, so code fences in markdown and JSX would not
   highlight. No indent queries, so no auto-indent. See
   `docs/specs/tree-sitter.md`.
-- No text objects (`diw`, `ci"`, `da(`).
-- `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
-  end of the line rather than implementing the full "end in column 1" case.
+- No regular expressions in search, and no `:s`. See
+  [docs/specs/search.md](docs/specs/search.md).
+- No marks (`m{a}`, `` `{a} ``), and no `gn`.
 - No git and no LSP, though both are the point — see
   [RECOMMENDATION.md](RECOMMENDATION.md). LSP hangs off `Editor::sync_syntax`,
   the same edit drain tree-sitter uses.

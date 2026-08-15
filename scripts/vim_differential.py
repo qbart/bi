@@ -28,8 +28,6 @@ BEE = os.path.join(
 # inserts the DEL byte literally instead of processing it as a keypress. It is
 # covered by a unit test instead.
 KNOWN_DIVERGENCES = {
-    "dw at line end": "bee stops at the line end rather than vim's full "
-                      "'end in column 1' rule (documented in README)",
     "esc on search line": "same harness artifact as \"/ not found\": `-es` aborts"
                           " the sequence. Interactive vim agrees with bee.",
     "/ not found": "harness artifact, not a real difference: `vim -es -c normal`"
@@ -224,6 +222,14 @@ CASES = [
     ("esc on search line", "abc\n",                 "/zz\x1bx"),
     ("bare / repeats",     "a1a2a3\n",              "/a\r/\rx"),
     ("/ then . repeats",   "aXbXc\n",               "d/X\r."),
+
+    # vim's "exclusive motion ending in column 1" rule, which the README used
+    # to say was only approximated
+    ("dw ending col 1",    "a b\ncd\n",            "2ldw"),
+    ("dw into blank line", "foo\n\nbar\n",         "dw"),
+    ("dw from indent",     "  foo\nbar\n",         "dw"),
+    ("dw trailing spaces", "foo   \nbar\n",        "dw"),
+    ("dw at line end",     "hello\nworld\n",       "3ldw"),
 
     # regressions on what already existed
     ("dw",             "foo bar baz\n",        "dw"),
