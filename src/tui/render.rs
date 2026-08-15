@@ -32,6 +32,10 @@ const SELECTION_BG: Color = Color::Indexed(239);
 /// Every other head is drawn as a reversed cell instead.
 const EXTRA_CURSOR_BG: Color = Color::Magenta;
 
+/// Background for search matches. Distinct from the selection, since a match
+/// can sit inside one.
+const SEARCH_BG: Color = Color::Indexed(58);
+
 /// Repaints the background of the columns in `cols` within an already-built
 /// line, leaving the foreground alone.
 ///
@@ -254,6 +258,22 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             }
             None => spans.push(Span::raw(expand_tabs(raw))),
         }
+        // Search matches, under the selection so a selected match still reads
+        // as selected. Bounded by the row, like every other pass here.
+        if ed.highlight_search
+            && let Some(search) = &ed.last_search
+        {
+            let line_start = ed.buffer.rope().line_to_char(row);
+            let line_end = line_start + raw.chars().count();
+            for (start, end) in
+                ed.buffer.matches_in(line_start, line_end, &search.pattern, search.whole_word)
+            {
+                let from = display_col(raw, start.saturating_sub(line_start));
+                let to = display_col(raw, (end - line_start).min(raw.chars().count()));
+                spans = paint_range(spans, (from + gutter)..(to + gutter), SEARCH_BG);
+            }
+        }
+
         // Selected columns on this row, in screen columns and offset past the
         // gutter. Charwise includes the character under the head; linewise
         // covers the row whatever the columns are.
@@ -452,6 +472,10 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
 fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
     if let Mode::Command(line) = &ed.mode {
         return Paragraph::new(Line::from(format!(":{line}")));
+    }
+    if let Mode::Search { query, forward } = &ed.mode {
+        let prefix = if *forward { '/' } else { '?' };
+        return Paragraph::new(Line::from(format!("{prefix}{query}")));
     }
 
     let name = ed

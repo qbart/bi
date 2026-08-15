@@ -39,6 +39,18 @@ pub enum Motion {
         /// through `cpo`'s `;` flag.
         repeat: bool,
     },
+    /// An absolute char index a search resolved to.
+    ///
+    /// `Editor` turns [`Motion::Search`] into one of these: it holds the
+    /// pattern, so by the time `Buffer` resolves the motion there is nothing
+    /// left to match, only somewhere to go.
+    Found(usize),
+    /// `/` `?` `n` `N` `*` `#`. Carries no pattern for the same reason
+    /// [`Motion::RepeatFind`] carries no character — the search lives on
+    /// `Editor`, which substitutes the real one before this resolves.
+    Search {
+        reverse: bool,
+    },
     /// `;` and `,`. Carries no character: the last find lives on `Editor`,
     /// because it has to survive the keymap's `reset()` between commands.
     /// `Editor` substitutes the real [`Motion::FindChar`] before resolving.
@@ -121,6 +133,8 @@ impl Motion {
                     Kind::Exclusive
                 }
             }
+            // Exclusive, so `d/three` stops before the match and leaves it.
+            Motion::Search { .. } | Motion::Found(_) => Kind::Exclusive,
             // Never actually asked: `Editor::resolve_find` turns this into a
             // `FindChar` — which carries the real direction — before anything
             // resolves it. Exclusive is the conservative answer if it ever
@@ -137,6 +151,7 @@ impl Motion {
     /// Whether a count picks a destination rather than repeating the motion.
     /// `5G` goes to line 5; it does not go to the last line five times.
     pub fn is_absolute(self) -> bool {
-        matches!(self, Motion::FirstLine | Motion::LastLine | Motion::Line(_))
+        // `Found` names a destination outright, so a count must not repeat it.
+        matches!(self, Motion::FirstLine | Motion::LastLine | Motion::Line(_) | Motion::Found(_))
     }
 }

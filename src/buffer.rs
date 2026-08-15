@@ -535,6 +535,7 @@ impl Buffer {
             Motion::FirstLine => return self.at_row(0, eol),
             Motion::LastLine => return self.at_row(usize::MAX, eol),
             Motion::Line(n) => return self.at_row(n.saturating_sub(1), eol),
+            Motion::Found(at) => return self.clamped(Cursor::at(at), eol),
             // Consumes its own count, and a miss stays put — which is what
             // leaves an operator with an empty range and so nothing to do.
             Motion::FindChar { ch, forward, till, repeat } => {
@@ -558,7 +559,9 @@ impl Buffer {
                 | Motion::LastLine
                 | Motion::Line(_)
                 | Motion::FindChar { .. }
-                | Motion::RepeatFind { .. } => cur,
+                | Motion::RepeatFind { .. }
+                | Motion::Search { .. }
+                | Motion::Found(_) => cur,
             };
         }
         cur
@@ -864,12 +867,14 @@ impl Buffer {
             Motion::FirstLine => self.at_row(0, allow_eol),
             Motion::LastLine => self.at_row(usize::MAX, allow_eol),
             Motion::Line(n) => self.at_row(n.saturating_sub(1), allow_eol),
+            Motion::Found(found) => self.clamped(Cursor::at(found), allow_eol),
             Motion::CurrentLine => at,
             Motion::FindChar { ch, forward, till, repeat } => {
                 self.find_char(at, ch, forward, till, repeat, 1).unwrap_or(at)
             }
-            // Substituted by `Editor::resolve_find` before it gets here.
-            Motion::RepeatFind { .. } => at,
+            // Both are substituted by `Editor` before they get here — the
+            // pattern and the last find both live up there.
+            Motion::RepeatFind { .. } | Motion::Search { .. } => at,
         }
     }
 
@@ -946,30 +951,104 @@ impl Buffer {
     }
 
     /// Next occurrence of `needle` after `from`, wrapping to the start.
-    ///
-    /// Naive scan. The buffer is a rope and the needle is a word, so this is
-    /// fine for `Ctrl-N`; a real `/` search wants something better and will
-    /// bring its own.
     pub fn find_next(&self, from: usize, needle: &str) -> Option<usize> {
+        self.search(from, needle, true, false)
+    }
+
+    /// Whether a match at `start` of `len` chars is bounded by non-word
+    /// characters — what `*` needs so `foo` does not match inside `foobar`.
+    fn is_whole_word(chars: &[char], start: usize, len: usize) -> bool {
+        let before = start.checked_sub(1).map(|i| class_of(chars[i]));
+        let after = chars.get(start + len).map(|&c| class_of(c));
+        before != Some(CharClass::Word) && after != Some(CharClass::Word)
+    }
+
+    /// Next match of `needle` from `from`, in either direction, wrapping.
+    ///
+    /// Smartcase: an all-lowercase needle matches case-insensitively, and any
+    /// uppercase in it makes the whole thing case-sensitive. That is
+    /// `ignorecase` plus `smartcase`, which is what nearly everyone sets.
+    ///
+    /// Naive scan over a materialised `Vec<char>`. Fine at the sizes bee opens;
+    /// a regex backend will replace the matching without changing the shape.
+    pub fn search(
+        &self,
+        from: usize,
+        needle: &str,
+        forward: bool,
+        whole_word: bool,
+    ) -> Option<usize> {
         if needle.is_empty() {
             return None;
         }
-        let text = self.rope.to_string();
-        let chars: Vec<char> = text.chars().collect();
-        let pat: Vec<char> = needle.chars().collect();
+        let cased = needle.chars().any(char::is_uppercase);
+        let fold = |c: char| if cased { c } else { c.to_ascii_lowercase() };
+
+        let chars: Vec<char> = self.rope.chars().map(fold).collect();
+        let raw: Vec<char> = self.rope.chars().collect();
+        let pat: Vec<char> = needle.chars().map(fold).collect();
         if pat.len() > chars.len() {
             return None;
         }
 
         let last = chars.len() - pat.len();
+        let hit = |i: usize| {
+            chars[i..i + pat.len()] == pat[..]
+                && (!whole_word || Self::is_whole_word(&raw, i, pat.len()))
+        };
+
         // Wrapping, so a cursor past the final match still finds the first one.
         for offset in 0..=last {
-            let i = (from + 1 + offset) % (last + 1);
-            if chars[i..i + pat.len()] == pat[..] {
+            let i = if forward {
+                (from + 1 + offset) % (last + 1)
+            } else {
+                // Counting down from `from - 1`, wrapping to the end.
+                (from + last + 1 - (offset + 1) % (last + 1)) % (last + 1)
+            };
+            if hit(i) {
                 return Some(i);
             }
         }
         None
+    }
+
+    /// Every match inside `start..end`, for the renderer to highlight.
+    ///
+    /// Takes a range so the search-highlight pass stays bounded by the
+    /// viewport, like every other pass in `render`.
+    pub fn matches_in(
+        &self,
+        start: usize,
+        end: usize,
+        needle: &str,
+        whole_word: bool,
+    ) -> Vec<(usize, usize)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let cased = needle.chars().any(char::is_uppercase);
+        let fold = |c: char| if cased { c } else { c.to_ascii_lowercase() };
+
+        let raw: Vec<char> = self.rope.chars().collect();
+        let chars: Vec<char> = raw.iter().map(|&c| fold(c)).collect();
+        let pat: Vec<char> = needle.chars().map(fold).collect();
+        if pat.len() > chars.len() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut i = start.min(chars.len() - pat.len());
+        while i + pat.len() <= chars.len() && i < end {
+            if chars[i..i + pat.len()] == pat[..]
+                && (!whole_word || Self::is_whole_word(&raw, i, pat.len()))
+            {
+                out.push((i, i + pat.len()));
+                i += pat.len();
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     /// The word under `at`, for `Ctrl-N` to look for.

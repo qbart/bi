@@ -6,7 +6,7 @@
 
 ## Status
 
-**Specified**, not yet built.
+**Built.**
 
 Covers literal matching with smartcase, match highlighting, and `:noh`. Regular
 expressions and `:s` are deferred; both build on what is here.
@@ -129,3 +129,19 @@ that already works.
 
 **Incremental search** (`incsearch`) — jumping as you type. Needs the render
 pass to see a provisional match that no command has produced yet.
+
+## Verified
+
+`scripts/vim_differential.py` covers `/ ? n N * #`, `d/`, `c/`, `y/`, wrapping,
+smartcase both ways, the bare `/` repeat, and `.` after a search-delete. All
+match vim.
+
+Two cases are recorded as known divergences and are **not** real differences:
+`vim -es -c "normal ..."` aborts the whole key sequence when a search fails or
+is cancelled, so a trailing `x` never runs there. Interactive vim, driven
+through a pty, agrees with bee in both.
+
+One thing the differential could not have caught, because it only compares
+files: entering the search line resets the keymap, so a pending operator would
+be lost. `d/foo` silently did nothing until the operator was made to travel
+with the mode change.

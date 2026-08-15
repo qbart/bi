@@ -11,10 +11,10 @@ and twelve. This file records the gap, what closes it, and in what order.
 | **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
 | 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
 | **4** ✅ | `.` — repeat last change | a record of the last change |
-| **5** | `/ ? n N * #` search | see `search.md` |
-| **6** | `Ctrl-E/Y`, `Ctrl-D/U` — scrolling only | the window height |
+| **5** ✅ | `/ ? n N * #` search | see `search.md` |
+| **6** ✅ | `Ctrl-E/Y`, `Ctrl-D/U` — scrolling only | the window height |
 
-Steps 1–4 are built. Steps
+Steps 1–6 are built. Steps
 4–6 are recorded so their shape is known, not because they are being built yet
 — see *Deferred*.
 
@@ -372,3 +372,16 @@ know where the window *starts* as an authority rather than a cache, and
 `zz` needs to *set* it without the cursor moving. Both want the viewport to
 be a real thing that the editor owns. Scrolling only needs a number the
 renderer already hands over.
+
+### Verified
+
+Scrolling cannot be checked by comparing files — it changes what you see, not
+what you have. Both editors were driven through a pty instead and their windows
+and cursors compared directly, with vim given bee's `scrolloff=3` so the two are
+answering the same question. `Ctrl-E`, `Ctrl-E`×3, `Ctrl-D`, `Ctrl-D`×2 and
+`Ctrl-D` then `Ctrl-U` all land identically.
+
+The bug worth recording: `scroll_to_cursor` runs every frame, so a scroll that
+leaves the cursor inside the scrolloff margin is undone before it is ever drawn.
+`Ctrl-E` appeared to do nothing at all. The cursor has to be pushed clear of the
+margin, not merely kept inside the window.

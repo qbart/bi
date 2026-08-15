@@ -101,6 +101,32 @@ there is nothing to decide at yank time. A count goes before the quote: `3"p`.
 | `{n}~` | flip the case under the cursor and step right, stopping at the line end |
 | `{n}J` | join `{n}` lines up, collapsing the indent to one space |
 
+**Searching**
+
+| Key | Does |
+|---|---|
+| `/pat` `?pat` | search forward / backward, wrapping |
+| `n` `N` | repeat the search / repeat it reversed |
+| `*` `#` | search forward / backward for the word under the cursor, whole-word |
+
+A search is a motion, so `d/foo`, `c/foo` and `y/foo` all work, and it is
+**exclusive** — `d/three` stops before the match. An all-lowercase pattern
+matches case-insensitively; a capital anywhere in it makes the search
+case-sensitive. Matches are highlighted until `:noh`. A bare `/` repeats the
+last pattern. Regular expressions and `:s` are not built yet.
+
+**Scrolling**
+
+| Key | Does |
+|---|---|
+| `Ctrl-E` `Ctrl-Y` | move the window one line down / up |
+| `Ctrl-D` `Ctrl-U` | move it half a window down / up, taking the cursor along |
+
+`Ctrl-E`/`Ctrl-Y` move the window and only drag the cursor when it would
+otherwise fall outside. Deliberately absent: `H`/`M`/`L`, `zz`/`zt`/`zb` and
+`Ctrl-F`/`Ctrl-B`, which need the viewport to be something the editor owns
+rather than a row index — see [docs/specs/motions.md](docs/specs/motions.md).
+
 **Repeating**
 
 | Key | Does |
@@ -210,6 +236,7 @@ afterwards repeats it.
 | `:wq` `:x` | write and quit |
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
 | `:e <path>` | edit another file |
+| `:noh` | stop highlighting search matches |
 | `:{n}` | go to line *n* |
 
 ## Layout

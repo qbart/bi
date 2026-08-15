@@ -30,6 +30,12 @@ BEE = os.path.join(
 KNOWN_DIVERGENCES = {
     "dw at line end": "bee stops at the line end rather than vim's full "
                       "'end in column 1' rule (documented in README)",
+    "esc on search line": "same harness artifact as \"/ not found\": `-es` aborts"
+                          " the sequence. Interactive vim agrees with bee.",
+    "/ not found": "harness artifact, not a real difference: `vim -es -c normal`"
+                   " aborts the whole key sequence when a search fails, so the"
+                   " trailing x never runs. Interactive vim agrees with bee —"
+                   " checked through a pty.",
 }
 
 
@@ -197,6 +203,27 @@ CASES = [
     (". after undo",   "one two three\n",      "dwu."),
     ("v then d then .","abcdefgh\n",           "vlld0."),
     ("V then d then .","1\n2\n3\n4\n5\n",     "Vjd."),
+
+    # search
+    ("/ lands on match",   "one two three\n",       "/three\rx"),
+    ("d/ is exclusive",    "one two three four\n",  "d/three\r"),
+    ("/ wraps",            "one two\n",             "$/one\rx"),
+    ("? backward",         "one two three\n",       "$?two\rx"),
+    ("d? backward",        "one two three\n",       "$d?two\r"),
+    ("n repeats",          "foo boo zoo\n",         "/oo\rnx"),
+    ("N reverses",         "aXbXcXd\n",             "/X\rnnNx"),
+    ("n after ? keeps dir","a1a2a3\n",              "$?a\rnx"),
+    ("* whole word",       "foo\nfoobar\nfoo\n",   "*x"),
+    ("* wraps to itself",  "foo bar\n",             "*x"),
+    ("# backward",         "foo\nbar\nfoo\n",      "G#x"),
+    ("smartcase lower",    "Foo foo\n",             "/foo\rx"),
+    ("smartcase upper",    "foo Foo\n",             "/Foo\rx"),
+    ("c/ then type",       "one two three\n",       "c/three\rZ\x1b"),
+    ("y/ then P",          "one two three\n",       "y/three\rP"),
+    ("/ not found",        "abc\n",                 "/zzz\rx"),
+    ("esc on search line", "abc\n",                 "/zz\x1bx"),
+    ("bare / repeats",     "a1a2a3\n",              "/a\r/\rx"),
+    ("/ then . repeats",   "aXbXc\n",               "d/X\r."),
 
     # regressions on what already existed
     ("dw",             "foo bar baz\n",        "dw"),

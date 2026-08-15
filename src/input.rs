@@ -89,6 +89,7 @@ impl Input {
             Mode::Insert => Self::insert(key),
             Mode::Replace => Self::replace(key),
             Mode::Command(_) => Self::command_line(key),
+            Mode::Search { .. } => Self::search_line(key),
             Mode::Pick => Self::pick(key),
         }
     }
@@ -211,6 +212,10 @@ impl Input {
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
+            KeyCode::Char('e') if ctrl => self.plain(Action::ScrollLine { down: true }),
+            KeyCode::Char('y') if ctrl => self.plain(Action::ScrollLine { down: false }),
+            KeyCode::Char('d') if ctrl => self.plain(Action::ScrollHalfPage { down: true }),
+            KeyCode::Char('u') if ctrl => self.plain(Action::ScrollHalfPage { down: false }),
             KeyCode::Down if ctrl && key.mods.alt => {
                 self.plain(Action::AddCursorLine { below: true })
             }
@@ -324,6 +329,21 @@ impl Input {
             if c == ';' || c == ',' {
                 return self.resolve(Motion::RepeatFind { reverse: c == ',' });
             }
+            // `d/foo<CR>` and `dn`. The search line is a mode of its own, so
+            // the operator has to travel with the mode change rather than
+            // waiting here — `reset()` runs on the way in.
+            if c == '/' || c == '?' {
+                let operator = Some((op, self.sink));
+                let count = self.fold_count();
+                self.reset();
+                return Some(Command {
+                    count: 1,
+                    action: Action::EnterSearch { forward: c == '/', operator, count },
+                });
+            }
+            if c == 'n' || c == 'N' {
+                return self.resolve(Motion::Search { reverse: c == 'N' });
+            }
             if c == 'g' {
                 self.g_pending = true;
                 return None;
@@ -389,6 +409,21 @@ impl Input {
                 self.replace_pending = true;
                 return None;
             }
+            '/' | '?' => {
+                // The pending operator travels with the mode change: entering
+                // the search line resets the keymap, so `d/foo` would lose it.
+                let operator = self.operator.map(|op| (op, self.sink));
+                let count = self.fold_count();
+                self.reset();
+                return Some(Command {
+                    count: 1,
+                    action: Action::EnterSearch { forward: c == '/', operator, count },
+                });
+            }
+            'n' => return self.resolve(Motion::Search { reverse: false }),
+            'N' => return self.resolve(Motion::Search { reverse: true }),
+            '*' => return self.plain(Action::SearchWord { forward: true }),
+            '#' => return self.plain(Action::SearchWord { forward: false }),
             'v' => return self.plain(Action::EnterVisual(VisualKind::Char)),
             'V' => return self.plain(Action::EnterVisual(VisualKind::Line)),
             'R' => return self.plain(Action::EnterReplace),
@@ -578,6 +613,21 @@ impl Input {
             KeyCode::Backspace => Action::PickBackspace,
             KeyCode::Down => Action::PickNext,
             KeyCode::Up => Action::PickPrev,
+            _ => return None,
+        };
+        Some(Command { count: 1, action })
+    }
+
+    /// The `/` or `?` line. Same shape as the `:` line — every printable key
+    /// is pattern text, so nothing here can be a command.
+    fn search_line(key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
+        let action = match key.code {
+            KeyCode::Esc => Action::SearchCancel,
+            KeyCode::Char('c') if ctrl => Action::SearchCancel,
+            KeyCode::Enter => Action::SearchExecute,
+            KeyCode::Backspace => Action::SearchBackspace,
+            KeyCode::Char(c) => Action::SearchChar(c),
             _ => return None,
         };
         Some(Command { count: 1, action })

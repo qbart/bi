@@ -33,6 +33,11 @@ pub enum Mode {
     Visual(VisualKind),
     /// The `:` line being typed, without the leading colon.
     Command(String),
+    /// The `/` or `?` line being typed, without the leading key.
+    Search {
+        query: String,
+        forward: bool,
+    },
     /// The picker overlay is up. Its state lives in `Editor::picker` — a
     /// `Picker` is far too large to sit inside this enum.
     Pick,
@@ -47,6 +52,7 @@ impl Mode {
             Mode::Visual(VisualKind::Char) => "VISUAL",
             Mode::Visual(VisualKind::Line) => "V-LINE",
             Mode::Command(_) => "COMMAND",
+            Mode::Search { .. } => "SEARCH",
             Mode::Pick => "PICK",
         }
     }
@@ -121,6 +127,33 @@ pub enum Action {
     RepeatChange {
         count: Option<usize>,
     },
+
+    /// `/` or `?`.
+    ///
+    /// Carries any pending operator, because entering the search line resets
+    /// the keymap and `d/foo<CR>` would otherwise lose its `d`.
+    EnterSearch {
+        forward: bool,
+        operator: Option<(Operator, Sink)>,
+        count: usize,
+    },
+    SearchChar(char),
+    SearchBackspace,
+    SearchExecute,
+    SearchCancel,
+    /// `*` / `#` — search for the word under the cursor, whole-word.
+    SearchWord {
+        forward: bool,
+    },
+
+    /// `Ctrl-E` / `Ctrl-Y` — move the window, not the cursor.
+    ScrollLine {
+        down: bool,
+    },
+    /// `Ctrl-D` / `Ctrl-U` — move both, half a window at a time.
+    ScrollHalfPage {
+        down: bool,
+    },
     /// `R`
     EnterReplace,
     /// A character typed in replace mode.
@@ -172,6 +205,16 @@ impl Action {
         }
         matches!(self, Action::InsertChar(_) | Action::Undo | Action::Redo)
     }
+}
+
+/// The last search, for `n`, `N` and the highlight pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    pub pattern: String,
+    /// `*` and `#` only match whole words.
+    pub whole_word: bool,
+    /// The direction it was typed with, which is what `n` repeats.
+    pub forward: bool,
 }
 
 /// How much text a visual operator covered, so `.` can repeat it from wherever
@@ -315,6 +358,16 @@ pub struct Editor {
     /// Set while `.` is replaying, so the replay does not record itself and
     /// compound its own count.
     replaying: bool,
+    /// The last search, for `n`/`N` and the highlight pass. Beside
+    /// `last_find`, and there for the same reason: it outlives `Input::reset`.
+    pub last_search: Option<Search>,
+    /// Whether matches are highlighted. A search turns it on, `:noh` off.
+    pub highlight_search: bool,
+    /// An operator waiting for the search line to be finished.
+    pending_search_op: Option<(Operator, Sink, usize)>,
+    /// Height of the window the renderer last drew, which is all the scrolling
+    /// commands need — and the reason they do not require a viewport type.
+    viewport_height: usize,
     pub status: String,
     /// First visible row.
     pub scroll: usize,
@@ -372,6 +425,10 @@ impl Editor {
             last_change: None,
             recording: None,
             replaying: false,
+            last_search: None,
+            highlight_search: false,
+            pending_search_op: None,
+            viewport_height: 0,
             status: String::new(),
             scroll: 0,
             quit: false,
@@ -589,6 +646,15 @@ impl Editor {
             Motion::FindChar { .. } => {
                 self.last_find = Some(motion);
                 Some(motion)
+            }
+            Motion::Search { reverse } => {
+                let search = self.last_search.clone()?;
+                let forward = search.forward != reverse;
+                let at = self.selections.cursor().at;
+                let found = self.buffer.search(at, &search.pattern, forward, search.whole_word)?;
+                // Resolved to an absolute destination: the pattern is gone by
+                // the time `Buffer` sees it, so hand over a line-free jump.
+                Some(Motion::Found(found))
             }
             Motion::RepeatFind { reverse } => match self.last_find {
                 Some(Motion::FindChar { ch, forward, till, .. }) => {
@@ -961,6 +1027,62 @@ impl Editor {
                 });
             }
 
+            Action::EnterSearch { forward, operator, count } => {
+                self.status.clear();
+                self.pending_search_op = operator.map(|(op, sink)| (op, sink, *count));
+                self.mode = Mode::Search { query: String::new(), forward: *forward };
+            }
+            Action::SearchChar(c) => {
+                if let Mode::Search { query, .. } = &mut self.mode {
+                    query.push(*c);
+                }
+            }
+            Action::SearchBackspace => {
+                // Backspacing off the front cancels, as it does on a `:` line.
+                if let Mode::Search { query, .. } = &mut self.mode
+                    && query.pop().is_none()
+                {
+                    self.cancel_search();
+                }
+            }
+            Action::SearchCancel => self.cancel_search(),
+            Action::SearchExecute => {
+                let Mode::Search { query, forward } = &self.mode else { return };
+                let (query, forward) = (query.clone(), *forward);
+                self.mode = Mode::Normal;
+                if query.is_empty() {
+                    // A bare `/` repeats the last pattern, as in vim.
+                    if self.last_search.is_none() {
+                        self.pending_search_op = None;
+                        return;
+                    }
+                } else {
+                    self.last_search = Some(Search { pattern: query, whole_word: false, forward });
+                }
+                self.highlight_search = true;
+                self.run_search();
+            }
+            Action::SearchWord { forward } => {
+                let at = self.selections.cursor();
+                let Some((start, end)) = self.buffer.word_at(at) else {
+                    self.status = "no word under the cursor".into();
+                    return;
+                };
+                self.last_search = Some(Search {
+                    pattern: self.buffer.slice(start, end),
+                    whole_word: true,
+                    forward: *forward,
+                });
+                self.highlight_search = true;
+                self.run_search();
+            }
+
+            Action::ScrollLine { down } => self.scroll_by(if *down { 1 } else { -1 }, false),
+            Action::ScrollHalfPage { down } => {
+                let half = (self.viewport_height / 2).max(1) as isize;
+                self.scroll_by(if *down { half } else { -half }, true);
+            }
+
             Action::EnterCommandMode => {
                 self.status.clear();
                 self.mode = Mode::Command(String::new());
@@ -986,6 +1108,72 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.run_ex(&line);
             }
+        }
+    }
+
+    fn cancel_search(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending_search_op = None;
+    }
+
+    /// Applies the last search as a motion, or as the target of the operator
+    /// that was waiting for the search line to finish.
+    fn run_search(&mut self) {
+        let action = match self.pending_search_op.take() {
+            Some((op, sink, count)) => Action::Operate {
+                op,
+                target: Target::Motion(Motion::Search { reverse: false }),
+                count,
+                sink,
+            },
+            None => Action::Move(Motion::Search { reverse: false }),
+        };
+        let found = self.resolve_find(Motion::Search { reverse: false }).is_some();
+        if !found {
+            let pattern = self.last_search.as_ref().map(|s| s.pattern.clone()).unwrap_or_default();
+            self.status = format!("pattern not found: {pattern}");
+            return;
+        }
+        self.apply(cmd_of(action));
+    }
+
+    /// Lines of context kept above and below the cursor.
+    const SCROLLOFF: usize = 3;
+
+    fn margin(height: usize) -> usize {
+        Self::SCROLLOFF.min(height.saturating_sub(1) / 2)
+    }
+
+    /// Moves the window by `lines`, and the cursor with it when `follow` — or
+    /// when the window would otherwise leave the cursor behind.
+    fn scroll_by(&mut self, lines: isize, follow: bool) {
+        let height = self.viewport_height;
+        if height == 0 {
+            return;
+        }
+        let last = self.buffer.line_count().saturating_sub(1);
+        let max_scroll = self.buffer.line_count().saturating_sub(height);
+        self.scroll = self.scroll.saturating_add_signed(lines).min(max_scroll);
+
+        let row = self.buffer.row_at(self.selections.cursor());
+        // The cursor has to end up inside the window *including* the scrolloff
+        // margin. Leave it in the margin and `scroll_to_cursor` — which runs
+        // every frame — immediately drags the window back, undoing the scroll.
+        let margin = Self::margin(height);
+        let top = (self.scroll + margin).min(last);
+        let bottom = (self.scroll + height).saturating_sub(margin + 1).min(last);
+
+        let wanted = if follow {
+            // `Ctrl-D`/`Ctrl-U` keep the cursor's place within the window.
+            row.saturating_add_signed(lines).min(last).clamp(top.min(bottom), bottom)
+        } else {
+            // `Ctrl-E`/`Ctrl-Y` move the cursor only when the window would
+            // otherwise leave it outside.
+            row.clamp(top.min(bottom), bottom)
+        };
+        if wanted != row {
+            let cursor = self.buffer.at_row(wanted, false);
+            self.set_cursor(cursor);
         }
     }
 
@@ -1052,6 +1240,7 @@ impl Editor {
             }
             "q" | "quit" => self.quit(force),
             "e" | "edit" => self.edit(arg, force),
+            "noh" | "nohl" | "nohlsearch" => self.highlight_search = false,
             "wq" | "x" => {
                 if self.write(arg) {
                     self.quit(true);
@@ -1141,9 +1330,9 @@ impl Editor {
         if height == 0 {
             return;
         }
-        const SCROLLOFF: usize = 3;
+        self.viewport_height = height;
         let row = self.buffer.row_at(self.selections.cursor());
-        let margin = SCROLLOFF.min(height.saturating_sub(1) / 2);
+        let margin = Self::margin(height);
 
         if row < self.scroll + margin {
             self.scroll = row.saturating_sub(margin);
@@ -2262,5 +2451,226 @@ mod tests {
         ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
         ed.apply(cmd(Action::EnterNormal));
         assert_eq!(ed.cursor_col(), 3, "only insert steps back");
+    }
+
+    // ---- search ------------------------------------------------------------
+
+    fn search_for(ed: &mut Editor, pattern: &str, forward: bool) {
+        ed.apply(cmd(Action::EnterSearch { forward, operator: None, count: 1 }));
+        for c in pattern.chars() {
+            ed.apply(cmd(Action::SearchChar(c)));
+        }
+        ed.apply(cmd(Action::SearchExecute));
+    }
+
+    #[test]
+    fn a_search_lands_on_the_first_character_of_the_match() {
+        let mut ed = editor("one two three");
+        search_for(&mut ed, "three", true);
+        assert_eq!(ed.cursor().at, 8);
+    }
+
+    #[test]
+    fn a_search_wraps_round_the_end() {
+        let mut ed = editor("one two");
+        ed.set_cursor(Cursor::at(6));
+        search_for(&mut ed, "one", true);
+        assert_eq!(ed.cursor().at, 0);
+    }
+
+    #[test]
+    fn a_backward_search_goes_the_other_way() {
+        let mut ed = editor("one two three");
+        ed.set_cursor(Cursor::at(12));
+        search_for(&mut ed, "two", false);
+        assert_eq!(ed.cursor().at, 4);
+    }
+
+    #[test]
+    fn n_repeats_in_the_direction_the_search_was_typed() {
+        let mut ed = editor("a1a2a3");
+        ed.set_cursor(Cursor::at(5));
+        search_for(&mut ed, "a", false);
+        assert_eq!(ed.cursor().at, 4, "backward to the third a");
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
+        assert_eq!(ed.cursor().at, 2, "n keeps going backward");
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: true })));
+        assert_eq!(ed.cursor().at, 4, "N reverses");
+    }
+
+    /// A search is a motion, which is most of why it is worth having.
+    #[test]
+    fn a_search_is_an_operator_target_and_is_exclusive() {
+        let mut ed = editor("one two three four");
+        ed.apply(cmd(Action::EnterSearch {
+            forward: true,
+            operator: Some((Operator::Delete, Sink::Ring)),
+            count: 1,
+        }));
+        for c in "three".chars() {
+            ed.apply(cmd(Action::SearchChar(c)));
+        }
+        ed.apply(cmd(Action::SearchExecute));
+        assert_eq!(ed.buffer.rope().to_string(), "three four", "stops before the match");
+    }
+
+    #[test]
+    fn smartcase_is_insensitive_until_the_pattern_has_a_capital() {
+        // A search finds the *next* match, so both of these start before the
+        // only candidate rather than on it.
+        let mut ed = editor("bar FOO");
+        search_for(&mut ed, "foo", true);
+        assert_eq!(ed.cursor().at, 4, "an all-lowercase pattern ignores case");
+
+        // Two candidates, differing only in case: a capital in the pattern
+        // makes it skip the lowercase one.
+        let mut ed = editor("x foo Foo");
+        search_for(&mut ed, "Foo", true);
+        assert_eq!(ed.cursor().at, 6, "a capital makes it case-sensitive");
+    }
+
+    #[test]
+    fn star_matches_whole_words_only() {
+        let mut ed = editor("foo\nfoobar\nfoo");
+        ed.apply(cmd(Action::SearchWord { forward: true }));
+        assert_eq!(ed.cursor_row(), 2, "skipped foobar");
+    }
+
+    #[test]
+    fn a_pattern_that_is_not_there_reports_and_does_not_move() {
+        let mut ed = editor("abc");
+        ed.set_cursor(Cursor::at(1));
+        search_for(&mut ed, "zzz", true);
+        assert_eq!(ed.cursor().at, 1);
+        assert!(ed.status.contains("not found"), "got: {}", ed.status);
+    }
+
+    #[test]
+    fn a_bare_search_repeats_the_last_pattern() {
+        let mut ed = editor("a1a2a3");
+        search_for(&mut ed, "a", true);
+        assert_eq!(ed.cursor().at, 2);
+        search_for(&mut ed, "", true);
+        assert_eq!(ed.cursor().at, 4, "the empty pattern reuses the last one");
+    }
+
+    #[test]
+    fn cancelling_the_search_line_leaves_everything_alone() {
+        let mut ed = editor("one two");
+        ed.apply(cmd(Action::EnterSearch {
+            forward: true,
+            operator: Some((Operator::Delete, Sink::Ring)),
+            count: 1,
+        }));
+        ed.apply(cmd(Action::SearchChar('t')));
+        ed.apply(cmd(Action::SearchCancel));
+        assert_eq!(ed.mode, Mode::Normal);
+        assert_eq!(ed.buffer.rope().to_string(), "one two", "the operator went with it");
+    }
+
+    #[test]
+    fn backspacing_off_the_front_of_the_search_line_cancels() {
+        let mut ed = editor("abc");
+        ed.apply(cmd(Action::EnterSearch { forward: true, operator: None, count: 1 }));
+        ed.apply(cmd(Action::SearchChar('a')));
+        ed.apply(cmd(Action::SearchBackspace));
+        ed.apply(cmd(Action::SearchBackspace));
+        assert_eq!(ed.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn searching_turns_highlighting_on_and_noh_turns_it_off() {
+        let mut ed = editor("foo foo");
+        assert!(!ed.highlight_search);
+        search_for(&mut ed, "foo", true);
+        assert!(ed.highlight_search);
+        ed.run_ex("noh");
+        assert!(!ed.highlight_search);
+    }
+
+    #[test]
+    fn a_search_delete_is_repeatable_with_dot() {
+        let mut ed = editor("aXbXc");
+        ed.apply(cmd(Action::EnterSearch {
+            forward: true,
+            operator: Some((Operator::Delete, Sink::Ring)),
+            count: 1,
+        }));
+        ed.apply(cmd(Action::SearchChar('X')));
+        ed.apply(cmd(Action::SearchExecute));
+        assert_eq!(ed.buffer.rope().to_string(), "XbXc");
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+        assert_eq!(ed.buffer.rope().to_string(), "Xc");
+    }
+
+    // ---- scrolling ---------------------------------------------------------
+
+    fn tall(lines: usize) -> Editor {
+        let text: String = (1..=lines).map(|i| format!("line{i:02}\n")).collect();
+        let mut ed = editor(&text);
+        ed.set_cursor(Cursor::at(0));
+        ed.scroll_to_cursor(9);
+        ed
+    }
+
+    #[test]
+    fn ctrl_e_moves_the_window_and_pushes_the_cursor_out_of_the_margin() {
+        let mut ed = tall(30);
+        assert_eq!(ed.scroll, 0);
+        ed.apply(cmd(Action::ScrollLine { down: true }));
+        assert_eq!(ed.scroll, 1, "the window moved one line");
+        assert_eq!(ed.cursor_row(), 4, "and the cursor was pushed clear of the scrolloff");
+    }
+
+    #[test]
+    fn ctrl_y_moves_the_window_back() {
+        let mut ed = tall(30);
+        for _ in 0..5 {
+            ed.apply(cmd(Action::ScrollLine { down: true }));
+        }
+        assert_eq!(ed.scroll, 5);
+        ed.apply(cmd(Action::ScrollLine { down: false }));
+        assert_eq!(ed.scroll, 4);
+    }
+
+    #[test]
+    fn ctrl_d_moves_half_a_window_and_takes_the_cursor_with_it() {
+        let mut ed = tall(30);
+        ed.apply(cmd(Action::ScrollHalfPage { down: true }));
+        assert_eq!(ed.scroll, 4, "half of nine, rounded down");
+        // The cursor would keep its place in the window at row 4, but that is
+        // the very top of the new window and scrolloff pushes it clear. Vim
+        // with `scrolloff=3` lands in the same place — checked through a pty.
+        assert_eq!(ed.cursor_row(), 7);
+    }
+
+    #[test]
+    fn ctrl_u_comes_back() {
+        let mut ed = tall(30);
+        ed.apply(cmd(Action::ScrollHalfPage { down: true }));
+        ed.apply(cmd(Action::ScrollHalfPage { down: true }));
+        assert_eq!(ed.scroll, 8);
+        ed.apply(cmd(Action::ScrollHalfPage { down: false }));
+        assert_eq!(ed.scroll, 4);
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_ends_rather_than_running_off() {
+        let mut ed = tall(30);
+        for _ in 0..50 {
+            ed.apply(cmd(Action::ScrollHalfPage { down: true }));
+        }
+        assert_eq!(ed.scroll, 30 - 9, "the last line stays on screen");
+        for _ in 0..50 {
+            ed.apply(cmd(Action::ScrollHalfPage { down: false }));
+        }
+        assert_eq!(ed.scroll, 0);
+    }
+
+    #[test]
+    fn a_file_shorter_than_the_window_does_not_scroll() {
+        let mut ed = tall(3);
+        ed.apply(cmd(Action::ScrollHalfPage { down: true }));
+        assert_eq!(ed.scroll, 0);
     }
 }
