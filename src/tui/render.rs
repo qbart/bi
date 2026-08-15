@@ -481,8 +481,15 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
         Span::styled(ed.status.clone(), Style::default().fg(Color::Cyan)),
     ];
 
+    // Several cursors is a state you cannot otherwise tell from the mode: the
+    // label still says NORMAL, and the only other sign is coloured cells that
+    // may be scrolled off. Say how many.
+    let cursors = ed.selections.len();
+    let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
+
     let right = format!(
-        "{}  {}:{} ",
+        "{}{}  {}:{} ",
+        count,
         pending,
         ed.buffer.row_at(ed.selections.cursor()) + 1,
         ed.buffer.col_at(ed.selections.cursor()) + 1

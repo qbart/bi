@@ -397,6 +397,11 @@ impl Input {
                 return None;
             }
             ';' | ',' => return self.resolve(Motion::RepeatFind { reverse: c == ',' }),
+            '.' => {
+                let count = self.explicit_count();
+                self.reset();
+                return Some(Command { count: 1, action: Action::RepeatChange { count } });
+            }
             '~' => {
                 let count = self.fold_count();
                 self.reset();

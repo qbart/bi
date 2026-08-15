@@ -117,6 +117,10 @@ pub enum Action {
     },
     /// `Esc` in normal mode, when there is more than one cursor.
     CollapseCursors,
+    /// `.` — repeat the last change. `count` replaces the original's.
+    RepeatChange {
+        count: Option<usize>,
+    },
     /// `R`
     EnterReplace,
     /// A character typed in replace mode.
@@ -170,6 +174,102 @@ impl Action {
     }
 }
 
+/// How much text a visual operator covered, so `.` can repeat it from wherever
+/// the cursor is now — the selection itself is gone by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    Chars(usize),
+    Lines(usize),
+}
+
+/// The last change, in the form that replays it.
+#[derive(Debug, Clone)]
+struct Change {
+    command: Command,
+    /// Keystrokes of the insert or replace session it opened.
+    ///
+    /// `Action`s rather than a `String` because `Backspace` is part of what was
+    /// typed, and it can cross the start of the insertion and eat text that was
+    /// already there.
+    typed: Vec<Action>,
+    extent: Option<Extent>,
+}
+
+impl Action {
+    /// Whether this action begins something `.` should repeat.
+    ///
+    /// Yank is deliberately absent: vim does not repeat it, because `.` after a
+    /// yank almost always means "repeat the edit I made before the yank".
+    fn starts_change(&self) -> bool {
+        match self {
+            Action::Operate { op, .. } | Action::OperateSelection { op, .. } => {
+                *op != Operator::Yank
+            }
+            Action::Paste { .. }
+            | Action::ReplaceChar { .. }
+            | Action::ToggleCase { .. }
+            | Action::JoinLines { .. }
+            | Action::EnterInsert
+            | Action::EnterInsertAfter
+            | Action::EnterInsertLineStart
+            | Action::EnterInsertLineEnd
+            | Action::OpenLineBelow
+            | Action::OpenLineAbove
+            | Action::EnterReplace => true,
+            _ => false,
+        }
+    }
+
+    /// Whether this action is a keystroke *within* a session rather than a
+    /// command in its own right.
+    fn is_session_key(&self) -> bool {
+        matches!(
+            self,
+            Action::InsertChar(_)
+                | Action::InsertNewline
+                | Action::Backspace
+                | Action::ReplaceTyped(_)
+                | Action::ReplaceBackspace
+        )
+    }
+
+    /// Whether the action leaves the buffer in a state `.` can replay from —
+    /// i.e. whether it opens a session that has to be closed before the change
+    /// is complete.
+    fn opens_session(&self) -> bool {
+        match self {
+            Action::Operate { op, .. } | Action::OperateSelection { op, .. } => {
+                *op == Operator::Change
+            }
+            Action::EnterInsert
+            | Action::EnterInsertAfter
+            | Action::EnterInsertLineStart
+            | Action::EnterInsertLineEnd
+            | Action::OpenLineBelow
+            | Action::OpenLineAbove
+            | Action::EnterReplace => true,
+            _ => false,
+        }
+    }
+}
+
+fn cmd_of(action: Action) -> Command {
+    Command { count: 1, action }
+}
+
+/// The same command with its count replaced, for `{n}.`.
+fn with_count(command: Command, count: usize) -> Command {
+    let action = match command.action {
+        Action::Operate { op, target, sink, .. } => Action::Operate { op, target, count, sink },
+        Action::Paste { before, .. } => Action::Paste { before, count },
+        Action::ReplaceChar { ch, .. } => Action::ReplaceChar { ch, count },
+        Action::ToggleCase { .. } => Action::ToggleCase { count },
+        Action::JoinLines { .. } => Action::JoinLines { count },
+        other => return Command { count, action: other },
+    };
+    Command { count: 1, action }
+}
+
 /// Moves a selection by `shift` characters, saturating at zero.
 fn shifted(selection: Selection, shift: isize) -> Selection {
     let move_one = |c: Cursor| Cursor::at(c.at.saturating_add_signed(shift));
@@ -209,6 +309,12 @@ pub struct Editor {
     /// Selections as they were when the open undo group started. Empty between
     /// groups; filled by the first command that opens one.
     undo_from: Cursors,
+    /// The change `.` replays, and the one being recorded.
+    last_change: Option<Change>,
+    recording: Option<Change>,
+    /// Set while `.` is replaying, so the replay does not record itself and
+    /// compound its own count.
+    replaying: bool,
     pub status: String,
     /// First visible row.
     pub scroll: usize,
@@ -263,6 +369,9 @@ impl Editor {
             last_find: None,
             replaced: Vec::new(),
             undo_from: Vec::new(),
+            last_change: None,
+            recording: None,
+            replaying: false,
             status: String::new(),
             scroll: 0,
             quit: false,
@@ -270,9 +379,14 @@ impl Editor {
     }
 
     pub fn apply(&mut self, cmd: Command) {
+        if let Action::RepeatChange { count } = cmd.action {
+            self.repeat_change(count);
+            return;
+        }
         if self.undo_from.is_empty() {
             self.undo_from = self.selections.as_pairs();
         }
+        self.record(&cmd);
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
         for _ in 0..n {
             self.apply_once(&cmd.action);
@@ -292,6 +406,108 @@ impl Editor {
             let after = self.selections.as_pairs();
             self.buffer.commit_undo(std::mem::take(&mut self.undo_from), after);
         }
+    }
+
+    /// Notes what `.` would replay.
+    ///
+    /// A change that opens a session — insert or replace — is not finished
+    /// until the mode comes back to normal, which is what makes `ciwfoo<Esc>`
+    /// one repeatable unit rather than five commands.
+    fn record(&mut self, cmd: &Command) {
+        if self.replaying {
+            return;
+        }
+
+        if cmd.action.starts_change() {
+            let extent = match cmd.action {
+                // The selection is gone by the time `.` runs, so remember how
+                // much it covered.
+                Action::OperateSelection { .. } => Some(self.selection_extent()),
+                _ => None,
+            };
+            let change = Change { command: cmd.clone(), typed: Vec::new(), extent };
+            if cmd.action.opens_session() {
+                self.recording = Some(change);
+            } else {
+                self.last_change = Some(change);
+                self.recording = None;
+            }
+            return;
+        }
+
+        if let Some(recording) = &mut self.recording {
+            if cmd.action.is_session_key() {
+                recording.typed.push(cmd.action.clone());
+            } else if matches!(cmd.action, Action::EnterNormal) {
+                // The session is over, so the change is complete.
+                self.last_change = self.recording.take();
+            }
+        }
+    }
+
+    fn selection_extent(&self) -> Extent {
+        let selection = self.selections.primary();
+        let (lo, hi) = selection.range();
+        match self.mode.visual() {
+            Some(VisualKind::Line) => {
+                let rows = self.buffer.row_at(Cursor::at(hi)) - self.buffer.row_at(Cursor::at(lo));
+                Extent::Lines(rows + 1)
+            }
+            _ => Extent::Chars(hi - lo + 1),
+        }
+    }
+
+    /// Replays the last change. `count`, when the user typed one on the `.`
+    /// itself, replaces the original — `3x` then `2.` deletes two.
+    fn repeat_change(&mut self, count: Option<usize>) {
+        let Some(mut change) = self.last_change.clone() else {
+            self.status = "nothing to repeat".into();
+            return;
+        };
+        if let Some(count) = count {
+            change.command = with_count(change.command, count);
+        }
+
+        self.replaying = true;
+
+        match change.extent {
+            // A visual operator repeats over the same extent from here, since
+            // there is no selection any more.
+            Some(extent) => self.repeat_over(&change, extent),
+            None => self.apply(change.command.clone()),
+        }
+        for action in &change.typed {
+            self.apply(Command { count: 1, action: action.clone() });
+        }
+        if change.command.action.opens_session() {
+            self.apply(cmd_of(Action::EnterNormal));
+        }
+
+        self.replaying = false;
+        // The replay is now the last change, so a second `.` repeats the same
+        // thing rather than nothing.
+        self.last_change = Some(change);
+    }
+
+    /// Re-selects `extent` from the cursor and applies the operator to it.
+    fn repeat_over(&mut self, change: &Change, extent: Extent) {
+        let Action::OperateSelection { op, sink } = change.command.action else { return };
+        let kind = match extent {
+            Extent::Chars(_) => VisualKind::Char,
+            Extent::Lines(_) => VisualKind::Line,
+        };
+        self.mode = Mode::Visual(kind);
+        self.for_each_selection(|ed, sel| {
+            let head = match extent {
+                Extent::Chars(n) => Cursor::at(sel.head.at + n - 1),
+                Extent::Lines(n) => {
+                    let row = ed.buffer.row_at(sel.head) + n - 1;
+                    ed.buffer.at_row(row.min(ed.buffer.line_count() - 1), false)
+                }
+            };
+            Selection { anchor: sel.head, head }
+        });
+        self.apply(cmd_of(Action::OperateSelection { op, sink }));
     }
 
     /// Runs `f` for every selection, highest position first.
@@ -493,12 +709,21 @@ impl Editor {
                 });
             }
             Action::EnterNormal => {
+                // Leaving insert steps the cursor one *left*, back onto the
+                // last character typed — not merely clamping it onto a valid
+                // column. Vim does this, and it is what makes `iAB<Esc>.`
+                // insert at the right place. Leaving visual mode does not.
+                let stepping_back = matches!(self.mode, Mode::Insert | Mode::Replace);
                 self.mode = Mode::Normal;
                 self.replaced.clear();
                 self.selections.collapse_each();
-                // Matches vim: leaving insert pulls the cursor back onto a char.
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.clamped(sel.head, false))
+                    let head = if stepping_back && ed.buffer.col_at(sel.head) > 0 {
+                        Cursor::at(sel.head.at - 1)
+                    } else {
+                        sel.head
+                    };
+                    Selection::collapsed(ed.buffer.clamped(head, false))
                 });
             }
             Action::OpenLineBelow | Action::OpenLineAbove => {
@@ -682,6 +907,9 @@ impl Editor {
                 self.selections.push(Selection::at(line_start + col));
             }
             Action::CollapseCursors => self.selections.collapse_to_primary(),
+            // Intercepted in `apply`, which has to run before the undo group
+            // and the change recorder see it.
+            Action::RepeatChange { .. } => {}
 
             Action::EnterReplace => {
                 self.mode = Mode::Replace;
@@ -1828,5 +2056,211 @@ mod tests {
         );
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         assert_eq!(ed.buffer.rope().to_string(), " ");
+    }
+
+    // ---- `.` ---------------------------------------------------------------
+
+    fn dot(ed: &mut Editor) {
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+    }
+
+    #[test]
+    fn dot_repeats_an_immediate_change() {
+        let mut ed = editor("abcdef");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "bcdef");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "cdef");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "def", "and again");
+    }
+
+    #[test]
+    fn dot_replays_a_whole_insert_session_as_one_unit() {
+        let mut ed = editor("hello");
+        ed.apply(cmd(Action::EnterInsert));
+        type_str(&mut ed, "AB");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "ABhello");
+
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "AABBhello");
+    }
+
+    /// The reason `typed` holds actions rather than a string: a backspace can
+    /// cross the start of the insertion and eat text that was already there.
+    #[test]
+    fn dot_replays_backspaces_within_the_session() {
+        let mut ed = editor("hello");
+        ed.apply(cmd(Action::EnterInsert));
+        type_str(&mut ed, "ab");
+        ed.apply(cmd(Action::Backspace));
+        type_str(&mut ed, "c");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "achello");
+
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "aacchello");
+    }
+
+    #[test]
+    fn a_motion_or_a_yank_does_not_become_the_thing_dot_repeats() {
+        let mut ed = editor("one two three");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::WordForward),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "two three");
+
+        // Neither of these is a change.
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::WordForward),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+
+        // `dw` again, from where the motion left the cursor — verified against
+        // vim, which gives the same.
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "tthree", "still the delete");
+    }
+
+    #[test]
+    fn undo_does_not_become_the_thing_dot_repeats() {
+        let mut ed = editor("abcdef");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "bcdef", "the delete, not the undo");
+    }
+
+    #[test]
+    fn dot_carries_the_original_count() {
+        let mut ed = editor("abcdefghi");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 3,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "defghi");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "ghi", "three more");
+    }
+
+    #[test]
+    fn a_count_on_the_dot_itself_replaces_the_original() {
+        let mut ed = editor("abcdef");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        ed.apply(cmd(Action::RepeatChange { count: Some(3) }));
+        assert_eq!(ed.buffer.rope().to_string(), "ef");
+    }
+
+    #[test]
+    fn dot_with_nothing_recorded_says_so() {
+        let mut ed = editor("abc");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "abc");
+        assert!(!ed.status.is_empty());
+    }
+
+    /// A visual operator has no selection left by the time `.` runs, so it
+    /// repeats over the same extent from wherever the cursor is.
+    #[test]
+    fn dot_after_a_charwise_visual_delete_repeats_the_extent() {
+        let mut ed = editor("abcdefgh");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "defgh");
+
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "gh", "three more characters");
+    }
+
+    #[test]
+    fn dot_after_a_linewise_visual_delete_repeats_the_line_count() {
+        let mut ed = editor("1\n2\n3\n4\n5");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "3\n4\n5");
+
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "5", "two more lines");
+    }
+
+    #[test]
+    fn a_replay_does_not_record_itself() {
+        // Otherwise the second `.` would repeat the repeat and counts compound.
+        let mut ed = editor("aaaaaaaa");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 2,
+            sink: Sink::Ring,
+        }));
+        dot(&mut ed);
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "aa", "two at a time, three times");
+    }
+
+    #[test]
+    fn dot_runs_at_every_cursor() {
+        let mut ed = with_cursors("ax ax ax", &[0, 3, 6]);
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "x x x");
+        dot(&mut ed);
+        assert_eq!(ed.buffer.rope().to_string(), "  ");
+    }
+
+    // ---- pre-existing bugs `.` uncovered ----------------------------------
+
+    /// Vim steps the cursor one left when leaving insert, back onto the last
+    /// character typed. Only clamping it left the cursor one column too far
+    /// right, which `.` then made visible.
+    #[test]
+    fn leaving_insert_steps_the_cursor_back_onto_what_was_typed() {
+        let mut ed = editor("hello");
+        ed.apply(cmd(Action::EnterInsert));
+        type_str(&mut ed, "AB");
+        assert_eq!(ed.cursor_col(), 2, "past the B while inserting");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.cursor_col(), 1, "back onto the B");
+    }
+
+    #[test]
+    fn leaving_visual_mode_does_not_step_the_cursor() {
+        let mut ed = editor("hello");
+        ed.set_cursor(Cursor::at(3));
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.cursor_col(), 3, "only insert steps back");
     }
 }

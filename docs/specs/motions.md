@@ -10,18 +10,17 @@ and twelve. This file records the gap, what closes it, and in what order.
 | **1** ✅ | `:e` `:e!` `:e <path>`; `D C s S X r{char} ~ J` | nothing new |
 | **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
 | 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
-| **4** | `.` — repeat last change | a record of the last change |
+| **4** ✅ | `.` — repeat last change | a record of the last change |
 | 5 | `/ ? n N * #` search, then `:s` | a search primitive |
 | 6 | `H M L`, `Ctrl-D/U/F/B`, `zz zt zb` | the viewport as a real concept |
 
-Steps 1–3 are pure additions and are specified here; steps 1 and 2 are built. Steps
+Steps 1–4 are built. Steps
 4–6 are recorded so their shape is known, not because they are being built yet
 — see *Deferred*.
 
-`.` is the largest single omission and the one with reach: replaying a change
-means every command can describe itself, which constrains everything built
-after it. It is deferred but not forgotten, and the `Command` type is where it
-will land.
+`.` was the largest single omission and the one with reach. It is built, and it
+turned out to need less than feared: commands were already values, so recording
+one and replaying it is most of the work.
 
 ## What exists
 
@@ -212,7 +211,7 @@ spans is the point of having both.
 through bee and compares the resulting file. It is not part of `cargo test`: it
 needs vim on `PATH` and drives the binary through a pty.
 
-61 cases match vim exactly, with no divergences. Four differences it found were
+103 cases match vim exactly, with no divergences. Four differences it found were
 fixed rather than recorded — the `t`-repeat rule above, `a"`'s trailing
 whitespace, linewise inner blocks, and a **pre-existing** bug where `dG` on a
 file that already ended in a newline swallowed that newline. It also caught four
@@ -315,3 +314,19 @@ the front of the ring.
 
 **`.` inside a macro or a count-prefixed insert** (`3ifoo<Esc>`) — bee has no
 macros, and repeat-counted insert is its own feature.
+
+### What building it turned up
+
+Two **pre-existing** bugs, neither caused by `.` but both made obvious by it,
+because a repeat starts from wherever the last one left the cursor:
+
+- **Leaving insert did not step the cursor left.** Vim moves back onto the last
+  character typed; bee only clamped onto a valid column, leaving it one to the
+  right. `iAB<Esc>.` inserted in the wrong place. Leaving *visual* mode
+  correctly does not step, so the fix is conditional on the mode being left.
+- **`w` on the final word of a file did not move.** A file ending in a newline
+  has a phantom row after it, and the clamp was happy to sit there. Vim puts
+  the cursor on the last real character, which is what makes `dw` on the last
+  word take the rest of the line. Only in normal mode: an operator resolves
+  with `allow_eol` and needs to reach one past the end, and fixing it
+  unconditionally broke `dw` on a one-word buffer.

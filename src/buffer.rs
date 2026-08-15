@@ -492,7 +492,16 @@ impl Buffer {
         while i < len && class_of(self.rope.char(i)) == CharClass::Whitespace {
             i += 1;
         }
-        self.clamped(Cursor::at(i.min(len)), allow_eol)
+        let landed = self.clamped(Cursor::at(i.min(len)), allow_eol);
+        // A file ending in a newline has a phantom row after it, and `clamped`
+        // is happy to sit on it. Vim puts the cursor on the last real character
+        // instead, which is what makes `w` on the final word of a file move at
+        // all. Only in normal mode: an operator resolves with `allow_eol` and
+        // needs to reach one past the end so `dw` can take the last word whole.
+        if !allow_eol && landed.at >= len && len > 0 {
+            return self.clamped(Cursor::at(len - 1), false);
+        }
+        landed
     }
 
     /// `b` — start of the previous word.

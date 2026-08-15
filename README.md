@@ -101,6 +101,17 @@ there is nothing to decide at yank time. A count goes before the quote: `3"p`.
 | `{n}~` | flip the case under the cursor and step right, stopping at the line end |
 | `{n}J` | join `{n}` lines up, collapsing the indent to one space |
 
+**Repeating**
+
+| Key | Does |
+|---|---|
+| `.` | repeat the last change — `{n}.` repeats it with a new count |
+
+`.` repeats the last thing that *changed text*, so a motion, a yank, an undo or
+a `:` command leaves it alone. A whole insert session is one unit, which makes
+`ciwfoo` then `.` a rename. After a visual operator it repeats over the same
+extent from the cursor, as vim does. With several cursors it runs at each.
+
 **Undo**
 
 | Key | Does |
@@ -155,7 +166,8 @@ including the cursors themselves, which come back when you undo. In visual mode
 `viw` then `Ctrl-N` `Ctrl-N` then `c` is a rename.
 
 The terminal has one real cursor; it sits on the primary selection and the
-others are drawn as coloured cells.
+others are drawn as coloured cells. The status line shows the count, since the
+mode label alone cannot tell you that more than one is live.
 
 ### Replace mode
 
