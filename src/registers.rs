@@ -51,12 +51,7 @@ pub struct Registers {
 
 impl Default for Registers {
     fn default() -> Self {
-        Self {
-            ring: VecDeque::new(),
-            bytes: 0,
-            capacity: 4096,
-            byte_budget: 64 << 20,
-        }
+        Self { ring: VecDeque::new(), bytes: 0, capacity: 4096, byte_budget: 64 << 20 }
     }
 }
 

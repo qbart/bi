@@ -24,11 +24,7 @@ pub struct Change {
 
 impl Change {
     fn inverse(&self) -> Change {
-        Change {
-            start: self.start,
-            removed: self.inserted.clone(),
-            inserted: self.removed.clone(),
-        }
+        Change { start: self.start, removed: self.inserted.clone(), inserted: self.removed.clone() }
     }
 
     /// Char range this change replaces when applied forward.

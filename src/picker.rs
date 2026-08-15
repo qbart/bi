@@ -53,9 +53,7 @@ fn matches_query(text: &str, query: &str) -> bool {
         return true;
     }
     let hay = text.to_lowercase();
-    query
-        .split_whitespace()
-        .all(|term| hay.contains(&term.to_lowercase()))
+    query.split_whitespace().all(|term| hay.contains(&term.to_lowercase()))
 }
 
 impl Picker {
@@ -100,9 +98,7 @@ impl Picker {
     }
 
     pub fn preview(&self) -> &str {
-        self.selected()
-            .map(|i| self.items[i].text.as_str())
-            .unwrap_or("")
+        self.selected().map(|i| self.items[i].text.as_str()).unwrap_or("")
     }
 
     fn refilter(&mut self) {
@@ -173,10 +169,7 @@ mod tests {
     use super::*;
 
     fn picker(texts: &[&str]) -> Picker {
-        let items = texts
-            .iter()
-            .map(|t| Item { text: (*t).into(), badge: None })
-            .collect();
+        let items = texts.iter().map(|t| Item { text: (*t).into(), badge: None }).collect();
         Picker::new(PickerKind::Register { before: false }, items)
     }
 

@@ -156,11 +156,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
         let number = Span::styled(
             format!("{:>width$} ", row + 1, width = gutter - 1),
-            Style::default().fg(if row == cursor_row {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }),
+            Style::default().fg(if row == cursor_row { Color::Yellow } else { Color::DarkGray }),
         );
         let mut spans = vec![number];
         match &highlights {
@@ -181,10 +177,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
     // Past-the-end rows, so an empty buffer doesn't look like a hang.
     while lines.len() < text_area.height as usize {
-        lines.push(Line::from(Span::styled(
-            "~",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
     }
 
     frame.render_widget(Paragraph::new(lines), text_area);
@@ -220,11 +213,7 @@ fn row_label(text: &str, width: usize) -> String {
     if expanded.chars().count() <= width {
         return expanded;
     }
-    expanded
-        .chars()
-        .take(width.saturating_sub(1))
-        .chain(std::iter::once('…'))
-        .collect()
+    expanded.chars().take(width.saturating_sub(1)).chain(std::iter::once('…')).collect()
 }
 
 /// A centred box over the buffer: query, match list, preview.
@@ -301,9 +290,8 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
     let empty = rows.is_empty();
     frame.render_widget(Paragraph::new(rows), list_area);
 
-    let preview = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let preview =
+        Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray));
     let preview_inner = preview.inner(preview_area);
     frame.render_widget(preview, preview_area);
 
@@ -358,12 +346,8 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
         Span::styled(ed.status.clone(), Style::default().fg(Color::Cyan)),
     ];
 
-    let right = format!(
-        "{}  {}:{} ",
-        pending,
-        ed.buffer.cursor_row() + 1,
-        ed.buffer.cursor_col() + 1
-    );
+    let right =
+        format!("{}  {}:{} ", pending, ed.buffer.cursor_row() + 1, ed.buffer.cursor_col() + 1);
 
     let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (width as usize).saturating_sub(left_width + right.chars().count());

@@ -105,9 +105,7 @@ impl Input {
         let sink = self.sink;
         self.reset();
         Some(match operator {
-            Some(op) => {
-                Command { count: 1, action: Action::Operate { op, motion, count, sink } }
-            }
+            Some(op) => Command { count: 1, action: Action::Operate { op, motion, count, sink } },
             None => Command { count, action: Action::Move(motion) },
         })
     }
@@ -361,8 +359,8 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registers::Sink;
     use crate::picker::PickerKind;
+    use crate::registers::Sink;
 
     fn key(c: char) -> Key {
         Key::char(c)
@@ -423,7 +421,12 @@ mod tests {
     fn dw_is_an_operator_over_a_motion() {
         assert_eq!(
             typed("dw").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::WordForward,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -431,7 +434,12 @@ mod tests {
     fn cw_carries_the_change_operator() {
         assert_eq!(
             typed("cw").action,
-            Action::Operate { op: Operator::Change, motion: Motion::WordForward, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Change,
+                motion: Motion::WordForward,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -439,11 +447,21 @@ mod tests {
     fn the_doubled_form_is_the_current_line() {
         assert_eq!(
             typed("dd").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::CurrentLine, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
         assert_eq!(
             typed("cc").action,
-            Action::Operate { op: Operator::Change, motion: Motion::CurrentLine, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Change,
+                motion: Motion::CurrentLine,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -451,7 +469,12 @@ mod tests {
     fn counts_on_both_sides_multiply() {
         assert_eq!(
             typed("2d3w").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 6, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::WordForward,
+                count: 6,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -459,7 +482,12 @@ mod tests {
     fn a_count_after_the_operator_stands_alone() {
         assert_eq!(
             typed("d3w").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::WordForward, count: 3, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::WordForward,
+                count: 3,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -467,7 +495,12 @@ mod tests {
     fn zero_after_an_operator_is_the_line_start_motion_not_a_count() {
         assert_eq!(
             typed("d0").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::LineStart, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::LineStart,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -475,7 +508,12 @@ mod tests {
     fn an_operator_reaches_through_the_g_prefix() {
         assert_eq!(
             typed("dgg").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::FirstLine, count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::FirstLine,
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -490,7 +528,12 @@ mod tests {
         assert_eq!(typed("5G").action, Action::Move(Motion::Line(5)));
         assert_eq!(
             typed("d5G").action,
-            Action::Operate { op: Operator::Delete, motion: Motion::Line(5), count: 1, sink: Sink::Ring }
+            Action::Operate {
+                op: Operator::Delete,
+                motion: Motion::Line(5),
+                count: 1,
+                sink: Sink::Ring
+            }
         );
     }
 
@@ -605,14 +648,8 @@ mod tests {
     /// input, so `"zdd` deletes to the ring — the `"z` is dropped, not the `dd`.
     #[test]
     fn quote_p_opens_the_picker() {
-        assert_eq!(
-            typed("\"p").action,
-            Action::OpenPicker(PickerKind::Register { before: false })
-        );
-        assert_eq!(
-            typed("\"P").action,
-            Action::OpenPicker(PickerKind::Register { before: true })
-        );
+        assert_eq!(typed("\"p").action, Action::OpenPicker(PickerKind::Register { before: false }));
+        assert_eq!(typed("\"P").action, Action::OpenPicker(PickerKind::Register { before: true }));
     }
 
     #[test]
@@ -626,10 +663,7 @@ mod tests {
         assert_eq!(act(ctrl('a')), Action::PickToggleShort);
         assert_eq!(act(Key::code(KeyCode::Enter)), Action::PickAccept);
         assert_eq!(act(Key::code(KeyCode::Esc)), Action::PickCancel);
-        assert_eq!(
-            act(Key::code(KeyCode::Backspace)),
-            Action::PickBackspace
-        );
+        assert_eq!(act(Key::code(KeyCode::Backspace)), Action::PickBackspace);
         assert_eq!(act(Key::code(KeyCode::Down)), Action::PickNext);
         assert_eq!(act(Key::code(KeyCode::Up)), Action::PickPrev);
     }
@@ -638,10 +672,7 @@ mod tests {
     #[test]
     fn a_plain_p_in_the_picker_is_a_query_char() {
         let mut input = Input::default();
-        assert_eq!(
-            input.on_key(key('p'), &Mode::Pick).unwrap().action,
-            Action::PickChar('p')
-        );
+        assert_eq!(input.on_key(key('p'), &Mode::Pick).unwrap().action, Action::PickChar('p'));
     }
 
     #[test]

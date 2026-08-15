@@ -109,8 +109,7 @@ impl Buffer {
         let path = path.as_ref().to_path_buf();
         let mut buf = Self::empty();
         if path.exists() {
-            let file = File::open(&path)
-                .with_context(|| format!("opening {}", path.display()))?;
+            let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
             buf.rope = Rope::from_reader(BufReader::new(file))
                 .with_context(|| format!("reading {}", path.display()))?;
         }
@@ -119,15 +118,11 @@ impl Buffer {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        let path = self
-            .path
-            .clone()
-            .context("no file name (use `:w <path>`)")?;
+        let path = self.path.clone().context("no file name (use `:w <path>`)")?;
         // What lands on disk has to be a revision, or nothing can be marked as
         // saved and the buffer stays "modified" straight after a good write.
         self.commit_undo();
-        let file = File::create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         self.rope
             .write_to(BufWriter::new(file))
             .with_context(|| format!("writing {}", path.display()))?;
@@ -153,11 +148,7 @@ impl Buffer {
     /// phantom trailing empty line.
     pub fn line_count(&self) -> usize {
         let n = self.rope.len_lines();
-        if n > 1 && self.rope.line(n - 1).len_chars() == 0 {
-            n - 1
-        } else {
-            n
-        }
+        if n > 1 && self.rope.line(n - 1).len_chars() == 0 { n - 1 } else { n }
     }
 
     pub fn cursor_row(&self) -> usize {
@@ -196,10 +187,7 @@ impl Buffer {
         let char_idx = char_idx.min(self.rope.len_chars());
         let row = self.rope.char_to_line(char_idx);
         let row_start = self.rope.line_to_char(row);
-        Point {
-            row,
-            col: self.rope.char_to_byte(char_idx) - self.rope.char_to_byte(row_start),
-        }
+        Point { row, col: self.rope.char_to_byte(char_idx) - self.rope.char_to_byte(row_start) }
     }
 
     /// Replaces `start..end` (chars) with `text`, logging an [`Edit`] for
@@ -601,11 +589,7 @@ impl Buffer {
                 let line_end = self.rope.line_to_char(row) + self.line_len(row);
                 // `p` goes after the char under the cursor — but an empty line
                 // has no such char, so it must not step onto the next one.
-                let at = if before {
-                    self.cursor.at
-                } else {
-                    (self.cursor.at + 1).min(line_end)
-                };
+                let at = if before { self.cursor.at } else { (self.cursor.at + 1).min(line_end) };
                 let text = entry.text.repeat(count);
                 let len = text.chars().count();
                 self.apply_edit(at, at, &text);
@@ -666,7 +650,6 @@ impl Buffer {
     pub fn goto_row(&mut self, row: usize, allow_eol: bool) {
         self.cursor = self.at_row(row, allow_eol);
     }
-
 }
 
 #[cfg(test)]
@@ -950,7 +933,10 @@ mod tests {
 
     #[test]
     fn d_dollar_deletes_through_the_last_char_but_not_the_newline() {
-        assert_eq!(op("hello world\nnext", 6, Operator::Delete, Motion::LineEnd, 1), "hello \nnext");
+        assert_eq!(
+            op("hello world\nnext", 6, Operator::Delete, Motion::LineEnd, 1),
+            "hello \nnext"
+        );
     }
 
     #[test]
@@ -985,7 +971,10 @@ mod tests {
 
     #[test]
     fn dd_takes_the_whole_line_including_its_newline() {
-        assert_eq!(op("one\ntwo\nthree", 1, Operator::Delete, Motion::CurrentLine, 1), "two\nthree");
+        assert_eq!(
+            op("one\ntwo\nthree", 1, Operator::Delete, Motion::CurrentLine, 1),
+            "two\nthree"
+        );
     }
 
     #[test]

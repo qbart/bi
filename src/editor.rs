@@ -98,12 +98,7 @@ impl Action {
         if let Action::Move(m) = self {
             return !m.is_absolute();
         }
-        matches!(
-            self,
-            Action::InsertChar(_)
-                | Action::Undo
-                | Action::Redo
-        )
+        matches!(self, Action::InsertChar(_) | Action::Undo | Action::Redo)
     }
 }
 
@@ -282,8 +277,6 @@ impl Editor {
                 self.buffer.open_line(false);
             }
 
-
-
             Action::Undo => {
                 if !self.buffer.undo() {
                     self.status = "already at oldest change".into();
@@ -405,23 +398,15 @@ impl Editor {
 
     /// Returns whether the write succeeded.
     fn write(&mut self, path: &str) -> bool {
-        let result = if path.is_empty() {
-            self.buffer.save()
-        } else {
-            self.buffer.save_as(path)
-        };
+        let result = if path.is_empty() { self.buffer.save() } else { self.buffer.save_as(path) };
         match result {
             Ok(()) => {
                 // `:w other.rs` can change the language under us.
                 if !path.is_empty() {
                     self.reload_syntax();
                 }
-                let name = self
-                    .buffer
-                    .path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
+                let name =
+                    self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 self.status = format!("\"{name}\" written");
                 true
             }
@@ -747,10 +732,7 @@ mod tests {
         let mut ed = ed_with_ring();
         ed.buffer.cursor = ed.buffer.at_row(0, false);
         ed.apply(open_register_picker(true));
-        pick_keys(
-            &mut ed,
-            &[Action::PickChar('b'), Action::PickChar('e'), Action::PickAccept],
-        );
+        pick_keys(&mut ed, &[Action::PickChar('b'), Action::PickChar('e'), Action::PickAccept]);
         assert_eq!(ed.buffer.rope().to_string(), "beta\nalpha\nbeta\ngamma");
     }
 

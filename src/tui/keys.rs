@@ -62,11 +62,8 @@ mod tests {
 
     #[test]
     fn alt_and_shift_are_carried_even_though_the_keymap_ignores_them() {
-        let key = translate(ev(
-            CtCode::Char('j'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ))
-        .unwrap();
+        let key =
+            translate(ev(CtCode::Char('j'), KeyModifiers::ALT | KeyModifiers::SHIFT)).unwrap();
         assert_eq!(key.code, KeyCode::Char('j'));
         assert!(key.mods.alt && key.mods.shift && !key.mods.ctrl);
     }

@@ -32,10 +32,7 @@ pub struct Span {
 /// library that costs build time and binary size.
 fn language_for(extension: &str) -> Option<(Language, &'static str)> {
     match extension {
-        "rs" => Some((
-            tree_sitter_rust::LANGUAGE.into(),
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-        )),
+        "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
         _ => None,
     }
 }
@@ -103,8 +100,7 @@ impl Syntax {
         cursor.set_byte_range(range.clone());
 
         let mut raw: Vec<(usize, usize, u32)> = Vec::new();
-        let mut matches =
-            cursor.matches(&self.query, self.tree.root_node(), RopeProvider(rope));
+        let mut matches = cursor.matches(&self.query, self.tree.root_node(), RopeProvider(rope));
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node.byte_range();
@@ -134,11 +130,7 @@ impl Syntax {
                 Some(last) if last.end_byte == byte && last.capture == capture => {
                     last.end_byte = byte + 1;
                 }
-                _ => spans.push(Span {
-                    start_byte: byte,
-                    end_byte: byte + 1,
-                    capture,
-                }),
+                _ => spans.push(Span { start_byte: byte, end_byte: byte + 1, capture }),
             }
         }
         spans
@@ -178,10 +170,7 @@ fn input_edit(edit: &Edit) -> InputEdit {
 }
 
 fn point(p: crate::buffer::Point) -> TsPoint {
-    TsPoint {
-        row: p.row,
-        column: p.col,
-    }
+    TsPoint { row: p.row, column: p.col }
 }
 
 #[cfg(test)]
@@ -287,11 +276,7 @@ mod tests {
         buffer.cursor = crate::buffer::Cursor::at(0);
         buffer.insert_str("// leading comment\n");
         buffer.cursor = crate::buffer::Cursor::at(5);
-        buffer.operate(
-            crate::motion::Operator::Delete,
-            crate::motion::Motion::Right,
-            3,
-        );
+        buffer.operate(crate::motion::Operator::Delete, crate::motion::Motion::Right, 3);
 
         sync(&mut syntax, &mut buffer);
 
