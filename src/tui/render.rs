@@ -9,7 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use bee::editor::{Editor, Mode};
+use bee::buffer::Cursor;
+use bee::editor::{Editor, Mode, VisualKind};
 use bee::picker::Picker;
 use bee::syntax::{Span as HlSpan, Syntax};
 
@@ -23,6 +24,48 @@ const TAB_WIDTH: usize = 4;
 /// unreadable. Goes wherever the highlight table goes when a theme file exists.
 const CURSOR_LINE_BG: Color = Color::Indexed(236);
 
+/// Background for selected text. Lighter than the cursor line, so a selection
+/// that covers the cursor's line still reads as a selection.
+const SELECTION_BG: Color = Color::Indexed(239);
+
+/// Repaints the background of the columns in `cols` within an already-built
+/// line, leaving the foreground alone.
+///
+/// Spans are split at the range's edges rather than styled whole, because a
+/// selection almost never lines up with a syntax span.
+fn paint_range(
+    spans: Vec<Span<'static>>,
+    cols: std::ops::Range<usize>,
+    bg: Color,
+) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut col = 0usize;
+    for span in spans {
+        let text = span.content.to_string();
+        let width = text.chars().count();
+        let (start, end) = (col, col + width);
+        col = end;
+
+        if end <= cols.start || start >= cols.end {
+            out.push(span);
+            continue;
+        }
+        let lo = cols.start.saturating_sub(start);
+        let hi = (cols.end - start).min(width);
+        let take =
+            |from: usize, to: usize| -> String { text.chars().take(to).skip(from).collect() };
+
+        if lo > 0 {
+            out.push(Span::styled(take(0, lo), span.style));
+        }
+        out.push(Span::styled(take(lo, hi), span.style.bg(bg)));
+        if hi < width {
+            out.push(Span::styled(take(hi, width), span.style));
+        }
+    }
+    out
+}
+
 /// Paints `bg` behind a line and pads it to `width`, so the highlight reaches
 /// the edge of the pane instead of stopping at the last character.
 ///
@@ -33,8 +76,16 @@ fn fill_line(spans: Vec<Span<'static>>, bg: Color, width: usize) -> Line<'static
     let mut spans: Vec<Span<'static>> = spans
         .into_iter()
         .map(|s| {
-            let style = s.style.bg(bg);
-            s.style(style)
+            // Only where nothing is painted yet: a selection on the cursor's
+            // own line has already claimed those cells, and the cursor line
+            // must not paint over it.
+            match s.style.bg {
+                Some(_) => s,
+                None => {
+                    let style = s.style.bg(bg);
+                    s.style(style)
+                }
+            }
         })
         .collect();
     spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), Style::default().bg(bg)));
@@ -199,6 +250,39 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             }
             None => spans.push(Span::raw(expand_tabs(raw))),
         }
+        // Selected columns on this row, in screen columns and offset past the
+        // gutter. Charwise includes the character under the head; linewise
+        // covers the row whatever the columns are.
+        for selection in ed.selections.all() {
+            // A collapsed selection still covers something in visual mode — one
+            // character for `v`, the whole line for `V` — so only skip it
+            // outside visual, where it is a plain cursor.
+            if selection.is_collapsed() && ed.mode.visual().is_none() {
+                continue;
+            }
+            let (lo, hi) = selection.range();
+            let (first, last) =
+                (ed.buffer.row_at(Cursor::at(lo)), ed.buffer.row_at(Cursor::at(hi)));
+            if row < first || row > last {
+                continue;
+            }
+            let cols = match ed.mode.visual() {
+                Some(VisualKind::Line) => 0..raw.chars().count().max(1),
+                _ => {
+                    let line_start = ed.buffer.rope().line_to_char(row);
+                    let from = lo.saturating_sub(line_start).min(raw.chars().count());
+                    let to = if row < last {
+                        raw.chars().count()
+                    } else {
+                        (hi - line_start + 1).min(raw.chars().count())
+                    };
+                    display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
+                }
+            };
+            let cols = (cols.start + gutter)..(cols.end + gutter);
+            spans = paint_range(spans, cols, SELECTION_BG);
+        }
+
         lines.push(if row == cursor_row {
             fill_line(spans, CURSOR_LINE_BG, text_area.width as usize)
         } else {

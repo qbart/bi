@@ -717,6 +717,46 @@ impl Buffer {
             }
             (false, _) => self.rope.slice(start..end).to_string(),
         };
+        Some(self.take(at, op, start, end, text, linewise))
+    }
+
+    /// Applies `op` over an explicit char range.
+    ///
+    /// What visual mode uses: the range comes from the selection rather than
+    /// from a motion, so none of the target machinery applies. `Buffer` is kept
+    /// out of the selection business entirely — `Editor` works out the range
+    /// and hands it over.
+    pub fn operate_range(
+        &mut self,
+        at: Cursor,
+        op: Operator,
+        start: usize,
+        end: usize,
+        linewise: bool,
+    ) -> Option<(Entry, Cursor)> {
+        if end <= start {
+            return None;
+        }
+        let mut text = self.rope.slice(start..end).to_string();
+        // Every linewise entry ends in a newline, or pasting it back could not
+        // open a line.
+        if linewise && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        Some(self.take(at, op, start, end, text, linewise))
+    }
+
+    /// The shared tail of both: capture `text`, then either leave the buffer
+    /// alone (yank) or cut the range out.
+    fn take(
+        &mut self,
+        at: Cursor,
+        op: Operator,
+        start: usize,
+        end: usize,
+        text: String,
+        linewise: bool,
+    ) -> (Entry, Cursor) {
         let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
 
         let landed = if op == Operator::Yank {
@@ -729,7 +769,23 @@ impl Buffer {
             // text was, which for `d$` or `cc` is one past what's left.
             self.clamped(Cursor::at(start), op == Operator::Change)
         };
-        Some((Entry { text, kind }, landed))
+        (Entry { text, kind }, landed)
+    }
+
+    /// Char range covering the whole of every line `start..=end` touches,
+    /// plus the terminator when there is one. Linewise visual.
+    pub fn line_range(&self, start: usize, end: usize, take_terminator: bool) -> (usize, usize) {
+        let first = self.row_at(Cursor::at(start));
+        let last = self.row_at(Cursor::at(end));
+        let from = self.rope.line_to_char(first);
+        let content_end = self.rope.line_to_char(last) + self.line_len(last);
+        let len = self.rope.len_chars();
+        let to = if take_terminator && content_end < len && self.rope.char(content_end) == '\n' {
+            content_end + 1
+        } else {
+            content_end
+        };
+        (from, to)
     }
 
     /// Puts `entry` back, `count` times, as one edit.

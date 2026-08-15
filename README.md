@@ -117,8 +117,33 @@ tree, so undoing and then typing keeps the old branch rather than discarding it
 
 | Key | Does |
 |---|---|
+| `v` `V` | charwise / linewise visual mode |
+| `R` | replace mode |
 | `Esc`, `Ctrl-C` | back to normal mode, or cancel a half-typed command |
 | `:` | ex command line |
+
+### Visual mode
+
+`v` starts a charwise selection, `V` a linewise one. The same key again, or
+`Esc`, leaves. Every motion and text object works — the selection's head moves
+and its anchor stays put — so `viw`, `vi(`, `vap` and `v$` all do what you would
+expect.
+
+| Key | Does |
+|---|---|
+| `d` `x` | delete the selection |
+| `c` `s` | change it |
+| `y` | yank it |
+| `o` | swap the ends, to adjust the other one |
+| `iw` `i(` … | make that text object the selection |
+
+Charwise selections include the character under the cursor, as in vim.
+
+### Replace mode
+
+`R` overwrites instead of inserting, until `Esc`. `Backspace` puts back what was
+overwritten rather than deleting, and typing past the end of a line appends
+rather than eating the newline. The whole session is one undo step.
 
 ### Insert mode
 

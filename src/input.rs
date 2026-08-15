@@ -9,7 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::editor::{Action, Command, Mode};
+use crate::editor::{Action, Command, Mode, VisualKind};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
@@ -83,7 +83,11 @@ impl Input {
     pub fn on_key(&mut self, key: Key, mode: &Mode) -> Option<Command> {
         match mode {
             Mode::Normal => self.normal(key),
+            // Visual shares normal's grammar: the same motions, counts and
+            // text objects, differing only in what an operator applies to.
+            Mode::Visual(_) => self.visual(key),
             Mode::Insert => Self::insert(key),
+            Mode::Replace => Self::replace(key),
             Mode::Command(_) => Self::command_line(key),
             Mode::Pick => Self::pick(key),
         }
@@ -375,6 +379,9 @@ impl Input {
                 self.replace_pending = true;
                 return None;
             }
+            'v' => return self.plain(Action::EnterVisual(VisualKind::Char)),
+            'V' => return self.plain(Action::EnterVisual(VisualKind::Line)),
+            'R' => return self.plain(Action::EnterReplace),
             'f' | 'F' | 't' | 'T' => {
                 self.find_pending = find_key(c);
                 return None;
@@ -429,6 +436,92 @@ impl Input {
             }
         };
         self.plain(action)
+    }
+
+    /// Visual mode. Falls through to `normal` for everything it does not
+    /// claim, so every motion and text object works unchanged.
+    fn visual(&mut self, key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
+
+        // Esc has to be claimed here. Normal mode's Esc only clears the pending
+        // keymap state and resolves to no command at all, which would leave
+        // visual mode running with the user believing they had left it.
+        if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+            self.reset();
+            return Some(Command { count: 1, action: Action::EnterNormal });
+        }
+
+        let KeyCode::Char(c) = key.code else {
+            return self.normal(key);
+        };
+        if ctrl {
+            return self.normal(key);
+        }
+
+        // `i`/`a` name a text object here rather than entering insert mode, and
+        // the object becomes the selection rather than being operated on. This
+        // is what makes `viw` and `vi(` work.
+        if let Some(around) = self.object_pending.take() {
+            return match object_key(c) {
+                Some(object) => {
+                    self.reset();
+                    Some(Command { count: 1, action: Action::SelectObject { object, around } })
+                }
+                None => {
+                    self.reset();
+                    None
+                }
+            };
+        }
+        if c == 'i' || c == 'a' {
+            self.object_pending = Some(c == 'a');
+            return None;
+        }
+
+        // An operator in visual mode takes the selection, not a motion, so it
+        // resolves immediately rather than waiting for one.
+        let op = match c {
+            'd' | 'x' => Some(Operator::Delete),
+            'c' | 's' => Some(Operator::Change),
+            'y' => Some(Operator::Yank),
+            _ => None,
+        };
+        if let Some(op) = op {
+            let sink = self.sink;
+            self.reset();
+            return Some(Command { count: 1, action: Action::OperateSelection { op, sink } });
+        }
+
+        match c {
+            'o' => {
+                self.reset();
+                Some(Command { count: 1, action: Action::SwapEnds })
+            }
+            'v' => self.plain(Action::EnterVisual(VisualKind::Char)),
+            'V' => self.plain(Action::EnterVisual(VisualKind::Line)),
+            _ => self.normal(key),
+        }
+    }
+
+    /// Replace mode. Printable keys overwrite; `Backspace` puts back what was
+    /// overwritten rather than deleting.
+    fn replace(key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
+        let action = match key.code {
+            KeyCode::Esc => Action::EnterNormal,
+            KeyCode::Char('c') if ctrl => Action::EnterNormal,
+            KeyCode::Char(c) => Action::ReplaceTyped(c),
+            KeyCode::Backspace => Action::ReplaceBackspace,
+            KeyCode::Enter => Action::InsertNewline,
+            KeyCode::Tab => Action::ReplaceTyped('\t'),
+            KeyCode::Left => Action::Move(Motion::Left),
+            KeyCode::Right => Action::Move(Motion::Right),
+            KeyCode::Down => Action::Move(Motion::Down),
+            KeyCode::Up => Action::Move(Motion::Up),
+            KeyCode::Home => Action::Move(Motion::LineStart),
+            KeyCode::End => Action::Move(Motion::LineEnd),
+        };
+        Some(Command { count: 1, action })
     }
 
     fn insert(key: Key) -> Option<Command> {

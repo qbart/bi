@@ -9,16 +9,27 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, Cursor};
-use crate::motion::{Motion, Operator, Target};
+use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
 
+/// Charwise or linewise. Blockwise is deferred — see `docs/specs/selections.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+    Char,
+    Line,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Insert,
+    /// Overwrites rather than inserts. `R`.
+    Replace,
+    /// Selections have room in them and motions move the head.
+    Visual(VisualKind),
     /// The `:` line being typed, without the leading colon.
     Command(String),
     /// The picker overlay is up. Its state lives in `Editor::picker` — a
@@ -31,6 +42,9 @@ impl Mode {
         match self {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
+            Mode::Replace => "REPLACE",
+            Mode::Visual(VisualKind::Char) => "VISUAL",
+            Mode::Visual(VisualKind::Line) => "V-LINE",
             Mode::Command(_) => "COMMAND",
             Mode::Pick => "PICK",
         }
@@ -38,7 +52,14 @@ impl Mode {
 
     /// Whether the cursor may rest one past the last char of a line.
     pub fn allows_eol(&self) -> bool {
-        matches!(self, Mode::Insert)
+        matches!(self, Mode::Insert | Mode::Replace)
+    }
+
+    pub fn visual(&self) -> Option<VisualKind> {
+        match self {
+            Mode::Visual(kind) => Some(*kind),
+            _ => None,
+        }
     }
 }
 
@@ -73,6 +94,26 @@ pub enum Action {
     EnterInsertLineStart,
     EnterInsertLineEnd,
     EnterNormal,
+    /// `v` / `V`. The same key again leaves, as in vim.
+    EnterVisual(VisualKind),
+    /// `o` — swap which end of the selection the motions move.
+    SwapEnds,
+    /// An operator over whatever is selected. Visual mode's `d`, `c`, `y`.
+    OperateSelection {
+        op: Operator,
+        sink: Sink,
+    },
+    /// `viw`, `vi(` — make the object the selection rather than operating on it.
+    SelectObject {
+        object: TextObject,
+        around: bool,
+    },
+    /// `R`
+    EnterReplace,
+    /// A character typed in replace mode.
+    ReplaceTyped(char),
+    /// Backspace in replace mode: puts back what was overwritten.
+    ReplaceBackspace,
     OpenLineBelow,
     OpenLineAbove,
 
@@ -153,6 +194,9 @@ pub struct Editor {
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
+    /// What replace mode has overwritten, newest last, one entry per selection
+    /// per keystroke. Backspace pops it to put the original characters back.
+    replaced: Vec<Vec<Option<char>>>,
     pub status: String,
     /// First visible row.
     pub scroll: usize,
@@ -205,6 +249,7 @@ impl Editor {
             syntax: None,
             mode: Mode::Normal,
             last_find: None,
+            replaced: Vec::new(),
             status: String::new(),
             scroll: 0,
             quit: false,
@@ -219,12 +264,15 @@ impl Editor {
 
         // One command is one undo step, so the group closes here rather than
         // inside the count loop — `5x` comes back in a single `u`. Insert mode
-        // is the exception: the group stays open until Esc, which is what makes
+        // and replace are the exceptions: the group stays open until Esc, which makes
         // a typing run (and the `\n` that `o` inserted before it) undo together.
         // One command is one undo step even across N selections, so the group
         // closes after the whole pass rather than per selection — otherwise `u`
         // would walk back through a multi-cursor edit one cursor at a time.
-        if self.mode != Mode::Insert {
+        //
+        // Insert and replace are the exceptions: both hold the group open until
+        // Esc, so a typing run — or a whole `R` session — comes back in one `u`.
+        if !matches!(self.mode, Mode::Insert | Mode::Replace) {
             let at = self.selections.cursor();
             self.buffer.commit_undo(at);
         }
@@ -323,8 +371,16 @@ impl Editor {
         match action {
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
+                let visual = self.mode.visual().is_some();
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.moved(sel.head, m, eol))
+                    let head = ed.buffer.moved(sel.head, m, eol);
+                    // In visual mode only the head moves; the anchor is what
+                    // makes it a range rather than a cursor.
+                    if visual {
+                        Selection { anchor: sel.anchor, head }
+                    } else {
+                        Selection::collapsed(head)
+                    }
                 });
             }
             Action::Operate { op, target, count, sink } => {
@@ -412,6 +468,8 @@ impl Editor {
             }
             Action::EnterNormal => {
                 self.mode = Mode::Normal;
+                self.replaced.clear();
+                self.selections.collapse_each();
                 // Matches vim: leaving insert pulls the cursor back onto a char.
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.clamped(sel.head, false))
@@ -479,6 +537,111 @@ impl Editor {
             Action::Backspace => {
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.backspace(sel.head))
+                });
+            }
+
+            Action::EnterVisual(kind) => {
+                // The same key again leaves, as in vim.
+                self.mode = if self.mode == Mode::Visual(*kind) {
+                    self.selections.collapse_each();
+                    Mode::Normal
+                } else {
+                    Mode::Visual(*kind)
+                };
+            }
+            Action::SwapEnds => {
+                self.for_each_selection(|_, sel| sel.flipped());
+            }
+            Action::OperateSelection { op, sink } => {
+                let (op, sink) = (*op, *sink);
+                let linewise = self.mode.visual() == Some(VisualKind::Line);
+                self.for_each_selection(|ed, sel| {
+                    let len = ed.buffer.rope().len_chars();
+                    let (start, end) = if linewise {
+                        // Change keeps the line for insert mode to sit on, the
+                        // same rule `cc` follows.
+                        let (lo, hi) = sel.range();
+                        ed.buffer.line_range(lo, hi, op != Operator::Change)
+                    } else {
+                        // Charwise visual includes the character under the head.
+                        sel.inclusive_range(len)
+                    };
+                    match ed.buffer.operate_range(sel.head, op, start, end, linewise) {
+                        Some((entry, landed)) => {
+                            if sink == Sink::Ring {
+                                ed.registers.push(entry);
+                            }
+                            Selection::collapsed(landed)
+                        }
+                        None => Selection::collapsed(sel.head),
+                    }
+                });
+                self.mode = if op == Operator::Change { Mode::Insert } else { Mode::Normal };
+            }
+
+            Action::SelectObject { object, around } => {
+                let (object, around) = (*object, *around);
+                self.for_each_selection(|ed, sel| {
+                    match ed.buffer.object_range(sel.head, object, around) {
+                        // The head sits *on* the last character, not past it:
+                        // charwise visual is inclusive, so an exclusive end
+                        // would select one character too many.
+                        Some((start, end)) => Selection {
+                            anchor: Cursor::at(start),
+                            head: Cursor::at(end.saturating_sub(1).max(start)),
+                        },
+                        None => sel,
+                    }
+                });
+            }
+
+            Action::EnterReplace => {
+                self.mode = Mode::Replace;
+                self.replaced.clear();
+            }
+            Action::ReplaceTyped(c) => {
+                let c = *c;
+                let mut overwritten = Vec::new();
+                self.for_each_selection(|ed, sel| {
+                    let row = ed.buffer.row_at(sel.head);
+                    let col = ed.buffer.col_at(sel.head);
+                    // Past the end of the line it appends, rather than eating
+                    // the newline — which is what vim does.
+                    let at_eol = col >= ed.buffer.line_len(row);
+                    overwritten.push(if at_eol {
+                        None
+                    } else {
+                        Some(ed.buffer.rope().char(sel.head.at))
+                    });
+                    let landed = if at_eol {
+                        ed.buffer.insert_char(sel.head, c)
+                    } else {
+                        ed.buffer
+                            .replace_chars(sel.head, c, 1)
+                            .map(|landed| Cursor::at(landed.at + 1))
+                            .unwrap_or(sel.head)
+                    };
+                    Selection::collapsed(landed)
+                });
+                self.replaced.push(overwritten);
+            }
+            Action::ReplaceBackspace => {
+                let Some(overwritten) = self.replaced.pop() else { return };
+                let mut i = 0;
+                self.for_each_selection(|ed, sel| {
+                    let original = overwritten.get(i).copied().flatten();
+                    i += 1;
+                    if sel.head.at == 0 {
+                        return sel;
+                    }
+                    let back = Cursor::at(sel.head.at - 1);
+                    let landed = match original {
+                        // Put back what was overwritten rather than deleting.
+                        Some(ch) => ed.buffer.replace_chars(back, ch, 1).unwrap_or(back),
+                        // Nothing was overwritten here — it was an append.
+                        None => ed.buffer.backspace(sel.head),
+                    };
+                    Selection::collapsed(landed)
                 });
             }
 
@@ -1285,5 +1448,175 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
         ed.apply(cmd(Action::Undo));
         assert_eq!(ed.selections.len(), 1);
+    }
+
+    // ---- visual mode -------------------------------------------------------
+
+    fn visual(text: &str, at: usize, kind: VisualKind) -> Editor {
+        let mut ed = editor(text);
+        ed.set_cursor(Cursor::at(at));
+        ed.apply(cmd(Action::EnterVisual(kind)));
+        ed
+    }
+
+    #[test]
+    fn v_starts_a_selection_and_motions_move_only_the_head() {
+        let mut ed = visual("hello world", 0, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        let sel = ed.selections.primary();
+        assert_eq!(sel.anchor.at, 0, "the anchor stays where the selection began");
+        assert_eq!(sel.head.at, 2);
+    }
+
+    #[test]
+    fn the_same_key_again_leaves_visual_mode() {
+        let mut ed = visual("hello", 0, VisualKind::Char);
+        assert_eq!(ed.mode, Mode::Visual(VisualKind::Char));
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        assert_eq!(ed.mode, Mode::Normal);
+        assert!(ed.selections.primary().is_collapsed());
+    }
+
+    #[test]
+    fn v_then_big_v_switches_kind_rather_than_leaving() {
+        let mut ed = visual("hello", 0, VisualKind::Char);
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        assert_eq!(ed.mode, Mode::Visual(VisualKind::Line));
+    }
+
+    #[test]
+    fn o_swaps_the_ends_so_the_other_one_can_be_adjusted() {
+        let mut ed = visual("hello world", 2, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        let before = ed.selections.primary();
+        ed.apply(cmd(Action::SwapEnds));
+        let after = ed.selections.primary();
+        assert_eq!(after.anchor.at, before.head.at);
+        assert_eq!(after.head.at, before.anchor.at);
+        assert_eq!(after.range(), before.range(), "the range is unchanged");
+    }
+
+    /// Charwise visual includes the character under the head, as in vim.
+    #[test]
+    fn a_charwise_operator_takes_the_character_under_the_head() {
+        let mut ed = visual("hello", 0, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "llo", "both h and e");
+        assert_eq!(ed.mode, Mode::Normal, "and it drops back to normal");
+    }
+
+    #[test]
+    fn a_linewise_operator_takes_whole_lines_whatever_the_columns() {
+        let mut ed = visual("one\ntwo\nthree", 5, VisualKind::Line);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "one\nthree");
+    }
+
+    #[test]
+    fn a_visual_change_leaves_you_in_insert_mode() {
+        let mut ed = visual("hello", 0, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Change, sink: Sink::Ring }));
+        assert_eq!(ed.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn a_visual_yank_captures_without_changing_the_text() {
+        let mut ed = visual("hello", 0, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "hello");
+        assert_eq!(ed.registers.front().unwrap().text, "he");
+    }
+
+    #[test]
+    fn a_linewise_yank_is_a_linewise_entry() {
+        let mut ed = visual("one\ntwo", 0, VisualKind::Line);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+        let entry = ed.registers.front().unwrap();
+        assert_eq!(entry.kind, EntryKind::Linewise);
+        assert!(entry.text.ends_with('\n'), "or pasting it could not open a line");
+    }
+
+    #[test]
+    fn viw_makes_the_object_the_selection() {
+        let mut ed = visual("foo bar baz", 5, VisualKind::Char);
+        ed.apply(cmd(Action::SelectObject {
+            object: TextObject::Word { big: false },
+            around: false,
+        }));
+        let sel = ed.selections.primary();
+        assert_eq!((sel.anchor.at, sel.head.at), (4, 6), "the head sits on the last char");
+
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "foo  baz");
+    }
+
+    // ---- replace mode ------------------------------------------------------
+
+    fn replaced(text: &str, keys: &str) -> Editor {
+        let mut ed = editor(text);
+        ed.apply(cmd(Action::EnterReplace));
+        for c in keys.chars() {
+            ed.apply(cmd(Action::ReplaceTyped(c)));
+        }
+        ed
+    }
+
+    #[test]
+    fn r_overwrites_rather_than_inserting() {
+        let ed = replaced("abcdef", "XY");
+        assert_eq!(ed.buffer.rope().to_string(), "XYcdef");
+    }
+
+    #[test]
+    fn replace_past_the_end_of_the_line_appends() {
+        // Vim does not let it eat the newline.
+        let ed = replaced("ab\nnext", "XYZ");
+        assert_eq!(ed.buffer.rope().to_string(), "XYZ\nnext");
+    }
+
+    /// The one thing `R` has that overwriting alone does not: Backspace puts
+    /// the original characters back. Not testable through the vim differential
+    /// harness, which inserts the DEL byte literally.
+    #[test]
+    fn backspace_in_replace_mode_restores_what_was_overwritten() {
+        let mut ed = replaced("abcdef", "XY");
+        assert_eq!(ed.buffer.rope().to_string(), "XYcdef");
+
+        ed.apply(cmd(Action::ReplaceBackspace));
+        assert_eq!(ed.buffer.rope().to_string(), "Xbcdef", "the b came back");
+        ed.apply(cmd(Action::ReplaceBackspace));
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef", "and the a");
+    }
+
+    #[test]
+    fn backspacing_past_an_appended_char_removes_it_rather_than_restoring() {
+        let mut ed = replaced("ab", "XYZ");
+        assert_eq!(ed.buffer.rope().to_string(), "XYZ");
+        // The Z was appended past the end, so there is nothing to put back.
+        ed.apply(cmd(Action::ReplaceBackspace));
+        assert_eq!(ed.buffer.rope().to_string(), "XY");
+    }
+
+    #[test]
+    fn leaving_replace_mode_forgets_what_it_overwrote() {
+        let mut ed = replaced("abcdef", "XY");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.mode, Mode::Normal);
+        // Nothing to pop, so this must not put stale characters back.
+        ed.apply(cmd(Action::ReplaceBackspace));
+        assert_eq!(ed.buffer.rope().to_string(), "XYcdef");
+    }
+
+    #[test]
+    fn a_replace_session_is_one_undo_step() {
+        let mut ed = replaced("abcdef", "XY");
+        ed.apply(cmd(Action::EnterNormal));
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef");
     }
 }

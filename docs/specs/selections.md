@@ -12,12 +12,12 @@ reason is that it turns two features into one piece of machinery.
 
 ## Status
 
-Step 1 is **built**; the cursor no longer exists on `Buffer`.
+Steps 1 and 2 are **built**; the cursor no longer exists on `Buffer`.
 
 | Step | Scope | Needs |
 |---|---|---|
 | **1** ✅ | The selection model; cursor leaves `Buffer` | this file |
-| 2 | Visual mode `v` `V`, Replace mode `R` | step 1 |
+| **2** ✅ | Visual mode `v` `V`, Replace mode `R` | step 1 |
 | 3 | Multi-cursor | step 2 |
 
 Blockwise visual (`Ctrl-V`) is **not** in step 2 — see *Deferred*.
@@ -142,9 +142,25 @@ Mode::Visual(VisualKind)   // Char | Line
 - A charwise visual selection is **inclusive** of the character under the head,
   matching vim. Linewise covers whole lines regardless of column.
 
-`Action::Operate` already takes a `Target`. Visual mode adds one more:
-`Target::Selection`, meaning "whatever is selected". That keeps operators from
-needing to know what mode they are in.
+Operators in visual mode go through `Action::OperateSelection` rather than a
+new `Target` variant. The range comes from the selection, which lives on
+`Editor`, and putting a `Target::Selection` into `Buffer`'s target machinery
+would have meant teaching `Buffer` about selections — the one thing step 1 took
+out of it. `Editor` works the range out and hands it to `Buffer::operate_range`.
+
+`i`/`a` in visual mode name a text object and make it the *selection*
+(`Action::SelectObject`) rather than operating on it, which is what makes `viw`
+and `vi(` work.
+
+Two things that only show up when you try it, both caught by differential
+testing against vim:
+
+- **`Esc` has to be claimed by visual mode.** Falling through to normal mode's
+  `Esc` only clears pending keymap state and resolves to no command, so visual
+  mode kept running while the user believed they had left it.
+- **A collapsed selection still covers something in visual mode** — one
+  character for `v`, a whole line for `V`. The renderer skipped collapsed
+  selections, so `V` on a single line highlighted nothing.
 
 ### Replace
 
@@ -154,7 +170,12 @@ Mode::Replace
 
 `R` overwrites instead of inserting, until `Esc`. Backspace restores what was
 there rather than deleting — so the session has to remember the characters it
-overwrote, as a stack on the mode.
+overwrote, as a stack on `Editor` (one entry per selection per keystroke, so it
+works with several cursors).
+
+A whole `R` session is **one undo step**, which means replace mode holds the
+undo group open until `Esc` exactly as insert mode does. Missing that made every
+keystroke its own revision.
 
 Overwriting stops at the line end: typing past it appends rather than eating the
 newline, which is what vim does. `r{char}` is unrelated and already built.

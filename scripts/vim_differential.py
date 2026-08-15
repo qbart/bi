@@ -24,6 +24,9 @@ BEE = os.path.join(
 
 # Keys bee deliberately does not implement the way vim does, with the reason.
 # Anything here still runs; it is reported separately rather than as a failure.
+# Replace mode's Backspace cannot be tested here: `vim -es -c "normal ..."`
+# inserts the DEL byte literally instead of processing it as a keypress. It is
+# covered by a unit test instead.
 KNOWN_DIVERGENCES = {
     "dw at line end": "bee stops at the line end rather than vim's full "
                       "'end in column 1' rule (documented in README)",
@@ -146,6 +149,30 @@ CASES = [
     ("3J",             "a\nb\nc\nd\n",         "3J"),
     ("J trailing sp",  "foo \nbar\n",          "J"),
     ("J blank next",   "foo\n\nbar\n",         "J"),
+
+    # visual mode
+    ("v then d",       "hello world\n",        "vlld"),
+    ("v motion d",     "hello world\n",        "vwd"),
+    ("viw d",          "foo bar baz\n",        "wviwd"),
+    ("vi( d",          "f(a, b)\n",            "favi(d"),
+    ("v$ d",           "hello world\n",        "v$d"),
+    ("v0 d",           "hello world\n",        "6lv0d"),
+    ("v then y then P","abc def\n",            "vlyP"),
+    ("v then c",       "hello\n",              "vlcZ\x1b"),
+    ("v then x",       "hello\n",              "vlx"),
+    ("v o then d",     "hello world\n",        "6lvllohd"),
+    ("v v cancels",    "hello\n",              "vlvx"),
+    ("v esc cancels",  "hello\n",              "vl\x1bx"),
+    ("V then d",       "one\ntwo\nthree\n",    "Vd"),
+    ("V j d",          "one\ntwo\nthree\n",    "Vjd"),
+    ("V then y P",     "one\ntwo\n",           "VyP"),
+    ("V then c",       "one\ntwo\n",           "VcZ\x1b"),
+    ("v across lines",  "one\ntwo\n",          "vjd"),
+
+    # replace mode
+    ("R over text",    "abcdef\n",             "RXY\x1b"),
+    ("R past the end", "ab\n",                 "RXYZ\x1b"),
+    ("R then move",    "abcdef\n",             "llRZ\x1b"),
 
     # regressions on what already existed
     ("dw",             "foo bar baz\n",        "dw"),
