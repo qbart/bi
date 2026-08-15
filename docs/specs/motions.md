@@ -8,13 +8,13 @@ and twelve. This file records the gap, what closes it, and in what order.
 | Step | Scope | Needs |
 |---|---|---|
 | **1** ✅ | `:e` `:e!` `:e <path>`; `D C s S X r{char} ~ J` | nothing new |
-| 2 | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
+| **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
 | 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
 | 4 | `.` — repeat last change | every command able to replay itself |
 | 5 | `/ ? n N * #` search, then `:s` | a search primitive |
 | 6 | `H M L`, `Ctrl-D/U/F/B`, `zz zt zb` | the viewport as a real concept |
 
-Steps 1–3 are pure additions and are specified here; step 1 is built. Steps
+Steps 1–3 are pure additions and are specified here; steps 1 and 2 are built. Steps
 4–6 are recorded so their shape is known, not because they are being built yet
 — see *Deferred*.
 
@@ -118,8 +118,14 @@ which is `:q`'s existing wording — the precedent in this codebase.
 line. They never cross a line boundary, which is what makes them cheap.
 
 ```rust
-Motion::FindChar { ch: char, forward: bool, till: bool },
+Motion::FindChar { ch: char, forward: bool, till: bool, repeat: bool },
 ```
+
+`repeat` is set only by `;` and `,`, and only `t`/`T` read it. A freshly typed
+`t.` from a position already next to a dot stays put; `;` from there has to skip
+to the following match or it would never advance. Vim draws the same
+distinction through `cpo`'s `;` flag — differential testing against vim is what
+turned this up.
 
 | Key | Direction | Lands |
 |---|---|---|
@@ -175,7 +181,10 @@ object computes both.
 reason: it needs the rope. Each returns a char range or `None`.
 
 `Delimited` searches outward for the enclosing pair and must count nesting, or
-`di(` inside `f(g(x))` deletes the wrong span. Quotes cannot nest, so `Quoted`
+`di(` inside `f(g(x))` deletes the wrong span. When the contents occupy whole
+lines it also becomes **linewise**: `di{` on a braced body leaves the braces on
+their own lines rather than collapsing them to `{}`. `a"` takes the whitespace
+after the closing quote — the same rule `aw` follows. Quotes cannot nest, so `Quoted`
 scans the current line only and pairs them in order — which is what vim does,
 and why `ci"` behaves oddly on a line with an odd number of quotes. That
 oddity is preserved rather than improved on; a smarter rule would need the
@@ -195,6 +204,19 @@ it, rather than changing what `0` does.
 
 `e` is **inclusive** where `w` is exclusive — `dw` and `de` deleting different
 spans is the point of having both.
+
+## Verification
+
+`cargo test` covers the pieces. Conformance is checked separately by
+`scripts/vim_differential.py`, which runs the same keys through real vim and
+through bee and compares the resulting file. It is not part of `cargo test`: it
+needs vim on `PATH` and drives the binary through a pty.
+
+61 cases match vim exactly, with no divergences. Four differences it found were
+fixed rather than recorded — the `t`-repeat rule above, `a"`'s trailing
+whitespace, linewise inner blocks, and a **pre-existing** bug where `dG` on a
+file that already ended in a newline swallowed that newline. It also caught four
+of my own wrong assumptions, where bee was right and the expectation was not.
 
 ## Deferred
 

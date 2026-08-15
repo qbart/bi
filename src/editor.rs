@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::Buffer;
-use crate::motion::{Motion, Operator};
+use crate::motion::{Motion, Operator, Target};
 use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{EntryKind, Registers, Sink};
 use crate::syntax::Syntax;
@@ -47,7 +47,7 @@ pub enum Action {
     /// An operator over the range a motion covers: `dw`, `c$`, `dd`.
     Operate {
         op: Operator,
-        motion: Motion,
+        target: Target,
         /// Already folded — `2d3w` arrives here as 6.
         count: usize,
         sink: Sink,
@@ -138,6 +138,9 @@ pub struct Editor {
     /// it destroys it for the other. One drain point feeds both.
     pub syntax: Option<Syntax>,
     pub mode: Mode,
+    /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
+    /// the keymap because it must outlive `Input::reset()`.
+    last_find: Option<Motion>,
     pub status: String,
     /// First visible row.
     pub scroll: usize,
@@ -188,6 +191,7 @@ impl Editor {
             picker: None,
             syntax: None,
             mode: Mode::Normal,
+            last_find: None,
             status: String::new(),
             scroll: 0,
             quit: false,
@@ -209,13 +213,50 @@ impl Editor {
         }
     }
 
+    /// Substitutes `;` / `,` with the find they repeat, and remembers any find
+    /// that goes past.
+    ///
+    /// The last find lives here rather than in the keymap because it has to
+    /// survive `Input::reset()`, which runs after every resolved command.
+    /// `None` means "there is nothing to repeat" — the caller drops the whole
+    /// action. It cannot resolve to some harmless motion instead: every motion
+    /// means something, and a linewise one would make a bare `d;` delete the
+    /// line.
+    fn resolve_find(&mut self, motion: Motion) -> Option<Motion> {
+        match motion {
+            Motion::FindChar { .. } => {
+                self.last_find = Some(motion);
+                Some(motion)
+            }
+            Motion::RepeatFind { reverse } => match self.last_find {
+                Some(Motion::FindChar { ch, forward, till, .. }) => {
+                    Some(Motion::FindChar { ch, forward: forward != reverse, till, repeat: true })
+                }
+                _ => None,
+            },
+            _ => Some(motion),
+        }
+    }
+
+    fn resolve_find_target(&mut self, target: Target) -> Option<Target> {
+        match target {
+            Target::Motion(m) => self.resolve_find(m).map(Target::Motion),
+            object => Some(object),
+        }
+    }
+
     fn apply_once(&mut self, action: &Action) {
         let eol = self.mode.allows_eol();
 
         match action {
-            Action::Move(m) => self.buffer.apply_motion(*m, eol),
-            Action::Operate { op, motion, count, sink } => {
-                if let Some(entry) = self.buffer.operate(*op, *motion, *count) {
+            Action::Move(m) => {
+                if let Some(m) = self.resolve_find(*m) {
+                    self.buffer.apply_motion(m, eol);
+                }
+            }
+            Action::Operate { op, target, count, sink } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                if let Some(entry) = self.buffer.operate(*op, target, *count) {
                     if *sink == Sink::Ring {
                         self.registers.push(entry);
                     }
@@ -587,7 +628,7 @@ mod tests {
     }
 
     fn operate(op: Operator, motion: Motion, count: usize) -> Command {
-        cmd(Action::Operate { op, motion, count, sink: Sink::Ring })
+        cmd(Action::Operate { op, target: Target::Motion(motion), count, sink: Sink::Ring })
     }
 
     /// `5x` — one command whose count the operator folded in.
@@ -676,7 +717,7 @@ mod tests {
             count: 1,
             action: Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::BlackHole,
             },

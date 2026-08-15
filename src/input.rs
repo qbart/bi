@@ -11,7 +11,7 @@
 
 use crate::editor::{Action, Command, Mode};
 use crate::key::{Key, KeyCode};
-use crate::motion::{Motion, Operator};
+use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
 use crate::registers::Sink;
 
@@ -26,6 +26,11 @@ pub struct Input {
     quote_pending: bool,
     /// `r` has been typed and is waiting for the character to write.
     replace_pending: bool,
+    /// `f`/`F`/`t`/`T` has been typed and is waiting for its target character.
+    find_pending: Option<(bool, bool)>,
+    /// `i` or `a` has been typed under an operator and is waiting for the
+    /// object it selects. The bool is the `a` of `aw`.
+    object_pending: Option<bool>,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
 }
@@ -42,6 +47,34 @@ fn motion_key(c: char) -> Option<Motion> {
         'b' => Motion::WordBackward,
         '0' | '^' => Motion::LineStart,
         '$' => Motion::LineEnd,
+        _ => return None,
+    })
+}
+
+/// `(forward, till)` for the four find keys.
+fn find_key(c: char) -> Option<(bool, bool)> {
+    Some(match c {
+        'f' => (true, false),
+        't' => (true, true),
+        'F' => (false, false),
+        'T' => (false, true),
+        _ => return None,
+    })
+}
+
+/// The key that names a text object, after `i` or `a`.
+///
+/// `b` and `B` are vim's aliases for `(` and `{`, and cost nothing here.
+fn object_key(c: char) -> Option<TextObject> {
+    Some(match c {
+        'w' => TextObject::Word { big: false },
+        'W' => TextObject::Word { big: true },
+        'p' => TextObject::Paragraph,
+        '"' | '\'' | '`' => TextObject::Quoted(c),
+        '(' | ')' | 'b' => TextObject::Delimited('('),
+        '[' | ']' => TextObject::Delimited('['),
+        '{' | '}' | 'B' => TextObject::Delimited('{'),
+        '<' | '>' => TextObject::Delimited('<'),
         _ => return None,
     })
 }
@@ -83,6 +116,17 @@ impl Input {
         if self.replace_pending {
             s.push('r');
         }
+        if let Some((forward, till)) = self.find_pending {
+            s.push(match (forward, till) {
+                (true, false) => 'f',
+                (true, true) => 't',
+                (false, false) => 'F',
+                (false, true) => 'T',
+            });
+        }
+        if let Some(around) = self.object_pending {
+            s.push(if around { 'a' } else { 'i' });
+        }
         s
     }
 
@@ -110,8 +154,25 @@ impl Input {
         let sink = self.sink;
         self.reset();
         Some(match operator {
-            Some(op) => Command { count: 1, action: Action::Operate { op, motion, count, sink } },
+            Some(op) => Command {
+                count: 1,
+                action: Action::Operate { op, target: Target::Motion(motion), count, sink },
+            },
             None => Command { count, action: Action::Move(motion) },
+        })
+    }
+
+    /// Resolves a text object. Unlike a motion it is only ever a target, so
+    /// there is no "just move there" case — `iw` on its own does nothing until
+    /// visual mode gives it one.
+    fn resolve_object(&mut self, object: TextObject, around: bool) -> Option<Command> {
+        let op = self.operator?;
+        let count = self.fold_count();
+        let sink = self.sink;
+        self.reset();
+        Some(Command {
+            count: 1,
+            action: Action::Operate { op, target: Target::Object { object, around }, count, sink },
         })
     }
 
@@ -164,6 +225,23 @@ impl Input {
             let count = self.fold_count();
             self.reset();
             return Some(Command { count: 1, action: Action::ReplaceChar { ch: c, count } });
+        }
+
+        // `f`/`t` and friends hold out for their target, which is taken
+        // literally for the same reason `r`'s is.
+        if let Some((forward, till)) = self.find_pending.take() {
+            return self.resolve(Motion::FindChar { ch: c, forward, till, repeat: false });
+        }
+
+        // `i`/`a` under an operator hold out for the object they select.
+        if let Some(around) = self.object_pending.take() {
+            return match object_key(c) {
+                Some(object) => self.resolve_object(object, around),
+                None => {
+                    self.reset();
+                    None
+                }
+            };
         }
 
         // `"` is holding out for the register it names. Only the black hole
@@ -220,6 +298,17 @@ impl Input {
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
+            }
+            if c == 'i' || c == 'a' {
+                self.object_pending = Some(c == 'a');
+                return None;
+            }
+            if let Some(pending) = find_key(c) {
+                self.find_pending = Some(pending);
+                return None;
+            }
+            if c == ';' || c == ',' {
+                return self.resolve(Motion::RepeatFind { reverse: c == ',' });
             }
             if c == 'g' {
                 self.g_pending = true;
@@ -286,6 +375,11 @@ impl Input {
                 self.replace_pending = true;
                 return None;
             }
+            'f' | 'F' | 't' | 'T' => {
+                self.find_pending = find_key(c);
+                return None;
+            }
+            ';' | ',' => return self.resolve(Motion::RepeatFind { reverse: c == ',' }),
             '~' => {
                 let count = self.fold_count();
                 self.reset();
@@ -458,7 +552,7 @@ mod tests {
             typed("dw").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -471,7 +565,7 @@ mod tests {
             typed("cw").action,
             Action::Operate {
                 op: Operator::Change,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -484,7 +578,7 @@ mod tests {
             typed("dd").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -493,7 +587,7 @@ mod tests {
             typed("cc").action,
             Action::Operate {
                 op: Operator::Change,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -506,7 +600,7 @@ mod tests {
             typed("2d3w").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 6,
                 sink: Sink::Ring
             }
@@ -519,7 +613,7 @@ mod tests {
             typed("d3w").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 3,
                 sink: Sink::Ring
             }
@@ -532,7 +626,7 @@ mod tests {
             typed("d0").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::LineStart,
+                target: Target::Motion(Motion::LineStart),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -545,7 +639,7 @@ mod tests {
             typed("dgg").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::FirstLine,
+                target: Target::Motion(Motion::FirstLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -565,7 +659,7 @@ mod tests {
             typed("d5G").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::Line(5),
+                target: Target::Motion(Motion::Line(5)),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -578,7 +672,7 @@ mod tests {
             typed("yw").action,
             Action::Operate {
                 op: Operator::Yank,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -587,7 +681,7 @@ mod tests {
             typed("yy").action,
             Action::Operate {
                 op: Operator::Yank,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -601,7 +695,7 @@ mod tests {
             typed("Y").action,
             Action::Operate {
                 op: Operator::Yank,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -610,7 +704,7 @@ mod tests {
             typed("x").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::Right,
+                target: Target::Motion(Motion::Right),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -619,7 +713,7 @@ mod tests {
             typed("5x").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::Right,
+                target: Target::Motion(Motion::Right),
                 count: 5,
                 sink: Sink::Ring
             }
@@ -641,7 +735,7 @@ mod tests {
             typed("\"_dd").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::BlackHole
             }
@@ -650,7 +744,7 @@ mod tests {
             typed("\"_dw").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::WordForward,
+                target: Target::Motion(Motion::WordForward),
                 count: 1,
                 sink: Sink::BlackHole
             }
@@ -667,7 +761,7 @@ mod tests {
             typed_with(&mut input, "dd").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -717,7 +811,7 @@ mod tests {
             typed_with(&mut Input::default(), "\"zdd").action,
             Action::Operate {
                 op: Operator::Delete,
-                motion: Motion::CurrentLine,
+                target: Target::Motion(Motion::CurrentLine),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -794,7 +888,7 @@ mod tests {
         for (c, op, motion) in cases {
             assert_eq!(
                 typed(&c.to_string()).action,
-                Action::Operate { op, motion, count: 1, sink: Sink::Ring },
+                Action::Operate { op, target: Target::Motion(motion), count: 1, sink: Sink::Ring },
                 "{c} should be the shorthand for {op:?} over {motion:?}",
             );
         }
@@ -852,5 +946,172 @@ mod tests {
         assert_eq!(typed("3~").action, Action::ToggleCase { count: 3 });
         assert_eq!(typed("J").action, Action::JoinLines { count: 1 });
         assert_eq!(typed("4J").action, Action::JoinLines { count: 4 });
+    }
+
+    // ---- step 2: find-char and text objects --------------------------------
+
+    fn find(ch: char, forward: bool, till: bool) -> Motion {
+        Motion::FindChar { ch, forward, till, repeat: false }
+    }
+
+    #[test]
+    fn the_four_find_keys_wait_for_a_character() {
+        let cases = [
+            ("fx", find('x', true, false)),
+            ("tx", find('x', true, true)),
+            ("Fx", find('x', false, false)),
+            ("Tx", find('x', false, true)),
+        ];
+        for (keys, motion) in cases {
+            assert_eq!(typed(keys).action, Action::Move(motion), "{keys}");
+        }
+    }
+
+    #[test]
+    fn a_find_alone_resolves_to_nothing_and_shows_in_the_status_line() {
+        let mut input = Input::default();
+        assert!(input.on_key(key('f'), &Mode::Normal).is_none());
+        assert_eq!(input.pending_display(), "f");
+    }
+
+    #[test]
+    fn a_find_takes_its_argument_literally() {
+        // Every one of these means something else in normal mode.
+        for c in ['d', '5', 'i', ';', '"'] {
+            assert_eq!(
+                typed(&format!("f{c}")).action,
+                Action::Move(find(c, true, false)),
+                "f{c} should search for a literal {c}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_find_works_as_an_operator_target() {
+        assert_eq!(
+            typed("df,").action,
+            Action::Operate {
+                op: Operator::Delete,
+                target: Target::Motion(find(',', true, false)),
+                count: 1,
+                sink: Sink::Ring,
+            }
+        );
+    }
+
+    #[test]
+    fn counts_reach_a_find_through_an_operator() {
+        let Action::Operate { count, .. } = typed("2d3f,").action else {
+            panic!("expected an operator");
+        };
+        assert_eq!(count, 6, "counts multiply, as they do for any motion");
+    }
+
+    #[test]
+    fn semicolon_and_comma_repeat_and_reverse() {
+        assert_eq!(typed(";").action, Action::Move(Motion::RepeatFind { reverse: false }));
+        assert_eq!(typed(",").action, Action::Move(Motion::RepeatFind { reverse: true }));
+        assert_eq!(
+            typed("d;").action,
+            Action::Operate {
+                op: Operator::Delete,
+                target: Target::Motion(Motion::RepeatFind { reverse: false }),
+                count: 1,
+                sink: Sink::Ring,
+            }
+        );
+    }
+
+    #[test]
+    fn esc_abandons_a_pending_find() {
+        let mut input = Input::default();
+        input.on_key(key('f'), &Mode::Normal);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        assert_eq!(input.pending_display(), "");
+        assert_eq!(input.on_key(key('x'), &Mode::Normal).unwrap().action, typed("x").action);
+    }
+
+    // ---- text objects ------------------------------------------------------
+
+    fn object(object: TextObject, around: bool) -> Action {
+        Action::Operate {
+            op: Operator::Delete,
+            target: Target::Object { object, around },
+            count: 1,
+            sink: Sink::Ring,
+        }
+    }
+
+    #[test]
+    fn diw_and_daw_reach_the_word_object() {
+        assert_eq!(typed("diw").action, object(TextObject::Word { big: false }, false));
+        assert_eq!(typed("daw").action, object(TextObject::Word { big: false }, true));
+        assert_eq!(typed("diW").action, object(TextObject::Word { big: true }, false));
+    }
+
+    #[test]
+    fn the_bracket_objects_are_named_by_their_opening_char() {
+        // Either bracket of a pair selects it, and b/B are vim's aliases.
+        for keys in ["di(", "di)", "dib"] {
+            assert_eq!(typed(keys).action, object(TextObject::Delimited('('), false), "{keys}");
+        }
+        for keys in ["di{", "di}", "diB"] {
+            assert_eq!(typed(keys).action, object(TextObject::Delimited('{'), false), "{keys}");
+        }
+        assert_eq!(typed("di[").action, object(TextObject::Delimited('['), false));
+        assert_eq!(typed("di<").action, object(TextObject::Delimited('<'), false));
+    }
+
+    #[test]
+    fn the_quote_objects_carry_their_quote() {
+        assert_eq!(typed("di\"").action, object(TextObject::Quoted('"'), false));
+        assert_eq!(typed("di'").action, object(TextObject::Quoted('\''), false));
+        assert_eq!(typed("da`").action, object(TextObject::Quoted('`'), true));
+    }
+
+    #[test]
+    fn ip_and_ap_reach_the_paragraph_object() {
+        assert_eq!(typed("dip").action, object(TextObject::Paragraph, false));
+        assert_eq!(typed("dap").action, object(TextObject::Paragraph, true));
+    }
+
+    #[test]
+    fn change_and_yank_take_objects_too() {
+        let expect = |op| Action::Operate {
+            op,
+            target: Target::Object { object: TextObject::Word { big: false }, around: false },
+            count: 1,
+            sink: Sink::Ring,
+        };
+        assert_eq!(typed("ciw").action, expect(Operator::Change));
+        assert_eq!(typed("yiw").action, expect(Operator::Yank));
+    }
+
+    /// `i` and `a` only mean "text object" while an operator is waiting. On
+    /// their own they still enter insert mode, or the editor would be unusable.
+    #[test]
+    fn i_and_a_still_enter_insert_mode_without_an_operator() {
+        assert_eq!(typed("i").action, Action::EnterInsert);
+        assert_eq!(typed("a").action, Action::EnterInsertAfter);
+    }
+
+    #[test]
+    fn an_unknown_object_key_abandons_the_operator() {
+        let mut input = Input::default();
+        for c in ['d', 'i'] {
+            assert!(input.on_key(key(c), &Mode::Normal).is_none());
+        }
+        assert_eq!(input.pending_display(), "di");
+        assert!(input.on_key(key('z'), &Mode::Normal).is_none(), "no object named z");
+        assert_eq!(input.pending_display(), "", "and the operator is dropped");
+    }
+
+    #[test]
+    fn esc_abandons_a_pending_object() {
+        let mut input = Input::default();
+        input.on_key(key('d'), &Mode::Normal);
+        input.on_key(key('i'), &Mode::Normal);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        assert_eq!(input.pending_display(), "");
     }
 }

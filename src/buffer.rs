@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use ropey::Rope;
 
 use crate::history::{Change, History};
-use crate::motion::{Kind, Motion, Operator};
+use crate::motion::{Kind, Motion, Operator, Target, TextObject};
 use crate::registers::{Entry, EntryKind};
 
 /// A position as (row, byte-column-within-row).
@@ -525,6 +525,11 @@ impl Buffer {
             Motion::FirstLine => return self.at_row(0, eol),
             Motion::LastLine => return self.at_row(usize::MAX, eol),
             Motion::Line(n) => return self.at_row(n.saturating_sub(1), eol),
+            // Consumes its own count, and a miss stays put — which is what
+            // leaves an operator with an empty range and so nothing to do.
+            Motion::FindChar { ch, forward, till, repeat } => {
+                return self.find_char(from, ch, forward, till, repeat, count).unwrap_or(from);
+            }
             _ => {}
         }
         let mut cur = from;
@@ -538,7 +543,12 @@ impl Buffer {
                 Motion::WordBackward => self.word_backward(cur, eol),
                 Motion::LineStart => self.line_start(cur),
                 Motion::LineEnd => self.line_end(cur, eol),
-                Motion::CurrentLine | Motion::FirstLine | Motion::LastLine | Motion::Line(_) => cur,
+                Motion::CurrentLine
+                | Motion::FirstLine
+                | Motion::LastLine
+                | Motion::Line(_)
+                | Motion::FindChar { .. }
+                | Motion::RepeatFind { .. } => cur,
             };
         }
         cur
@@ -585,9 +595,31 @@ impl Buffer {
     /// `None` when the motion goes nowhere — `b` at the start of the buffer,
     /// say — so the caller can leave the text alone rather than record an empty
     /// edit in the undo history.
-    fn operator_range(&self, op: Operator, motion: Motion, count: usize) -> Option<(usize, usize)> {
+    fn operator_range(&self, op: Operator, target: Target, count: usize) -> Option<(usize, usize)> {
         let count = count.max(1);
         let len = self.rope.len_chars();
+
+        // A text object names its range outright, so none of the motion
+        // machinery below applies to it.
+        let motion = match target {
+            Target::Motion(m) => m,
+            Target::Object { object, around } => {
+                let (start, end) = self.object_range(object, around)?;
+                // A linewise object has to take its terminator too, or `dip`
+                // leaves the empty line behind. `cip` keeps it, for the same
+                // reason `cc` does: insert mode needs a line to sit on.
+                let end = if target.kind() == Kind::Linewise
+                    && op != Operator::Change
+                    && end < len
+                    && self.rope.char(end) == '\n'
+                {
+                    end + 1
+                } else {
+                    end
+                };
+                return (end > start).then_some((start, end));
+            }
+        };
 
         if motion.kind() == Kind::Linewise {
             let (first, last) = self.linewise_rows(motion, count);
@@ -603,12 +635,25 @@ impl Buffer {
                 len
             };
             // Deleting through the final line takes the *preceding* newline, or
-            // the file keeps a stray empty line.
-            return Some(if end == len && content_start > 0 {
+            // the file keeps a stray empty line — but only when the buffer does
+            // not already end in one. When it does, `end` *is* that newline and
+            // taking another would swallow the terminator `dG` should leave.
+            let ends_in_newline = len > 0 && self.rope.char(len - 1) == '\n';
+            return Some(if end == len && content_start > 0 && !ends_in_newline {
                 (content_start - 1, end)
             } else {
                 (content_start, end)
             });
+        }
+
+        // A find that misses covers nothing. This cannot be read off the target
+        // alone: `f` is inclusive, so a target still sitting on the cursor gets
+        // widened by one below and would delete a character the find never
+        // reached.
+        if let Motion::FindChar { ch, forward, till, repeat } = motion
+            && self.find_char(self.cursor, ch, forward, till, repeat, count).is_none()
+        {
+            return None;
         }
 
         // Vim quirk: `cw` on a non-blank is `ce` — it changes the word without
@@ -640,23 +685,34 @@ impl Buffer {
     /// registers, which is what makes `"_` a policy at the call site rather
     /// than a flag threaded through here. `None` means the motion covered
     /// nothing and the buffer is untouched.
-    pub fn operate(&mut self, op: Operator, motion: Motion, count: usize) -> Option<Entry> {
-        let (start, end) = self.operator_range(op, motion, count)?;
-        let linewise = motion.kind() == Kind::Linewise;
+    pub fn operate(&mut self, op: Operator, target: Target, count: usize) -> Option<Entry> {
+        let (start, end) = self.operator_range(op, target, count)?;
+        let linewise = target.kind() == Kind::Linewise;
 
         // A linewise entry is always whole lines ending in a newline, even when
         // it came from a final line that had none — otherwise pasting it could
         // not open a line. So capture the *content* span rather than the span
         // the operator is about to remove, which differs at the buffer's end.
-        let text = if linewise {
-            let (first, last) = self.linewise_rows(motion, count);
-            let from = self.rope.line_to_char(first);
-            let to = self.rope.line_to_char(last) + self.line_len(last);
-            let mut text = self.rope.slice(from..to).to_string();
-            text.push('\n');
-            text
-        } else {
-            self.rope.slice(start..end).to_string()
+        let text = match (linewise, target) {
+            (true, Target::Motion(motion)) => {
+                let (first, last) = self.linewise_rows(motion, count);
+                let from = self.rope.line_to_char(first);
+                let to = self.rope.line_to_char(last) + self.line_len(last);
+                let mut text = self.rope.slice(from..to).to_string();
+                text.push('\n');
+                text
+            }
+            // A linewise object already knows its own span; it just has to end
+            // in a newline like every other linewise entry, or pasting it back
+            // could not open a line.
+            (true, Target::Object { .. }) => {
+                let mut text = self.rope.slice(start..end).to_string();
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text
+            }
+            (false, _) => self.rope.slice(start..end).to_string(),
         };
         let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
 
@@ -741,11 +797,304 @@ impl Buffer {
             Motion::LastLine => self.at_row(usize::MAX, allow_eol),
             Motion::Line(n) => self.at_row(n.saturating_sub(1), allow_eol),
             Motion::CurrentLine => self.cursor,
+            Motion::FindChar { ch, forward, till, repeat } => {
+                self.find_char(self.cursor, ch, forward, till, repeat, 1).unwrap_or(self.cursor)
+            }
+            // Substituted by `Editor::resolve_find` before it gets here.
+            Motion::RepeatFind { .. } => self.cursor,
         };
     }
 
     pub fn goto_row(&mut self, row: usize, allow_eol: bool) {
         self.cursor = self.at_row(row, allow_eol);
+    }
+
+    // ---- find-char ---------------------------------------------------------
+
+    /// Bounds of `row` as a char range, excluding the line terminator.
+    fn line_span(&self, row: usize) -> (usize, usize) {
+        let start = self.rope.line_to_char(row);
+        (start, start + self.line_len(row))
+    }
+
+    /// `f` `F` `t` `T`. `None` when the character is not on the line, which is
+    /// what makes `df;` on a line with no `;` change nothing.
+    ///
+    /// The count is consumed here rather than by repeating the motion, because
+    /// `t` lands one short of its target: repeating it from there would find
+    /// the same character again and never advance.
+    fn find_char(
+        &self,
+        from: Cursor,
+        ch: char,
+        forward: bool,
+        till: bool,
+        repeat: bool,
+        count: usize,
+    ) -> Option<Cursor> {
+        let (line_start, line_end) = self.line_span(self.row_of(from.at));
+        let mut at = from.at;
+
+        // A repeated `t` starts one character further along: the cursor is
+        // already parked next to the match it found last time, so searching
+        // from here would find that same one and never advance. A freshly typed
+        // `t` must *not* do this — vim draws the same distinction through
+        // `cpo`'s `;` flag, and `t.` then `;` is where you notice.
+        if till && repeat {
+            at =
+                if forward { (at + 1).min(line_end) } else { at.saturating_sub(1).max(line_start) };
+        }
+
+        for _ in 0..count.max(1) {
+            if forward {
+                let mut i = at + 1;
+                loop {
+                    if i >= line_end {
+                        return None;
+                    }
+                    if self.rope.char(i) == ch {
+                        break;
+                    }
+                    i += 1;
+                }
+                at = i;
+            } else {
+                let mut i = at;
+                loop {
+                    if i <= line_start {
+                        return None;
+                    }
+                    i -= 1;
+                    if self.rope.char(i) == ch {
+                        break;
+                    }
+                }
+                at = i;
+            }
+        }
+
+        // `t` stops one short. Guarded so `t` can never step outside the line.
+        Some(Cursor::at(match (till, forward) {
+            (true, true) => at.saturating_sub(1).max(line_start),
+            (true, false) => (at + 1).min(line_end),
+            (false, _) => at,
+        }))
+    }
+
+    // ---- text objects ------------------------------------------------------
+
+    /// The char range a text object covers, or `None` when the cursor is not
+    /// inside one.
+    ///
+    /// Lives here for the same reason the motion resolvers do: it needs the
+    /// rope. Returns a range rather than a cursor, which is the whole
+    /// difference between an object and a motion.
+    pub fn object_range(&self, object: TextObject, around: bool) -> Option<(usize, usize)> {
+        match object {
+            TextObject::Word { big } => self.word_object(around, big),
+            TextObject::Quoted(q) => self.quoted_object(q, around),
+            TextObject::Delimited(open) => self.delimited_object(open, around),
+            TextObject::Paragraph => self.paragraph_object(around),
+        }
+    }
+
+    /// `iw` is the run of same-class characters under the cursor. `aw` adds the
+    /// whitespace after it, or — when there is none, at the end of a line — the
+    /// whitespace before it, which is what vim does.
+    fn word_object(&self, around: bool, big: bool) -> Option<(usize, usize)> {
+        let len = self.rope.len_chars();
+        let at = self.cursor.at;
+        if at >= len {
+            return None;
+        }
+        // A WORD is anything non-blank, so punctuation and letters are one run.
+        let class = |c: char| {
+            let k = class_of(c);
+            if big && k == CharClass::Punct { CharClass::Word } else { k }
+        };
+        let here = class(self.rope.char(at));
+        let (line_start, line_end) = self.line_span(self.row_of(at));
+
+        let mut start = at;
+        while start > line_start && class(self.rope.char(start - 1)) == here {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < line_end && class(self.rope.char(end)) == here {
+            end += 1;
+        }
+        if !around {
+            return Some((start, end));
+        }
+
+        let mut after = end;
+        while after < line_end && class_of(self.rope.char(after)) == CharClass::Whitespace {
+            after += 1;
+        }
+        if after > end {
+            return Some((start, after));
+        }
+        // Nothing trailing to take, so reach backwards instead.
+        let mut before = start;
+        while before > line_start && class_of(self.rope.char(before - 1)) == CharClass::Whitespace {
+            before -= 1;
+        }
+        Some((before, end))
+    }
+
+    /// `i"` — between the quotes; `a"` — including them.
+    ///
+    /// Quotes cannot nest, so this pairs them in order along the line. That is
+    /// vim's rule, and it is why `ci"` behaves oddly on a line with an odd
+    /// number of quotes. Preserved rather than improved on: a better rule wants
+    /// the parse tree.
+    fn quoted_object(&self, quote: char, around: bool) -> Option<(usize, usize)> {
+        let at = self.cursor.at;
+        let (line_start, line_end) = self.line_span(self.row_of(at));
+
+        let mut pairs = Vec::new();
+        let mut open: Option<usize> = None;
+        let mut i = line_start;
+        while i < line_end {
+            if self.rope.char(i) == quote {
+                match open.take() {
+                    Some(o) => pairs.push((o, i)),
+                    None => open = Some(i),
+                }
+            }
+            i += 1;
+        }
+
+        // The cursor may be on the opening quote, inside, or on the closer.
+        let (o, c) = pairs.into_iter().find(|&(o, c)| at >= o && at <= c)?;
+        if !around {
+            return (c > o + 1).then_some((o + 1, c));
+        }
+
+        // `a"` reaches for the whitespace after the closing quote, and only
+        // falls back to the whitespace before the opening one when there is
+        // none — the same rule `aw` follows, and the reason `da"` leaves one
+        // space rather than two.
+        let end = c + 1;
+        let mut after = end;
+        while after < line_end && self.rope.char(after).is_whitespace() {
+            after += 1;
+        }
+        if after > end {
+            return Some((o, after));
+        }
+        let mut before = o;
+        while before > line_start && self.rope.char(before - 1).is_whitespace() {
+            before -= 1;
+        }
+        Some((before, end))
+    }
+
+    /// `i(` — inside the brackets; `a(` — including them.
+    ///
+    /// Counts nesting on the way out, or `di(` inside `f(g(x))` would find the
+    /// wrong pair.
+    fn delimited_object(&self, open: char, around: bool) -> Option<(usize, usize)> {
+        let close = match open {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '<' => '>',
+            _ => return None,
+        };
+        let len = self.rope.len_chars();
+        let at = self.cursor.at.min(len.saturating_sub(1));
+
+        // Sitting on a bracket counts as being inside that pair.
+        let start = if self.rope.char(at) == open {
+            at
+        } else {
+            let mut depth = 0usize;
+            let mut i = at;
+            loop {
+                let c = self.rope.char(i);
+                if c == close && i != at {
+                    depth += 1;
+                } else if c == open {
+                    if depth == 0 {
+                        break i;
+                    }
+                    depth -= 1;
+                }
+                if i == 0 {
+                    return None;
+                }
+                i -= 1;
+            }
+        };
+
+        let mut depth = 0usize;
+        let mut i = start + 1;
+        let end = loop {
+            if i >= len {
+                return None;
+            }
+            let c = self.rope.char(i);
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                if depth == 0 {
+                    break i;
+                }
+                depth -= 1;
+            }
+            i += 1;
+        };
+
+        if around {
+            return Some((start, end + 1));
+        }
+        if end <= start + 1 {
+            return None;
+        }
+
+        // Vim: when the contents occupy whole lines, `i{` covers those lines
+        // rather than the exact span — `di{` on a braced body leaves the braces
+        // on their own lines instead of collapsing them to `{}`. Only applies
+        // when nothing but whitespace shares the bracket lines.
+        let open_row = self.row_of(start);
+        let close_row = self.row_of(end);
+        if close_row > open_row + 1 {
+            let (_, open_line_end) = self.line_span(open_row);
+            let close_line_start = self.rope.line_to_char(close_row);
+            let tail_blank = (start + 1..open_line_end).all(|i| self.rope.char(i).is_whitespace());
+            let head_blank = (close_line_start..end).all(|i| self.rope.char(i).is_whitespace());
+            if tail_blank && head_blank {
+                return Some((self.rope.line_to_char(open_row + 1), close_line_start));
+            }
+        }
+        Some((start + 1, end))
+    }
+
+    /// `ip` — the run of non-blank lines around the cursor, or the run of blank
+    /// ones when it sits on a blank line. `ap` adds the blank lines after.
+    fn paragraph_object(&self, around: bool) -> Option<(usize, usize)> {
+        let last = self.line_count().saturating_sub(1);
+        let blank = |row: usize| self.line_len(row) == 0;
+        let here = blank(self.cursor_row());
+
+        let mut first = self.cursor_row();
+        while first > 0 && blank(first - 1) == here {
+            first -= 1;
+        }
+        let mut end = self.cursor_row();
+        while end < last && blank(end + 1) == here {
+            end += 1;
+        }
+        if around {
+            while end < last && blank(end + 1) != here {
+                end += 1;
+            }
+        }
+
+        let from = self.rope.line_to_char(first);
+        let to = self.rope.line_to_char(end) + self.line_len(end);
+        (to > from || first != end).then_some((from, to))
     }
 }
 
@@ -806,14 +1155,14 @@ mod tests {
     fn x_does_not_eat_the_newline() {
         let mut b = buf("ab\ncd");
         b.cursor = Cursor::at(1);
-        b.operate(Operator::Delete, Motion::Right, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::Right), 1);
         assert_eq!(b.rope().to_string(), "a\ncd");
         // Deleting the last char of a line drags the cursor back onto a char.
         assert_eq!(b.cursor_col(), 0);
 
         // On an empty line there is nothing under the cursor to take.
         let mut b = buf("\ncd");
-        b.operate(Operator::Delete, Motion::Right, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::Right), 1);
         assert_eq!(b.rope().to_string(), "\ncd");
     }
 
@@ -821,7 +1170,7 @@ mod tests {
     fn dd_on_the_last_line_leaves_no_empty_line() {
         let mut b = buf("a\nb\nc");
         b.goto_row(2, false);
-        b.operate(Operator::Delete, Motion::CurrentLine, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1);
         assert_eq!(b.rope().to_string(), "a\nb");
         assert_eq!(b.line_count(), 2);
         assert_eq!(b.cursor_row(), 1);
@@ -830,7 +1179,7 @@ mod tests {
     #[test]
     fn dd_on_the_only_line_empties_the_buffer() {
         let mut b = buf("only");
-        b.operate(Operator::Delete, Motion::CurrentLine, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1);
         assert_eq!(b.rope().to_string(), "");
         assert_eq!(b.cursor.at, 0);
     }
@@ -905,7 +1254,7 @@ mod tests {
     fn undo_of_a_multibyte_deletion_puts_the_text_back() {
         let mut b = buf("añb\ncd");
         b.cursor = Cursor::at(1);
-        b.operate(Operator::Delete, Motion::Right, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::Right), 1);
         b.commit_undo();
         assert_eq!(b.rope().to_string(), "ab\ncd");
 
@@ -982,112 +1331,151 @@ mod tests {
 
     // ---- operators ---------------------------------------------------------
 
-    fn op(text: &str, at: usize, op: Operator, m: Motion, count: usize) -> String {
+    fn op(text: &str, at: usize, op: Operator, target: Target, count: usize) -> String {
         let mut b = buf(text);
         b.cursor = Cursor::at(at);
-        b.operate(op, m, count);
+        b.operate(op, target, count);
         b.rope().to_string()
     }
 
     #[test]
     fn dw_deletes_to_the_start_of_the_next_word() {
-        assert_eq!(op("foo bar baz", 0, Operator::Delete, Motion::WordForward, 1), "bar baz");
+        assert_eq!(
+            op("foo bar baz", 0, Operator::Delete, Target::Motion(Motion::WordForward), 1),
+            "bar baz"
+        );
     }
 
     #[test]
     fn dw_on_the_last_word_takes_all_of_it() {
-        assert_eq!(op("foo", 0, Operator::Delete, Motion::WordForward, 1), "");
+        assert_eq!(op("foo", 0, Operator::Delete, Target::Motion(Motion::WordForward), 1), "");
     }
 
     #[test]
     fn counted_dw_deletes_that_many_words() {
-        assert_eq!(op("a b c d", 0, Operator::Delete, Motion::WordForward, 3), "d");
+        assert_eq!(op("a b c d", 0, Operator::Delete, Target::Motion(Motion::WordForward), 3), "d");
     }
 
     /// Vim quirk: `cw` on a non-blank behaves like `ce`, so the whitespace after
     /// the word survives. A literal `w` would have eaten it.
     #[test]
     fn cw_changes_the_word_and_leaves_the_spaces() {
-        assert_eq!(op("foo   bar", 0, Operator::Change, Motion::WordForward, 1), "   bar");
+        assert_eq!(
+            op("foo   bar", 0, Operator::Change, Target::Motion(Motion::WordForward), 1),
+            "   bar"
+        );
     }
 
     #[test]
     fn cw_on_whitespace_is_not_special_and_acts_like_w() {
-        assert_eq!(op("a   bar", 1, Operator::Change, Motion::WordForward, 1), "abar");
+        assert_eq!(
+            op("a   bar", 1, Operator::Change, Target::Motion(Motion::WordForward), 1),
+            "abar"
+        );
     }
 
     #[test]
     fn counted_cw_reaches_the_end_of_the_last_word() {
-        assert_eq!(op("foo   bar baz", 0, Operator::Change, Motion::WordForward, 2), " baz");
+        assert_eq!(
+            op("foo   bar baz", 0, Operator::Change, Target::Motion(Motion::WordForward), 2),
+            " baz"
+        );
     }
 
     /// Vim quirk: `dw` at the end of a line stops there instead of pulling the
     /// next line up.
     #[test]
     fn dw_at_the_end_of_a_line_does_not_join_lines() {
-        assert_eq!(op("hello\nworld", 3, Operator::Delete, Motion::WordForward, 1), "hel\nworld");
+        assert_eq!(
+            op("hello\nworld", 3, Operator::Delete, Target::Motion(Motion::WordForward), 1),
+            "hel\nworld"
+        );
     }
 
     #[test]
     fn d_dollar_deletes_through_the_last_char_but_not_the_newline() {
         assert_eq!(
-            op("hello world\nnext", 6, Operator::Delete, Motion::LineEnd, 1),
+            op("hello world\nnext", 6, Operator::Delete, Target::Motion(Motion::LineEnd), 1),
             "hello \nnext"
         );
     }
 
     #[test]
     fn d_zero_deletes_back_to_the_line_start() {
-        assert_eq!(op("hello world", 6, Operator::Delete, Motion::LineStart, 1), "world");
+        assert_eq!(
+            op("hello world", 6, Operator::Delete, Target::Motion(Motion::LineStart), 1),
+            "world"
+        );
     }
 
     #[test]
     fn db_deletes_the_previous_word() {
-        assert_eq!(op("foo bar", 4, Operator::Delete, Motion::WordBackward, 1), "bar");
+        assert_eq!(
+            op("foo bar", 4, Operator::Delete, Target::Motion(Motion::WordBackward), 1),
+            "bar"
+        );
     }
 
     #[test]
     fn dl_takes_the_char_under_the_cursor() {
-        assert_eq!(op("abc", 1, Operator::Delete, Motion::Right, 1), "ac");
+        assert_eq!(op("abc", 1, Operator::Delete, Target::Motion(Motion::Right), 1), "ac");
     }
 
     #[test]
     fn dj_is_linewise_and_takes_both_lines() {
-        assert_eq!(op("one\ntwo\nthree", 1, Operator::Delete, Motion::Down, 1), "three");
+        assert_eq!(
+            op("one\ntwo\nthree", 1, Operator::Delete, Target::Motion(Motion::Down), 1),
+            "three"
+        );
     }
 
     #[test]
     fn dk_is_linewise_upward() {
-        assert_eq!(op("one\ntwo\nthree", 5, Operator::Delete, Motion::Up, 1), "three");
+        assert_eq!(
+            op("one\ntwo\nthree", 5, Operator::Delete, Target::Motion(Motion::Up), 1),
+            "three"
+        );
     }
 
     #[test]
     fn dgg_deletes_from_the_first_line_through_this_one() {
-        assert_eq!(op("one\ntwo\nthree", 5, Operator::Delete, Motion::FirstLine, 1), "three");
+        assert_eq!(
+            op("one\ntwo\nthree", 5, Operator::Delete, Target::Motion(Motion::FirstLine), 1),
+            "three"
+        );
     }
 
     #[test]
     fn dd_takes_the_whole_line_including_its_newline() {
         assert_eq!(
-            op("one\ntwo\nthree", 1, Operator::Delete, Motion::CurrentLine, 1),
+            op("one\ntwo\nthree", 1, Operator::Delete, Target::Motion(Motion::CurrentLine), 1),
             "two\nthree"
         );
     }
 
     #[test]
     fn counted_dd_takes_that_many_lines() {
-        assert_eq!(op("one\ntwo\nthree", 1, Operator::Delete, Motion::CurrentLine, 2), "three");
+        assert_eq!(
+            op("one\ntwo\nthree", 1, Operator::Delete, Target::Motion(Motion::CurrentLine), 2),
+            "three"
+        );
     }
 
     #[test]
     fn dd_past_the_end_stops_at_the_last_line() {
-        assert_eq!(op("one\ntwo", 0, Operator::Delete, Motion::CurrentLine, 99), "");
+        assert_eq!(
+            op("one\ntwo", 0, Operator::Delete, Target::Motion(Motion::CurrentLine), 99),
+            ""
+        );
     }
 
     /// `cc` empties the line but keeps it, so insert mode has somewhere to go.
     #[test]
     fn cc_clears_the_line_without_removing_it() {
-        assert_eq!(op("one\ntwo", 1, Operator::Change, Motion::CurrentLine, 1), "\ntwo");
+        assert_eq!(
+            op("one\ntwo", 1, Operator::Change, Target::Motion(Motion::CurrentLine), 1),
+            "\ntwo"
+        );
     }
 
     #[test]
@@ -1095,7 +1483,7 @@ mod tests {
         let mut b = buf("abc");
         b.cursor = Cursor::at(0);
         assert!(
-            b.operate(Operator::Delete, Motion::WordBackward, 1).is_none(),
+            b.operate(Operator::Delete, Target::Motion(Motion::WordBackward), 1).is_none(),
             "b at char 0 has no range"
         );
         assert_eq!(b.rope().to_string(), "abc");
@@ -1106,7 +1494,7 @@ mod tests {
     #[test]
     fn a_charwise_operator_captures_what_it_took() {
         let mut b = buf("foo bar");
-        let e = b.operate(Operator::Delete, Motion::WordForward, 1).unwrap();
+        let e = b.operate(Operator::Delete, Target::Motion(Motion::WordForward), 1).unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(e.kind, EntryKind::Charwise);
     }
@@ -1114,7 +1502,7 @@ mod tests {
     #[test]
     fn a_linewise_operator_captures_a_trailing_newline() {
         let mut b = buf("one\ntwo");
-        let e = b.operate(Operator::Delete, Motion::CurrentLine, 1).unwrap();
+        let e = b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1).unwrap();
         assert_eq!(e.text, "one\n");
         assert_eq!(e.kind, EntryKind::Linewise);
     }
@@ -1125,14 +1513,14 @@ mod tests {
     fn a_linewise_capture_from_the_last_line_still_ends_in_a_newline() {
         let mut b = buf("one\ntwo");
         b.cursor = Cursor::at(4);
-        let e = b.operate(Operator::Yank, Motion::CurrentLine, 1).unwrap();
+        let e = b.operate(Operator::Yank, Target::Motion(Motion::CurrentLine), 1).unwrap();
         assert_eq!(e.text, "two\n");
     }
 
     #[test]
     fn yank_captures_without_touching_the_text() {
         let mut b = buf("foo bar");
-        let e = b.operate(Operator::Yank, Motion::WordForward, 1).unwrap();
+        let e = b.operate(Operator::Yank, Target::Motion(Motion::WordForward), 1).unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(b.rope().to_string(), "foo bar", "yank is not a mutation");
         assert!(b.pending_edits.is_empty(), "and logs no edit");
@@ -1142,7 +1530,7 @@ mod tests {
     fn a_backward_yank_leaves_the_cursor_at_the_start_of_the_range() {
         let mut b = buf("foo bar");
         b.cursor = Cursor::at(4);
-        let e = b.operate(Operator::Yank, Motion::WordBackward, 1).unwrap();
+        let e = b.operate(Operator::Yank, Target::Motion(Motion::WordBackward), 1).unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(b.cursor.at, 0);
     }
@@ -1232,7 +1620,7 @@ mod tests {
     fn delete_leaves_the_cursor_on_a_char() {
         let mut b = buf("foo bar");
         b.cursor = Cursor::at(4);
-        b.operate(Operator::Delete, Motion::LineEnd, 1);
+        b.operate(Operator::Delete, Target::Motion(Motion::LineEnd), 1);
         assert_eq!(b.rope().to_string(), "foo ");
         assert_eq!(b.cursor.at, 3, "pulled back onto the last remaining char");
     }
@@ -1241,7 +1629,7 @@ mod tests {
     fn change_leaves_the_cursor_where_the_text_was() {
         let mut b = buf("foo bar");
         b.cursor = Cursor::at(4);
-        b.operate(Operator::Change, Motion::LineEnd, 1);
+        b.operate(Operator::Change, Target::Motion(Motion::LineEnd), 1);
         assert_eq!(b.rope().to_string(), "foo ");
         assert_eq!(b.cursor.at, 4, "sitting past the end, ready to type");
     }
@@ -1363,5 +1751,361 @@ mod tests {
         assert_eq!(b.rope.to_string(), "foo bar");
         assert!(b.undo());
         assert_eq!(b.rope.to_string(), "foo\nbar");
+    }
+
+    // ---- find-char ---------------------------------------------------------
+
+    fn find(text: &str, at: usize, m: Motion) -> Option<usize> {
+        let mut b = buf(text);
+        b.cursor = Cursor::at(at);
+        let before = b.cursor.at;
+        b.apply_motion(m, false);
+        (b.cursor.at != before || before == 0).then_some(b.cursor.at)
+    }
+
+    fn f(ch: char, forward: bool, till: bool) -> Motion {
+        Motion::FindChar { ch, forward, till, repeat: false }
+    }
+
+    #[test]
+    fn f_lands_on_the_char_and_t_stops_before_it() {
+        //          0123456789
+        let text = "foo bar baz";
+        assert_eq!(find(text, 0, f('b', true, false)), Some(4), "f b");
+        assert_eq!(find(text, 0, f('b', true, true)), Some(3), "t b stops one short");
+    }
+
+    #[test]
+    fn big_f_searches_backwards_and_big_t_stops_after() {
+        let text = "foo bar baz";
+        assert_eq!(find(text, 10, f('b', false, false)), Some(8), "F b");
+        assert_eq!(find(text, 10, f('b', false, true)), Some(9), "T b stops one after");
+    }
+
+    #[test]
+    fn a_find_never_leaves_the_line() {
+        let mut b = buf("abc\nxbz");
+        b.cursor = Cursor::at(0);
+        b.apply_motion(f('z', true, false), false);
+        assert_eq!(b.cursor.at, 0, "the z is on the next line, so nothing moved");
+
+        b.cursor = Cursor::at(5);
+        b.apply_motion(f('a', false, false), false);
+        assert_eq!(b.cursor.at, 5, "the a is on the previous line");
+    }
+
+    #[test]
+    fn a_counted_find_reaches_the_nth_occurrence() {
+        let mut b = buf("a,b,c,d");
+        b.cursor = Cursor::at(0);
+        assert_eq!(b.find_char(b.cursor, ',', true, false, false, 3).map(|c| c.at), Some(5));
+        // `t` with a count stops before the nth, not before the first.
+        assert_eq!(b.find_char(b.cursor, ',', true, true, false, 3).map(|c| c.at), Some(4));
+    }
+
+    #[test]
+    fn f_finds_the_next_occurrence_not_the_one_under_the_cursor() {
+        let mut b = buf("xaxa");
+        b.cursor = Cursor::at(0);
+        b.apply_motion(f('x', true, false), false);
+        assert_eq!(b.cursor.at, 2, "started on an x, so it moved to the next one");
+    }
+
+    #[test]
+    fn df_is_inclusive_and_d_big_f_is_exclusive() {
+        // `df)` takes the bracket; `dF(` leaves it.
+        assert_eq!(op("a(bc)d", 1, Operator::Delete, Target::Motion(f(')', true, false)), 1), "ad",);
+        assert_eq!(
+            op("a(bc)d", 4, Operator::Delete, Target::Motion(f('(', false, false)), 1),
+            "a)d",
+        );
+    }
+
+    #[test]
+    fn an_operator_over_a_find_that_misses_changes_nothing() {
+        let mut b = buf("abc");
+        b.cursor = Cursor::at(0);
+        assert!(b.operate(Operator::Delete, Target::Motion(f('z', true, false)), 1).is_none());
+        assert_eq!(b.rope().to_string(), "abc");
+    }
+
+    // ---- text objects ------------------------------------------------------
+
+    fn obj(text: &str, at: usize, object: TextObject, around: bool) -> Option<String> {
+        let mut b = buf(text);
+        b.cursor = Cursor::at(at);
+        let (s, e) = b.object_range(object, around)?;
+        Some(b.rope().slice(s..e).to_string())
+    }
+
+    const WORD: TextObject = TextObject::Word { big: false };
+    const BIG_WORD: TextObject = TextObject::Word { big: true };
+
+    #[test]
+    fn iw_is_the_word_under_the_cursor_from_anywhere_in_it() {
+        for at in 4..7 {
+            assert_eq!(obj("foo bar baz", at, WORD, false).as_deref(), Some("bar"), "at {at}");
+        }
+    }
+
+    #[test]
+    fn iw_on_whitespace_is_the_run_of_whitespace() {
+        assert_eq!(obj("a   b", 2, WORD, false).as_deref(), Some("   "));
+    }
+
+    #[test]
+    fn iw_stops_at_punctuation_but_a_big_word_does_not() {
+        assert_eq!(obj("foo.bar", 0, WORD, false).as_deref(), Some("foo"));
+        assert_eq!(obj("foo.bar", 0, BIG_WORD, false).as_deref(), Some("foo.bar"));
+    }
+
+    #[test]
+    fn aw_takes_the_whitespace_after_the_word() {
+        assert_eq!(obj("foo bar baz", 0, WORD, true).as_deref(), Some("foo "));
+    }
+
+    /// Vim's rule: with nothing trailing to take, `aw` reaches backwards
+    /// instead, so `daw` on the last word does not leave a dangling space.
+    #[test]
+    fn aw_at_the_end_of_a_line_takes_the_whitespace_before_it() {
+        assert_eq!(obj("foo bar", 4, WORD, true).as_deref(), Some(" bar"));
+    }
+
+    #[test]
+    fn a_word_object_never_crosses_a_line() {
+        assert_eq!(obj("foo\nbar", 1, WORD, false).as_deref(), Some("foo"));
+        assert_eq!(obj("foo\nbar", 1, WORD, true).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn i_quote_is_the_contents_and_a_quote_includes_them() {
+        let text = "say \"hello there\" now";
+        assert_eq!(obj(text, 8, TextObject::Quoted('"'), false).as_deref(), Some("hello there"));
+        // `a"` takes the trailing space too, exactly as `aw` does — verified
+        // against vim.
+        assert_eq!(
+            obj(text, 8, TextObject::Quoted('"'), true).as_deref(),
+            Some("\"hello there\" ")
+        );
+    }
+
+    #[test]
+    fn a_quote_object_works_from_either_quote_itself() {
+        let text = "\"abc\"";
+        assert_eq!(obj(text, 0, TextObject::Quoted('"'), false).as_deref(), Some("abc"));
+        assert_eq!(obj(text, 4, TextObject::Quoted('"'), false).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn quotes_pair_in_order_along_the_line() {
+        // Cursor between the pairs is inside neither.
+        let text = "\"a\" x \"b\"";
+        assert_eq!(obj(text, 1, TextObject::Quoted('"'), false).as_deref(), Some("a"));
+        assert_eq!(obj(text, 7, TextObject::Quoted('"'), false).as_deref(), Some("b"));
+        assert_eq!(obj(text, 4, TextObject::Quoted('"'), false), None, "in the gap");
+    }
+
+    #[test]
+    fn an_empty_quote_pair_has_nothing_inside_but_can_still_be_taken_around() {
+        assert_eq!(obj("x\"\"y", 1, TextObject::Quoted('"'), false), None);
+        assert_eq!(obj("x\"\"y", 1, TextObject::Quoted('"'), true).as_deref(), Some("\"\""));
+    }
+
+    #[test]
+    fn i_paren_is_the_contents_and_a_paren_includes_the_brackets() {
+        let text = "f(a, b)";
+        assert_eq!(obj(text, 3, TextObject::Delimited('('), false).as_deref(), Some("a, b"));
+        assert_eq!(obj(text, 3, TextObject::Delimited('('), true).as_deref(), Some("(a, b)"));
+    }
+
+    /// The reason nesting has to be counted: the naive scan finds the wrong
+    /// pair the moment brackets are nested.
+    #[test]
+    fn a_delimited_object_counts_nesting_on_the_way_out() {
+        //          0123456789
+        let text = "f(g(x), y)";
+        assert_eq!(obj(text, 4, TextObject::Delimited('('), false).as_deref(), Some("x"));
+        assert_eq!(obj(text, 7, TextObject::Delimited('('), false).as_deref(), Some("g(x), y"));
+    }
+
+    #[test]
+    fn a_delimited_object_counts_nesting_on_the_way_in_too() {
+        assert_eq!(
+            obj("((a))", 0, TextObject::Delimited('('), false).as_deref(),
+            Some("(a)"),
+            "from the outer bracket, the inner pair is the contents",
+        );
+    }
+
+    #[test]
+    fn a_delimited_object_spans_lines() {
+        let text = "fn a() {\n    body\n}";
+        // Whole-line contents make `i{` linewise, so this is the body *line*
+        // rather than the exact span between the braces. vim does the same,
+        // which is why `di{` leaves `{` and `}` on their own lines.
+        assert_eq!(obj(text, 13, TextObject::Delimited('{'), false).as_deref(), Some("    body\n"),);
+    }
+
+    #[test]
+    fn a_delimited_object_outside_any_pair_is_none() {
+        assert_eq!(obj("no brackets", 3, TextObject::Delimited('('), false), None);
+        assert_eq!(obj("a(b) c", 5, TextObject::Delimited('('), false), None);
+    }
+
+    #[test]
+    fn ip_is_the_run_of_non_blank_lines() {
+        let text = "one\ntwo\n\nthree\n";
+        assert_eq!(obj(text, 0, TextObject::Paragraph, false).as_deref(), Some("one\ntwo"));
+        assert_eq!(obj(text, 9, TextObject::Paragraph, false).as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn ap_reaches_into_the_blank_lines_after_it() {
+        let text = "one\n\n\ntwo\n";
+        assert_eq!(obj(text, 0, TextObject::Paragraph, true).as_deref(), Some("one\n\n"));
+    }
+
+    // ---- operators over objects --------------------------------------------
+
+    #[test]
+    fn diw_and_daw_differ_by_the_trailing_space() {
+        let iw = Target::Object { object: WORD, around: false };
+        let aw = Target::Object { object: WORD, around: true };
+        assert_eq!(op("foo bar baz", 4, Operator::Delete, iw, 1), "foo  baz");
+        assert_eq!(op("foo bar baz", 4, Operator::Delete, aw, 1), "foo baz");
+    }
+
+    #[test]
+    fn ci_quote_empties_the_string_and_leaves_the_quotes() {
+        let target = Target::Object { object: TextObject::Quoted('"'), around: false };
+        assert_eq!(op("say \"hello\"", 6, Operator::Change, target, 1), "say \"\"");
+    }
+
+    #[test]
+    fn di_paren_leaves_the_brackets_behind() {
+        let target = Target::Object { object: TextObject::Delimited('('), around: false };
+        assert_eq!(op("f(a, b)", 3, Operator::Delete, target, 1), "f()");
+    }
+
+    #[test]
+    fn yanking_an_object_captures_it_without_changing_the_text() {
+        let mut b = buf("foo bar");
+        b.cursor = Cursor::at(4);
+        let target = Target::Object { object: WORD, around: false };
+        let e = b.operate(Operator::Yank, target, 1).unwrap();
+        assert_eq!(e.text, "bar");
+        assert_eq!(e.kind, EntryKind::Charwise);
+        assert_eq!(b.rope().to_string(), "foo bar");
+    }
+
+    /// A paragraph is linewise, so `dip` must take the line terminator with it
+    /// rather than leaving an empty line, and the capture must end in a newline
+    /// so pasting it back opens a line.
+    #[test]
+    fn dip_is_linewise() {
+        let mut b = buf("one\ntwo\n\nthree\n");
+        b.cursor = Cursor::at(0);
+        let target = Target::Object { object: TextObject::Paragraph, around: false };
+        let e = b.operate(Operator::Delete, target, 1).unwrap();
+        assert_eq!(e.kind, EntryKind::Linewise);
+        assert_eq!(e.text, "one\ntwo\n");
+        assert_eq!(b.rope().to_string(), "\nthree\n", "no empty line left over");
+    }
+
+    /// `cip` keeps the line for insert mode to sit on, exactly as `cc` does.
+    #[test]
+    fn cip_keeps_a_line_to_type_on() {
+        let mut b = buf("one\ntwo\n\nthree\n");
+        b.cursor = Cursor::at(0);
+        let target = Target::Object { object: TextObject::Paragraph, around: false };
+        b.operate(Operator::Change, target, 1);
+        assert_eq!(b.rope().to_string(), "\n\nthree\n");
+    }
+
+    #[test]
+    fn an_object_the_cursor_is_not_inside_changes_nothing() {
+        let mut b = buf("abc");
+        b.cursor = Cursor::at(1);
+        let target = Target::Object { object: TextObject::Delimited('('), around: false };
+        assert!(b.operate(Operator::Delete, target, 1).is_none());
+        assert_eq!(b.rope().to_string(), "abc");
+    }
+
+    // ---- conformance fixes found by differential testing against vim -------
+
+    /// `;` after `t` has to skip the match it is already parked next to, or it
+    /// never advances. A freshly typed `t` must not skip. Found by running
+    /// `t.;x` through both editors.
+    #[test]
+    fn a_repeated_till_skips_the_match_it_is_already_next_to() {
+        let fresh = Motion::FindChar { ch: '.', forward: true, till: true, repeat: false };
+        let again = Motion::FindChar { ch: '.', forward: true, till: true, repeat: true };
+
+        let mut b = buf("a.b.c.d");
+        b.apply_motion(fresh, false);
+        assert_eq!(b.cursor.at, 0, "a fresh t. from column 0 stays put, as in vim");
+
+        b.apply_motion(again, false);
+        assert_eq!(b.cursor.at, 2, "but ; moves on to before the next dot");
+    }
+
+    #[test]
+    fn a_repeated_till_backwards_skips_too() {
+        let again = Motion::FindChar { ch: '.', forward: false, till: true, repeat: true };
+        let mut b = buf("a.b.c.d");
+        b.cursor = Cursor::at(4);
+        b.apply_motion(again, false);
+        assert_eq!(b.cursor.at, 2);
+    }
+
+    /// `dG` through the last line of a file that already ends in a newline must
+    /// leave that newline alone. The "take the preceding newline" rule only
+    /// applies when the buffer has no terminator of its own.
+    #[test]
+    fn deleting_to_the_end_keeps_a_trailing_newline_that_was_already_there() {
+        let mut b = buf("one\ntwo\nthree\n");
+        b.goto_row(1, false);
+        b.operate(Operator::Delete, Target::Motion(Motion::LastLine), 1);
+        assert_eq!(b.rope().to_string(), "one\n");
+    }
+
+    #[test]
+    fn deleting_to_the_end_of_a_file_without_one_does_not_invent_a_newline() {
+        let mut b = buf("one\ntwo\nthree");
+        b.goto_row(1, false);
+        b.operate(Operator::Delete, Target::Motion(Motion::LastLine), 1);
+        assert_eq!(b.rope().to_string(), "one");
+    }
+
+    /// `a"` takes the whitespace after the closing quote, so `da"` leaves one
+    /// space rather than two.
+    #[test]
+    fn a_quote_takes_the_space_after_it() {
+        let target = Target::Object { object: TextObject::Quoted('"'), around: false };
+        let around = Target::Object { object: TextObject::Quoted('"'), around: true };
+        assert_eq!(op("say \"hi\" ok", 5, Operator::Delete, target, 1), "say \"\" ok");
+        assert_eq!(op("say \"hi\" ok", 5, Operator::Delete, around, 1), "say ok");
+    }
+
+    #[test]
+    fn a_quote_falls_back_to_the_space_before_it() {
+        let around = Target::Object { object: TextObject::Quoted('"'), around: true };
+        assert_eq!(op("say \"hi\"", 5, Operator::Delete, around, 1), "say");
+    }
+
+    /// An inner block whose contents are whole lines is linewise, so `di{`
+    /// leaves the braces on their own lines instead of collapsing them.
+    #[test]
+    fn an_inner_block_of_whole_lines_is_linewise() {
+        let target = Target::Object { object: TextObject::Delimited('{'), around: false };
+        assert_eq!(op("fn a() {\n    body\n}\n", 13, Operator::Delete, target, 1), "fn a() {\n}\n",);
+    }
+
+    /// But only when the brackets have their lines to themselves — a partial
+    /// line stays charwise.
+    #[test]
+    fn an_inner_block_sharing_a_line_stays_charwise() {
+        let target = Target::Object { object: TextObject::Delimited('('), around: false };
+        assert_eq!(op("f(a,\n b)", 2, Operator::Delete, target, 1), "f()");
     }
 }

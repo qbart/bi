@@ -276,7 +276,11 @@ mod tests {
         buffer.cursor = crate::buffer::Cursor::at(0);
         buffer.insert_str("// leading comment\n");
         buffer.cursor = crate::buffer::Cursor::at(5);
-        buffer.operate(crate::motion::Operator::Delete, crate::motion::Motion::Right, 3);
+        buffer.operate(
+            crate::motion::Operator::Delete,
+            crate::motion::Target::Motion(crate::motion::Motion::Right),
+            3,
+        );
 
         sync(&mut syntax, &mut buffer);
 

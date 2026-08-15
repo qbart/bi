@@ -25,6 +25,65 @@ pub enum Motion {
     /// The doubled operator form — the `dd` in `dd`, the `cc` in `cc`. Covers
     /// `count` whole lines starting at the cursor's.
     CurrentLine,
+    /// `f{c}` `F{c}` `t{c}` `T{c}` — within the current line only, which is
+    /// what keeps them cheap and is also what vim does.
+    FindChar {
+        ch: char,
+        forward: bool,
+        till: bool,
+        /// Set when this came from `;` or `,` rather than being typed fresh.
+        ///
+        /// Only `t`/`T` care. A fresh `t.` from a position already next to the
+        /// target stays put, but `;` from there has to skip to the following
+        /// match or it would never advance. Vim exposes the same distinction
+        /// through `cpo`'s `;` flag.
+        repeat: bool,
+    },
+    /// `;` and `,`. Carries no character: the last find lives on `Editor`,
+    /// because it has to survive the keymap's `reset()` between commands.
+    /// `Editor` substitutes the real [`Motion::FindChar`] before resolving.
+    RepeatFind {
+        reverse: bool,
+    },
+}
+
+/// A range *containing* the cursor, rather than somewhere to move to.
+///
+/// This is why `iw` cannot be spelled as a [`Motion`]: a motion answers "where
+/// does this go from here", and `iw` answers "what is the word I am inside".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextObject {
+    /// `iw` / `iW` — `big` is the whitespace-delimited WORD.
+    Word { big: bool },
+    /// `i"` `i'` `` i` `` — the quote character itself.
+    Quoted(char),
+    /// `i(` `i[` `i{` `i<` — identified by the opening bracket.
+    Delimited(char),
+    /// `ip`
+    Paragraph,
+}
+
+/// What an operator applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Motion(Motion),
+    /// `around` is the `a` of `aw` — the object plus its surroundings.
+    Object {
+        object: TextObject,
+        around: bool,
+    },
+}
+
+impl Target {
+    pub fn kind(self) -> Kind {
+        match self {
+            Target::Motion(m) => m.kind(),
+            // A text object already names an explicit range, so `kind` only has
+            // to say how the captured text behaves when pasted back.
+            Target::Object { object: TextObject::Paragraph, .. } => Kind::Linewise,
+            Target::Object { .. } => Kind::Exclusive,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +111,21 @@ impl Motion {
             Motion::Up | Motion::Down | Motion::FirstLine | Motion::LastLine => Kind::Linewise,
             Motion::Line(_) | Motion::CurrentLine => Kind::Linewise,
             Motion::LineEnd => Kind::Inclusive,
+            // Vim's asymmetry, and it is load-bearing: forward finds are
+            // inclusive so `df)` takes the `)`, backward ones are exclusive so
+            // `dF(` stops before the `(`. Both then do the obvious thing.
+            Motion::FindChar { forward, .. } => {
+                if forward {
+                    Kind::Inclusive
+                } else {
+                    Kind::Exclusive
+                }
+            }
+            // Never actually asked: `Editor::resolve_find` turns this into a
+            // `FindChar` — which carries the real direction — before anything
+            // resolves it. Exclusive is the conservative answer if it ever
+            // leaked, since it deletes less rather than more.
+            Motion::RepeatFind { .. } => Kind::Exclusive,
             Motion::Left
             | Motion::Right
             | Motion::WordForward

@@ -11,6 +11,7 @@ See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 cargo run -- <file>
 cargo test
 cargo fmt --check
+python3 scripts/vim_differential.py   # needs vim; not part of cargo test
 ```
 
 `rustfmt.toml` sets `use_small_heuristics = "Max"`, which keeps short struct
@@ -31,6 +32,9 @@ words. `{n}` below means an optional count.
 | `h` `l` | left, right (`Space` also moves right) |
 | `j` `k` | down, up, keeping a goal column through short lines |
 | `w` `b` | start of the next / previous word |
+| `f{c}` `F{c}` | onto the next / previous `{c}`, within the line |
+| `t{c}` `T{c}` | just before / after it |
+| `;` `,` | repeat the last find, or reverse it |
 | `0` `^` | start of the line (`^` is an alias for `0` until a first-non-blank motion exists) |
 | `$` | end of the line |
 | `gg` | first line |
@@ -50,6 +54,21 @@ words. `{n}` below means an optional count.
 | `Y` | `yy` |
 | `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
 | `X` | delete the char before the cursor — `dh` |
+
+**Text objects** — take the thing the cursor is *inside*, rather than a
+direction to move in. `i` is the object, `a` includes its surroundings.
+
+| Key | Selects |
+|---|---|
+| `iw` `aw` | word; `aw` takes the whitespace after it (or before, at a line end) |
+| `iW` `aW` | WORD — whitespace-delimited, so `foo.bar` is one |
+| `i"` `i'` `` i` `` | the contents of the quotes; `a"` includes them and the space after |
+| `i(` `i[` `i{` `i<` | inside the brackets; either bracket of a pair works, and `b`/`B` alias `(`/`{` |
+| `a(` `a{` … | including the brackets |
+| `ip` `ap` | paragraph — a run of non-blank lines; `ap` reaches into the blanks after |
+
+So `diw`, `ciw`, `ci"`, `da(`, `dip` all work. When a `{ }` pair has its braces
+on their own lines, `di{` is linewise and leaves them there — as in vim.
 
 `cw` follows vim and behaves like `ce`: it changes the word without swallowing
 the whitespace after it. `dw` at the end of a line stops there rather than
