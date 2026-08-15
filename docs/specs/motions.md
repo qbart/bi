@@ -10,7 +10,7 @@ and twelve. This file records the gap, what closes it, and in what order.
 | **1** ✅ | `:e` `:e!` `:e <path>`; `D C s S X r{char} ~ J` | nothing new |
 | **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
 | 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
-| 4 | `.` — repeat last change | every command able to replay itself |
+| **4** | `.` — repeat last change | a record of the last change |
 | 5 | `/ ? n N * #` search, then `:s` | a search primitive |
 | 6 | `H M L`, `Ctrl-D/U/F/B`, `zz zt zb` | the viewport as a real concept |
 
@@ -220,10 +220,7 @@ of my own wrong assumptions, where bee was right and the expectation was not.
 
 ## Deferred
 
-**`.` (repeat)** — needs `Command` to carry enough to replay itself, including
-any text an insert session produced. The `Command` type is the right home. Do
-this before the command set grows much further, or every command added first
-becomes a thing to retrofit.
+**Marks** (`m{a}`, `` `{a} ``, `'{a}`) — independent of everything here.
 
 **Search** (`/ ? n N * #`) and `:s` — needs a search primitive over the rope
 and a `Mode::Search` that behaves like `Mode::Command`.
@@ -233,8 +230,88 @@ blocked on the same thing. `Editor::scroll` is a bare row index and
 `scroll_to_cursor` takes a height in rows, which bakes in "the viewport is N
 whole lines". These want a viewport type. They come as a set or not at all.
 
-**Marks** (`m{a}`, `` `{a} ``, `'{a}`) — independent of everything here.
-
 **Case operators** (`gu gU g~`) and **indent** (`> <`) — ordinary operators;
 they need `Operator` to grow, and `>` needs an indent width, which is a config
 question the project has deliberately not answered yet.
+
+## Step 4 — `.`
+
+Repeats the last **change**. Not the last command: a motion, an undo, a yank or
+a `:` command all leave `.` alone, so `dw`, `j`, `.` deletes a second word.
+
+### What is recorded
+
+```rust
+/// The last change, in the form that replays it.
+struct Change {
+    /// The command that started it.
+    command: Command,
+    /// Keystrokes of the insert or replace session it opened, if any.
+    typed: Vec<Action>,
+    /// The extent a visual operator covered, so `.` can repeat it from
+    /// wherever the cursor is now.
+    extent: Option<Extent>,
+}
+```
+
+`typed` holds `Action`s rather than a `String` because `Backspace` is part of
+what was typed. Replaying "abc" when the user typed "abx", backspace, "c" would
+produce the same text here but not in general — the backspace can cross the
+start of the insertion and eat text that was already there.
+
+`command` carries its own count, so `3x` then `.` deletes three more
+characters. An explicit count on the `.` itself replaces it, as in vim: `3x`
+then `2.` deletes two.
+
+### What starts a change
+
+Every action that mutates text, plus the ones that open a session:
+
+| Kind | Actions |
+|---|---|
+| Immediate | `Operate` (not `Yank`), `Paste`, `ReplaceChar`, `ToggleCase`, `JoinLines` |
+| Opens insert | `EnterInsert`, `EnterInsertAfter`, `EnterInsertLineStart`, `EnterInsertLineEnd`, `OpenLineBelow`, `OpenLineAbove`, and `Operate`/`OperateSelection` with `Change` |
+| Opens replace | `EnterReplace` |
+
+Yank is deliberately absent: vim does not repeat it, because `.` after a yank
+almost always means "repeat the edit I made before the yank".
+
+An immediate change is finished the moment it is applied. A session change is
+finished when the mode returns to normal, which is what makes `ciwfoo<Esc>` one
+repeatable unit rather than five.
+
+### Visual repeat
+
+`.` after a visual operator repeats it over the same **extent** from the
+current cursor, which is what vim does — the selection itself is gone by then.
+
+```rust
+enum Extent {
+    /// Charwise: this many characters.
+    Chars(usize),
+    /// Linewise: this many whole lines.
+    Lines(usize),
+}
+```
+
+So `vjjd` then `.` deletes three more lines, and `vlld` then `.` deletes three
+more characters.
+
+### Replaying
+
+`.` re-applies `command`, then each entry in `typed`, then leaves the mode. The
+replay must not record itself, or the second `.` would repeat the repeat and
+counts would compound — a `replaying` flag guards it.
+
+Because commands already run at every selection, `.` works with several cursors
+for free.
+
+### Not covered
+
+**`.` after a picker paste.** The picker is an overlay with its own mode and
+its result depends on what was chosen; replaying the keystrokes would reopen
+it. A plain `p` repeats the same entry anyway, since choosing one moves it to
+the front of the ring.
+
+**`.` inside a macro or a count-prefixed insert** (`3ifoo<Esc>`) — bee has no
+macros, and repeat-counted insert is its own feature.
