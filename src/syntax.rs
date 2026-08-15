@@ -305,16 +305,16 @@ mod tests {
         let mut buffer = Buffer::empty();
         let mut at = crate::buffer::Cursor::default();
         at = buffer.insert_str(at, "fn main() {}\n");
-        buffer.commit_undo(at);
+        buffer.commit_undo(vec![(at.at, at.at)], vec![(at.at, at.at)]);
         let mut syntax = Syntax::new("rs", buffer.rope()).unwrap();
         sync(&mut syntax, &mut buffer);
 
         at = crate::buffer::Cursor::at(buffer.rope().len_chars());
         at = buffer.insert_str(at, "struct S;\n");
-        buffer.commit_undo(at);
+        buffer.commit_undo(vec![(at.at, at.at)], vec![(at.at, at.at)]);
         sync(&mut syntax, &mut buffer);
 
-        buffer.undo(at);
+        buffer.undo(vec![(at.at, at.at)], vec![(at.at, at.at)]);
         sync(&mut syntax, &mut buffer);
 
         let fresh = Syntax::new("rs", buffer.rope()).unwrap();

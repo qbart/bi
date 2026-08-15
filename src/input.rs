@@ -198,15 +198,25 @@ impl Input {
         let ctrl = key.mods.ctrl;
 
         match key.code {
+            // Esc clears the pending keymap state *and* drops any extra
+            // cursors. Collapsing with one cursor is a no-op, so this can be
+            // unconditional.
             KeyCode::Esc => {
                 self.reset();
-                None
+                Some(Command { count: 1, action: Action::CollapseCursors })
             }
             KeyCode::Char('c') if ctrl => {
                 self.reset();
-                None
+                Some(Command { count: 1, action: Action::CollapseCursors })
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
+            KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
+            KeyCode::Down if ctrl && key.mods.alt => {
+                self.plain(Action::AddCursorLine { below: true })
+            }
+            KeyCode::Up if ctrl && key.mods.alt => {
+                self.plain(Action::AddCursorLine { below: false })
+            }
             KeyCode::Char(c) => self.normal_char(c),
             KeyCode::Left => self.resolve(Motion::Left),
             KeyCode::Right => self.resolve(Motion::Right),
@@ -449,6 +459,11 @@ impl Input {
         if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
             self.reset();
             return Some(Command { count: 1, action: Action::EnterNormal });
+        }
+        // `Ctrl-N` in visual selects the next occurrence of the selection,
+        // which is the multi-cursor idiom people expect from other editors.
+        if ctrl && key.code == KeyCode::Char('n') {
+            return self.plain(Action::AddCursorNextMatch);
         }
 
         let KeyCode::Char(c) = key.code else {

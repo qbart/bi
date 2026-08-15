@@ -12,13 +12,13 @@ reason is that it turns two features into one piece of machinery.
 
 ## Status
 
-Steps 1 and 2 are **built**; the cursor no longer exists on `Buffer`.
+**Built.** The cursor no longer exists on `Buffer`.
 
 | Step | Scope | Needs |
 |---|---|---|
 | **1** ✅ | The selection model; cursor leaves `Buffer` | this file |
 | **2** ✅ | Visual mode `v` `V`, Replace mode `R` | step 1 |
-| 3 | Multi-cursor | step 2 |
+| **3** ✅ | Multi-cursor | step 2 |
 
 Blockwise visual (`Ctrl-V`) is **not** in step 2 — see *Deferred*.
 
@@ -119,9 +119,16 @@ single cursor makes redo unusable, and it is the difference between multi-cursor
 being a feature and being a party trick. The change is contained — `History`
 already stores a `usize` per revision and it becomes a `Selections`.
 
-**Not done in step 1.** Undo still restores one cursor, because nothing creates
-a second one until step 3 and the difference is unobservable before then. It
-lands with step 3, not after it.
+Done in step 3, as promised. Doing it properly also *simplified* `Buffer`:
+`apply_edit` used to take a cursor purely so history could record one, and with
+several selections the group's first change comes from whichever happened to be
+highest — a position that is not the state to restore. `Editor` now captures the
+set when a group opens (`undo_from`) and passes both ends at `commit`, so
+`apply_edit` needs no cursor at all.
+
+`History` stores plain `(anchor, head)` pairs rather than a `Selections`, which
+keeps it a leaf module: `Selections` knows about `Cursor`, and importing it
+there would tie the undo tree to the editor's idea of what a cursor is.
 
 ## Step 2 — visual and replace mode
 

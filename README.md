@@ -139,6 +139,24 @@ expect.
 
 Charwise selections include the character under the cursor, as in vim.
 
+### Multiple cursors
+
+Vim has none of this, so the bindings are bee's own.
+
+| Key | Does |
+|---|---|
+| `Ctrl-N` | add a cursor at the next occurrence of the word under the cursor, wrapping |
+| `Ctrl-Alt-Down` `Ctrl-Alt-Up` | add a cursor on the line below / above, keeping the column |
+| `Esc` | collapse back to one cursor |
+
+Every command applies at every cursor, and the whole thing is one undo step —
+including the cursors themselves, which come back when you undo. In visual mode
+`Ctrl-N` selects the next occurrence of the *selection* instead, so
+`viw` then `Ctrl-N` `Ctrl-N` then `c` is a rename.
+
+The terminal has one real cursor; it sits on the primary selection and the
+others are drawn as coloured cells.
+
 ### Replace mode
 
 `R` overwrites instead of inserting, until `Esc`. `Backspace` puts back what was
@@ -301,10 +319,10 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   `tests/lib_boundary.rs`, which reads the library's modules and fails on any
   that name a terminal crate. Only a Cargo workspace would make that a compiler
   rule, and that is not worth its churn while there is one frontend.
-- **The cursor lives on `Buffer`.** Two views of one file need two cursors, so
-  window splits and visual mode's anchor both want it to move onto a view.
-  `Cursor` is already a value type, which is the half of that work that was
-  expensive.
+- ~~**The cursor lives on `Buffer`.**~~ Fixed: `Editor` owns a `Selections` set
+  and `Buffer` is a text store with no notion of where anyone is looking. Normal
+  mode is every selection collapsed, visual is one with room in it, multi-cursor
+  is several. See [docs/specs/selections.md](docs/specs/selections.md).
 - **`Editor::scroll` is a row index** and `scroll_to_cursor` takes a height in
   rows, which bakes in "the viewport is N whole lines". Soft wrap breaks that
   assumption, and so does any pixel-scrolling frontend.

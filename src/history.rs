@@ -40,20 +40,25 @@ struct Revision {
     children: Vec<usize>,
     /// Applied in order, transforms the parent's text into this revision's.
     changes: Vec<Change>,
-    /// Where the cursor was before this revision's first change: where undo
-    /// puts you back.
-    cursor_before: usize,
-    /// Where the cursor ended up: where redo puts you.
-    cursor_after: usize,
+    /// Selections as they were before this revision: where undo puts you back.
+    before: Cursors,
+    /// Selections as they ended up: where redo puts you.
+    after: Cursors,
 }
+
+/// Selections as plain data — `(anchor, head)` char indices.
+///
+/// A `Vec` rather than the `Selections` type so that history stays a leaf
+/// module: `Selections` knows about `Cursor`, which lives on the far side of
+/// `Buffer`, and importing it here would tie the undo tree to the editor's
+/// idea of what a cursor is.
+pub type Cursors = Vec<(usize, usize)>;
 
 pub struct History {
     revisions: Vec<Revision>,
     current: usize,
     /// Changes made since the last commit, not yet a revision.
     pending: Vec<Change>,
-    /// Cursor as it was when `pending` started accumulating.
-    pending_cursor: usize,
     /// Revision matching what's on disk. `None` once the file has been written
     /// from a state we can no longer identify — currently unreachable, but
     /// `saved` is an `Option` so that a failed write can clear it.
@@ -67,31 +72,30 @@ impl Default for History {
                 parent: None,
                 children: Vec::new(),
                 changes: Vec::new(),
-                cursor_before: 0,
-                cursor_after: 0,
+                before: Vec::new(),
+                after: Vec::new(),
             }],
             current: 0,
             pending: Vec::new(),
-            pending_cursor: 0,
             saved: Some(0),
         }
     }
 }
 
 impl History {
-    /// Adds a change to the group being built. `cursor` is the cursor as it was
-    /// *before* the change — only the first one in a group is kept.
-    pub fn record(&mut self, change: Change, cursor: usize) {
-        if self.pending.is_empty() {
-            self.pending_cursor = cursor;
-        }
+    /// Adds a change to the group being built.
+    ///
+    /// Takes no cursor: with several selections the group's first change comes
+    /// from whichever one happened to be highest, and that one position is not
+    /// the state to restore. The caller passes the whole set at `commit`.
+    pub fn record(&mut self, change: Change) {
         self.pending.push(change);
     }
 
     /// Closes the current group into a revision. A no-op when nothing is
     /// pending, so callers can commit at every command boundary without
     /// checking.
-    pub fn commit(&mut self, cursor_after: usize) {
+    pub fn commit(&mut self, before: Cursors, after: Cursors) {
         if self.pending.is_empty() {
             return;
         }
@@ -100,8 +104,8 @@ impl History {
             parent: Some(self.current),
             children: Vec::new(),
             changes: std::mem::take(&mut self.pending),
-            cursor_before: self.pending_cursor,
-            cursor_after,
+            before,
+            after,
         });
         self.revisions[self.current].children.push(node);
         self.current = node;
@@ -120,30 +124,36 @@ impl History {
 
     /// Changes that walk one step back, already inverted and reversed, plus the
     /// cursor to restore. `None` at the oldest change.
-    pub fn undo(&mut self) -> Option<(Vec<Change>, usize)> {
+    pub fn undo(&mut self) -> Option<(Vec<Change>, Cursors)> {
         let rev = &self.revisions[self.current];
         let parent = rev.parent?;
         let changes = rev.changes.iter().rev().map(Change::inverse).collect();
-        let cursor = rev.cursor_before;
+        let cursors = rev.before.clone();
         self.current = parent;
-        Some((changes, cursor))
+        Some((changes, cursors))
     }
 
     /// Changes that walk one step forward along the newest branch, plus the
     /// cursor to restore. `None` at the newest change on this branch.
-    pub fn redo(&mut self) -> Option<(Vec<Change>, usize)> {
+    pub fn redo(&mut self) -> Option<(Vec<Change>, Cursors)> {
         let child = *self.revisions[self.current].children.last()?;
         let rev = &self.revisions[child];
         let changes = rev.changes.clone();
-        let cursor = rev.cursor_after;
+        let cursors = rev.after.clone();
         self.current = child;
-        Some((changes, cursor))
+        Some((changes, cursors))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single-cursor set, which is what these cases care about — the whole
+    /// set is exercised through the editor.
+    fn one(at: usize) -> Cursors {
+        vec![(at, at)]
+    }
 
     fn ins(start: usize, text: &str) -> Change {
         Change { start, removed: String::new(), inserted: text.into() }
@@ -154,14 +164,14 @@ mod tests {
     #[test]
     fn editing_after_undo_branches_instead_of_discarding() {
         let mut h = History::default();
-        h.record(ins(0, "a"), 0);
-        h.commit(1);
-        h.record(ins(1, "b"), 1);
-        h.commit(2);
+        h.record(ins(0, "a"));
+        h.commit(one(1), one(1));
+        h.record(ins(1, "b"));
+        h.commit(one(2), one(2));
 
         h.undo();
-        h.record(ins(1, "c"), 1);
-        h.commit(2);
+        h.record(ins(1, "c"));
+        h.commit(one(2), one(2));
 
         assert_eq!(h.revisions[1].children, vec![2, 3], "both branches kept");
         assert_eq!(
@@ -174,11 +184,11 @@ mod tests {
     #[test]
     fn redo_follows_the_newest_branch() {
         let mut h = History::default();
-        h.record(ins(0, "a"), 0);
-        h.commit(1);
+        h.record(ins(0, "a"));
+        h.commit(one(1), one(1));
         h.undo();
-        h.record(ins(0, "z"), 0);
-        h.commit(1);
+        h.record(ins(0, "z"));
+        h.commit(one(1), one(1));
         h.undo();
 
         let (changes, _) = h.redo().expect("a branch to redo into");
@@ -188,8 +198,8 @@ mod tests {
     #[test]
     fn commit_without_changes_creates_no_revision() {
         let mut h = History::default();
-        h.commit(0);
-        h.commit(0);
+        h.commit(one(0), one(0));
+        h.commit(one(0), one(0));
         assert_eq!(h.revisions.len(), 1, "only the root");
     }
 }

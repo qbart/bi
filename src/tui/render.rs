@@ -28,6 +28,10 @@ const CURSOR_LINE_BG: Color = Color::Indexed(236);
 /// that covers the cursor's line still reads as a selection.
 const SELECTION_BG: Color = Color::Indexed(239);
 
+/// A terminal has exactly one real cursor, and the primary selection gets it.
+/// Every other head is drawn as a reversed cell instead.
+const EXTRA_CURSOR_BG: Color = Color::Magenta;
+
 /// Repaints the background of the columns in `cols` within an already-built
 /// line, leaving the foreground alone.
 ///
@@ -281,6 +285,22 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             };
             let cols = (cols.start + gutter)..(cols.end + gutter);
             spans = paint_range(spans, cols, SELECTION_BG);
+        }
+
+        // The terminal's own cursor sits on the primary head; the others have
+        // to be painted or they are invisible.
+        if ed.selections.len() > 1 {
+            for (i, selection) in ed.selections.all().iter().enumerate() {
+                if i == ed.selections.primary_index() {
+                    continue;
+                }
+                let head = selection.head;
+                if ed.buffer.row_at(head) != row {
+                    continue;
+                }
+                let col = display_col(raw, ed.buffer.col_at(head)) + gutter;
+                spans = paint_range(spans, col..col + 1, EXTRA_CURSOR_BG);
+            }
         }
 
         lines.push(if row == cursor_row {

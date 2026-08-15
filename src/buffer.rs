@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ropey::Rope;
 
-use crate::history::{Change, History};
+use crate::history::{Change, Cursors, History};
 use crate::motion::{Kind, Motion, Operator, Target, TextObject};
 use crate::registers::{Entry, EntryKind};
 
@@ -115,13 +115,13 @@ impl Buffer {
         Ok(buf)
     }
 
-    /// Takes the cursor because a write closes the open undo group, and a
+    /// Takes the selections because a write closes the open undo group, and a
     /// group needs somewhere to put you when you undo back through it.
-    pub fn save(&mut self, at: Cursor) -> Result<()> {
+    pub fn save(&mut self, before: Cursors, after: Cursors) -> Result<()> {
         let path = self.path.clone().context("no file name (use `:w <path>`)")?;
         // What lands on disk has to be a revision, or nothing can be marked as
         // saved and the buffer stays "modified" straight after a good write.
-        self.commit_undo(at);
+        self.commit_undo(before, after);
         let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         self.rope
             .write_to(BufWriter::new(file))
@@ -130,9 +130,14 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn save_as(&mut self, at: Cursor, path: impl AsRef<Path>) -> Result<()> {
+    pub fn save_as(
+        &mut self,
+        before: Cursors,
+        after: Cursors,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
         self.path = Some(path.as_ref().to_path_buf());
-        self.save(at)
+        self.save(before, after)
     }
 
     pub fn rope(&self) -> &Rope {
@@ -233,50 +238,55 @@ impl Buffer {
 
     /// The single mutation primitive: replace `start..end` (chars) with `text`
     /// and record it for undo.
-    fn apply_edit(&mut self, at: Cursor, start: usize, end: usize, text: &str) {
+    ///
+    /// No cursor: with several selections the group's first change comes from
+    /// whichever one happened to be highest, and that position is not the state
+    /// undo should restore. `commit_undo` takes the whole set instead.
+    fn apply_edit(&mut self, start: usize, end: usize, text: &str) {
         let change = self.edit_raw(start, end, text);
-        self.history.record(change, at.at);
+        self.history.record(change);
     }
 
     // ---- undo --------------------------------------------------------------
 
     /// Closes the current undo group. A no-op if nothing has changed since the
     /// last one, so callers can commit at every command boundary blindly.
-    pub fn commit_undo(&mut self, at: Cursor) {
-        self.history.commit(at.at);
+    pub fn commit_undo(&mut self, before: Cursors, after: Cursors) {
+        self.history.commit(before, after);
     }
 
     /// Replays `changes` through [`Buffer::edit_raw`], so history traversal
     /// emits [`Edit`]s exactly as ordinary typing does — an undo reaches
     /// tree-sitter and LSP as just another incremental edit.
-    fn replay(&mut self, changes: Vec<Change>, cursor: usize) -> Cursor {
+    fn replay(&mut self, changes: Vec<Change>, cursors: Cursors) -> Cursors {
         for change in changes {
             let (start, end) = change.range();
             self.edit_raw(start, end, &change.inserted);
         }
-        Cursor::at(cursor.min(self.rope.len_chars()))
+        let len = self.rope.len_chars();
+        cursors.into_iter().map(|(a, h)| (a.min(len), h.min(len))).collect()
     }
 
     /// Steps one revision back. Returns false at the oldest change.
-    /// `None` at the oldest change. `Some` carries where the cursor goes.
-    pub fn undo(&mut self, at: Cursor) -> Option<Cursor> {
-        self.commit_undo(at);
-        let (changes, cursor) = self.history.undo()?;
-        Some(self.replay(changes, cursor))
+    /// `None` at the oldest change. `Some` carries the selections to restore.
+    pub fn undo(&mut self, before: Cursors, after: Cursors) -> Option<Cursors> {
+        self.commit_undo(before, after);
+        let (changes, cursors) = self.history.undo()?;
+        Some(self.replay(changes, cursors))
     }
 
     /// Steps one revision forward, along the most recently created branch.
     /// Returns false at the newest change.
-    pub fn redo(&mut self, at: Cursor) -> Option<Cursor> {
-        self.commit_undo(at);
-        let (changes, cursor) = self.history.redo()?;
-        Some(self.replay(changes, cursor))
+    pub fn redo(&mut self, before: Cursors, after: Cursors) -> Option<Cursors> {
+        self.commit_undo(before, after);
+        let (changes, cursors) = self.history.redo()?;
+        Some(self.replay(changes, cursors))
     }
 
     // ---- editing -----------------------------------------------------------
 
     pub fn insert_str(&mut self, at: Cursor, text: &str) -> Cursor {
-        self.apply_edit(at, at.at, at.at, text);
+        self.apply_edit(at.at, at.at, text);
         Cursor::at(at.at + text.chars().count())
     }
 
@@ -289,7 +299,7 @@ impl Buffer {
         if at.at == 0 {
             return at;
         }
-        self.apply_edit(at, at.at - 1, at.at, "");
+        self.apply_edit(at.at - 1, at.at, "");
         Cursor::at(at.at - 1)
     }
 
@@ -304,7 +314,7 @@ impl Buffer {
             return None;
         }
         let text: String = std::iter::repeat_n(ch, count).collect();
-        self.apply_edit(at, at.at, at.at + count, &text);
+        self.apply_edit(at.at, at.at + count, &text);
         // Vim leaves the cursor on the last character it replaced.
         Some(Cursor::at(at.at + text.chars().count().saturating_sub(1)))
     }
@@ -332,7 +342,7 @@ impl Buffer {
                 continue;
             };
             let width = flipped.chars().count();
-            self.apply_edit(cursor, cursor.at, cursor.at + 1, &flipped);
+            self.apply_edit(cursor.at, cursor.at + 1, &flipped);
             cursor = Cursor::at(cursor.at + width);
         }
         self.clamped(cursor, false)
@@ -363,7 +373,7 @@ impl Buffer {
             let ends_blank = end == line_start || matches!(self.rope.char(end - 1), ' ' | '\t');
             let sep = if ends_blank || next_len == indent { "" } else { " " };
 
-            self.apply_edit(cursor, end, next_start + indent, sep);
+            self.apply_edit(end, next_start + indent, sep);
             // Vim leaves the cursor on the join.
             cursor = Cursor::at(end);
         }
@@ -396,7 +406,7 @@ impl Buffer {
         } else {
             self.rope.line_to_char(row)
         };
-        self.apply_edit(at, start, start, "\n");
+        self.apply_edit(start, start, "\n");
         Cursor::at(if below { start + 1 } else { start })
     }
 
@@ -764,7 +774,7 @@ impl Buffer {
             // for the forward motions where that is already the cursor.
             if start < at.at { self.clamped(Cursor::at(start), false) } else { at }
         } else {
-            self.apply_edit(at, start, end, "");
+            self.apply_edit(start, end, "");
             // Delete lands back on a char; change leaves the cursor where the
             // text was, which for `d$` or `cc` is one past what's left.
             self.clamped(Cursor::at(start), op == Operator::Change)
@@ -800,7 +810,7 @@ impl Buffer {
                 let start = if before { at.at } else { (at.at + 1).min(line_end) };
                 let text = entry.text.repeat(count);
                 let len = text.chars().count();
-                self.apply_edit(at, start, start, &text);
+                self.apply_edit(start, start, &text);
                 self.clamped(Cursor::at(start + len.saturating_sub(1)), false)
             }
             EntryKind::Linewise => {
@@ -823,7 +833,7 @@ impl Buffer {
                     text = format!("\n{body}");
                 }
 
-                self.apply_edit(at, start, start, &text);
+                self.apply_edit(start, start, &text);
                 let landed = if before { row } else { row + 1 };
                 self.at_row(landed, false)
             }
@@ -924,6 +934,44 @@ impl Buffer {
             (true, false) => (at + 1).min(line_end),
             (false, _) => at,
         }))
+    }
+
+    /// Next occurrence of `needle` after `from`, wrapping to the start.
+    ///
+    /// Naive scan. The buffer is a rope and the needle is a word, so this is
+    /// fine for `Ctrl-N`; a real `/` search wants something better and will
+    /// bring its own.
+    pub fn find_next(&self, from: usize, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        let text = self.rope.to_string();
+        let chars: Vec<char> = text.chars().collect();
+        let pat: Vec<char> = needle.chars().collect();
+        if pat.len() > chars.len() {
+            return None;
+        }
+
+        let last = chars.len() - pat.len();
+        // Wrapping, so a cursor past the final match still finds the first one.
+        for offset in 0..=last {
+            let i = (from + 1 + offset) % (last + 1);
+            if chars[i..i + pat.len()] == pat[..] {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The word under `at`, for `Ctrl-N` to look for.
+    pub fn word_at(&self, at: Cursor) -> Option<(usize, usize)> {
+        self.object_range(at, TextObject::Word { big: false }, false)
+    }
+
+    /// Text of a char range.
+    pub fn slice(&self, start: usize, end: usize) -> String {
+        let len = self.rope.len_chars();
+        self.rope.slice(start.min(len)..end.min(len)).to_string()
     }
 
     // ---- text objects ------------------------------------------------------
@@ -1161,6 +1209,10 @@ mod tests {
     struct Fixture {
         inner: Buffer,
         cursor: Cursor,
+        /// Where the cursor was when the open undo group started, mirroring
+        /// `Editor::undo_from`. Without it a group records where it *ended*
+        /// as its "before", and undo lands in the wrong place.
+        undo_from: Option<Cursor>,
     }
 
     impl std::ops::Deref for Fixture {
@@ -1190,44 +1242,66 @@ mod tests {
             self.cursor = self.inner.at_row(row, eol);
         }
         fn insert_str(&mut self, text: &str) {
+            self.mark();
             self.cursor = self.inner.insert_str(self.cursor, text);
         }
         fn backspace(&mut self) {
+            self.mark();
             self.cursor = self.inner.backspace(self.cursor);
         }
         fn open_line(&mut self, below: bool) {
+            self.mark();
             self.cursor = self.inner.open_line(self.cursor, below);
         }
+        /// Single-cursor, so each "set" is one pair. Multi-cursor undo is
+        /// covered in `editor.rs`.
+        fn pairs(&self) -> crate::history::Cursors {
+            vec![(self.cursor.at, self.cursor.at)]
+        }
+        /// Opens the undo group if it is not open already.
+        fn mark(&mut self) {
+            self.undo_from.get_or_insert(self.cursor);
+        }
+        fn bounds(&mut self) -> (crate::history::Cursors, crate::history::Cursors) {
+            let from = self.undo_from.take().unwrap_or(self.cursor);
+            (vec![(from.at, from.at)], self.pairs())
+        }
         fn commit_undo(&mut self) {
-            self.inner.commit_undo(self.cursor);
+            let (before, after) = self.bounds();
+            self.inner.commit_undo(before, after);
         }
         fn undo(&mut self) -> bool {
-            match self.inner.undo(self.cursor) {
-                Some(c) => {
-                    self.cursor = c;
+            let (before, after) = self.bounds();
+            match self.inner.undo(before, after) {
+                Some(cursors) => {
+                    self.cursor = Cursor::at(cursors.first().map_or(0, |&(_, h)| h));
                     true
                 }
                 None => false,
             }
         }
         fn redo(&mut self) -> bool {
-            match self.inner.redo(self.cursor) {
-                Some(c) => {
-                    self.cursor = c;
+            let (before, after) = self.bounds();
+            match self.inner.redo(before, after) {
+                Some(cursors) => {
+                    self.cursor = Cursor::at(cursors.first().map_or(0, |&(_, h)| h));
                     true
                 }
                 None => false,
             }
         }
         fn operate(&mut self, op: Operator, target: Target, count: usize) -> Option<Entry> {
+            self.mark();
             let (entry, landed) = self.inner.operate(self.cursor, op, target, count)?;
             self.cursor = landed;
             Some(entry)
         }
         fn paste(&mut self, entry: &Entry, before: bool, count: usize) {
+            self.mark();
             self.cursor = self.inner.paste(self.cursor, entry, before, count);
         }
         fn replace_chars(&mut self, ch: char, count: usize) -> bool {
+            self.mark();
             match self.inner.replace_chars(self.cursor, ch, count) {
                 Some(c) => {
                     self.cursor = c;
@@ -1237,16 +1311,19 @@ mod tests {
             }
         }
         fn toggle_case(&mut self, count: usize) {
+            self.mark();
             self.cursor = self.inner.toggle_case(self.cursor, count);
         }
         fn join_lines(&mut self, count: usize) {
+            self.mark();
             self.cursor = self.inner.join_lines(self.cursor, count);
         }
         fn object_range(&self, object: TextObject, around: bool) -> Option<(usize, usize)> {
             self.inner.object_range(self.cursor, object, around)
         }
         fn save_as(&mut self, path: impl AsRef<Path>) -> Result<()> {
-            self.inner.save_as(self.cursor, path)
+            let (before, after) = self.bounds();
+            self.inner.save_as(before, after, path)
         }
     }
 
@@ -1255,7 +1332,7 @@ mod tests {
     fn buf(text: &str) -> Fixture {
         let mut b = Buffer::empty();
         b.rope = Rope::from_str(text);
-        Fixture { inner: b, cursor: Cursor::default() }
+        Fixture { inner: b, cursor: Cursor::default(), undo_from: None }
     }
 
     #[test]
@@ -1976,8 +2053,6 @@ mod tests {
         assert!(b.operate(Operator::Delete, Target::Motion(f('z', true, false)), 1).is_none());
         assert_eq!(b.rope().to_string(), "abc");
     }
-
-    // ---- text objects ------------------------------------------------------
 
     fn obj(text: &str, at: usize, object: TextObject, around: bool) -> Option<String> {
         let mut b = buf(text);

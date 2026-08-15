@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, Cursor};
+use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{EntryKind, Registers, Sink};
@@ -108,6 +109,14 @@ pub enum Action {
         object: TextObject,
         around: bool,
     },
+    /// `Ctrl-N` — a cursor at the next occurrence of the word under the cursor.
+    AddCursorNextMatch,
+    /// `Ctrl-Alt-Down` / `Ctrl-Alt-Up`.
+    AddCursorLine {
+        below: bool,
+    },
+    /// `Esc` in normal mode, when there is more than one cursor.
+    CollapseCursors,
     /// `R`
     EnterReplace,
     /// A character typed in replace mode.
@@ -197,6 +206,9 @@ pub struct Editor {
     /// What replace mode has overwritten, newest last, one entry per selection
     /// per keystroke. Backspace pops it to put the original characters back.
     replaced: Vec<Vec<Option<char>>>,
+    /// Selections as they were when the open undo group started. Empty between
+    /// groups; filled by the first command that opens one.
+    undo_from: Cursors,
     pub status: String,
     /// First visible row.
     pub scroll: usize,
@@ -250,6 +262,7 @@ impl Editor {
             mode: Mode::Normal,
             last_find: None,
             replaced: Vec::new(),
+            undo_from: Vec::new(),
             status: String::new(),
             scroll: 0,
             quit: false,
@@ -257,6 +270,9 @@ impl Editor {
     }
 
     pub fn apply(&mut self, cmd: Command) {
+        if self.undo_from.is_empty() {
+            self.undo_from = self.selections.as_pairs();
+        }
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
         for _ in 0..n {
             self.apply_once(&cmd.action);
@@ -273,8 +289,8 @@ impl Editor {
         // Insert and replace are the exceptions: both hold the group open until
         // Esc, so a typing run — or a whole `R` session — comes back in one `u`.
         if !matches!(self.mode, Mode::Insert | Mode::Replace) {
-            let at = self.selections.cursor();
-            self.buffer.commit_undo(at);
+            let after = self.selections.as_pairs();
+            self.buffer.commit_undo(std::mem::take(&mut self.undo_from), after);
         }
     }
 
@@ -313,6 +329,16 @@ impl Editor {
         }
 
         self.selections.set(list);
+    }
+
+    /// The selections to record as a revision's `before` and `after`.
+    ///
+    /// `undo_from` is captured at the start of each command and cleared when a
+    /// group closes, so a group that spans several commands — a typing run —
+    /// still reports where it started.
+    fn undo_bounds(&mut self) -> (Cursors, Cursors) {
+        let after = self.selections.as_pairs();
+        (std::mem::take(&mut self.undo_from), after)
     }
 
     /// The primary cursor — what a single-cursor operation acts on.
@@ -514,14 +540,22 @@ impl Editor {
 
             // Undo and redo are whole-buffer operations, not per-selection: the
             // history restores the position it recorded.
-            Action::Undo => match self.buffer.undo(self.selections.cursor()) {
-                Some(cursor) => self.selections = Selections::single(cursor),
-                None => self.status = "already at oldest change".into(),
-            },
-            Action::Redo => match self.buffer.redo(self.selections.cursor()) {
-                Some(cursor) => self.selections = Selections::single(cursor),
-                None => self.status = "already at newest change".into(),
-            },
+            // Whole-buffer operations, not per-selection: history restores the
+            // selection set it recorded.
+            Action::Undo => {
+                let (before, after) = self.undo_bounds();
+                match self.buffer.undo(before, after) {
+                    Some(pairs) => self.selections = Selections::from_pairs(pairs),
+                    None => self.status = "already at oldest change".into(),
+                }
+            }
+            Action::Redo => {
+                let (before, after) = self.undo_bounds();
+                match self.buffer.redo(before, after) {
+                    Some(pairs) => self.selections = Selections::from_pairs(pairs),
+                    None => self.status = "already at newest change".into(),
+                }
+            }
 
             Action::InsertChar(c) => {
                 let c = *c;
@@ -594,6 +628,60 @@ impl Editor {
                     }
                 });
             }
+
+            Action::AddCursorNextMatch => {
+                let primary = self.selections.primary();
+                // The selection itself when there is one, otherwise the word
+                // under the cursor — so it works in both normal and visual.
+                let (start, end) = if primary.is_collapsed() {
+                    match self.buffer.word_at(primary.head) {
+                        Some(range) => range,
+                        None => {
+                            self.status = "no word under the cursor".into();
+                            return;
+                        }
+                    }
+                } else {
+                    primary.inclusive_range(self.buffer.rope().len_chars())
+                };
+
+                let needle = self.buffer.slice(start, end);
+                let Some(found) = self.buffer.find_next(primary.head.at, &needle) else {
+                    self.status = format!("no more matches for \"{needle}\"");
+                    return;
+                };
+                if found == start {
+                    self.status = "only one match".into();
+                    return;
+                }
+                let width = needle.chars().count();
+                // A selection with room in it is only meaningful in visual
+                // mode. In normal mode the new cursor goes to the *start* of
+                // the match: collapsing the range onto its head would leave it
+                // on the last character, so typing would land inside the word
+                // rather than in front of it.
+                self.selections.push(match self.mode.visual() {
+                    Some(_) => {
+                        Selection { anchor: Cursor::at(found), head: Cursor::at(found + width - 1) }
+                    }
+                    None => Selection::at(found),
+                });
+            }
+            Action::AddCursorLine { below } => {
+                let primary = self.selections.primary();
+                let row = self.buffer.row_at(primary.head);
+                let target = if *below { row + 1 } else { row.wrapping_sub(1) };
+                if *below && target >= self.buffer.line_count() || !*below && row == 0 {
+                    self.status = "no line there".into();
+                    return;
+                }
+                // Keeps the column, which is what makes a column of cursors.
+                let col = self.buffer.col_at(primary.head);
+                let line_start = self.buffer.rope().line_to_char(target);
+                let col = col.min(self.buffer.line_len(target).saturating_sub(1));
+                self.selections.push(Selection::at(line_start + col));
+            }
+            Action::CollapseCursors => self.selections.collapse_to_primary(),
 
             Action::EnterReplace => {
                 self.mode = Mode::Replace;
@@ -754,9 +842,12 @@ impl Editor {
 
     /// Returns whether the write succeeded.
     fn write(&mut self, path: &str) -> bool {
-        let at = self.selections.cursor();
-        let result =
-            if path.is_empty() { self.buffer.save(at) } else { self.buffer.save_as(at, path) };
+        let (before, after) = self.undo_bounds();
+        let result = if path.is_empty() {
+            self.buffer.save(before, after)
+        } else {
+            self.buffer.save_as(before, after, path)
+        };
         match result {
             Ok(()) => {
                 // `:w other.rs` can change the language under us.
@@ -850,7 +941,9 @@ mod tests {
         let mut ed = Editor::empty();
         if !text.is_empty() {
             let at = ed.buffer.insert_str(ed.cursor(), text);
-            ed.buffer.commit_undo(at);
+            ed.set_cursor(at);
+            let pairs = ed.selections.as_pairs();
+            ed.buffer.commit_undo(pairs.clone(), pairs);
         }
         ed.set_cursor(Cursor::at(0));
         ed
@@ -1283,7 +1376,8 @@ mod tests {
         let f = Scratch::new("history.txt", "one\n");
         let mut ed = opened(&f);
         type_str(&mut ed, "typed");
-        ed.buffer.commit_undo(ed.cursor());
+        let pairs = ed.selections.as_pairs();
+        ed.buffer.commit_undo(pairs.clone(), pairs);
 
         f.write("two\n");
         ex(&mut ed, "e!");
@@ -1344,7 +1438,8 @@ mod tests {
     #[test]
     fn e_on_a_buffer_with_no_file_name_reports_rather_than_panicking() {
         let mut ed = editor("scratch");
-        ed.buffer.commit_undo(ed.cursor());
+        let pairs = ed.selections.as_pairs();
+        ed.buffer.commit_undo(pairs.clone(), pairs);
         ex(&mut ed, "e");
         assert!(!ed.status.is_empty(), "should say something");
         assert_eq!(ed.buffer.rope().to_string(), "scratch");
@@ -1438,16 +1533,21 @@ mod tests {
         assert!(ed.cursor_row() <= 2);
     }
 
-    /// Undo restores a single cursor for now. Restoring the whole set is step 3
-    /// of docs/specs/selections.md, where it first becomes observable.
+    /// Undo restores the whole selection set, not just one cursor. Without
+    /// this, undoing a multi-cursor edit strands you with a single cursor and
+    /// redo is unusable.
     #[test]
-    fn undo_collapses_to_one_cursor_for_now() {
+    fn undo_restores_every_cursor() {
         let mut ed = with_cursors("aa bb", &[0, 3]);
         ed.mode = Mode::Insert;
         ed.apply(cmd(Action::InsertChar('X')));
         ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "Xaa Xbb");
+
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.selections.len(), 1);
+        assert_eq!(ed.buffer.rope().to_string(), "aa bb");
+        assert_eq!(ed.selections.len(), 2, "both cursors come back");
+        assert_eq!(heads(&ed), vec![0, 3]);
     }
 
     // ---- visual mode -------------------------------------------------------
@@ -1618,5 +1718,115 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
         ed.apply(cmd(Action::Undo));
         assert_eq!(ed.buffer.rope().to_string(), "abcdef");
+    }
+
+    // ---- multi-cursor ------------------------------------------------------
+
+    #[test]
+    fn ctrl_n_puts_a_cursor_on_the_next_occurrence() {
+        let mut ed = editor("foo bar foo baz foo");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(ed.selections.len(), 2);
+        assert_eq!(heads(&ed), vec![0, 8], "at the start of the match, not its end");
+
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(heads(&ed), vec![0, 8, 16]);
+    }
+
+    /// The cursor must land on the *first* character of the match: collapsing
+    /// the matched range onto its head would leave it on the last one, and
+    /// typing would go inside the word.
+    #[test]
+    fn typing_with_several_cursors_lands_in_front_of_each_match() {
+        let mut ed = editor("foo\nfoo\nfoo");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        ed.mode = Mode::Insert;
+        ed.apply(cmd(Action::InsertChar('X')));
+        assert_eq!(ed.buffer.rope().to_string(), "Xfoo\nXfoo\nXfoo");
+    }
+
+    #[test]
+    fn the_search_wraps_so_a_late_cursor_still_finds_the_first_match() {
+        let mut ed = editor("foo bar foo");
+        ed.set_cursor(Cursor::at(8));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(heads(&ed), vec![0, 8], "wrapped to the one at the start");
+    }
+
+    #[test]
+    fn a_word_with_no_other_occurrence_says_so_rather_than_adding_a_cursor() {
+        let mut ed = editor("unique word");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(ed.selections.len(), 1);
+        assert!(!ed.status.is_empty());
+    }
+
+    #[test]
+    fn ctrl_alt_down_adds_a_cursor_below_keeping_the_column() {
+        let mut ed = editor("hello\nworld\nthere");
+        ed.set_cursor(Cursor::at(3));
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        assert_eq!(ed.selections.len(), 2);
+        assert_eq!(heads(&ed), vec![3, 9], "same column, next row");
+    }
+
+    #[test]
+    fn adding_a_cursor_past_the_last_line_reports_rather_than_wrapping() {
+        let mut ed = editor("only one line");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        assert_eq!(ed.selections.len(), 1);
+        assert!(!ed.status.is_empty());
+    }
+
+    #[test]
+    fn a_cursor_below_clamps_to_a_shorter_line() {
+        let mut ed = editor("longer line\nab");
+        ed.set_cursor(Cursor::at(9));
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        let row1 = ed.buffer.rope().line_to_char(1);
+        assert_eq!(heads(&ed), vec![9, row1 + 1], "clamped onto the short line");
+    }
+
+    #[test]
+    fn esc_collapses_to_the_primary_cursor() {
+        let mut ed = editor("foo foo foo");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(ed.selections.len(), 3);
+
+        ed.apply(cmd(Action::CollapseCursors));
+        assert_eq!(ed.selections.len(), 1);
+    }
+
+    #[test]
+    fn operators_run_at_every_cursor() {
+        let mut ed = editor("foo a\nfoo b\nfoo c");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Object { object: TextObject::Word { big: false }, around: true },
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "a\nb\nc");
+    }
+
+    #[test]
+    fn ctrl_n_in_visual_mode_selects_the_next_occurrence_of_the_selection() {
+        let mut ed = editor("abc abc");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+
+        assert_eq!(ed.selections.len(), 2);
+        assert!(
+            ed.selections.all().iter().all(|s| !s.is_collapsed()),
+            "both are ranges, because visual mode is about ranges",
+        );
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), " ");
     }
 }

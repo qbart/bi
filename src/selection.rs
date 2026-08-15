@@ -123,6 +123,24 @@ impl Selections {
         self.primary
     }
 
+    /// As plain `(anchor, head)` pairs, for the undo tree to store.
+    pub fn as_pairs(&self) -> crate::history::Cursors {
+        self.list.iter().map(|s| (s.anchor.at, s.head.at)).collect()
+    }
+
+    /// Rebuilds from what the undo tree gave back. An empty list means the
+    /// revision predates selection-aware history; a single cursor at 0 is the
+    /// safe answer there.
+    pub fn from_pairs(pairs: crate::history::Cursors) -> Self {
+        let list: Vec<Selection> = pairs
+            .into_iter()
+            .map(|(anchor, head)| Selection { anchor: Cursor::at(anchor), head: Cursor::at(head) })
+            .collect();
+        let mut selections = Self::default();
+        selections.set(list);
+        selections
+    }
+
     /// Replaces the set, restoring the invariants.
     ///
     /// An empty `list` keeps what was there: there is always a cursor, and
