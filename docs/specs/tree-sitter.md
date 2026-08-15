@@ -89,7 +89,7 @@ pub struct Span {
 }
 ```
 
-`ui.rs` maps names to `ratatui::Style`. This is the boundary that keeps the
+`tui/render.rs` maps names to `ratatui::Style`. This is the boundary that keeps the
 core frontend-agnostic: a terminal maps `keyword` to an ANSI colour, a GUI maps
 it to a font weight and an RGB value it picks itself. Producing `Style` here
 would weld the core to ratatui in the one place it is hardest to unpick, and a
@@ -174,6 +174,6 @@ motion.
 
 **Background parsing** for large files.
 
-**Theme configuration** — the capture-name table lives in `ui.rs` until the
+**Theme configuration** — the capture-name table lives in `tui/render.rs` until the
 config language decision (RECOMMENDATION.md, "what actually bites you" #1) is
 made.

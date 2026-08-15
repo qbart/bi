@@ -9,9 +9,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::editor::{Editor, Mode};
-use crate::picker::Picker;
-use crate::syntax::{Span as HlSpan, Syntax};
+use bee::editor::{Editor, Mode};
+use bee::picker::Picker;
+use bee::syntax::{Span as HlSpan, Syntax};
 
 const TAB_WIDTH: usize = 4;
 

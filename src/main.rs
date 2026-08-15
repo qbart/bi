@@ -1,19 +1,10 @@
-//! bee — a batteries-included modal editor.
+//! bee's terminal frontend.
 //!
-//! Step 1: the core loop. Open a file, move, edit, save, quit.
-//! Tree-sitter, git, and LSP come after this foundation is proven, and the
-//! seams they need ([`buffer::Edit`], the [`editor::Action`] table, viewport-
-//! bounded rendering) exist already.
+//! Terminal setup, the event loop, and nothing else. The editor itself is the
+//! `bee` library — see `src/lib.rs`. A second frontend would replace this file
+//! and `src/tui/`, and touch nothing below them.
 
-mod buffer;
-mod editor;
-mod history;
-mod input;
-mod motion;
-mod picker;
-mod registers;
-mod syntax;
-mod ui;
+mod tui;
 
 use std::io::{self, Stdout};
 use std::panic;
@@ -27,8 +18,8 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, terminal};
 
-use editor::Editor;
-use input::Input;
+use bee::editor::Editor;
+use bee::input::Input;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -72,13 +63,15 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
     let mut input = Input::default();
 
     loop {
-        term.draw(|frame| ui::render(frame, ed, &input.pending_display()))?;
+        term.draw(|frame| tui::render::render(frame, ed, &input.pending_display()))?;
 
         match event::read()? {
             // Windows terminals emit Release too; without this filter every key
             // fires twice.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if let Some(cmd) = input.on_key(key, &ed.mode) {
+                if let Some(key) = tui::keys::translate(key)
+                    && let Some(cmd) = input.on_key(key, &ed.mode)
+                {
                     ed.status.clear();
                     ed.apply(cmd);
                 }

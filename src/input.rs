@@ -9,9 +9,8 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
 use crate::editor::{Action, Command, Mode};
+use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator};
 use crate::picker::PickerKind;
 use crate::registers::Sink;
@@ -46,7 +45,7 @@ fn motion_key(c: char) -> Option<Motion> {
 }
 
 impl Input {
-    pub fn on_key(&mut self, key: KeyEvent, mode: &Mode) -> Option<Command> {
+    pub fn on_key(&mut self, key: Key, mode: &Mode) -> Option<Command> {
         match mode {
             Mode::Normal => self.normal(key),
             Mode::Insert => Self::insert(key),
@@ -127,8 +126,8 @@ impl Input {
         Some(Command { count, action })
     }
 
-    fn normal(&mut self, key: KeyEvent) -> Option<Command> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn normal(&mut self, key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
 
         match key.code {
             KeyCode::Esc => {
@@ -305,8 +304,8 @@ impl Input {
         self.plain(action)
     }
 
-    fn insert(key: KeyEvent) -> Option<Command> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn insert(key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
 
         let action = match key.code {
             KeyCode::Esc => Action::EnterNormal,
@@ -321,13 +320,12 @@ impl Input {
             KeyCode::Up => Action::Move(Motion::Up),
             KeyCode::Home => Action::Move(Motion::LineStart),
             KeyCode::End => Action::Move(Motion::LineEnd),
-            _ => return None,
         };
         Some(Command { count: 1, action })
     }
 
-    fn pick(key: KeyEvent) -> Option<Command> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn pick(key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
 
         let action = match key.code {
             KeyCode::Esc => Action::PickCancel,
@@ -345,8 +343,8 @@ impl Input {
         Some(Command { count: 1, action })
     }
 
-    fn command_line(key: KeyEvent) -> Option<Command> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn command_line(key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
 
         let action = match key.code {
             KeyCode::Esc => Action::CommandCancel,
@@ -366,12 +364,12 @@ mod tests {
     use crate::registers::Sink;
     use crate::picker::PickerKind;
 
-    fn key(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    fn key(c: char) -> Key {
+        Key::char(c)
     }
 
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    fn ctrl(c: char) -> Key {
+        Key::ctrl(c)
     }
 
     /// Feeds `keys` and returns the one command they produce, asserting that
@@ -620,20 +618,20 @@ mod tests {
     #[test]
     fn picker_keys_map_to_pick_actions() {
         let mut input = Input::default();
-        let mut act = |k: KeyEvent| input.on_key(k, &Mode::Pick).unwrap().action;
+        let mut act = |k: Key| input.on_key(k, &Mode::Pick).unwrap().action;
 
         assert_eq!(act(key('a')), Action::PickChar('a'));
         assert_eq!(act(ctrl('n')), Action::PickNext);
         assert_eq!(act(ctrl('p')), Action::PickPrev);
         assert_eq!(act(ctrl('a')), Action::PickToggleShort);
-        assert_eq!(act(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::PickAccept);
-        assert_eq!(act(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::PickCancel);
+        assert_eq!(act(Key::code(KeyCode::Enter)), Action::PickAccept);
+        assert_eq!(act(Key::code(KeyCode::Esc)), Action::PickCancel);
         assert_eq!(
-            act(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            act(Key::code(KeyCode::Backspace)),
             Action::PickBackspace
         );
-        assert_eq!(act(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), Action::PickNext);
-        assert_eq!(act(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)), Action::PickPrev);
+        assert_eq!(act(Key::code(KeyCode::Down)), Action::PickNext);
+        assert_eq!(act(Key::code(KeyCode::Up)), Action::PickPrev);
     }
 
     /// `p` is a literal in the picker's query, not the paste key.
@@ -673,7 +671,7 @@ mod tests {
         input.on_key(key('d'), &Mode::Normal);
         assert_eq!(input.pending_display(), "2d");
 
-        input.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &Mode::Normal);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
         assert_eq!(input.pending_display(), "");
     }
 

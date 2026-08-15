@@ -12,7 +12,7 @@ crate is already `pub` — there is not one `pub(crate)` to widen.
 
 ## Status
 
-**Specified**, not yet built.
+**Built.**
 
 Scope is the boundary and nothing else. Behaviour is preserved exactly,
 including the quirks noted below. The other architectural items in the README —
@@ -48,12 +48,14 @@ and the paths say where the code lives.
 and `syntax`, and nothing imports it.
 
 `ratatui` stays a plain dependency — Cargo has no per-target dependencies for a
-lib and bin in the same package. The boundary is therefore a convention, not a
-compiler rule: **no module reachable from `lib.rs` may name `ratatui` or
-`crossterm`.** Only splitting into a workspace would let the compiler enforce
-that, and a workspace is not worth its churn for one frontend. The guard is a
-grep, and the README should say so rather than imply a stronger boundary than
-exists.
+lib and bin in the same package. The boundary is therefore not a compiler rule:
+**no module reachable from `lib.rs` may name `ratatui` or `crossterm`.** Only
+splitting into a workspace would let the compiler enforce that, and a workspace
+is not worth its churn for one frontend.
+
+It is enforced by a test instead — see *Tests* below. A grep in the README would
+have been the cheaper option and the wrong one: nobody runs it, and it cannot
+tell a doc comment that *names* the boundary from code that *breaks* it.
 
 ## Keys
 
@@ -174,25 +176,43 @@ KeyModifiers::NONE)`. They become `Key::char('d')`, `Key::ctrl('r')` and
 `src/tui/keys.rs` gets its own tests: that `CONTROL` maps to `mods.ctrl`, and
 that an unmapped code yields `None`.
 
-`tests/lib_boundary.rs` is new and is the point of the exercise. It drives
-`Input` and `Editor` through `bee`'s public API only — open a buffer, feed keys,
-assert contents — and it can only compile if the core is genuinely
-frontend-free. The split proves itself.
+`tests/lib_boundary.rs` is new and is the point of the exercise. It plays the
+part of an embedder: it links `bee`, never names a terminal, and drives a
+headless session through the public API — type, move, delete, undo, redo, yank,
+paste, switch modes. It can only compile if the core is genuinely frontend-free,
+so the split proves itself on every `cargo test`.
+
+Two guards in the same file cover what compiling cannot:
+
+`no_library_module_names_a_terminal_crate` reads each module `lib.rs` declares
+and fails on any non-comment line naming `ratatui` or `crossterm`. Comment lines
+are skipped deliberately — the doc comments explaining the boundary name the
+crates they forbid, and a check that fails on its own documentation gets deleted
+rather than fixed.
+
+`the_module_list_matches_what_lib_rs_declares` keeps that check honest. The
+module list is a literal, not a directory walk, so that adding a module is a
+deliberate decision about which side of the boundary it lands on — and this test
+fails if `lib.rs` gains a `pub mod` the list does not cover, which is otherwise a
+silent hole.
+
+Both were verified by injecting a violation and watching them fail, not by
+watching them pass.
 
 ## Verification
 
-- `cargo build` and `cargo test` both clean.
-- `grep -rn 'ratatui\|crossterm' src/*.rs` returns nothing. Only `src/tui/` and
-  `src/main.rs` may match.
+- `cargo build` clean; `cargo test` green at 148.
+- `cargo clippy --all-targets` surfaces one pre-existing `collapsible_if` in
+  `editor.rs:312`, untouched by this change and left alone.
 
 ## Docs
 
 The README's "No `[lib]` target, and `input.rs` speaks crossterm's key types"
 bullet leaves *Architectural, and cheaper to fix now than later*. It is replaced
-by a note that the boundary exists and is grep-enforced rather than
+by a note that the boundary exists and is test-enforced rather than
 compiler-enforced — the honest version, since a reader who assumes the compiler
-is guarding it will eventually add a `ratatui` import to `editor.rs` and be
-surprised it builds.
+is guarding it will eventually be surprised by what a workspace would have
+caught and this does not.
 
 `main.rs`'s module doc currently describes the whole editor. It becomes a
 description of the terminal frontend, and the architectural note moves to

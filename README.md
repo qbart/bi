@@ -122,6 +122,12 @@ afterwards repeats it.
 
 ## Layout
 
+bee is a library plus a frontend. The library is the editor and knows nothing
+about terminals; `src/tui/` is the terminal frontend, and a GUI would be its
+sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-split.md).
+
+**The library** — `src/lib.rs`:
+
 | File | Holds |
 |---|---|
 | `buffer.rs` | rope, cursor, motions, the single mutation primitive |
@@ -132,8 +138,15 @@ afterwards repeats it.
 | `picker.rs` | the overlay's state: query, matches, selection |
 | `syntax.rs` | tree-sitter: incremental reparse, highlight spans |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
-| `ui.rs` | viewport-bounded render pass |
+| `key.rs` | `Key` / `KeyCode` / `Mods` — bee's own key vocabulary |
+
+**The terminal frontend** — `src/main.rs`:
+
+| File | Holds |
+|---|---|
 | `main.rs` | terminal lifecycle, event loop |
+| `tui/render.rs` | viewport-bounded render pass |
+| `tui/keys.rs` | crossterm key events → `bee::key::Key` |
 
 ## The seven decisions this step locks in
 
@@ -142,8 +155,9 @@ afterwards repeats it.
    tree-sitter wants byte columns; neither leaks inward.
 2. **One mutation primitive.** Every edit goes through `Buffer::apply_edit`,
    which records an `Edit` carrying old/new byte ranges and points — exactly
-   `tree_sitter::InputEdit`. The rope field is private to enforce this. Nothing
-   consumes `pending_edits` yet; `main.rs` drains it each frame.
+   `tree_sitter::InputEdit`. The rope field is private to enforce this.
+   `Editor::sync_syntax` drains `pending_edits` each frame — tree-sitter reads
+   it today, and LSP `didChange` will read the same drain.
 
    `apply_edit` is a thin wrapper over `edit_raw`: the raw form mutates the rope
    and logs the `Edit`, the wrapper additionally records undo history. Undo and
@@ -174,7 +188,7 @@ afterwards repeats it.
    `Esc`, so a typing run undoes in one go, along with the `\n` that `o`
    inserted before it.
 6. **Highlighting emits capture names, not styles.** `syntax.rs` produces
-   `keyword` / `string` / `comment`; `ui.rs` maps those to colours. A GUI
+   `keyword` / `string` / `comment`; `tui/render.rs` maps those to colours. A GUI
    frontend writes its own table, and a theme file eventually replaces both.
    Producing `ratatui::Style` in the core would weld it to the terminal in the
    one place that is hardest to unpick.
@@ -214,15 +228,17 @@ afterwards repeats it.
   already `Option<Syntax>` and an unknown extension already renders as plain
   text, so the no-syntax path exists and works.
 - **The config language is undecided**, and two tables are now waiting on it —
-  the keymap in `input.rs` and the highlight colours in `ui.rs`. Both are
+  the keymap in `input.rs` and the highlight colours in `tui/render.rs`. Both are
   hardcoded. RECOMMENDATION.md names this as the painful retrofit, and every
   feature added before deciding makes it slightly worse.
-- **No `[lib]` target, and `input.rs` speaks crossterm's key types.** Nothing
-  else can link the core, so a second frontend (a GUI, a test harness, an
-  embedding) has no way in. The fix is small — a `lib.rs`, bee's own `Key`
-  type, and `main.rs` reduced to a thin terminal frontend — and the rest of the
-  core is already clean: `buffer`, `editor`, `history`, `motion`, `registers`
-  and `picker` contain zero terminal references.
+- **The core/frontend boundary is enforced by a test, not the compiler.** Fixed
+  as far as it goes: there is a `lib.rs`, `input.rs` speaks `bee::key::Key`
+  rather than crossterm's types, and rendering and event translation live in
+  `src/tui/`. But a lib and a bin in one package share one dependency list, so
+  nothing stops `editor.rs` from importing ratatui — except
+  `tests/lib_boundary.rs`, which reads the library's modules and fails on any
+  that name a terminal crate. Only a Cargo workspace would make that a compiler
+  rule, and that is not worth its churn while there is one frontend.
 - **The cursor lives on `Buffer`.** Two views of one file need two cursors, so
   window splits and visual mode's anchor both want it to move onto a view.
   `Cursor` is already a value type, which is the half of that work that was
@@ -237,9 +253,9 @@ LSP, which hangs off the same `pending_edits` drain that tree-sitter now uses �
 `Editor::sync_syntax` is where `textDocument/didChange` goes. Before that, the
 config-language decision (RECOMMENDATION.md, "what actually bites you" #1) is
 still unmade and still cheap: the keymap in `input.rs` and the highlight table
-in `ui.rs` are both waiting for it.
+in `tui/render.rs` are both waiting for it.
 
 Previously, on tree-sitter: `pending_edits`
 feeds `Tree::edit` + `Parser::parse` with the old tree; highlight queries then
-map to styles in `ui.rs`. Deliberately *not* yet: a config language or a plugin
+map to styles in `tui/render.rs`. Deliberately *not* yet: a config language or a plugin
 system.
