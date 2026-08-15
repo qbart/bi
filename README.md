@@ -202,6 +202,34 @@ afterwards repeats it.
 - No text objects (`diw`, `ci"`, `da(`).
 - `dw` uses a simplified form of vim's exclusive-motion rule: it stops at the
   end of the line rather than implementing the full "end in column 1" case.
+- No git and no LSP, though both are the point — see
+  [RECOMMENDATION.md](RECOMMENDATION.md). LSP hangs off `Editor::sync_syntax`,
+  the same edit drain tree-sitter uses.
+
+### Architectural, and cheaper to fix now than later
+
+- **Tree-sitter is not optional, so building needs a C toolchain.** Grammars
+  are C compiled by `cc`, which breaks minimal containers and makes
+  cross-compilation harder. A Cargo feature would fix it: `Editor::syntax` is
+  already `Option<Syntax>` and an unknown extension already renders as plain
+  text, so the no-syntax path exists and works.
+- **The config language is undecided**, and two tables are now waiting on it —
+  the keymap in `input.rs` and the highlight colours in `ui.rs`. Both are
+  hardcoded. RECOMMENDATION.md names this as the painful retrofit, and every
+  feature added before deciding makes it slightly worse.
+- **No `[lib]` target, and `input.rs` speaks crossterm's key types.** Nothing
+  else can link the core, so a second frontend (a GUI, a test harness, an
+  embedding) has no way in. The fix is small — a `lib.rs`, bee's own `Key`
+  type, and `main.rs` reduced to a thin terminal frontend — and the rest of the
+  core is already clean: `buffer`, `editor`, `history`, `motion`, `registers`
+  and `picker` contain zero terminal references.
+- **The cursor lives on `Buffer`.** Two views of one file need two cursors, so
+  window splits and visual mode's anchor both want it to move onto a view.
+  `Cursor` is already a value type, which is the half of that work that was
+  expensive.
+- **`Editor::scroll` is a row index** and `scroll_to_cursor` takes a height in
+  rows, which bakes in "the viewport is N whole lines". Soft wrap breaks that
+  assumption, and so does any pixel-scrolling frontend.
 
 ## Next
 
