@@ -24,4 +24,5 @@ pub mod key;
 pub mod motion;
 pub mod picker;
 pub mod registers;
+pub mod selection;
 pub mod syntax;

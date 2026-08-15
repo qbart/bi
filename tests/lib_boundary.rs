@@ -120,6 +120,7 @@ const LIB_MODULES: &[&str] = &[
     "motion.rs",
     "picker.rs",
     "registers.rs",
+    "selection.rs",
     "syntax.rs",
 ];
 

@@ -157,8 +157,19 @@ one real cursor. The primary selection gets it; every other head is drawn as a
 styled cell — reversed video — by the same span-patching path
 `fill_line` already uses for the cursor line.
 
-Bindings are an open question, recorded in the *Decisions* section below,
-because vim has no multi-cursor and so offers no answer to copy.
+Vim has no multi-cursor and so offers no bindings to copy. bee's:
+
+| Key | Does |
+|---|---|
+| `Ctrl-N` | add a cursor at the next occurrence of the word under the cursor |
+| `Ctrl-Alt-Down` / `Ctrl-Alt-Up` | add a cursor on the line below / above |
+| `Esc` | collapse to the primary cursor |
+
+Chosen over VSCode's `Ctrl-D` because that is vim's half-page scroll, which
+`motions.md` step 6 still wants, and over a `g` prefix because `gj`/`gk` are
+vim's display-line motions and soft wrap will want them. `Ctrl-N`/`Ctrl-P` are
+picker-only today, so normal mode has them free. This is also the first use of
+the `alt` modifier `Key` has been carrying since the library split.
 
 ## Deferred
 
