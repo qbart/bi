@@ -10,7 +10,12 @@ See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 ```sh
 cargo run -- <file>
 cargo test
+cargo fmt --check
 ```
+
+`rustfmt.toml` sets `use_small_heuristics = "Max"`, which keeps short struct
+literals, match arms and `if`/`else` on one line. That is the style the code was
+already written in; the default heuristics would expand a large part of it.
 
 ## Key bindings
 

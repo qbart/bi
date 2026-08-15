@@ -1,0 +1,12 @@
+# bee is hand-formatted in a compact style: struct literals, match arms and
+# short if/else stay on one line where they fit. rustfmt's default heuristics
+# expand those at roughly 60% of max_width, which would rewrite a large part of
+# the codebase. "Max" lets anything fitting inside max_width stay as written,
+# so this config ratifies the existing style rather than replacing it.
+use_small_heuristics = "Max"
+
+# The default, stated so a change to rustfmt's default cannot silently reflow
+# the whole tree. Comments and doc comments are wrapped by hand nearer 80.
+max_width = 100
+
+edition = "2024"
