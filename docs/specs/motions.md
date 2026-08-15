@@ -11,8 +11,8 @@ and twelve. This file records the gap, what closes it, and in what order.
 | **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
 | 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
 | **4** ✅ | `.` — repeat last change | a record of the last change |
-| 5 | `/ ? n N * #` search, then `:s` | a search primitive |
-| 6 | `H M L`, `Ctrl-D/U/F/B`, `zz zt zb` | the viewport as a real concept |
+| **5** | `/ ? n N * #` search | see `search.md` |
+| **6** | `Ctrl-E/Y`, `Ctrl-D/U` — scrolling only | the window height |
 
 Steps 1–4 are built. Steps
 4–6 are recorded so their shape is known, not because they are being built yet
@@ -224,10 +224,16 @@ of my own wrong assumptions, where bee was right and the expectation was not.
 **Search** (`/ ? n N * #`) and `:s` — needs a search primitive over the rope
 and a `Mode::Search` that behaves like `Mode::Command`.
 
-**Viewport motions** (`H M L`, `Ctrl-D/U/F/B`, `Ctrl-E/Y`, `zz zt zb`) — all
-blocked on the same thing. `Editor::scroll` is a bare row index and
-`scroll_to_cursor` takes a height in rows, which bakes in "the viewport is N
-whole lines". These want a viewport type. They come as a set or not at all.
+**Scrolling** — `Ctrl-E`/`Ctrl-Y` (one line) and `Ctrl-D`/`Ctrl-U` (half a
+window). Step 6, and specified below.
+
+**Cursor-positioning within the window** — `H`, `M`, `L`, and the
+window-repositioning `zz`/`zt`/`zb`, plus `Ctrl-F`/`Ctrl-B`. Deliberately **not**
+planned. `H`/`M`/`L` are motions that need to know where the window starts and
+how tall it is, and `zz`/`zt`/`zb` need to set that independently of the cursor
+— which is the viewport type `Editor::scroll` currently is not. Scrolling
+alone needs only the *height*, which the renderer already passes to
+`scroll_to_cursor` every frame, so it is affordable in a way the rest is not.
 
 **Case operators** (`gu gU g~`) and **indent** (`> <`) — ordinary operators;
 they need `Operator` to grow, and `>` needs an indent width, which is a config
@@ -330,3 +336,39 @@ because a repeat starts from wherever the last one left the cursor:
   word take the rest of the line. Only in normal mode: an operator resolves
   with `allow_eol` and needs to reach one past the end, and fixing it
   unconditionally broke `dw` on a one-word buffer.
+
+## Step 6 — scrolling
+
+Only the four that move the window. `H`/`M`/`L`, `zz`/`zt`/`zb` and
+`Ctrl-F`/`Ctrl-B` are out of scope; see *Deferred*.
+
+| Key | Does |
+|---|---|
+| `Ctrl-E` / `Ctrl-Y` | scroll the window one line down / up |
+| `Ctrl-D` / `Ctrl-U` | scroll half a window down / up |
+
+**These are not motions.** `dCtrl-D` is not a thing in vim and is not one here:
+they take no operator and produce no range.
+
+The two pairs differ in what happens to the cursor, and it is worth being
+precise because it is the only interesting part:
+
+- `Ctrl-E`/`Ctrl-Y` move the **window only**. The cursor stays on its buffer
+  line, and moves solely when the window would otherwise leave it behind —
+  verified in vim: with the cursor on the top visible line, `Ctrl-E` leaves it
+  on the *new* top line, one further down. Scrolloff counts as "behind".
+- `Ctrl-D`/`Ctrl-U` move **both**, keeping the cursor's position within the
+  window. From the top line of a nine-line window, `Ctrl-D` lands four lines
+  further down and the window follows.
+
+### What it needs
+
+The window height, and nothing else. `Editor::scroll_to_cursor(height)` is
+already called by the renderer once per frame, so the editor can remember the
+height it was last given rather than inventing a viewport type.
+
+That is the whole reason this subset is cheap and the rest is not: `H` needs to
+know where the window *starts* as an authority rather than a cache, and
+`zz` needs to *set* it without the cursor moving. Both want the viewport to
+be a real thing that the editor owns. Scrolling only needs a number the
+renderer already hands over.
