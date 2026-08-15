@@ -300,6 +300,103 @@ impl Buffer {
         self.cursor = Cursor::at(self.cursor.at - 1);
     }
 
+    /// `r{char}` — overwrites `count` chars in place.
+    ///
+    /// Returns false and changes nothing when the line has fewer than `count`
+    /// characters left, which is vim's behaviour: `3rx` on a two-character tail
+    /// is a no-op, not a partial replace.
+    pub fn replace_chars(&mut self, ch: char, count: usize) -> bool {
+        let row = self.cursor_row();
+        if self.line_len(row) < self.cursor_col() + count {
+            return false;
+        }
+        let at = self.cursor.at;
+        let text: String = std::iter::repeat_n(ch, count).collect();
+        self.apply_edit(at, at + count, &text);
+        // Vim leaves the cursor on the last character it replaced.
+        self.cursor = Cursor::at(at + text.chars().count().saturating_sub(1));
+        true
+    }
+
+    /// `~` — flips the case under the cursor and steps right, `count` times.
+    ///
+    /// Stops at the end of the line rather than wrapping onto the next.
+    /// Characters with no case are stepped over, not skipped: `~` on a digit
+    /// still advances, as vim does.
+    pub fn toggle_case(&mut self, count: usize) {
+        for _ in 0..count {
+            let row = self.cursor_row();
+            if self.cursor_col() >= self.line_len(row) {
+                break;
+            }
+            let at = self.cursor.at;
+            let ch = self.rope.char(at);
+            // `ß` uppercases to `SS`, so the replacement is not always one char.
+            let flipped: String = if ch.is_lowercase() {
+                ch.to_uppercase().collect()
+            } else if ch.is_uppercase() {
+                ch.to_lowercase().collect()
+            } else {
+                self.cursor = Cursor::at(at + 1);
+                continue;
+            };
+            let width = flipped.chars().count();
+            self.apply_edit(at, at + 1, &flipped);
+            self.cursor = Cursor::at(at + width);
+        }
+        self.clamp(false);
+    }
+
+    /// `J` — joins the line below onto this one, `count` lines' worth.
+    ///
+    /// The newline and the next line's indent become a single space. No space
+    /// is added when this line already ends in whitespace or the next line is
+    /// blank. `1J` and `2J` both join one line, as in vim.
+    pub fn join_lines(&mut self, count: usize) {
+        for _ in 0..count.max(2) - 1 {
+            let row = self.cursor_row();
+            if row + 1 >= self.line_count() {
+                break;
+            }
+            let line_start = self.rope.line_to_char(row);
+            let end = line_start + self.line_len(row);
+            let next_start = self.rope.line_to_char(row + 1);
+            let next_len = self.line_len(row + 1);
+
+            let mut indent = 0;
+            while indent < next_len && matches!(self.rope.char(next_start + indent), ' ' | '\t') {
+                indent += 1;
+            }
+
+            let ends_blank = end == line_start || matches!(self.rope.char(end - 1), ' ' | '\t');
+            let sep = if ends_blank || next_len == indent { "" } else { " " };
+
+            self.apply_edit(end, next_start + indent, sep);
+            // Vim leaves the cursor on the join.
+            self.cursor = Cursor::at(end);
+        }
+        self.clamp(false);
+    }
+
+    /// `:e` — re-reads the file from disk, discarding everything local.
+    ///
+    /// Undo history goes with it: the old revisions describe text that no
+    /// longer exists, and replaying them through `edit_raw` would desynchronise
+    /// the parse tree. Vim keeps history here behind `'undoreload'`; bee does
+    /// not. The caller must rebuild syntax — the tree belongs to the old text.
+    pub fn reload(&mut self) -> Result<()> {
+        let path = self.path.clone().context("no file name")?;
+        // Keep the cursor where the new text still has room for it. Clamping
+        // the raw char index is not enough: it can land on the phantom row
+        // after a trailing newline, which `line_count` does not count.
+        let (row, col) = (self.cursor_row(), self.cursor_col());
+        *self = Self::open(&path)?;
+        let row = row.min(self.line_count().saturating_sub(1));
+        let col = col.min(self.max_col(row, false));
+        self.cursor = Cursor::at(self.rope.line_to_char(row) + col);
+        Ok(())
+    }
+
     /// `o` / `O`.
     pub fn open_line(&mut self, below: bool) {
         let row = self.cursor_row();
@@ -1175,5 +1272,96 @@ mod tests {
         assert_eq!(e.old_end_point, Point { row: 1, col: 0 });
         assert_eq!(e.new_end_point, Point { row: 0, col: 2 });
         assert_eq!(b.rope().to_string(), "abcd");
+    }
+
+    // ---- r / ~ / J ---------------------------------------------------------
+
+    #[test]
+    fn r_overwrites_in_place_and_rests_on_the_last_char() {
+        let mut b = buf("abcdef");
+        b.cursor = Cursor::at(1);
+        assert!(b.replace_chars('x', 3));
+        assert_eq!(b.rope.to_string(), "axxxef");
+        assert_eq!(b.cursor_col(), 3, "vim leaves the cursor on the last replaced char");
+    }
+
+    #[test]
+    fn r_refuses_rather_than_partially_replacing_a_short_tail() {
+        let mut b = buf("abc\ndef");
+        b.cursor = Cursor::at(1);
+        assert!(!b.replace_chars('x', 5));
+        assert_eq!(b.rope.to_string(), "abc\ndef", "nothing changed");
+    }
+
+    #[test]
+    fn r_never_reaches_across_a_newline() {
+        let mut b = buf("ab\ncd");
+        b.cursor = Cursor::at(0);
+        assert!(!b.replace_chars('x', 3));
+        assert_eq!(b.rope.to_string(), "ab\ncd");
+    }
+
+    #[test]
+    fn tilde_flips_case_and_walks_right() {
+        let mut b = buf("hello world");
+        b.toggle_case(5);
+        assert_eq!(b.rope.to_string(), "HELLO world");
+        assert_eq!(b.cursor_col(), 5);
+    }
+
+    #[test]
+    fn tilde_steps_over_caseless_chars_and_stops_at_the_line_end() {
+        let mut b = buf("a1b\nxy");
+        b.toggle_case(99);
+        assert_eq!(b.rope.to_string(), "A1B\nxy", "did not wrap onto the next line");
+    }
+
+    #[test]
+    fn j_joins_with_one_space_and_eats_the_indent() {
+        let mut b = buf("foo\n    bar\nbaz");
+        b.join_lines(1);
+        assert_eq!(b.rope.to_string(), "foo bar\nbaz");
+        assert_eq!(b.cursor_col(), 3, "cursor lands on the join");
+    }
+
+    #[test]
+    fn j_adds_no_space_after_trailing_whitespace_or_before_a_blank_line() {
+        let mut b = buf("foo \nbar");
+        b.join_lines(1);
+        assert_eq!(b.rope.to_string(), "foo bar", "no double space");
+
+        let mut b = buf("foo\n\nbar");
+        b.join_lines(1);
+        assert_eq!(b.rope.to_string(), "foo\nbar", "nothing to separate");
+    }
+
+    #[test]
+    fn a_count_joins_that_many_lines_and_1j_means_the_same_as_2j() {
+        let mut b = buf("a\nb\nc\nd");
+        b.join_lines(3);
+        assert_eq!(b.rope.to_string(), "a b c\nd");
+
+        let mut b = buf("a\nb\nc");
+        b.join_lines(1);
+        let mut c = buf("a\nb\nc");
+        c.join_lines(2);
+        assert_eq!(b.rope.to_string(), c.rope.to_string());
+    }
+
+    #[test]
+    fn j_on_the_last_line_does_nothing() {
+        let mut b = buf("only");
+        b.join_lines(9);
+        assert_eq!(b.rope.to_string(), "only");
+    }
+
+    #[test]
+    fn the_new_commands_are_each_one_undo_step() {
+        let mut b = buf("foo\nbar");
+        b.join_lines(1);
+        b.commit_undo();
+        assert_eq!(b.rope.to_string(), "foo bar");
+        assert!(b.undo());
+        assert_eq!(b.rope.to_string(), "foo\nbar");
     }
 }

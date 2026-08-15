@@ -78,6 +78,23 @@ pub enum Action {
     Undo,
     Redo,
 
+    // These three fold their count in, like `Operate` and for the same reason:
+    // the count is part of what the command means, not how many times to run
+    // it. `3rx` replaces three characters once.
+    /// `r{char}` — overwrite in place, without entering insert mode.
+    ReplaceChar {
+        ch: char,
+        count: usize,
+    },
+    /// `~`
+    ToggleCase {
+        count: usize,
+    },
+    /// `J`
+    JoinLines {
+        count: usize,
+    },
+
     InsertChar(char),
     InsertNewline,
     Backspace,
@@ -277,6 +294,14 @@ impl Editor {
                 self.buffer.open_line(false);
             }
 
+            Action::ReplaceChar { ch, count } => {
+                if !self.buffer.replace_chars(*ch, *count) {
+                    self.status = "not enough characters on the line".into();
+                }
+            }
+            Action::ToggleCase { count } => self.buffer.toggle_case(*count),
+            Action::JoinLines { count } => self.buffer.join_lines(*count),
+
             Action::Undo => {
                 if !self.buffer.undo() {
                     self.status = "already at oldest change".into();
@@ -381,6 +406,7 @@ impl Editor {
                 self.write(arg);
             }
             "q" | "quit" => self.quit(force),
+            "e" | "edit" => self.edit(arg, force),
             "wq" | "x" => {
                 if self.write(arg) {
                     self.quit(true);
@@ -414,6 +440,34 @@ impl Editor {
                 self.status = format!("error: {e:#}");
                 false
             }
+        }
+    }
+
+    /// `:e` reloads, `:e!` reloads discarding changes, `:e <path>` edits
+    /// another file.
+    ///
+    /// The parse tree has to be rebuilt rather than patched: it belongs to text
+    /// that no longer exists, and `<path>` can change the language outright.
+    fn edit(&mut self, path: &str, force: bool) {
+        if self.buffer.is_modified() && !force {
+            self.status = "unsaved changes (use `:e!` to discard)".into();
+            return;
+        }
+
+        let result = if path.is_empty() {
+            self.buffer.reload()
+        } else {
+            Buffer::open(path).map(|buf| self.buffer = buf)
+        };
+
+        match result {
+            Ok(()) => {
+                self.reload_syntax();
+                let name =
+                    self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                self.status = format!("\"{name}\" loaded");
+            }
+            Err(e) => self.status = format!("{e:#}"),
         }
     }
 
@@ -808,5 +862,146 @@ mod tests {
         ed.apply(cmd(Action::Redo));
         ed.apply(cmd(Action::Redo));
         assert_eq!(ed.status, "already at newest change");
+    }
+
+    // ---- :e ----------------------------------------------------------------
+
+    /// A scratch file that cleans itself up.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str, text: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("bee-test-{}-{name}", std::process::id()));
+            std::fs::write(&path, text).unwrap();
+            Self(path)
+        }
+        fn write(&self, text: &str) {
+            std::fs::write(&self.0, text).unwrap();
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn opened(f: &Scratch) -> Editor {
+        Editor::open(f.path()).unwrap()
+    }
+
+    fn ex(ed: &mut Editor, line: &str) {
+        ed.run_ex(line);
+    }
+
+    #[test]
+    fn e_rereads_the_file_from_disk() {
+        let f = Scratch::new("reload.txt", "before\n");
+        let mut ed = opened(&f);
+        assert_eq!(ed.buffer.rope().to_string(), "before\n");
+
+        f.write("after\n");
+        ex(&mut ed, "e");
+        assert_eq!(ed.buffer.rope().to_string(), "after\n");
+    }
+
+    #[test]
+    fn e_refuses_to_discard_unsaved_changes() {
+        let f = Scratch::new("guard.txt", "on disk\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "local edit");
+        f.write("changed underneath\n");
+
+        ex(&mut ed, "e");
+        assert!(ed.status.contains("unsaved changes"), "got: {}", ed.status);
+        assert!(
+            ed.buffer.rope().to_string().contains("local edit"),
+            "the buffer must be left alone when the reload is refused",
+        );
+    }
+
+    #[test]
+    fn e_bang_discards_them() {
+        let f = Scratch::new("force.txt", "on disk\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "local edit");
+
+        ex(&mut ed, "e!");
+        assert_eq!(ed.buffer.rope().to_string(), "on disk\n");
+        assert!(!ed.buffer.is_modified(), "a fresh read is not a modified buffer");
+    }
+
+    #[test]
+    fn a_reload_drops_undo_history_rather_than_replaying_gone_text() {
+        let f = Scratch::new("history.txt", "one\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "typed");
+        ed.buffer.commit_undo();
+
+        f.write("two\n");
+        ex(&mut ed, "e!");
+        assert_eq!(ed.buffer.rope().to_string(), "two\n");
+
+        // Undoing here must not resurrect text from the previous file.
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "two\n");
+    }
+
+    #[test]
+    fn e_with_a_path_edits_that_file_instead() {
+        let a = Scratch::new("a.txt", "file a\n");
+        let b = Scratch::new("b.txt", "file b\n");
+        let mut ed = opened(&a);
+
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.buffer.rope().to_string(), "file b\n");
+        assert_eq!(ed.buffer.path.as_deref(), Some(std::path::Path::new(b.path())));
+    }
+
+    #[test]
+    fn a_shorter_file_does_not_leave_the_cursor_past_the_end() {
+        let f = Scratch::new("shrink.txt", "one\ntwo\nthree\nfour\n");
+        let mut ed = opened(&f);
+        ed.buffer.goto_row(3, false);
+
+        f.write("x\n");
+        ex(&mut ed, "e!");
+        assert!(
+            ed.buffer.cursor.at <= ed.buffer.rope().len_chars(),
+            "cursor {} is past the end of a {}-char buffer",
+            ed.buffer.cursor.at,
+            ed.buffer.rope().len_chars(),
+        );
+        assert_eq!(ed.buffer.cursor_row(), 0);
+    }
+
+    #[test]
+    fn a_reload_rebuilds_the_parse_tree_rather_than_patching_it() {
+        let f = Scratch::new("tree.rs", "fn a() {}\n");
+        let mut ed = opened(&f);
+        assert!(ed.syntax.is_some(), "a .rs file should have a grammar");
+
+        f.write("struct B;\n");
+        ex(&mut ed, "e!");
+
+        // A tree left over from the old text would disagree with the rope.
+        let rope = ed.buffer.rope();
+        let spans = ed.syntax.as_ref().unwrap().highlights(rope, 0..rope.len_bytes());
+        assert!(
+            spans.iter().all(|s| s.end_byte <= rope.len_bytes()),
+            "highlight spans point past the end of the reloaded text",
+        );
+    }
+
+    #[test]
+    fn e_on_a_buffer_with_no_file_name_reports_rather_than_panicking() {
+        let mut ed = editor("scratch");
+        ed.buffer.commit_undo();
+        ex(&mut ed, "e");
+        assert!(!ed.status.is_empty(), "should say something");
+        assert_eq!(ed.buffer.rope().to_string(), "scratch");
     }
 }

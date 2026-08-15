@@ -45,8 +45,11 @@ words. `{n}` below means an optional count.
 | `c{motion}` | change — delete, then enter insert mode |
 | `y{motion}` | yank |
 | `dd` `cc` `yy` | the whole line, `{n}` of them when counted |
+| `D` `C` | `d$` / `c$` — to the end of the line |
+| `S` | `cc` |
 | `Y` | `yy` |
-| `x` | delete the char under the cursor — exactly `dl` |
+| `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
+| `X` | delete the char before the cursor — `dh` |
 
 `cw` follows vim and behaves like `ce`: it changes the word without swallowing
 the whitespace after it. `dw` at the end of a line stops there rather than
@@ -70,6 +73,14 @@ there is nothing to decide at yank time. A count goes before the quote: `3"p`.
 | `i` `a` | before / after the cursor |
 | `I` `A` | at the start / end of the line |
 | `o` `O` | on a new line below / above |
+
+**Changing text in place**
+
+| Key | Does |
+|---|---|
+| `{n}r{char}` | overwrite `{n}` chars with `{char}`, refusing if the line is too short |
+| `{n}~` | flip the case under the cursor and step right, stopping at the line end |
+| `{n}J` | join `{n}` lines up, collapsing the indent to one space |
 
 **Undo**
 
@@ -123,6 +134,8 @@ afterwards repeats it.
 | `:w` `:w <path>` | write |
 | `:q` `:q!` | quit, refusing if there are unsaved changes unless forced |
 | `:wq` `:x` | write and quit |
+| `:e` `:e!` | reload from disk, refusing if modified unless forced |
+| `:e <path>` | edit another file |
 | `:{n}` | go to line *n* |
 
 ## Layout

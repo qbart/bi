@@ -24,6 +24,8 @@ pub struct Input {
     g_pending: bool,
     /// `"` has been typed and is waiting for the register it names.
     quote_pending: bool,
+    /// `r` has been typed and is waiting for the character to write.
+    replace_pending: bool,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
 }
@@ -77,6 +79,9 @@ impl Input {
         }
         if self.g_pending {
             s.push('g');
+        }
+        if self.replace_pending {
+            s.push('r');
         }
         s
     }
@@ -152,6 +157,15 @@ impl Input {
     }
 
     fn normal_char(&mut self, c: char) -> Option<Command> {
+        // `r` holds out for the character to write. Checked before everything
+        // else, so `r5` writes a `5` rather than starting a count and `rd`
+        // writes a `d` rather than starting an operator.
+        if self.replace_pending {
+            let count = self.fold_count();
+            self.reset();
+            return Some(Command { count: 1, action: Action::ReplaceChar { ch: c, count } });
+        }
+
         // `"` is holding out for the register it names. Only the black hole
         // exists so far; the picker and named registers are later steps.
         if self.quote_pending {
@@ -260,6 +274,27 @@ impl Input {
             // `Y` is `yy`, as in vim.
             'Y' => {
                 return self.resolve_as(Operator::Yank, Motion::CurrentLine);
+            }
+            // The operator shorthands. Same trick as `x` and `Y`: an operator
+            // the key implies rather than one the user typed.
+            'D' => return self.resolve_as(Operator::Delete, Motion::LineEnd),
+            'C' => return self.resolve_as(Operator::Change, Motion::LineEnd),
+            'S' => return self.resolve_as(Operator::Change, Motion::CurrentLine),
+            's' => return self.resolve_as(Operator::Change, Motion::Right),
+            'X' => return self.resolve_as(Operator::Delete, Motion::Left),
+            'r' => {
+                self.replace_pending = true;
+                return None;
+            }
+            '~' => {
+                let count = self.fold_count();
+                self.reset();
+                return Some(Command { count: 1, action: Action::ToggleCase { count } });
+            }
+            'J' => {
+                let count = self.fold_count();
+                self.reset();
+                return Some(Command { count: 1, action: Action::JoinLines { count } });
             }
             'd' => {
                 self.operator = Some(Operator::Delete);
@@ -743,5 +778,79 @@ mod tests {
             let cmd = input.on_key(key(c), &Mode::Insert).unwrap();
             assert_eq!(cmd.action, Action::InsertChar(c));
         }
+    }
+
+    // ---- step 1: operator shorthands, r, ~, J ------------------------------
+
+    #[test]
+    fn the_operator_shorthands_expand_to_operator_plus_motion() {
+        let cases = [
+            ('D', Operator::Delete, Motion::LineEnd),
+            ('C', Operator::Change, Motion::LineEnd),
+            ('S', Operator::Change, Motion::CurrentLine),
+            ('s', Operator::Change, Motion::Right),
+            ('X', Operator::Delete, Motion::Left),
+        ];
+        for (c, op, motion) in cases {
+            assert_eq!(
+                typed(&c.to_string()).action,
+                Action::Operate { op, motion, count: 1, sink: Sink::Ring },
+                "{c} should be the shorthand for {op:?} over {motion:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn d_and_c_shorthands_are_exactly_their_long_forms() {
+        assert_eq!(typed("D").action, typed("d$").action);
+        assert_eq!(typed("C").action, typed("c$").action);
+        assert_eq!(typed("S").action, typed("cc").action);
+        assert_eq!(typed("X").action, typed("dh").action);
+    }
+
+    #[test]
+    fn r_waits_for_its_character() {
+        let mut input = Input::default();
+        assert!(input.on_key(key('r'), &Mode::Normal).is_none(), "r alone resolves to nothing");
+        assert_eq!(input.pending_display(), "r", "and says so in the status line");
+        assert_eq!(
+            input.on_key(key('x'), &Mode::Normal).unwrap().action,
+            Action::ReplaceChar { ch: 'x', count: 1 }
+        );
+    }
+
+    #[test]
+    fn r_takes_its_argument_literally() {
+        // Each of these would mean something else in normal mode.
+        for c in ['5', 'd', 'g', '"', ':', 'r'] {
+            assert_eq!(
+                typed(&format!("r{c}")).action,
+                Action::ReplaceChar { ch: c, count: 1 },
+                "r{c} should write a literal {c}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_before_r_belongs_to_the_replace() {
+        assert_eq!(typed("3rx").action, Action::ReplaceChar { ch: 'x', count: 3 });
+    }
+
+    #[test]
+    fn esc_abandons_a_pending_r() {
+        let mut input = Input::default();
+        input.on_key(key('r'), &Mode::Normal);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        assert_eq!(input.pending_display(), "");
+        // The next key is an ordinary command again, not r's argument.
+        assert_eq!(input.on_key(key('x'), &Mode::Normal).unwrap().action, typed("x").action);
+    }
+
+    #[test]
+    fn tilde_and_j_fold_their_counts_in() {
+        assert_eq!(typed("~").action, Action::ToggleCase { count: 1 });
+        assert_eq!(typed("3~").action, Action::ToggleCase { count: 3 });
+        assert_eq!(typed("J").action, Action::JoinLines { count: 1 });
+        assert_eq!(typed("4J").action, Action::JoinLines { count: 4 });
     }
 }
