@@ -15,6 +15,32 @@ use bee::syntax::{Span as HlSpan, Syntax};
 
 const TAB_WIDTH: usize = 4;
 
+/// Background for the line the cursor is on.
+///
+/// Dark, because the rest of this table already assumes a dark terminal
+/// (comments are `DarkGray`). It has to stay subtle: it sits behind syntax
+/// colours rather than replacing them, so anything strong makes `comment`
+/// unreadable. Goes wherever the highlight table goes when a theme file exists.
+const CURSOR_LINE_BG: Color = Color::Indexed(236);
+
+/// Paints `bg` behind a line and pads it to `width`, so the highlight reaches
+/// the edge of the pane instead of stopping at the last character.
+///
+/// Span styles are patched rather than replaced — the syntax colours are the
+/// foreground and have to survive.
+fn fill_line(spans: Vec<Span<'static>>, bg: Color, width: usize) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .map(|s| {
+            let style = s.style.bg(bg);
+            s.style(style)
+        })
+        .collect();
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), Style::default().bg(bg)));
+    Line::from(spans)
+}
+
 /// Expands tabs for display.
 ///
 /// Width is counted in chars, so wide (CJK) and combining chars will be off.
@@ -172,7 +198,11 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             }
             None => spans.push(Span::raw(expand_tabs(raw))),
         }
-        lines.push(Line::from(spans));
+        lines.push(if row == cursor_row {
+            fill_line(spans, CURSOR_LINE_BG, text_area.width as usize)
+        } else {
+            Line::from(spans)
+        });
     }
 
     // Past-the-end rows, so an empty buffer doesn't look like a hang.
@@ -355,4 +385,34 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
     spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
 
     Paragraph::new(Line::from(spans))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_line_is_padded_to_the_full_width() {
+        let line = fill_line(vec![Span::raw("abc")], CURSOR_LINE_BG, 10);
+        let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(width, 10, "highlight must reach the edge of the pane");
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(CURSOR_LINE_BG)));
+    }
+
+    #[test]
+    fn the_background_does_not_disturb_syntax_colours() {
+        let spans =
+            vec![Span::styled("kw", Style::default().fg(Color::Magenta)), Span::raw(" plain")];
+        let line = fill_line(spans, CURSOR_LINE_BG, 20);
+        assert_eq!(line.spans[0].style.fg, Some(Color::Magenta));
+        assert_eq!(line.spans[0].style.bg, Some(CURSOR_LINE_BG));
+        assert_eq!(line.spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn a_line_wider_than_the_pane_is_not_truncated_or_panicked_on() {
+        let line = fill_line(vec![Span::raw("a".repeat(30))], CURSOR_LINE_BG, 10);
+        let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(width, 30);
+    }
 }
