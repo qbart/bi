@@ -12,11 +12,11 @@ reason is that it turns two features into one piece of machinery.
 
 ## Status
 
-**Specified**, not yet built.
+Step 1 is **built**; the cursor no longer exists on `Buffer`.
 
 | Step | Scope | Needs |
 |---|---|---|
-| 1 | The selection model; cursor leaves `Buffer` | this file |
+| **1** ✅ | The selection model; cursor leaves `Buffer` | this file |
 | 2 | Visual mode `v` `V`, Replace mode `R` | step 1 |
 | 3 | Multi-cursor | step 2 |
 
@@ -84,14 +84,23 @@ what a second view of the same file will need.
 
 ## Applying a command to N selections
 
-Back to front, highest position first.
+Back to front, highest position first — and that is necessary but not
+sufficient.
 
 An edit at position 40 does not disturb a selection at position 5, but an edit
-at 5 shifts everything after it. Iterating in descending order means each
-selection's recorded position is still valid when its turn comes, with no offset
-arithmetic at all. Ascending order would require rewriting every later selection
-after every edit — the bug that makes bolted-on multi-cursor implementations
-drift.
+at 5 shifts everything after it. Descending order therefore keeps each
+selection's **edit position** valid: it is still pointing at the right text when
+its turn comes.
+
+The positions that come *back* are a second problem, and the first cut of this
+got it wrong. A selection dealt with early sits above the ones still to come, so
+every later edit shifts it — the head it reported is stale the moment a lower
+edit lands. After each selection is handled, the buffer's length delta has to be
+applied to everything already processed. Without it, a multi-cursor insert
+leaves the second cursor one character short, the third two, and so on.
+
+So: descending order removes the need to correct the *inputs*; a running delta
+corrects the *outputs*. Both, or it drifts.
 
 After the pass: re-sort, merge any selections that now overlap, and clamp each
 to the buffer.
@@ -109,6 +118,10 @@ This matters more than it sounds: undoing a multi-cursor edit and finding a
 single cursor makes redo unusable, and it is the difference between multi-cursor
 being a feature and being a party trick. The change is contained — `History`
 already stores a `usize` per revision and it becomes a `Selections`.
+
+**Not done in step 1.** Undo still restores one cursor, because nothing creates
+a second one until step 3 and the difference is unobservable before then. It
+lands with step 3, not after it.
 
 ## Step 2 — visual and replace mode
 

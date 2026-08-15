@@ -8,10 +8,11 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Cursor};
 use crate::motion::{Motion, Operator, Target};
 use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{EntryKind, Registers, Sink};
+use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,12 @@ impl Action {
     }
 }
 
+/// Moves a selection by `shift` characters, saturating at zero.
+fn shifted(selection: Selection, shift: isize) -> Selection {
+    let move_one = |c: Cursor| Cursor::at(c.at.saturating_add_signed(shift));
+    Selection { anchor: move_one(selection.anchor), head: move_one(selection.head) }
+}
+
 #[derive(Debug, Clone)]
 pub struct Command {
     pub count: usize,
@@ -127,6 +134,11 @@ pub struct Command {
 
 pub struct Editor {
     pub buffer: Buffer,
+    /// Where everyone is looking. Normal mode is every selection collapsed;
+    /// visual is one with room in it; multi-cursor is more than one. Here
+    /// rather than on `Buffer` so a second view of the same file is possible —
+    /// see `docs/specs/selections.md`.
+    pub selections: Selections,
     /// Global, not per-buffer: yanking in one file and pasting in another is
     /// the point, so they outlive any single buffer.
     pub registers: Registers,
@@ -187,6 +199,7 @@ impl Editor {
     fn with_buffer(buffer: Buffer) -> Self {
         Self {
             buffer,
+            selections: Selections::default(),
             registers: Registers::default(),
             picker: None,
             syntax: None,
@@ -208,9 +221,68 @@ impl Editor {
         // inside the count loop — `5x` comes back in a single `u`. Insert mode
         // is the exception: the group stays open until Esc, which is what makes
         // a typing run (and the `\n` that `o` inserted before it) undo together.
+        // One command is one undo step even across N selections, so the group
+        // closes after the whole pass rather than per selection — otherwise `u`
+        // would walk back through a multi-cursor edit one cursor at a time.
         if self.mode != Mode::Insert {
-            self.buffer.commit_undo();
+            let at = self.selections.cursor();
+            self.buffer.commit_undo(at);
         }
+    }
+
+    /// Runs `f` for every selection, highest position first.
+    ///
+    /// Two things have to be true and only the first is free.
+    ///
+    /// Descending order keeps every selection's *edit position* valid: an edit
+    /// at 5 shifts what is above it, but one at 40 leaves 5 alone. So each
+    /// selection is still pointing at the right text when its turn comes.
+    ///
+    /// The positions `f` hands back are a separate problem. A selection dealt
+    /// with early sits above the ones still to come, so every later edit shifts
+    /// it — the head it reported is stale the moment a lower edit lands. After
+    /// each call the buffer's length delta is therefore applied to everything
+    /// already processed. Skipping this is the bug where the second cursor of a
+    /// multi-cursor insert ends up one character short per preceding cursor.
+    fn for_each_selection(&mut self, mut f: impl FnMut(&mut Editor, Selection) -> Selection) {
+        let mut list: Vec<Selection> = self.selections.all().to_vec();
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(list[i].range().0));
+
+        let mut done: Vec<usize> = Vec::with_capacity(list.len());
+        for &i in &order {
+            let before = self.buffer.rope().len_chars();
+            list[i] = f(self, list[i]);
+            let after = self.buffer.rope().len_chars();
+
+            if after != before {
+                let shift = after as isize - before as isize;
+                for &j in &done {
+                    list[j] = shifted(list[j], shift);
+                }
+            }
+            done.push(i);
+        }
+
+        self.selections.set(list);
+    }
+
+    /// The primary cursor — what a single-cursor operation acts on.
+    pub fn cursor(&self) -> Cursor {
+        self.selections.cursor()
+    }
+
+    pub fn cursor_row(&self) -> usize {
+        self.buffer.row_at(self.cursor())
+    }
+
+    pub fn cursor_col(&self) -> usize {
+        self.buffer.col_at(self.cursor())
+    }
+
+    /// Collapses to a single cursor at `cursor`.
+    pub fn set_cursor(&mut self, cursor: Cursor) {
+        self.selections = Selections::single(cursor);
     }
 
     /// Substitutes `;` / `,` with the find they repeat, and remembers any find
@@ -250,30 +322,41 @@ impl Editor {
 
         match action {
             Action::Move(m) => {
-                if let Some(m) = self.resolve_find(*m) {
-                    self.buffer.apply_motion(m, eol);
-                }
+                let Some(m) = self.resolve_find(*m) else { return };
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.moved(sel.head, m, eol))
+                });
             }
             Action::Operate { op, target, count, sink } => {
                 let Some(target) = self.resolve_find_target(*target) else { return };
-                if let Some(entry) = self.buffer.operate(*op, target, *count) {
-                    if *sink == Sink::Ring {
-                        self.registers.push(entry);
+                let (op, count, sink) = (*op, *count, *sink);
+                self.for_each_selection(|ed, sel| {
+                    match ed.buffer.operate(sel.head, op, target, count) {
+                        Some((entry, landed)) => {
+                            if sink == Sink::Ring {
+                                ed.registers.push(entry);
+                            }
+                            Selection::collapsed(landed)
+                        }
+                        None => sel,
                     }
-                    if *op == Operator::Change {
-                        self.mode = Mode::Insert;
-                    }
+                });
+                if op == Operator::Change {
+                    self.mode = Mode::Insert;
                 }
             }
-            Action::Paste { before, count } => match self.registers.front() {
+            Action::Paste { before, count } => {
                 // Cloned because pasting borrows the buffer mutably while the
                 // entry is still owned by the ring.
-                Some(entry) => {
-                    let entry = entry.clone();
-                    self.buffer.paste(&entry, *before, *count);
-                }
-                None => self.status = "nothing to paste".into(),
-            },
+                let Some(entry) = self.registers.front().cloned() else {
+                    self.status = "nothing to paste".into();
+                    return;
+                };
+                let (before, count) = (*before, *count);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.paste(sel.head, &entry, before, count))
+                });
+            }
 
             Action::OpenPicker(kind) => self.open_picker(*kind),
             Action::PickChar(c) => {
@@ -311,52 +394,93 @@ impl Editor {
                 // `a` may step onto the position just past the last char, which
                 // normal mode forbids — so switch modes first.
                 self.mode = Mode::Insert;
-                self.buffer.apply_motion(Motion::Right, true);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.moved(sel.head, Motion::Right, true))
+                });
             }
             Action::EnterInsertLineStart => {
                 self.mode = Mode::Insert;
-                self.buffer.apply_motion(Motion::LineStart, true);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.moved(sel.head, Motion::LineStart, true))
+                });
             }
             Action::EnterInsertLineEnd => {
                 self.mode = Mode::Insert;
-                self.buffer.apply_motion(Motion::LineEnd, true);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.moved(sel.head, Motion::LineEnd, true))
+                });
             }
             Action::EnterNormal => {
                 self.mode = Mode::Normal;
                 // Matches vim: leaving insert pulls the cursor back onto a char.
-                self.buffer.clamp(false);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.clamped(sel.head, false))
+                });
             }
-            Action::OpenLineBelow => {
+            Action::OpenLineBelow | Action::OpenLineAbove => {
+                let below = matches!(action, Action::OpenLineBelow);
                 self.mode = Mode::Insert;
-                self.buffer.open_line(true);
-            }
-            Action::OpenLineAbove => {
-                self.mode = Mode::Insert;
-                self.buffer.open_line(false);
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.open_line(sel.head, below))
+                });
             }
 
             Action::ReplaceChar { ch, count } => {
-                if !self.buffer.replace_chars(*ch, *count) {
+                let (ch, count) = (*ch, *count);
+                let mut refused = false;
+                self.for_each_selection(|ed, sel| {
+                    match ed.buffer.replace_chars(sel.head, ch, count) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => {
+                            refused = true;
+                            sel
+                        }
+                    }
+                });
+                if refused {
                     self.status = "not enough characters on the line".into();
                 }
             }
-            Action::ToggleCase { count } => self.buffer.toggle_case(*count),
-            Action::JoinLines { count } => self.buffer.join_lines(*count),
-
-            Action::Undo => {
-                if !self.buffer.undo() {
-                    self.status = "already at oldest change".into();
-                }
+            Action::ToggleCase { count } => {
+                let count = *count;
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.toggle_case(sel.head, count))
+                });
             }
-            Action::Redo => {
-                if !self.buffer.redo() {
-                    self.status = "already at newest change".into();
-                }
+            Action::JoinLines { count } => {
+                let count = *count;
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.join_lines(sel.head, count))
+                });
             }
 
-            Action::InsertChar(c) => self.buffer.insert_char(*c),
-            Action::InsertNewline => self.buffer.insert_char('\n'),
-            Action::Backspace => self.buffer.backspace(),
+            // Undo and redo are whole-buffer operations, not per-selection: the
+            // history restores the position it recorded.
+            Action::Undo => match self.buffer.undo(self.selections.cursor()) {
+                Some(cursor) => self.selections = Selections::single(cursor),
+                None => self.status = "already at oldest change".into(),
+            },
+            Action::Redo => match self.buffer.redo(self.selections.cursor()) {
+                Some(cursor) => self.selections = Selections::single(cursor),
+                None => self.status = "already at newest change".into(),
+            },
+
+            Action::InsertChar(c) => {
+                let c = *c;
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.insert_char(sel.head, c))
+                });
+            }
+            Action::InsertNewline => {
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.insert_char(sel.head, '\n'))
+                });
+            }
+            Action::Backspace => {
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.backspace(sel.head))
+                });
+            }
 
             Action::EnterCommandMode => {
                 self.status.clear();
@@ -422,7 +546,8 @@ impl Editor {
                 // so `.` and a later bare `p` repeat the entry you chose rather
                 // than whatever happened to be most recent.
                 self.registers.push(entry.clone());
-                self.buffer.paste(&entry, before, 1);
+                let landed = self.buffer.paste(self.selections.cursor(), &entry, before, 1);
+                self.selections = Selections::single(landed);
             }
         }
     }
@@ -455,7 +580,8 @@ impl Editor {
             }
             _ => {
                 if let Ok(n) = name.parse::<usize>() {
-                    self.buffer.goto_row(n.saturating_sub(1), false);
+                    let cursor = self.buffer.at_row(n.saturating_sub(1), false);
+                    self.selections = Selections::single(cursor);
                 } else {
                     self.status = format!("not a command: {name}");
                 }
@@ -465,7 +591,9 @@ impl Editor {
 
     /// Returns whether the write succeeded.
     fn write(&mut self, path: &str) -> bool {
-        let result = if path.is_empty() { self.buffer.save() } else { self.buffer.save_as(path) };
+        let at = self.selections.cursor();
+        let result =
+            if path.is_empty() { self.buffer.save(at) } else { self.buffer.save_as(at, path) };
         match result {
             Ok(()) => {
                 // `:w other.rs` can change the language under us.
@@ -495,14 +623,20 @@ impl Editor {
             return;
         }
 
+        let at = self.selections.cursor();
         let result = if path.is_empty() {
-            self.buffer.reload()
+            self.buffer.reload(at)
         } else {
-            Buffer::open(path).map(|buf| self.buffer = buf)
+            Buffer::open(path).map(|buf| {
+                self.buffer = buf;
+                // A different file, so the old position means nothing.
+                Cursor::default()
+            })
         };
 
         match result {
-            Ok(()) => {
+            Ok(cursor) => {
+                self.selections = Selections::single(cursor);
                 self.reload_syntax();
                 let name =
                     self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
@@ -526,7 +660,7 @@ impl Editor {
             return;
         }
         const SCROLLOFF: usize = 3;
-        let row = self.buffer.cursor_row();
+        let row = self.buffer.row_at(self.selections.cursor());
         let margin = SCROLLOFF.min(height.saturating_sub(1) / 2);
 
         if row < self.scroll + margin {
@@ -544,6 +678,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::buffer::Cursor;
+    use crate::motion::TextObject;
     use crate::picker::PickerKind;
 
     /// Text arrives as one committed revision, so a single undo lands back on
@@ -551,10 +686,10 @@ mod tests {
     fn editor(text: &str) -> Editor {
         let mut ed = Editor::empty();
         if !text.is_empty() {
-            ed.buffer.insert_str(text);
-            ed.buffer.commit_undo();
+            let at = ed.buffer.insert_str(ed.cursor(), text);
+            ed.buffer.commit_undo(at);
         }
-        ed.buffer.cursor = Cursor::at(0);
+        ed.set_cursor(Cursor::at(0));
         ed
     }
 
@@ -712,7 +847,7 @@ mod tests {
         let mut ed = editor("keep\njunk");
         ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
 
-        ed.buffer.cursor = Cursor::at(5);
+        ed.set_cursor(Cursor::at(5));
         ed.apply(Command {
             count: 1,
             action: Action::Operate {
@@ -780,7 +915,8 @@ mod tests {
     fn ed_with_ring() -> Editor {
         let mut ed = editor("alpha\nbeta\ngamma");
         for row in 0..3 {
-            ed.buffer.cursor = ed.buffer.at_row(row, false);
+            let c = ed.buffer.at_row(row, false);
+            ed.set_cursor(c);
             ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
         }
         ed
@@ -809,7 +945,8 @@ mod tests {
     #[test]
     fn accepting_pastes_the_chosen_entry_not_the_most_recent() {
         let mut ed = ed_with_ring();
-        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        let c = ed.buffer.at_row(0, false);
+        ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
 
@@ -825,7 +962,8 @@ mod tests {
     #[test]
     fn typing_in_the_picker_filters_what_accept_takes() {
         let mut ed = ed_with_ring();
-        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        let c = ed.buffer.at_row(0, false);
+        ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickChar('b'), Action::PickChar('e'), Action::PickAccept]);
         assert_eq!(ed.buffer.rope().to_string(), "beta\nalpha\nbeta\ngamma");
@@ -836,7 +974,8 @@ mod tests {
     #[test]
     fn accepting_moves_the_entry_to_the_front_of_the_ring() {
         let mut ed = ed_with_ring();
-        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        let c = ed.buffer.at_row(0, false);
+        ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
 
@@ -874,7 +1013,8 @@ mod tests {
     fn a_picked_paste_is_one_undo_step() {
         let mut ed = ed_with_ring();
         let before = ed.buffer.rope().to_string();
-        ed.buffer.cursor = ed.buffer.at_row(0, false);
+        let c = ed.buffer.at_row(0, false);
+        ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickAccept]);
         assert_ne!(ed.buffer.rope().to_string(), before);
@@ -980,7 +1120,7 @@ mod tests {
         let f = Scratch::new("history.txt", "one\n");
         let mut ed = opened(&f);
         type_str(&mut ed, "typed");
-        ed.buffer.commit_undo();
+        ed.buffer.commit_undo(ed.cursor());
 
         f.write("two\n");
         ex(&mut ed, "e!");
@@ -1006,17 +1146,18 @@ mod tests {
     fn a_shorter_file_does_not_leave_the_cursor_past_the_end() {
         let f = Scratch::new("shrink.txt", "one\ntwo\nthree\nfour\n");
         let mut ed = opened(&f);
-        ed.buffer.goto_row(3, false);
+        let c = ed.buffer.at_row(3, false);
+        ed.set_cursor(c);
 
         f.write("x\n");
         ex(&mut ed, "e!");
         assert!(
-            ed.buffer.cursor.at <= ed.buffer.rope().len_chars(),
+            ed.cursor().at <= ed.buffer.rope().len_chars(),
             "cursor {} is past the end of a {}-char buffer",
-            ed.buffer.cursor.at,
+            ed.cursor().at,
             ed.buffer.rope().len_chars(),
         );
-        assert_eq!(ed.buffer.cursor_row(), 0);
+        assert_eq!(ed.cursor_row(), 0);
     }
 
     #[test]
@@ -1040,9 +1181,109 @@ mod tests {
     #[test]
     fn e_on_a_buffer_with_no_file_name_reports_rather_than_panicking() {
         let mut ed = editor("scratch");
-        ed.buffer.commit_undo();
+        ed.buffer.commit_undo(ed.cursor());
         ex(&mut ed, "e");
         assert!(!ed.status.is_empty(), "should say something");
         assert_eq!(ed.buffer.rope().to_string(), "scratch");
+    }
+
+    // ---- commands across several selections --------------------------------
+    //
+    // Nothing binds a key to "add a cursor" yet — that is step 3 — but the
+    // machinery is here, and these are the cases it exists to get right.
+
+    fn with_cursors(text: &str, positions: &[usize]) -> Editor {
+        let mut ed = editor(text);
+        ed.selections.set(positions.iter().map(|&p| Selection::at(p)).collect());
+        ed
+    }
+
+    fn heads(ed: &Editor) -> Vec<usize> {
+        ed.selections.all().iter().map(|s| s.head.at).collect()
+    }
+
+    #[test]
+    fn typing_inserts_at_every_cursor() {
+        //                   0123456789
+        let mut ed = with_cursors("aa bb cc", &[0, 3, 6]);
+        ed.mode = Mode::Insert;
+        ed.apply(cmd(Action::InsertChar('X')));
+        assert_eq!(ed.buffer.rope().to_string(), "Xaa Xbb Xcc");
+    }
+
+    /// The reason edits run highest-position-first: an insert at 0 shifts
+    /// everything after it, so an ascending pass would put the later ones in
+    /// the wrong place.
+    #[test]
+    fn later_cursors_are_not_shifted_by_earlier_edits() {
+        let mut ed = with_cursors("....|....|", &[4, 9]);
+        ed.mode = Mode::Insert;
+        ed.apply(cmd(Action::InsertChar('#')));
+        assert_eq!(ed.buffer.rope().to_string(), "....#|....#|");
+        assert_eq!(heads(&ed), vec![5, 11], "each cursor sits after what it typed");
+    }
+
+    #[test]
+    fn a_motion_moves_every_cursor() {
+        let mut ed = with_cursors("abc\ndef\nghi", &[0, 4]);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        assert_eq!(heads(&ed), vec![1, 5]);
+    }
+
+    #[test]
+    fn an_operator_runs_at_every_cursor() {
+        let mut ed = with_cursors("foo bar baz", &[0, 4, 8]);
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Object { object: TextObject::Word { big: false }, around: false },
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.buffer.rope().to_string(), "  ");
+    }
+
+    #[test]
+    fn a_multi_cursor_edit_is_one_undo_step() {
+        let mut ed = with_cursors("aa bb cc", &[0, 3, 6]);
+        ed.mode = Mode::Insert;
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.mode = Mode::Normal;
+        ed.apply(cmd(Action::EnterNormal));
+
+        assert_eq!(ed.buffer.rope().to_string(), "Xaa Xbb Xcc");
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "aa bb cc", "one u, not one per cursor",);
+    }
+
+    #[test]
+    fn cursors_that_collide_merge_rather_than_typing_twice() {
+        // Two cursors one apart; deleting forward brings them together.
+        let mut ed = with_cursors("ab", &[0, 1]);
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.selections.len(), 1, "collided cursors are one cursor");
+    }
+
+    #[test]
+    fn the_primary_cursor_is_what_the_viewport_and_status_line_follow() {
+        let ed = with_cursors("one\ntwo\nthree", &[0, 8]);
+        assert_eq!(ed.cursor().at, ed.selections.primary().head.at);
+        assert!(ed.cursor_row() <= 2);
+    }
+
+    /// Undo restores a single cursor for now. Restoring the whole set is step 3
+    /// of docs/specs/selections.md, where it first becomes observable.
+    #[test]
+    fn undo_collapses_to_one_cursor_for_now() {
+        let mut ed = with_cursors("aa bb", &[0, 3]);
+        ed.mode = Mode::Insert;
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.selections.len(), 1);
     }
 }

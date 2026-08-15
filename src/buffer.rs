@@ -87,7 +87,6 @@ fn class_of(c: char) -> CharClass {
 pub struct Buffer {
     rope: Rope,
     pub path: Option<PathBuf>,
-    pub cursor: Cursor,
     /// Drained by tree-sitter / LSP once those exist.
     pub pending_edits: Vec<Edit>,
     history: History,
@@ -98,7 +97,6 @@ impl Buffer {
         Self {
             rope: Rope::new(),
             path: None,
-            cursor: Cursor::default(),
             pending_edits: Vec::new(),
             history: History::default(),
         }
@@ -117,11 +115,13 @@ impl Buffer {
         Ok(buf)
     }
 
-    pub fn save(&mut self) -> Result<()> {
+    /// Takes the cursor because a write closes the open undo group, and a
+    /// group needs somewhere to put you when you undo back through it.
+    pub fn save(&mut self, at: Cursor) -> Result<()> {
         let path = self.path.clone().context("no file name (use `:w <path>`)")?;
         // What lands on disk has to be a revision, or nothing can be marked as
         // saved and the buffer stays "modified" straight after a good write.
-        self.commit_undo();
+        self.commit_undo(at);
         let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         self.rope
             .write_to(BufWriter::new(file))
@@ -130,9 +130,9 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn save_as(&mut self, at: Cursor, path: impl AsRef<Path>) -> Result<()> {
         self.path = Some(path.as_ref().to_path_buf());
-        self.save()
+        self.save(at)
     }
 
     pub fn rope(&self) -> &Rope {
@@ -151,12 +151,14 @@ impl Buffer {
         if n > 1 && self.rope.line(n - 1).len_chars() == 0 { n - 1 } else { n }
     }
 
-    pub fn cursor_row(&self) -> usize {
-        self.rope.char_to_line(self.cursor.at)
+    /// Row of `at`. Public because everything above the buffer works in
+    /// selections now and has to ask.
+    pub fn row_at(&self, at: Cursor) -> usize {
+        self.rope.char_to_line(at.at.min(self.rope.len_chars()))
     }
 
-    pub fn cursor_col(&self) -> usize {
-        self.cursor.at - self.rope.line_to_char(self.cursor_row())
+    pub fn col_at(&self, at: Cursor) -> usize {
+        at.at - self.rope.line_to_char(self.row_at(at))
     }
 
     /// Chars in `row`, excluding the line terminator.
@@ -231,73 +233,64 @@ impl Buffer {
 
     /// The single mutation primitive: replace `start..end` (chars) with `text`
     /// and record it for undo.
-    fn apply_edit(&mut self, start: usize, end: usize, text: &str) {
+    fn apply_edit(&mut self, at: Cursor, start: usize, end: usize, text: &str) {
         let change = self.edit_raw(start, end, text);
-        self.history.record(change, self.cursor.at);
+        self.history.record(change, at.at);
     }
 
     // ---- undo --------------------------------------------------------------
 
     /// Closes the current undo group. A no-op if nothing has changed since the
     /// last one, so callers can commit at every command boundary blindly.
-    pub fn commit_undo(&mut self) {
-        self.history.commit(self.cursor.at);
+    pub fn commit_undo(&mut self, at: Cursor) {
+        self.history.commit(at.at);
     }
 
     /// Replays `changes` through [`Buffer::edit_raw`], so history traversal
     /// emits [`Edit`]s exactly as ordinary typing does — an undo reaches
     /// tree-sitter and LSP as just another incremental edit.
-    fn replay(&mut self, changes: Vec<Change>, cursor: usize) {
+    fn replay(&mut self, changes: Vec<Change>, cursor: usize) -> Cursor {
         for change in changes {
             let (start, end) = change.range();
             self.edit_raw(start, end, &change.inserted);
         }
-        self.cursor = Cursor::at(cursor.min(self.rope.len_chars()));
+        Cursor::at(cursor.min(self.rope.len_chars()))
     }
 
     /// Steps one revision back. Returns false at the oldest change.
-    pub fn undo(&mut self) -> bool {
-        self.commit_undo();
-        match self.history.undo() {
-            Some((changes, cursor)) => {
-                self.replay(changes, cursor);
-                true
-            }
-            None => false,
-        }
+    /// `None` at the oldest change. `Some` carries where the cursor goes.
+    pub fn undo(&mut self, at: Cursor) -> Option<Cursor> {
+        self.commit_undo(at);
+        let (changes, cursor) = self.history.undo()?;
+        Some(self.replay(changes, cursor))
     }
 
     /// Steps one revision forward, along the most recently created branch.
     /// Returns false at the newest change.
-    pub fn redo(&mut self) -> bool {
-        self.commit_undo();
-        match self.history.redo() {
-            Some((changes, cursor)) => {
-                self.replay(changes, cursor);
-                true
-            }
-            None => false,
-        }
+    pub fn redo(&mut self, at: Cursor) -> Option<Cursor> {
+        self.commit_undo(at);
+        let (changes, cursor) = self.history.redo()?;
+        Some(self.replay(changes, cursor))
     }
 
     // ---- editing -----------------------------------------------------------
 
-    pub fn insert_str(&mut self, text: &str) {
-        self.apply_edit(self.cursor.at, self.cursor.at, text);
-        self.cursor = Cursor::at(self.cursor.at + text.chars().count());
+    pub fn insert_str(&mut self, at: Cursor, text: &str) -> Cursor {
+        self.apply_edit(at, at.at, at.at, text);
+        Cursor::at(at.at + text.chars().count())
     }
 
-    pub fn insert_char(&mut self, ch: char) {
+    pub fn insert_char(&mut self, at: Cursor, ch: char) -> Cursor {
         let mut b = [0u8; 4];
-        self.insert_str(ch.encode_utf8(&mut b));
+        self.insert_str(at, ch.encode_utf8(&mut b))
     }
 
-    pub fn backspace(&mut self) {
-        if self.cursor.at == 0 {
-            return;
+    pub fn backspace(&mut self, at: Cursor) -> Cursor {
+        if at.at == 0 {
+            return at;
         }
-        self.apply_edit(self.cursor.at - 1, self.cursor.at, "");
-        self.cursor = Cursor::at(self.cursor.at - 1);
+        self.apply_edit(at, at.at - 1, at.at, "");
+        Cursor::at(at.at - 1)
     }
 
     /// `r{char}` — overwrites `count` chars in place.
@@ -305,17 +298,15 @@ impl Buffer {
     /// Returns false and changes nothing when the line has fewer than `count`
     /// characters left, which is vim's behaviour: `3rx` on a two-character tail
     /// is a no-op, not a partial replace.
-    pub fn replace_chars(&mut self, ch: char, count: usize) -> bool {
-        let row = self.cursor_row();
-        if self.line_len(row) < self.cursor_col() + count {
-            return false;
+    pub fn replace_chars(&mut self, at: Cursor, ch: char, count: usize) -> Option<Cursor> {
+        let row = self.row_at(at);
+        if self.line_len(row) < self.col_at(at) + count {
+            return None;
         }
-        let at = self.cursor.at;
         let text: String = std::iter::repeat_n(ch, count).collect();
-        self.apply_edit(at, at + count, &text);
+        self.apply_edit(at, at.at, at.at + count, &text);
         // Vim leaves the cursor on the last character it replaced.
-        self.cursor = Cursor::at(at + text.chars().count().saturating_sub(1));
-        true
+        Some(Cursor::at(at.at + text.chars().count().saturating_sub(1)))
     }
 
     /// `~` — flips the case under the cursor and steps right, `count` times.
@@ -323,28 +314,28 @@ impl Buffer {
     /// Stops at the end of the line rather than wrapping onto the next.
     /// Characters with no case are stepped over, not skipped: `~` on a digit
     /// still advances, as vim does.
-    pub fn toggle_case(&mut self, count: usize) {
+    pub fn toggle_case(&mut self, at: Cursor, count: usize) -> Cursor {
+        let mut cursor = at;
         for _ in 0..count {
-            let row = self.cursor_row();
-            if self.cursor_col() >= self.line_len(row) {
+            let row = self.row_at(cursor);
+            if self.col_at(cursor) >= self.line_len(row) {
                 break;
             }
-            let at = self.cursor.at;
-            let ch = self.rope.char(at);
+            let ch = self.rope.char(cursor.at);
             // `ß` uppercases to `SS`, so the replacement is not always one char.
             let flipped: String = if ch.is_lowercase() {
                 ch.to_uppercase().collect()
             } else if ch.is_uppercase() {
                 ch.to_lowercase().collect()
             } else {
-                self.cursor = Cursor::at(at + 1);
+                cursor = Cursor::at(cursor.at + 1);
                 continue;
             };
             let width = flipped.chars().count();
-            self.apply_edit(at, at + 1, &flipped);
-            self.cursor = Cursor::at(at + width);
+            self.apply_edit(cursor, cursor.at, cursor.at + 1, &flipped);
+            cursor = Cursor::at(cursor.at + width);
         }
-        self.clamp(false);
+        self.clamped(cursor, false)
     }
 
     /// `J` — joins the line below onto this one, `count` lines' worth.
@@ -352,9 +343,10 @@ impl Buffer {
     /// The newline and the next line's indent become a single space. No space
     /// is added when this line already ends in whitespace or the next line is
     /// blank. `1J` and `2J` both join one line, as in vim.
-    pub fn join_lines(&mut self, count: usize) {
+    pub fn join_lines(&mut self, at: Cursor, count: usize) -> Cursor {
+        let mut cursor = at;
         for _ in 0..count.max(2) - 1 {
-            let row = self.cursor_row();
+            let row = self.row_at(cursor);
             if row + 1 >= self.line_count() {
                 break;
             }
@@ -371,11 +363,11 @@ impl Buffer {
             let ends_blank = end == line_start || matches!(self.rope.char(end - 1), ' ' | '\t');
             let sep = if ends_blank || next_len == indent { "" } else { " " };
 
-            self.apply_edit(end, next_start + indent, sep);
+            self.apply_edit(cursor, end, next_start + indent, sep);
             // Vim leaves the cursor on the join.
-            self.cursor = Cursor::at(end);
+            cursor = Cursor::at(end);
         }
-        self.clamp(false);
+        self.clamped(cursor, false)
     }
 
     /// `:e` — re-reads the file from disk, discarding everything local.
@@ -384,29 +376,28 @@ impl Buffer {
     /// longer exists, and replaying them through `edit_raw` would desynchronise
     /// the parse tree. Vim keeps history here behind `'undoreload'`; bee does
     /// not. The caller must rebuild syntax — the tree belongs to the old text.
-    pub fn reload(&mut self) -> Result<()> {
+    pub fn reload(&mut self, at: Cursor) -> Result<Cursor> {
         let path = self.path.clone().context("no file name")?;
         // Keep the cursor where the new text still has room for it. Clamping
         // the raw char index is not enough: it can land on the phantom row
         // after a trailing newline, which `line_count` does not count.
-        let (row, col) = (self.cursor_row(), self.cursor_col());
+        let (row, col) = (self.row_at(at), self.col_at(at));
         *self = Self::open(&path)?;
         let row = row.min(self.line_count().saturating_sub(1));
         let col = col.min(self.max_col(row, false));
-        self.cursor = Cursor::at(self.rope.line_to_char(row) + col);
-        Ok(())
+        Ok(Cursor::at(self.rope.line_to_char(row) + col))
     }
 
     /// `o` / `O`.
-    pub fn open_line(&mut self, below: bool) {
-        let row = self.cursor_row();
-        let at = if below {
+    pub fn open_line(&mut self, at: Cursor, below: bool) -> Cursor {
+        let row = self.row_at(at);
+        let start = if below {
             self.rope.line_to_char(row) + self.line_len(row)
         } else {
             self.rope.line_to_char(row)
         };
-        self.apply_edit(at, at, "\n");
-        self.cursor = Cursor::at(if below { at + 1 } else { at });
+        self.apply_edit(at, start, start, "\n");
+        Cursor::at(if below { start + 1 } else { start })
     }
 
     // ---- motions -----------------------------------------------------------
@@ -580,12 +571,12 @@ impl Buffer {
     }
 
     /// The inclusive row span a linewise motion covers.
-    fn linewise_rows(&self, motion: Motion, count: usize) -> (usize, usize) {
-        let start_row = self.cursor_row();
+    fn linewise_rows(&self, at: Cursor, motion: Motion, count: usize) -> (usize, usize) {
+        let start_row = self.row_at(at);
         let last_row = self.line_count().saturating_sub(1);
         let target_row = match motion {
             Motion::CurrentLine => start_row + count.max(1) - 1,
-            _ => self.row_of(self.motion_target(motion, count, self.cursor).at),
+            _ => self.row_of(self.motion_target(motion, count, at).at),
         };
         (start_row.min(target_row), start_row.max(target_row).min(last_row))
     }
@@ -595,7 +586,13 @@ impl Buffer {
     /// `None` when the motion goes nowhere — `b` at the start of the buffer,
     /// say — so the caller can leave the text alone rather than record an empty
     /// edit in the undo history.
-    fn operator_range(&self, op: Operator, target: Target, count: usize) -> Option<(usize, usize)> {
+    fn operator_range(
+        &self,
+        at: Cursor,
+        op: Operator,
+        target: Target,
+        count: usize,
+    ) -> Option<(usize, usize)> {
         let count = count.max(1);
         let len = self.rope.len_chars();
 
@@ -604,7 +601,7 @@ impl Buffer {
         let motion = match target {
             Target::Motion(m) => m,
             Target::Object { object, around } => {
-                let (start, end) = self.object_range(object, around)?;
+                let (start, end) = self.object_range(at, object, around)?;
                 // A linewise object has to take its terminator too, or `dip`
                 // leaves the empty line behind. `cip` keeps it, for the same
                 // reason `cc` does: insert mode needs a line to sit on.
@@ -622,7 +619,7 @@ impl Buffer {
         };
 
         if motion.kind() == Kind::Linewise {
-            let (first, last) = self.linewise_rows(motion, count);
+            let (first, last) = self.linewise_rows(at, motion, count);
             let content_start = self.rope.line_to_char(first);
             // `cc` empties the lines but leaves them, so insert mode has a line
             // to sit on; `dd` takes the terminator too.
@@ -651,7 +648,7 @@ impl Buffer {
         // widened by one below and would delete a character the find never
         // reached.
         if let Motion::FindChar { ch, forward, till, repeat } = motion
-            && self.find_char(self.cursor, ch, forward, till, repeat, count).is_none()
+            && self.find_char(at, ch, forward, till, repeat, count).is_none()
         {
             return None;
         }
@@ -660,13 +657,13 @@ impl Buffer {
         // swallowing the whitespace after it. On whitespace it is plain `w`.
         if op == Operator::Change
             && motion == Motion::WordForward
-            && let Some(end) = self.word_end_from(self.cursor.at, count)
+            && let Some(end) = self.word_end_from(at.at, count)
         {
-            return Some((self.cursor.at, (end + 1).min(len)));
+            return Some((at.at, (end + 1).min(len)));
         }
 
-        let target = self.motion_target(motion, count, self.cursor).at;
-        let (lo, mut hi) = (self.cursor.at.min(target), self.cursor.at.max(target));
+        let target = self.motion_target(motion, count, at).at;
+        let (lo, mut hi) = (at.at.min(target), at.at.max(target));
         if motion.kind() == Kind::Inclusive {
             hi = (hi + 1).min(len);
         }
@@ -685,8 +682,14 @@ impl Buffer {
     /// registers, which is what makes `"_` a policy at the call site rather
     /// than a flag threaded through here. `None` means the motion covered
     /// nothing and the buffer is untouched.
-    pub fn operate(&mut self, op: Operator, target: Target, count: usize) -> Option<Entry> {
-        let (start, end) = self.operator_range(op, target, count)?;
+    pub fn operate(
+        &mut self,
+        at: Cursor,
+        op: Operator,
+        target: Target,
+        count: usize,
+    ) -> Option<(Entry, Cursor)> {
+        let (start, end) = self.operator_range(at, op, target, count)?;
         let linewise = target.kind() == Kind::Linewise;
 
         // A linewise entry is always whole lines ending in a newline, even when
@@ -695,7 +698,7 @@ impl Buffer {
         // the operator is about to remove, which differs at the buffer's end.
         let text = match (linewise, target) {
             (true, Target::Motion(motion)) => {
-                let (first, last) = self.linewise_rows(motion, count);
+                let (first, last) = self.linewise_rows(at, motion, count);
                 let from = self.rope.line_to_char(first);
                 let to = self.rope.line_to_char(last) + self.line_len(last);
                 let mut text = self.rope.slice(from..to).to_string();
@@ -716,42 +719,37 @@ impl Buffer {
         };
         let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
 
-        if op == Operator::Yank {
+        let landed = if op == Operator::Yank {
             // Yank moves the cursor to the start of what it took, and nowhere
             // for the forward motions where that is already the cursor.
-            if start < self.cursor.at {
-                self.cursor = Cursor::at(start);
-                self.clamp(false);
-            }
+            if start < at.at { self.clamped(Cursor::at(start), false) } else { at }
         } else {
-            self.apply_edit(start, end, "");
-            self.cursor = Cursor::at(start);
+            self.apply_edit(at, start, end, "");
             // Delete lands back on a char; change leaves the cursor where the
             // text was, which for `d$` or `cc` is one past what's left.
-            self.clamp(op == Operator::Change);
-        }
-        Some(Entry { text, kind })
+            self.clamped(Cursor::at(start), op == Operator::Change)
+        };
+        Some((Entry { text, kind }, landed))
     }
 
     /// Puts `entry` back, `count` times, as one edit.
-    pub fn paste(&mut self, entry: &Entry, before: bool, count: usize) {
+    pub fn paste(&mut self, at: Cursor, entry: &Entry, before: bool, count: usize) -> Cursor {
         let count = count.max(1);
         match entry.kind {
             EntryKind::Charwise => {
-                let row = self.cursor_row();
+                let row = self.row_at(at);
                 let line_end = self.rope.line_to_char(row) + self.line_len(row);
                 // `p` goes after the char under the cursor — but an empty line
                 // has no such char, so it must not step onto the next one.
-                let at = if before { self.cursor.at } else { (self.cursor.at + 1).min(line_end) };
+                let start = if before { at.at } else { (at.at + 1).min(line_end) };
                 let text = entry.text.repeat(count);
                 let len = text.chars().count();
-                self.apply_edit(at, at, &text);
-                self.cursor = Cursor::at(at + len.saturating_sub(1));
-                self.clamp(false);
+                self.apply_edit(at, start, start, &text);
+                self.clamped(Cursor::at(start + len.saturating_sub(1)), false)
             }
             EntryKind::Linewise => {
-                let row = self.cursor_row();
-                let at = if before {
+                let row = self.row_at(at);
+                let start = if before {
                     self.rope.line_to_char(row)
                 } else if row + 1 < self.rope.len_lines() {
                     self.rope.line_to_char(row + 1)
@@ -763,50 +761,41 @@ impl Buffer {
                 // Appending past a final line that has no newline: the entry's
                 // trailing newline has to move to the front, or the text lands
                 // on the end of that line instead of below it.
-                if at == self.rope.len_chars() && at > 0 && self.rope.char(at - 1) != '\n' {
+                if start == self.rope.len_chars() && start > 0 && self.rope.char(start - 1) != '\n'
+                {
                     let body = text.strip_suffix('\n').unwrap_or(&text);
                     text = format!("\n{body}");
                 }
 
-                self.apply_edit(at, at, &text);
+                self.apply_edit(at, start, start, &text);
                 let landed = if before { row } else { row + 1 };
-                self.cursor = self.at_row(landed, false);
+                self.at_row(landed, false)
             }
         }
     }
 
-    // ---- motions, mutating form --------------------------------------------
-
-    pub fn clamp(&mut self, allow_eol: bool) {
-        self.cursor = self.clamped(self.cursor, allow_eol);
-    }
-
-    /// Moves the cursor by `motion`. The mutating counterpart of the pure
-    /// motions above — `Action::Move` is the only caller.
-    pub fn apply_motion(&mut self, motion: Motion, allow_eol: bool) {
-        self.cursor = match motion {
-            Motion::Left => self.left(self.cursor),
-            Motion::Right => self.right(self.cursor, allow_eol),
-            Motion::Up => self.vertical(self.cursor, -1, allow_eol),
-            Motion::Down => self.vertical(self.cursor, 1, allow_eol),
-            Motion::WordForward => self.word_forward(self.cursor, allow_eol),
-            Motion::WordBackward => self.word_backward(self.cursor, allow_eol),
-            Motion::LineStart => self.line_start(self.cursor),
-            Motion::LineEnd => self.line_end(self.cursor, allow_eol),
+    /// Where `motion` lands from `at`. Pure, like every other motion here —
+    /// the buffer has no cursor of its own to move.
+    pub fn moved(&self, at: Cursor, motion: Motion, allow_eol: bool) -> Cursor {
+        match motion {
+            Motion::Left => self.left(at),
+            Motion::Right => self.right(at, allow_eol),
+            Motion::Up => self.vertical(at, -1, allow_eol),
+            Motion::Down => self.vertical(at, 1, allow_eol),
+            Motion::WordForward => self.word_forward(at, allow_eol),
+            Motion::WordBackward => self.word_backward(at, allow_eol),
+            Motion::LineStart => self.line_start(at),
+            Motion::LineEnd => self.line_end(at, allow_eol),
             Motion::FirstLine => self.at_row(0, allow_eol),
             Motion::LastLine => self.at_row(usize::MAX, allow_eol),
             Motion::Line(n) => self.at_row(n.saturating_sub(1), allow_eol),
-            Motion::CurrentLine => self.cursor,
+            Motion::CurrentLine => at,
             Motion::FindChar { ch, forward, till, repeat } => {
-                self.find_char(self.cursor, ch, forward, till, repeat, 1).unwrap_or(self.cursor)
+                self.find_char(at, ch, forward, till, repeat, 1).unwrap_or(at)
             }
             // Substituted by `Editor::resolve_find` before it gets here.
-            Motion::RepeatFind { .. } => self.cursor,
-        };
-    }
-
-    pub fn goto_row(&mut self, row: usize, allow_eol: bool) {
-        self.cursor = self.at_row(row, allow_eol);
+            Motion::RepeatFind { .. } => at,
+        }
     }
 
     // ---- find-char ---------------------------------------------------------
@@ -889,21 +878,26 @@ impl Buffer {
     /// Lives here for the same reason the motion resolvers do: it needs the
     /// rope. Returns a range rather than a cursor, which is the whole
     /// difference between an object and a motion.
-    pub fn object_range(&self, object: TextObject, around: bool) -> Option<(usize, usize)> {
+    pub fn object_range(
+        &self,
+        at: Cursor,
+        object: TextObject,
+        around: bool,
+    ) -> Option<(usize, usize)> {
         match object {
-            TextObject::Word { big } => self.word_object(around, big),
-            TextObject::Quoted(q) => self.quoted_object(q, around),
-            TextObject::Delimited(open) => self.delimited_object(open, around),
-            TextObject::Paragraph => self.paragraph_object(around),
+            TextObject::Word { big } => self.word_object(at, around, big),
+            TextObject::Quoted(q) => self.quoted_object(at, q, around),
+            TextObject::Delimited(open) => self.delimited_object(at, open, around),
+            TextObject::Paragraph => self.paragraph_object(at, around),
         }
     }
 
     /// `iw` is the run of same-class characters under the cursor. `aw` adds the
     /// whitespace after it, or — when there is none, at the end of a line — the
     /// whitespace before it, which is what vim does.
-    fn word_object(&self, around: bool, big: bool) -> Option<(usize, usize)> {
+    fn word_object(&self, at: Cursor, around: bool, big: bool) -> Option<(usize, usize)> {
         let len = self.rope.len_chars();
-        let at = self.cursor.at;
+        let at = at.at;
         if at >= len {
             return None;
         }
@@ -948,8 +942,8 @@ impl Buffer {
     /// vim's rule, and it is why `ci"` behaves oddly on a line with an odd
     /// number of quotes. Preserved rather than improved on: a better rule wants
     /// the parse tree.
-    fn quoted_object(&self, quote: char, around: bool) -> Option<(usize, usize)> {
-        let at = self.cursor.at;
+    fn quoted_object(&self, at: Cursor, quote: char, around: bool) -> Option<(usize, usize)> {
+        let at = at.at;
         let (line_start, line_end) = self.line_span(self.row_of(at));
 
         let mut pairs = Vec::new();
@@ -994,7 +988,7 @@ impl Buffer {
     ///
     /// Counts nesting on the way out, or `di(` inside `f(g(x))` would find the
     /// wrong pair.
-    fn delimited_object(&self, open: char, around: bool) -> Option<(usize, usize)> {
+    fn delimited_object(&self, at: Cursor, open: char, around: bool) -> Option<(usize, usize)> {
         let close = match open {
             '(' => ')',
             '[' => ']',
@@ -1003,7 +997,7 @@ impl Buffer {
             _ => return None,
         };
         let len = self.rope.len_chars();
-        let at = self.cursor.at.min(len.saturating_sub(1));
+        let at = at.at.min(len.saturating_sub(1));
 
         // Sitting on a bracket counts as being inside that pair.
         let start = if self.rope.char(at) == open {
@@ -1073,16 +1067,16 @@ impl Buffer {
 
     /// `ip` — the run of non-blank lines around the cursor, or the run of blank
     /// ones when it sits on a blank line. `ap` adds the blank lines after.
-    fn paragraph_object(&self, around: bool) -> Option<(usize, usize)> {
+    fn paragraph_object(&self, at: Cursor, around: bool) -> Option<(usize, usize)> {
         let last = self.line_count().saturating_sub(1);
         let blank = |row: usize| self.line_len(row) == 0;
-        let here = blank(self.cursor_row());
+        let here = blank(self.row_at(at));
 
-        let mut first = self.cursor_row();
+        let mut first = self.row_at(at);
         while first > 0 && blank(first - 1) == here {
             first -= 1;
         }
-        let mut end = self.cursor_row();
+        let mut end = self.row_at(at);
         while end < last && blank(end + 1) == here {
             end += 1;
         }
@@ -1102,12 +1096,110 @@ impl Buffer {
 mod tests {
     use super::*;
 
+    /// A buffer with a cursor attached.
+    ///
+    /// The cursor lives on `Editor` now, as a selection. These cases are about
+    /// what the text does, not about threading a position through every call,
+    /// so the fixture puts the old ergonomics back and derefs to `Buffer` for
+    /// everything that did not need one.
+    struct Fixture {
+        inner: Buffer,
+        cursor: Cursor,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = Buffer;
+        fn deref(&self) -> &Buffer {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for Fixture {
+        fn deref_mut(&mut self) -> &mut Buffer {
+            &mut self.inner
+        }
+    }
+
+    impl Fixture {
+        fn cursor_row(&self) -> usize {
+            self.inner.row_at(self.cursor)
+        }
+        fn cursor_col(&self) -> usize {
+            self.inner.col_at(self.cursor)
+        }
+        fn apply_motion(&mut self, motion: Motion, eol: bool) {
+            self.cursor = self.inner.moved(self.cursor, motion, eol);
+        }
+        fn goto_row(&mut self, row: usize, eol: bool) {
+            self.cursor = self.inner.at_row(row, eol);
+        }
+        fn insert_str(&mut self, text: &str) {
+            self.cursor = self.inner.insert_str(self.cursor, text);
+        }
+        fn backspace(&mut self) {
+            self.cursor = self.inner.backspace(self.cursor);
+        }
+        fn open_line(&mut self, below: bool) {
+            self.cursor = self.inner.open_line(self.cursor, below);
+        }
+        fn commit_undo(&mut self) {
+            self.inner.commit_undo(self.cursor);
+        }
+        fn undo(&mut self) -> bool {
+            match self.inner.undo(self.cursor) {
+                Some(c) => {
+                    self.cursor = c;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn redo(&mut self) -> bool {
+            match self.inner.redo(self.cursor) {
+                Some(c) => {
+                    self.cursor = c;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn operate(&mut self, op: Operator, target: Target, count: usize) -> Option<Entry> {
+            let (entry, landed) = self.inner.operate(self.cursor, op, target, count)?;
+            self.cursor = landed;
+            Some(entry)
+        }
+        fn paste(&mut self, entry: &Entry, before: bool, count: usize) {
+            self.cursor = self.inner.paste(self.cursor, entry, before, count);
+        }
+        fn replace_chars(&mut self, ch: char, count: usize) -> bool {
+            match self.inner.replace_chars(self.cursor, ch, count) {
+                Some(c) => {
+                    self.cursor = c;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn toggle_case(&mut self, count: usize) {
+            self.cursor = self.inner.toggle_case(self.cursor, count);
+        }
+        fn join_lines(&mut self, count: usize) {
+            self.cursor = self.inner.join_lines(self.cursor, count);
+        }
+        fn object_range(&self, object: TextObject, around: bool) -> Option<(usize, usize)> {
+            self.inner.object_range(self.cursor, object, around)
+        }
+        fn save_as(&mut self, path: impl AsRef<Path>) -> Result<()> {
+            self.inner.save_as(self.cursor, path)
+        }
+    }
+
     /// Loads `text` the way `open` does — straight into the rope, so the
     /// fixture leaves no undo history or pending edits behind.
-    fn buf(text: &str) -> Buffer {
+    fn buf(text: &str) -> Fixture {
         let mut b = Buffer::empty();
         b.rope = Rope::from_str(text);
-        b
+        Fixture { inner: b, cursor: Cursor::default() }
     }
 
     #[test]
@@ -1669,7 +1761,7 @@ mod tests {
         let mut b = buf("abcdef");
         b.cursor = Cursor::at(1);
         assert!(b.replace_chars('x', 3));
-        assert_eq!(b.rope.to_string(), "axxxef");
+        assert_eq!(b.rope().to_string(), "axxxef");
         assert_eq!(b.cursor_col(), 3, "vim leaves the cursor on the last replaced char");
     }
 
@@ -1678,7 +1770,7 @@ mod tests {
         let mut b = buf("abc\ndef");
         b.cursor = Cursor::at(1);
         assert!(!b.replace_chars('x', 5));
-        assert_eq!(b.rope.to_string(), "abc\ndef", "nothing changed");
+        assert_eq!(b.rope().to_string(), "abc\ndef", "nothing changed");
     }
 
     #[test]
@@ -1686,14 +1778,14 @@ mod tests {
         let mut b = buf("ab\ncd");
         b.cursor = Cursor::at(0);
         assert!(!b.replace_chars('x', 3));
-        assert_eq!(b.rope.to_string(), "ab\ncd");
+        assert_eq!(b.rope().to_string(), "ab\ncd");
     }
 
     #[test]
     fn tilde_flips_case_and_walks_right() {
         let mut b = buf("hello world");
         b.toggle_case(5);
-        assert_eq!(b.rope.to_string(), "HELLO world");
+        assert_eq!(b.rope().to_string(), "HELLO world");
         assert_eq!(b.cursor_col(), 5);
     }
 
@@ -1701,14 +1793,14 @@ mod tests {
     fn tilde_steps_over_caseless_chars_and_stops_at_the_line_end() {
         let mut b = buf("a1b\nxy");
         b.toggle_case(99);
-        assert_eq!(b.rope.to_string(), "A1B\nxy", "did not wrap onto the next line");
+        assert_eq!(b.rope().to_string(), "A1B\nxy", "did not wrap onto the next line");
     }
 
     #[test]
     fn j_joins_with_one_space_and_eats_the_indent() {
         let mut b = buf("foo\n    bar\nbaz");
         b.join_lines(1);
-        assert_eq!(b.rope.to_string(), "foo bar\nbaz");
+        assert_eq!(b.rope().to_string(), "foo bar\nbaz");
         assert_eq!(b.cursor_col(), 3, "cursor lands on the join");
     }
 
@@ -1716,31 +1808,31 @@ mod tests {
     fn j_adds_no_space_after_trailing_whitespace_or_before_a_blank_line() {
         let mut b = buf("foo \nbar");
         b.join_lines(1);
-        assert_eq!(b.rope.to_string(), "foo bar", "no double space");
+        assert_eq!(b.rope().to_string(), "foo bar", "no double space");
 
         let mut b = buf("foo\n\nbar");
         b.join_lines(1);
-        assert_eq!(b.rope.to_string(), "foo\nbar", "nothing to separate");
+        assert_eq!(b.rope().to_string(), "foo\nbar", "nothing to separate");
     }
 
     #[test]
     fn a_count_joins_that_many_lines_and_1j_means_the_same_as_2j() {
         let mut b = buf("a\nb\nc\nd");
         b.join_lines(3);
-        assert_eq!(b.rope.to_string(), "a b c\nd");
+        assert_eq!(b.rope().to_string(), "a b c\nd");
 
         let mut b = buf("a\nb\nc");
         b.join_lines(1);
         let mut c = buf("a\nb\nc");
         c.join_lines(2);
-        assert_eq!(b.rope.to_string(), c.rope.to_string());
+        assert_eq!(b.rope().to_string(), c.rope().to_string());
     }
 
     #[test]
     fn j_on_the_last_line_does_nothing() {
         let mut b = buf("only");
         b.join_lines(9);
-        assert_eq!(b.rope.to_string(), "only");
+        assert_eq!(b.rope().to_string(), "only");
     }
 
     #[test]
@@ -1748,9 +1840,9 @@ mod tests {
         let mut b = buf("foo\nbar");
         b.join_lines(1);
         b.commit_undo();
-        assert_eq!(b.rope.to_string(), "foo bar");
+        assert_eq!(b.rope().to_string(), "foo bar");
         assert!(b.undo());
-        assert_eq!(b.rope.to_string(), "foo\nbar");
+        assert_eq!(b.rope().to_string(), "foo\nbar");
     }
 
     // ---- find-char ---------------------------------------------------------

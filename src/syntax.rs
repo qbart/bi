@@ -262,21 +262,25 @@ mod tests {
     /// likeliest bug here, and it otherwise shows up as mysterious
     /// mis-highlighting long after the edit that caused it.
     #[test]
+    // The final write to `at` closes the edit sequence and is not read again.
+    #[allow(unused_assignments)]
     fn an_incremental_reparse_matches_a_fresh_parse() {
         let mut buffer = Buffer::empty();
-        buffer.insert_str("fn main() {}\n");
+        let mut at = crate::buffer::Cursor::default();
+        at = buffer.insert_str(at, "fn main() {}\n");
         let mut syntax = Syntax::new("rs", buffer.rope()).unwrap();
         sync(&mut syntax, &mut buffer);
 
         // A spread of edits: append, insert mid-line, insert a newline, delete.
-        buffer.cursor = crate::buffer::Cursor::at(buffer.rope().len_chars());
-        buffer.insert_str("struct S { a: u32 }\n");
-        buffer.cursor = crate::buffer::Cursor::at(3);
-        buffer.insert_str("_renamed");
-        buffer.cursor = crate::buffer::Cursor::at(0);
-        buffer.insert_str("// leading comment\n");
-        buffer.cursor = crate::buffer::Cursor::at(5);
+        at = crate::buffer::Cursor::at(buffer.rope().len_chars());
+        at = buffer.insert_str(at, "struct S { a: u32 }\n");
+        at = crate::buffer::Cursor::at(3);
+        at = buffer.insert_str(at, "_renamed");
+        at = crate::buffer::Cursor::at(0);
+        at = buffer.insert_str(at, "// leading comment\n");
+        at = crate::buffer::Cursor::at(5);
         buffer.operate(
+            at,
             crate::motion::Operator::Delete,
             crate::motion::Target::Motion(crate::motion::Motion::Right),
             3,
@@ -295,19 +299,22 @@ mod tests {
     /// Undo replays through the same mutation primitive, so it must keep the
     /// tree correct too rather than forcing a full reparse.
     #[test]
+    // The final write to `at` closes the edit sequence and is not read again.
+    #[allow(unused_assignments)]
     fn an_undo_keeps_the_incremental_tree_correct() {
         let mut buffer = Buffer::empty();
-        buffer.insert_str("fn main() {}\n");
-        buffer.commit_undo();
+        let mut at = crate::buffer::Cursor::default();
+        at = buffer.insert_str(at, "fn main() {}\n");
+        buffer.commit_undo(at);
         let mut syntax = Syntax::new("rs", buffer.rope()).unwrap();
         sync(&mut syntax, &mut buffer);
 
-        buffer.cursor = crate::buffer::Cursor::at(buffer.rope().len_chars());
-        buffer.insert_str("struct S;\n");
-        buffer.commit_undo();
+        at = crate::buffer::Cursor::at(buffer.rope().len_chars());
+        at = buffer.insert_str(at, "struct S;\n");
+        buffer.commit_undo(at);
         sync(&mut syntax, &mut buffer);
 
-        buffer.undo();
+        buffer.undo(at);
         sync(&mut syntax, &mut buffer);
 
         let fresh = Syntax::new("rs", buffer.rope()).unwrap();
@@ -317,14 +324,17 @@ mod tests {
     /// `Edit` carries byte offsets, so an edit after a multi-byte char must not
     /// hand tree-sitter a char index.
     #[test]
+    // The final write to `at` closes the edit sequence and is not read again.
+    #[allow(unused_assignments)]
     fn edits_after_multibyte_text_stay_correct() {
         let mut buffer = Buffer::empty();
-        buffer.insert_str("// é comment\nfn main() {}\n");
+        let mut at = crate::buffer::Cursor::default();
+        at = buffer.insert_str(at, "// é comment\nfn main() {}\n");
         let mut syntax = Syntax::new("rs", buffer.rope()).unwrap();
         sync(&mut syntax, &mut buffer);
 
-        buffer.cursor = crate::buffer::Cursor::at(5);
-        buffer.insert_str("ü more");
+        at = crate::buffer::Cursor::at(5);
+        at = buffer.insert_str(at, "ü more");
         sync(&mut syntax, &mut buffer);
 
         let fresh = Syntax::new("rs", buffer.rope()).unwrap();

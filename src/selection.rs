@@ -161,23 +161,6 @@ impl Selections {
         }
     }
 
-    /// Rewrites each selection through `f`, in **descending** position order.
-    ///
-    /// The order is the whole point: an edit at position 5 shifts everything
-    /// after it, but an edit at 40 leaves position 5 alone. Walking high to low
-    /// means every selection's recorded position is still valid when its turn
-    /// comes, and no offset arithmetic is needed. Ascending order is the bug
-    /// that makes bolted-on multi-cursor drift.
-    pub fn update_descending(&mut self, mut f: impl FnMut(Selection) -> Selection) {
-        let mut order: Vec<usize> = (0..self.list.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(self.list[i].range().0));
-        for i in order {
-            self.list[i] = f(self.list[i]);
-        }
-        let was = self.primary();
-        self.normalise(was);
-    }
-
     /// Sorts and merges what now overlaps.
     ///
     /// `follow` is the selection `primary` should end up pointing at, given by
@@ -322,24 +305,11 @@ mod tests {
         assert_eq!(heads, vec![4, 14]);
     }
 
-    /// The ordering that makes multi-cursor edits work at all.
     #[test]
-    fn updates_run_from_the_highest_position_down() {
-        let s = sels(&[0, 10, 20]);
-        let mut seen = Vec::new();
-        let mut s = s;
-        s.update_descending(|sel| {
-            seen.push(sel.head.at);
-            sel
-        });
-        assert_eq!(seen, vec![20, 10, 0], "an edit low down must not invalidate one above");
-    }
-
-    #[test]
-    fn an_update_that_collides_two_selections_merges_them() {
+    fn selections_that_land_on_the_same_place_merge() {
         let mut s = sels(&[10, 12]);
-        // Both move to the same place, as a shared motion target would.
-        s.update_descending(|_| Selection::at(5));
+        // Both moved to the same spot, as a shared motion target would do.
+        s.set(vec![Selection::at(5), Selection::at(5)]);
         assert_eq!(s.len(), 1);
         assert_eq!(s.cursor().at, 5);
     }

@@ -186,10 +186,10 @@ fn arrow_keys_move_without_any_terminal_types_involved() {
     let mut s = Session::new("ab\ncd");
     s.press(Key::code(KeyCode::Home));
     s.press(Key::code(KeyCode::Up));
-    assert_eq!(s.editor.buffer.cursor_row(), 0);
-    assert_eq!(s.editor.buffer.cursor_col(), 0);
+    assert_eq!(s.editor.cursor_row(), 0);
+    assert_eq!(s.editor.cursor_col(), 0);
 
     s.press(Key::code(KeyCode::Down));
     s.press(Key::code(KeyCode::End));
-    assert_eq!(s.editor.buffer.cursor_row(), 1);
+    assert_eq!(s.editor.cursor_row(), 1);
 }

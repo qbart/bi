@@ -157,7 +157,8 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
     let total = ed.buffer.line_count();
     let gutter = format!("{total}").len() + 1;
-    let cursor_row = ed.buffer.cursor_row();
+    let cursor = ed.selections.cursor();
+    let cursor_row = ed.buffer.row_at(cursor);
 
     let mut lines = Vec::with_capacity(text_area.height as usize);
     let mut cursor_screen_col = 0;
@@ -177,7 +178,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         let raw = raw.trim_end_matches(['\n', '\r']);
 
         if row == cursor_row {
-            cursor_screen_col = display_col(raw, ed.buffer.cursor_col());
+            cursor_screen_col = display_col(raw, ed.buffer.col_at(cursor));
         }
 
         let number = Span::styled(
@@ -376,8 +377,12 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
         Span::styled(ed.status.clone(), Style::default().fg(Color::Cyan)),
     ];
 
-    let right =
-        format!("{}  {}:{} ", pending, ed.buffer.cursor_row() + 1, ed.buffer.cursor_col() + 1);
+    let right = format!(
+        "{}  {}:{} ",
+        pending,
+        ed.buffer.row_at(ed.selections.cursor()) + 1,
+        ed.buffer.col_at(ed.selections.cursor()) + 1
+    );
 
     let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (width as usize).saturating_sub(left_width + right.chars().count());
