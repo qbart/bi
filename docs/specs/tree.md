@@ -10,7 +10,17 @@ what you select, and edits the filesystem.
 
 ## Status
 
-**Specified.** Nothing below is built.
+**Built.**
+
+The `Tree` model, the `Content` split, the ex-line lift, the keymap, the
+rendering and the three file operations. Deliberately out: filtering the tree,
+git status, file watching, editing the listing to move files, and multi-select
+— all listed at the end with their reasons.
+
+Five things below were wrong when this was written and are corrected in place,
+marked **Corrected**: what `View` does with a pane's height, what `Escalation`
+had left to do, what the root row is called, what a relative root does to `-`,
+and which trees a file operation refreshes.
 
 ## The tree is not a buffer
 
@@ -139,11 +149,17 @@ before" was never specifically a buffer.
 different questions and windows.md's reasoning for `last` is untouched. Leaving a
 buffer still writes `last`, whether what replaces it is another buffer or a tree.
 
-**Selections restored from `alt` are clamped**, for the reason windows.md gives
-for restoring from `last`: `Editor::settle` shifts the cursors of live windows
-through the edits they did not make, and a `Content::Text` parked in `alt` is not
-a live window. It is the same one case with no live window to shift, reached by a
-second road.
+**Corrected.** This first said selections restored from `alt` are clamped, on
+the grounds that a parked `Content::Text` is not a live window for `settle` to
+shift. True, and beside the point: `Ctrl-^` onto a buffer goes through `show`,
+which restores from the entry's `last` and clamps there already. `alt` is read
+for its *buffer id* in that case and nothing else.
+
+Where `alt` is read whole is the case it was widened for. `Ctrl-^` with a tree
+parked swaps the window's content back, expansion and all, and the file it
+displaces becomes the new alternate. That swap has to be checked before the
+slot is taken — taking first and matching after empties it for a buffer
+alternate too, which is exactly what the existing `Ctrl-^` test caught.
 
 ## The tree
 
@@ -166,7 +182,7 @@ pub struct Tree {
 
 pub struct Row {
     pub path: PathBuf,
-    /// The file name alone — the root row carries the root's display path.
+    /// The final component alone. The full root path is [`Tree::root`].
     pub name: String,
     pub depth: usize,
     pub kind: Kind,
@@ -185,6 +201,18 @@ is far cheaper than the machinery to avoid it.
 kind; it does not say `▾` or `│  ├─ `. A GUI frontend draws indent guides and
 icons from the same three fields, which is README decision #6 — capture names,
 not styles — applied to a second subsystem.
+
+**Corrected.** The root row carries the root's *final component*, not its
+display path. The full path is what the status row shows, and repeating it at
+the top of a pane eight columns wide was the same fact twice, in the place with
+the least room for it.
+
+**Corrected.** The root is resolved with `canonicalize` on the way in. `bee .`
+would otherwise root at `"."`, whose parent is `""` rather than the directory
+above it — leaving `-` nowhere to go in the one case the key exists for. The
+tests missed this because `Path` comparison normalises a *trailing* `.` away, so
+every scratch-directory spelling of it passed. Running the editor is what
+found it.
 
 **Order is directories first, then by name.** Case-insensitively, so `README.md`
 does not sort away from `readme-draft.md`.
@@ -320,10 +348,14 @@ the file under its old name.
 simply no longer has a file, exactly as if it had never been saved. Deleting the
 file out from under a pane the user is reading is not a reason to close it.
 
-**Every tree refreshes.** After any of the three succeed, every window whose tree
-contains the affected parent directory re-reads it, keeping expansion and holding
-the selection on the same path — or on the nearest surviving row when the
-selection is what was deleted.
+**Every tree refreshes.** After any of the three succeed, every open tree
+re-reads, keeping expansion and holding the selection on the same path — or on
+the nearest surviving row when the selection is what was deleted.
+
+**Corrected.** This first said "every window whose tree contains the affected
+parent directory". Every tree, in the end: one that cannot see the change
+re-reads to exactly the rows it had, so telling them apart would have bought
+nothing but the bookkeeping to do it.
 
 ## Dispatch, and what the tree forces
 
@@ -366,6 +398,19 @@ tree is what forces it: with the parse out front, `Escalation` is no longer how
 ex commands reach the editor. It survives only for `accept_pick`, where a
 register pick pastes into the buffer the view already holds and a buffer pick
 reaches the list that view was borrowed from.
+
+**Corrected.** `Escalation` does not survive at all. Running the editor found
+that `:` did nothing in a tree pane: `EnterCommandMode` and the picker keys are
+*session* state that was living inside `View`, so with no view they never ran.
+They move out to `Editor::run_session_action`, and once the picker's keys are
+there `accept_pick` follows — it sends a buffer pick to the list and a register
+pick through `in_view`. Nothing is left that a view discovers mid-flight and
+hands back, so the type is gone.
+
+The lesson is worth keeping. "Needs a view" is not the same question as "is an
+editing command": the command line and the picker look like editor features and
+are session state, and the only thing that tells them apart is a pane with no
+buffer to run them against.
 
 ## What this breaks
 

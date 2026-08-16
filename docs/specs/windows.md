@@ -198,6 +198,16 @@ pub struct Window {
     pub height: usize,
     pub width: usize,
 }
+```
+
+**Corrected.** `buffer`, `alt`, `selections` and `scroll` no longer sit here.
+[tree.md](tree.md) replaced them with `content: Content`, splitting `Text` from
+`Tree`, and moved the cursor and the scroll row inside the `Text` variant — a
+tree pane must not carry a `Selections` that means nothing. `alt` widened to a
+whole `Content` for the same reason. `height` and `width` are unchanged: they
+are true of any window, whatever it holds.
+
+```rust
 
 pub enum Node {
     Leaf(WindowId),
@@ -495,6 +505,14 @@ lines that edit text, which puts the awkwardness in a busier place.
 reason — the register picker pastes into the buffer it already has, but choosing
 a buffer reaches the list the `View` was borrowed from. One `Escalation` type
 covers both paths.
+
+**Corrected.** The corner is gone and so is `Escalation`. A tree window has no
+`View` at all, so a `:` line typed in one had nowhere to land — which forced the
+parse out in front of dispatch, where `Editor::run_ex` matches an `ExLine` and
+only the arms that need a rope go through a view. The command line and the
+picker turned out to be session state living in the wrong place for the same
+reason, and moved out beside it; `accept_pick` then had nothing left to hand
+back. See [tree.md](tree.md).
 
 ## Rendering
 

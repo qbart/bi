@@ -4,12 +4,13 @@ A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
 Status: modal editing, undo, registers, tree-sitter highlighting for Rust, a
-buffer list, and split windows.
+buffer list, split windows, and a file tree.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
 ```sh
 cargo run -- <file>
+cargo run -- .            # a directory opens the file tree
 cargo test
 cargo fmt --check
 python3 scripts/vim_differential.py   # needs vim; not part of cargo test
@@ -283,6 +284,9 @@ afterwards repeats it.
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
+| `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
+| `:rename <old> <new>` | move a file, taking any open buffer's path with it |
+| `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
 
 ### Windows and buffers
 
@@ -307,6 +311,31 @@ An edit in one moves the other's cursor *with the text* rather than clamping it
 Closing a window discards nothing, so it never asks about unsaved changes: the
 buffer stays in the list. Deleting a buffer closes no windows either — a window
 showing it falls through to the next one.
+
+### The file tree
+
+`bee .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
+and which one you meant is a question for the disk. `-` goes the other way, out
+of a file and into the tree above it. See [docs/specs/tree.md](docs/specs/tree.md).
+
+| Key | Does |
+|---|---|
+| `j` `k` `gg` `G` | move, with a count |
+| `l` / `→` | open a directory, or open the file under the cursor |
+| `h` / `←` | close a directory, or step to the parent row |
+| `Enter` | a directory toggles, a file opens |
+| `-` | re-root at the parent directory |
+| `gh` | show or hide dotfiles |
+| `R` | re-read from disk |
+| `a` `r` `d` | create, rename, delete — each fills in a `:` line for you to agree to |
+
+Enter on a file opens it in the last window focused before this one, so `:vs .`
+is a sidebar that stays put; with one window it opens in place and `Ctrl-^`
+brings the tree back with its expansion intact.
+
+The keymap is an allowlist, not normal mode minus the dangerous keys: anything
+it does not name does nothing, which is the safe failure for a pane sitting on a
+filesystem. Nothing in it enters insert mode, so a tree never can be.
 
 ### Line numbers
 
@@ -351,6 +380,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `picker.rs` | the overlay's state: query, matches, selection |
+| `tree.rs` | the file tree: expansion, the flattened rows, the filesystem |
 | `syntax.rs` | tree-sitter: incremental reparse, highlight spans |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `key.rs` | `Key` / `KeyCode` / `Mods` — bee's own key vocabulary |

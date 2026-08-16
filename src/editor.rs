@@ -611,6 +611,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "bp" | "bprev" | "bprevious" => ExLine::Buffer(BufferCmd::Prev),
         "bd" | "bdelete" => ExLine::Buffer(BufferCmd::Delete { force }),
         "ls" | "buffers" => ExLine::Buffer(BufferCmd::List),
+        // `:b#` written without a space, which is how it is spelt everywhere
+        // — including in this project's own README until now.
+        "b#" | "buffer#" => ExLine::Buffer(BufferCmd::Alternate),
         "b" | "buffer" => match arg {
             "" => ExLine::Error("which buffer?".into()),
             "#" => ExLine::Buffer(BufferCmd::Alternate),
@@ -1099,6 +1102,17 @@ impl Editor {
 
     fn run_buffer_cmd(&mut self, cmd: BufferCmd) {
         let focus = self.focus;
+
+        // A parked tree is an alternate like any other, and swapping back is
+        // the whole reason displacing it is tolerable: re-reading the
+        // directory would lose the expansion you had built up.
+        // Checked before taking: a buffer alternate must stay where it is, and
+        // `take` on a failed pattern would still have emptied the slot.
+        if cmd == BufferCmd::Alternate && matches!(self.window().alt, Some(Content::Tree(_))) {
+            let tree = self.window_mut().alt.take().expect("checked above");
+            return self.window_mut().show(tree);
+        }
+
         let ids = self.buffer_ids();
         let current = self.window().buffer();
         let at = current.and_then(|id| ids.iter().position(|&i| i == id)).unwrap_or(0);
@@ -3667,6 +3681,25 @@ mod tests {
         assert!(ed.window().buffer().is_some(), "accepting showed the buffer here");
     }
 
+    /// Displacing the tree is only tolerable because it comes straight back —
+    /// re-reading the directory and losing what you had open would make the
+    /// single-window flow a one-way trip.
+    #[test]
+    fn the_alternate_brings_a_displaced_tree_back_with_its_expansion() {
+        let d = ScratchDir::new("alt-tree").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Expand);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Enter);
+        assert!(ed.window().buffer().is_some(), "the file displaced the tree");
+
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+
+        let tree = ed.window().tree().expect("the tree came back");
+        assert_eq!(tree.rows().len(), 3, "root, pkg/ and a.rs — still expanded");
+    }
+
     /// A tree pane shows no buffer, so the lines that need one say so rather
     /// than failing quietly.
     #[test]
@@ -3848,6 +3881,17 @@ mod tests {
 
     /// A line that parses but cannot run says what it wanted, not that it was
     /// never a command. Easy to lose when the parse moved out of the view.
+    #[test]
+    fn the_alternate_answers_to_b_hash_with_no_space() {
+        let (a, b) = (Scratch::new("hash-a", "a\n"), Scratch::new("hash-b", "b\n"));
+        let mut ed = Editor::open(a.path()).unwrap();
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        ex(&mut ed, "b#");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n", "{}", ed.session.status);
+    }
+
     #[test]
     fn a_command_missing_its_argument_says_what_it_wanted() {
         let mut ed = editor("hello");
