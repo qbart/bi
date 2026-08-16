@@ -552,6 +552,15 @@ enum ExLine {
     WriteAll,
     Highlight(bool),
     Set(String),
+    Create(String),
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete {
+        path: String,
+        force: bool,
+    },
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -612,6 +621,19 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
+        // The tree keys are prefills over these three, which is why they are
+        // ex commands rather than tree-only actions: typeable without a tree,
+        // and testable without one.
+        "create" if !arg.is_empty() => ExLine::Create(arg.into()),
+        "create" => ExLine::Error("create what?".into()),
+        "rename" => match arg.split_once(char::is_whitespace) {
+            Some((from, to)) if !to.trim().is_empty() => {
+                ExLine::Rename { from: from.into(), to: to.trim().into() }
+            }
+            _ => ExLine::Error("rename takes the old path and the new one".into()),
+        },
+        "delete" if !arg.is_empty() => ExLine::Delete { path: arg.into(), force },
+        "delete" => ExLine::Error("delete what?".into()),
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         _ => match name.parse::<usize>() {
             Ok(row) => ExLine::Goto(row),
@@ -669,6 +691,19 @@ pub enum TreeCmd {
     Up,
     Refresh,
     ToggleHidden,
+    /// `a` `r` `d` — fills the command line in and hands over.
+    Prompt(FileOp),
+}
+
+/// The three things a tree key can start.
+///
+/// Each one only prefills a `:` line: the commands themselves are ordinary ex
+/// commands, typeable and testable with no tree open at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOp {
+    Create,
+    Rename,
+    Delete,
 }
 
 /// Which buffer a window should show, and what to do to the list.
@@ -1237,6 +1272,7 @@ impl Editor {
             TreeCmd::Up => return tree.up(),
             TreeCmd::Refresh => return tree.refresh(),
             TreeCmd::ToggleHidden => return tree.toggle_hidden(),
+            TreeCmd::Prompt(op) => return self.prompt_file_op(op),
             TreeCmd::Expand | TreeCmd::Enter => {}
         }
 
@@ -1611,6 +1647,157 @@ impl Editor {
         }
     }
 
+    // ---- the filesystem -----------------------------------------------------
+
+    /// Re-reads every open tree.
+    ///
+    /// All of them rather than only the ones showing the affected directory: a
+    /// tree that cannot see the change re-reads to exactly the rows it had, so
+    /// the bookkeeping to tell them apart would buy nothing.
+    fn refresh_trees(&mut self) {
+        for window in &mut self.windows {
+            if let Some(tree) = window.tree_mut() {
+                tree.refresh();
+            }
+        }
+    }
+
+    /// Reports what a filesystem call did, and re-reads the trees if it worked.
+    fn report(&mut self, result: std::io::Result<()>, done: String) {
+        self.session.status = match result {
+            Ok(()) => {
+                self.refresh_trees();
+                done
+            }
+            Err(e) => format!("{e}"),
+        };
+    }
+
+    /// `:create <path>` — an empty file, or a directory for a trailing slash.
+    ///
+    /// Intermediate directories are made along the way. Refusing because the
+    /// parent is missing would be a message telling you to type two more
+    /// commands you already asked for.
+    fn create_path(&mut self, path: &str) {
+        let target = std::path::Path::new(path);
+        if target.exists() {
+            self.session.status = format!("\"{path}\" already exists");
+            return;
+        }
+
+        let result = if path.ends_with('/') || path.ends_with(std::path::MAIN_SEPARATOR) {
+            std::fs::create_dir_all(target)
+        } else {
+            match target.parent().filter(|p| !p.as_os_str().is_empty()) {
+                Some(parent) => std::fs::create_dir_all(parent),
+                None => Ok(()),
+            }
+            .and_then(|()| std::fs::write(target, ""))
+        };
+        self.report(result, format!("\"{path}\" created"));
+    }
+
+    /// `:rename <old> <new>` — which is also how you move a file, since it is
+    /// the same call and pretending otherwise would need two commands.
+    fn rename_path(&mut self, from: &str, to: &str) {
+        let (source, target) = (std::path::Path::new(from), std::path::Path::new(to));
+        if !source.exists() {
+            self.session.status = format!("\"{from}\" does not exist");
+            return;
+        }
+        if target.exists() {
+            self.session.status = format!("\"{to}\" already exists");
+            return;
+        }
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.session.status = format!("{e}");
+            return;
+        }
+
+        if let Err(e) = std::fs::rename(source, target) {
+            self.session.status = format!("{e}");
+            return;
+        }
+
+        // A buffer left pointing at a path that no longer exists would recreate
+        // the file under its old name on the next `:w`.
+        for entry in &mut self.buffers {
+            if entry.buffer.path.as_deref() == Some(source) {
+                entry.buffer.path = Some(target.to_path_buf());
+                // The extension may have changed, and with it the grammar.
+                entry.syntax = syntax_for(&entry.buffer);
+            }
+        }
+        self.report(Ok(()), format!("\"{from}\" → \"{to}\""));
+    }
+
+    /// `:delete[!] <path>` — a file, or a directory that `!` says may have
+    /// something in it.
+    ///
+    /// An open buffer on the deleted file stays open: its text and history are
+    /// intact and it simply no longer has a file, exactly as if it had never
+    /// been saved. Closing a pane the user is reading is not what deleting a
+    /// file asked for.
+    fn delete_path(&mut self, path: &str, force: bool) {
+        let target = std::path::Path::new(path);
+        let Ok(meta) = std::fs::symlink_metadata(target) else {
+            self.session.status = format!("\"{path}\" does not exist");
+            return;
+        };
+
+        if self.modified_at(target) && !force {
+            self.session.status = format!("\"{path}\" has unsaved changes (use `:delete!`)");
+            return;
+        }
+
+        // A symlink is removed as the link it is, never followed into the
+        // directory it points at — the same rule the tree draws it by.
+        let result = if meta.is_dir() {
+            let empty = std::fs::read_dir(target).map(|mut d| d.next().is_none()).unwrap_or(false);
+            if !empty && !force {
+                self.session.status = format!("\"{path}\" is not empty (use `:delete!`)");
+                return;
+            }
+            std::fs::remove_dir_all(target)
+        } else {
+            std::fs::remove_file(target)
+        };
+        self.report(result, format!("\"{path}\" deleted"));
+    }
+
+    fn modified_at(&self, path: &std::path::Path) -> bool {
+        self.buffers
+            .iter()
+            .any(|b| b.buffer.path.as_deref() == Some(path) && b.buffer.is_modified())
+    }
+
+    /// `a` `r` `d` — puts the selected path on the command line and leaves it
+    /// there.
+    ///
+    /// A prefilled line *is* the confirmation: the editor has no prompt
+    /// machinery and gains none here. You see the path, and Enter is the
+    /// assent; where that is not enough, the guard is `!`.
+    fn prompt_file_op(&mut self, op: FileOp) {
+        let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
+        let path = row.path.display().to_string();
+        let line = match op {
+            // Inside a directory, beside a file — which is where you meant.
+            FileOp::Create => {
+                let dir = match row.kind {
+                    Kind::Dir => row.path.clone(),
+                    _ => row.path.parent().unwrap_or(&row.path).to_path_buf(),
+                };
+                format!("create {}/", dir.display())
+            }
+            FileOp::Rename => format!("rename {path} {path}"),
+            FileOp::Delete => format!("delete {path}"),
+        };
+        self.session.status.clear();
+        self.session.mode = Mode::Command(line);
+    }
+
     /// Runs a `:` line.
     ///
     /// Parsed before anything is dispatched, rather than discovered inside a
@@ -1628,6 +1815,9 @@ impl Editor {
             ExLine::WriteAll => self.write_all(),
             ExLine::Highlight(on) => self.session.highlight_search = on,
             ExLine::Set(arg) => self.set_option(&arg),
+            ExLine::Create(path) => self.create_path(&path),
+            ExLine::Rename { from, to } => self.rename_path(&from, &to),
+            ExLine::Delete { path, force } => self.delete_path(&path, force),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
 
@@ -3502,6 +3692,112 @@ mod tests {
 
         assert!(ed.window().buffer().is_some(), "a buffer is showing");
         assert!(matches!(ed.window().alt, Some(Content::Tree(_))), "the tree is the alternate");
+    }
+
+    // ---- file operations ----------------------------------------------------
+
+    #[test]
+    fn create_makes_the_intermediate_directories_and_refuses_to_overwrite() {
+        let d = ScratchDir::new("create");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ex(&mut ed, &format!("create {}/a/b/c.rs", d.path()));
+        assert!(std::path::Path::new(&format!("{}/a/b/c.rs", d.path())).is_file());
+
+        ex(&mut ed, &format!("create {}/a/b/c.rs", d.path()));
+        assert!(ed.session.status.contains("exists"), "{}", ed.session.status);
+    }
+
+    /// A trailing slash is what tells a directory from a file — the one bit of
+    /// syntax the three commands have.
+    #[test]
+    fn a_trailing_slash_creates_a_directory() {
+        let d = ScratchDir::new("create-dir");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ex(&mut ed, &format!("create {}/pkg/", d.path()));
+
+        assert!(std::path::Path::new(&format!("{}/pkg", d.path())).is_dir());
+    }
+
+    /// Leaving the buffer pointing at a path that no longer exists means the
+    /// next `:w` recreates the file under its old name.
+    #[test]
+    fn rename_moves_an_open_buffer_with_the_file_and_repicks_its_syntax() {
+        let d = ScratchDir::new("rename").file("a.txt");
+        let (from, to) = (format!("{}/a.txt", d.path()), format!("{}/b.rs", d.path()));
+        let mut ed = Editor::open(&from).unwrap();
+        assert!(ed.syntax().is_none(), "no grammar for .txt");
+
+        ex(&mut ed, &format!("rename {from} {to}"));
+
+        assert!(std::path::Path::new(&to).is_file(), "moved on disk");
+        assert!(!std::path::Path::new(&from).exists());
+        assert_eq!(ed.name_of(ed.window().buffer().unwrap()), to, "and the buffer came with it");
+        assert!(ed.syntax().is_some(), "a .rs now, so it highlights");
+    }
+
+    #[test]
+    fn delete_needs_a_bang_for_a_directory_with_anything_in_it() {
+        let d = ScratchDir::new("delete").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        let pkg = format!("{}/pkg", d.path());
+
+        ex(&mut ed, &format!("delete {pkg}"));
+        assert!(std::path::Path::new(&pkg).is_dir(), "refused: {}", ed.session.status);
+        assert!(ed.session.status.contains("not empty"), "{}", ed.session.status);
+
+        ex(&mut ed, &format!("delete! {pkg}"));
+        assert!(!std::path::Path::new(&pkg).exists());
+    }
+
+    /// Deleting the file out from under a pane the user is reading is not a
+    /// reason to close it — the text and its history are still there.
+    #[test]
+    fn deleting_a_file_leaves_its_buffer_open() {
+        let d = ScratchDir::new("delete-open").file("a.rs");
+        let path = format!("{}/a.rs", d.path());
+        let mut ed = Editor::open(&path).unwrap();
+
+        ex(&mut ed, &format!("delete {path}"));
+
+        assert!(!std::path::Path::new(&path).exists());
+        assert_eq!(ed.buffer_ids().len(), 1, "the buffer is still open");
+    }
+
+    #[test]
+    fn a_file_operation_refreshes_every_tree_that_can_see_it() {
+        let d = ScratchDir::new("refresh-trees").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        assert_eq!(ed.window().tree().unwrap().rows().len(), 2, "root plus a.rs");
+
+        ex(&mut ed, &format!("create {}/b.rs", d.path()));
+
+        assert_eq!(ed.window().tree().unwrap().rows().len(), 3, "without pressing R");
+    }
+
+    #[test]
+    fn the_file_op_keys_prefill_the_command_line_with_the_selected_path() {
+        let d = ScratchDir::new("prompt").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Prompt(FileOp::Delete));
+
+        let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
+        assert_eq!(line, &format!("delete {}/a.rs", d.path()));
+    }
+
+    #[test]
+    fn create_from_the_tree_offers_the_directory_you_are_standing_in() {
+        let d = ScratchDir::new("prompt-create").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Prompt(FileOp::Create));
+
+        let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
+        assert_eq!(line, &format!("create {}/pkg/", d.path()), "inside it, not beside it");
     }
 
     fn tree_key(ed: &mut Editor, tree_cmd: TreeCmd) {

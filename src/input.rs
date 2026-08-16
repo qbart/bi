@@ -9,7 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::editor::{Action, BufferCmd, Command, Mode, TreeCmd, VisualKind, WindowCmd};
+use crate::editor::{Action, BufferCmd, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
@@ -300,6 +300,13 @@ impl Input {
             KeyCode::Enter => TreeCmd::Enter,
             KeyCode::Char('-') => TreeCmd::Up,
             KeyCode::Char('R') => TreeCmd::Refresh,
+
+            // These three only fill the command line in; the work is done by
+            // `:create`, `:rename` and `:delete`, which are ordinary ex
+            // commands. `d` is free here because `Ctrl-D` was matched above.
+            KeyCode::Char('a') => TreeCmd::Prompt(FileOp::Create),
+            KeyCode::Char('r') => TreeCmd::Prompt(FileOp::Rename),
+            KeyCode::Char('d') => TreeCmd::Prompt(FileOp::Delete),
 
             // Everything else, Esc included, drops what was pending and does
             // nothing — which is what an allowlist means.
@@ -868,9 +875,18 @@ mod tests {
     /// edits or enters insert mode can reach a pane sitting on a filesystem.
     #[test]
     fn nothing_in_a_tree_enters_insert_or_edits() {
-        for c in ['i', 'a', 'A', 'I', 'o', 'O', 'c', 'x', 'p', 'v', 'V', 'd', 'u', 's'] {
+        for c in ['i', 'A', 'I', 'o', 'O', 'c', 'x', 'p', 'v', 'V', 'u', 's'] {
             assert!(in_tree(&c.to_string()).is_none(), "{c:?} did something in a tree");
         }
+    }
+
+    /// `a`, `r` and `d` are the exception, and they edit nothing themselves —
+    /// each one only puts a `:` line up for you to agree to.
+    #[test]
+    fn the_file_op_keys_ask_before_anything_happens() {
+        assert_eq!(tree_action("a"), Action::Tree(TreeCmd::Prompt(FileOp::Create)));
+        assert_eq!(tree_action("r"), Action::Tree(TreeCmd::Prompt(FileOp::Rename)));
+        assert_eq!(tree_action("d"), Action::Tree(TreeCmd::Prompt(FileOp::Delete)));
     }
 
     /// What it does let through: the window prefix and the command line, so a

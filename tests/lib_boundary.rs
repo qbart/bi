@@ -8,7 +8,8 @@
 use bee::editor::{Action, Command, Editor, Mode, WindowCmd};
 use bee::input::Input;
 use bee::key::{Key, KeyCode};
-use bee::window::{Chrome, ContentKind, Dir, Rect, Side};
+use bee::tree::Kind;
+use bee::window::{Chrome, Content, Dir, Rect, Side};
 
 /// A headless editor session: feed keys, read text back.
 struct Session {
@@ -27,7 +28,10 @@ impl Session {
     }
 
     fn press(&mut self, key: Key) {
-        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode, ContentKind::Text) {
+        // Whichever keymap the focused window wants — the frontend's whole
+        // part in the tree, and it names no terminal to ask.
+        let content = self.editor.content_kind();
+        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode, content) {
             self.editor.apply(cmd);
         }
         self.editor.settle();
@@ -233,4 +237,79 @@ fn arrow_keys_move_without_any_terminal_types_involved() {
     s.press(Key::code(KeyCode::Down));
     s.press(Key::code(KeyCode::End));
     assert_eq!(s.editor.cursor_row().unwrap(), 1);
+}
+
+/// A directory under the temp dir, gone when the test ends.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("bee-embed-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The tree, driven the way a frontend drives it: keys in, rows out.
+///
+/// An embedder gets depth and kind per row and draws its own markers. Nothing
+/// in here knows what a `▸` is, which is the point.
+#[test]
+fn an_embedder_can_browse_expand_and_open_without_a_terminal() {
+    let dir = ScratchDir::new("browse");
+    let mut session =
+        Session { editor: Editor::open(dir.path()).unwrap(), input: Input::default() };
+    session.editor.layout(
+        Rect::new(0, 0, 80, 24),
+        Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 },
+    );
+
+    let rows = session.editor.window().tree().unwrap().rows();
+    assert_eq!(rows[0].depth, 0, "the root");
+    assert!(rows.iter().any(|r| r.name == "src" && r.kind == Kind::Dir));
+
+    // Down onto src/, open it, down onto lib.rs, open that.
+    session.keys("jl");
+    let tree = session.editor.window().tree().unwrap();
+    assert!(tree.rows().iter().any(|r| r.name == "lib.rs" && r.depth == 2), "expanded");
+
+    session.keys("j");
+    session.press(Key::code(KeyCode::Enter));
+
+    assert_eq!(session.text(), "fn main() {}\n", "the file opened in this window");
+    assert!(
+        matches!(session.editor.window().alt, Some(Content::Tree(_))),
+        "and the tree it displaced is the alternate",
+    );
+}
+
+/// The three filesystem commands, with no tree involved at all — which is why
+/// they are ex commands rather than tree-only actions.
+#[test]
+fn an_embedder_can_create_rename_and_delete_files() {
+    let dir = ScratchDir::new("files");
+    let mut editor = Editor::open(dir.path()).unwrap();
+    let made = dir.path().join("pkg/notes.md");
+
+    editor.run_ex(&format!("create {}", made.display()));
+    assert!(made.is_file(), "with its parent made along the way");
+
+    let moved = dir.path().join("pkg/NOTES.md");
+    editor.run_ex(&format!("rename {} {}", made.display(), moved.display()));
+    assert!(moved.is_file() && !made.exists());
+
+    editor.run_ex(&format!("delete {}", moved.display()));
+    assert!(!moved.exists());
 }
