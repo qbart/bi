@@ -28,7 +28,7 @@ pub enum VisualKind {
     Block,
 }
 
-/// What the gutter shows. `:set lines`.
+/// What the gutter shows. `:set number`.
 ///
 /// See `docs/specs/line-numbers.md`. The rules live here rather than in the
 /// renderer because "what does row 12 show" is not a question about terminals.
@@ -57,7 +57,7 @@ impl LineNumbers {
         }
     }
 
-    /// The same number back, for `:set lines` to report.
+    /// The same number back, for `:set number` to report.
     pub fn setting(self) -> i64 {
         match self {
             Self::Off => 0,
@@ -466,7 +466,7 @@ pub struct Editor {
     /// vim does not light the buffer up on a plain `/`, and the status line's
     /// `[3/17]` says how many there are without painting them.
     pub highlight_search: bool,
-    /// What the gutter shows. `:set lines`.
+    /// What the gutter shows. `:set number`.
     pub line_numbers: LineNumbers,
     /// Whether the status line belongs to the search.
     ///
@@ -1690,16 +1690,16 @@ impl Editor {
         };
 
         match name {
-            "lines" => {
+            "number" => {
                 if value.is_empty() {
-                    self.status = format!("lines={}", self.line_numbers.setting());
+                    self.status = format!("number={}", self.line_numbers.setting());
                     return;
                 }
                 match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
                     Some(lines) => self.line_numbers = lines,
                     None => {
                         self.status =
-                            format!("lines takes 0 (off), -1 (relative) or a count: {value}");
+                            format!("number takes 0 (off), -1 (relative) or a count: {value}");
                     }
                 }
             }
@@ -2317,30 +2317,30 @@ mod tests {
     }
 
     #[test]
-    fn set_lines_takes_off_relative_and_a_count() {
+    fn set_number_takes_off_relative_and_a_count() {
         let mut ed = editor("one\ntwo\nthree");
         assert_eq!(ed.line_numbers, LineNumbers::Every(1), "every line, by default");
 
-        ex(&mut ed, "set lines 0");
+        ex(&mut ed, "set number 0");
         assert_eq!(ed.line_numbers, LineNumbers::Off);
-        ex(&mut ed, "set lines -1");
+        ex(&mut ed, "set number -1");
         assert_eq!(ed.line_numbers, LineNumbers::Relative);
-        ex(&mut ed, "set lines 5");
+        ex(&mut ed, "set number 5");
         assert_eq!(ed.line_numbers, LineNumbers::Every(5));
         // Vim's spelling, which the fingers type without asking.
-        ex(&mut ed, "set lines=10");
+        ex(&mut ed, "set number=10");
         assert_eq!(ed.line_numbers, LineNumbers::Every(10));
     }
 
     #[test]
     fn set_reports_and_refuses_rather_than_guessing() {
         let mut ed = editor("one");
-        ex(&mut ed, "set lines 5");
+        ex(&mut ed, "set number 5");
 
-        ex(&mut ed, "set lines");
-        assert_eq!(ed.status, "lines=5", "no value asks rather than sets");
+        ex(&mut ed, "set number");
+        assert_eq!(ed.status, "number=5", "no value asks rather than sets");
 
-        ex(&mut ed, "set lines -3");
+        ex(&mut ed, "set number -3");
         assert_eq!(ed.line_numbers, LineNumbers::Every(5), "left alone");
         assert!(ed.status.contains("-3"));
 

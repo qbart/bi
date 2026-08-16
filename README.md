@@ -274,13 +274,13 @@ afterwards repeats it.
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
 | `:e <path>` | edit another file |
 | `:hls` `:noh` | start / stop highlighting every search match |
-| `:set lines {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
+| `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
 
 ### Line numbers
 
-`:set lines {n}` decides what the gutter shows. `:set lines=5` works too, since
-that is vim's spelling.
+`:set number {n}` decides what the gutter shows. `:set number=5` works too,
+since that is vim's spelling.
 
 | Value | Gutter |
 |---|---|
@@ -294,9 +294,11 @@ mode — it is the one number a relative gutter cannot tell you, and the one
 `:{n}` needs. The gutter keeps the width of the largest line number in every
 mode, so moving the cursor never slides the file sideways.
 
-This is not vim's `lines`, which is the height of the terminal. `lines` is the
-word that means "the numbers down the side" to everyone who has not read
-`:help options`, and the terminal already knows how tall it is.
+Vim spells this as two booleans, `number` and `relativenumber`, because a
+boolean cannot say "every fifth". One option that takes a value says all three
+and makes off a value like any other — so `:set nu` and `:set rnu` do not work
+here, and bare `:set number` reports the current value rather than turning
+numbering on.
 
 ## Layout
 

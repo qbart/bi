@@ -11,21 +11,22 @@ sparse ruler — are one option apart.
 ## The option
 
 ```
-:set lines 0     no gutter at all
-:set lines -1    relative to the cursor line
-:set lines 1     every line numbered — the default
-:set lines 5     every fifth line numbered, the rest blank
-:set lines       report the current value
+:set number 0     no gutter at all
+:set number -1    relative to the cursor line
+:set number 1     every line numbered — the default
+:set number 5     every fifth line numbered, the rest blank
+:set number       report the current value
 ```
 
-`:set lines=5` works too, because that is the spelling vim's `:set` uses and
+`:set number=5` works too, because that is the spelling vim's `:set` uses and
 the fingers do not ask first.
 
-**This is not vim's `lines`.** There, `lines` is the height of the terminal.
-bee has no reason to expose that — the terminal already knows — and `lines` is
-the word that means "the numbers down the side" to everyone who has not read
-`:help options`. Written down here so the divergence is a decision rather than
-an accident.
+**It takes a value where vim's `number` is a boolean.** `:set nu` and
+`:set rnu` are two options in vim because a boolean cannot say "every fifth";
+one option that takes a number says all three, and off is just `0`. The cost is
+that `:set nu` does not work — bee has no boolean form and no `no` prefix — and
+that bare `:set number` reports rather than turning numbering on. Written down
+so the divergence is a decision rather than an accident.
 
 ## What each row shows
 
