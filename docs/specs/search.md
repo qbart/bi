@@ -88,15 +88,25 @@ every match is noise you then have to clear. `:hls` turns highlighting on for
 the session and `:noh` off again; the renderer's pass is unchanged and still
 bounded by the viewport, like every other pass in `render`.
 
-What it leaves is in the status line, and it is two things:
+What it leaves is the status line itself. While a search is live the footer
+shows the search and nothing else — no name, no mode, no position, exactly as
+it looks while the pattern is being typed — and it holds two things:
 
 - **The pattern**, prefixed with the direction being travelled rather than the
   one that was typed — `N` after `/foo` echoes `?foo`, because that is the
-  command that would repeat the move you just made. It sits in the status
-  message, so it stays until something else has something to say.
+  command that would repeat the move you just made.
 - **`[3/17]`** on the right: which match the cursor is on, out of how many.
   Off a match it counts what is behind, so `[0/17]` means "in front of the
   first" — vim's rule.
+
+A search is live from `/` until the first key that is not part of one. `n`,
+`N` and another `/` keep it; `Esc` on the search line and everything else end
+it, and the count ends with it — a remembered pattern is not a live search, and
+counting at someone who has moved on is the noise the highlighting was.
+
+The rule lives in `Action::is_search` and is applied once, in `Editor::apply`,
+because what ends a search is *anything else* — spelling that out per action is
+the version a new action forgets to join.
 
 The count is the one thing here that cannot be answered from the viewport, so
 it is the one place that scans the whole buffer. `Editor` caches the match

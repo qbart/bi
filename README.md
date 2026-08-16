@@ -117,14 +117,17 @@ case-sensitive. A bare `/` repeats the last pattern. Regular expressions and
 
 Matches are **not** highlighted, which is vim's default and not the thing you
 want while reading code; `:hls` turns highlighting on and `:noh` off again.
-What a search leaves behind instead is in the status line: the pattern, with
-the prefix of the direction you are travelling — so `N` after `/foo` reads
-`?foo` — and `[3/17]` on the right, which match the cursor is on out of how
-many. The count follows the cursor and the text, and `[0/17]` means the cursor
-is in front of the first match.
 
-While the search line is being typed it takes the whole status line, so there
-is nothing else there to read the pattern against.
+What a search leaves behind is the status line. While one is live the footer
+is the search and nothing else — no file name, no mode, no position — showing
+the pattern with the prefix of the direction you are travelling, so `N` after
+`/foo` reads `?foo`, and `[3/17]` at the right: which match the cursor is on
+out of how many. `[0/17]` means it is in front of the first.
+
+A search stays live while the keys are still the search — `n`, `N`, another
+`/`. The first key that is anything else hands the footer back, and the count
+goes with it: the pattern is still remembered for `n`, but bee has stopped
+counting at you.
 
 **Scrolling**
 

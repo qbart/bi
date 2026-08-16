@@ -495,7 +495,11 @@ fn status_line(
 }
 
 /// The footer, left to right: position, name, modified, status — then the
-/// match count, the pending keys and the mode, pushed to the right edge.
+/// pending keys and the mode, pushed to the right edge.
+///
+/// Unless the search has it, in which case it is the pattern and the match
+/// count and nothing else. `matches` is therefore only read there: a remembered
+/// pattern is not a reason to keep counting at someone who has moved on.
 ///
 /// Split out from [`status_line`] because a `Paragraph` cannot be read back,
 /// and the order is the thing worth guarding.
@@ -511,6 +515,23 @@ fn status_spans(
     if let Mode::Search { query, forward } = &ed.mode {
         let prefix = if *forward { '/' } else { '?' };
         return vec![Span::raw(format!("{prefix}{query}"))];
+    }
+    // The search keeps the line after `<CR>` too, for as long as the keys are
+    // still the search. The pattern reads the same as it did while it was
+    // being typed, which is the point: nothing else moves in or out around it.
+    if ed.search_focus {
+        let left = Span::raw(ed.status.clone());
+        let right = match matches {
+            Some((at, total)) => format!("[{at}/{total}] "),
+            None => String::new(),
+        };
+        let pad =
+            (width as usize).saturating_sub(left.content.chars().count() + right.chars().count());
+        return vec![
+            left,
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, Style::default().fg(Color::DarkGray)),
+        ];
     }
 
     let name = ed
@@ -542,14 +563,7 @@ fn status_spans(
     // may be scrolled off. Say how many.
     let cursors = ed.selections.len();
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
-    // `[3/17]` — which match the cursor is on, out of how many. Present for as
-    // long as there is a last search, which is how you find your way through
-    // one without every match being painted.
-    let found = match matches {
-        Some((at, total)) => format!("[{at}/{total}]  "),
-        None => String::new(),
-    };
-    let keys = format!("{count}{pending}  {found}");
+    let keys = format!("{count}{pending}  ");
 
     let mode = format!(" {} ", ed.mode.label());
     let mode_style = Style::default()
@@ -591,11 +605,22 @@ mod tests {
     }
 
     #[test]
-    fn the_match_count_sits_on_the_right_just_before_the_mode() {
+    fn a_search_takes_the_whole_footer_and_puts_the_count_on_the_right() {
+        let mut ed = Editor::empty();
+        ed.search_focus = true;
+        ed.status = "/foo".into();
+
+        let spans = status_spans(&ed, "", Some((3, 17)), 20);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "/foo         [3/17] ", "the pattern, the count, nothing else");
+    }
+
+    #[test]
+    fn the_count_goes_away_with_the_search_even_though_the_pattern_is_remembered() {
         let ed = Editor::empty();
-        let spans = status_spans(&ed, "", Some((3, 17)), 80);
-        let tail: Vec<&str> = spans.iter().rev().take(2).map(|s| s.content.as_ref()).collect();
-        assert_eq!(tail, vec![" NORMAL ", "  [3/17]  "]);
+        let text: String =
+            status_spans(&ed, "", Some((3, 17)), 80).iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("[3/17]"), "a remembered pattern is not a live search");
     }
 
     #[test]

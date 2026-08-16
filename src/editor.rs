@@ -286,6 +286,24 @@ impl Action {
         }
     }
 
+    /// Whether this action belongs to a search, and so leaves the status line
+    /// in the search's hands.
+    ///
+    /// `n` and `N` are here because jumping through matches is still the
+    /// search; `Esc` on the search line is not, because it abandons it.
+    fn is_search(&self) -> bool {
+        match self {
+            Action::EnterSearch { .. }
+            | Action::SearchChar(_)
+            | Action::SearchBackspace
+            | Action::SearchExecute
+            | Action::SearchWord { .. } => true,
+            Action::Move(Motion::Search { .. }) => true,
+            Action::Operate { target: Target::Motion(Motion::Search { .. }), .. } => true,
+            _ => false,
+        }
+    }
+
     /// Whether this action is a keystroke *within* a session rather than a
     /// command in its own right.
     fn is_session_key(&self) -> bool {
@@ -394,6 +412,13 @@ pub struct Editor {
     /// vim does not light the buffer up on a plain `/`, and the status line's
     /// `[3/17]` says how many there are without painting them.
     pub highlight_search: bool,
+    /// Whether the status line belongs to the search.
+    ///
+    /// True while the search line is being typed and for as long as the keys
+    /// that follow are still the search — `n`, `N`, another `/`. The footer
+    /// shows the pattern and the count and nothing else while it holds, which
+    /// is what vim's command line does.
+    pub search_focus: bool,
     /// Match positions for the status line's count, and what they were built
     /// from: the pattern, whether it was a whole-word search, and the buffer's
     /// edit count. Any of the three moving makes it stale.
@@ -463,6 +488,7 @@ impl Editor {
             replaying: false,
             last_search: None,
             highlight_search: false,
+            search_focus: false,
             match_cache: None,
             pending_search_op: None,
             viewport_height: 0,
@@ -474,6 +500,7 @@ impl Editor {
 
     pub fn apply(&mut self, cmd: Command) {
         if let Action::RepeatChange { count } = cmd.action {
+            self.search_focus = false;
             self.repeat_change(count);
             return;
         }
@@ -485,6 +512,12 @@ impl Editor {
         for _ in 0..n {
             self.apply_once(&cmd.action);
         }
+        // Decided per command rather than inside the search actions, because
+        // what ends it is *anything else* — one place to say so, and no way
+        // for a new action to forget. Set after the pass: `/` runs its motion
+        // through a nested `apply`, and the outer command is the one that says
+        // whether the search still owns the line.
+        self.search_focus = cmd.action.is_search();
 
         // One command is one undo step, so the group closes here rather than
         // inside the count loop — `5x` comes back in a single `u`. Insert mode
@@ -3204,6 +3237,40 @@ mod tests {
 
         ed.apply(cmd(Action::Move(Motion::Search { reverse: true })));
         assert_eq!(ed.status, "?a", "`N` is the same pattern the other way");
+    }
+
+    #[test]
+    fn the_search_keeps_the_status_line_while_the_keys_are_still_the_search() {
+        let mut ed = editor("a1a2a3");
+        search_for(&mut ed, "a", true);
+        assert!(ed.search_focus, "the line is the search's from the moment it runs");
+
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
+        assert!(ed.search_focus, "`n` is still the search");
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: true })));
+        assert!(ed.search_focus, "and so is `N`");
+
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        assert!(!ed.search_focus, "anything else hands the line back");
+    }
+
+    #[test]
+    fn abandoning_the_search_line_hands_the_status_line_back() {
+        let mut ed = editor("a1a2a3");
+        ed.apply(cmd(Action::EnterSearch { forward: true, operator: None, count: 1 }));
+        ed.apply(cmd(Action::SearchChar('a')));
+        assert!(ed.search_focus);
+
+        ed.apply(cmd(Action::SearchCancel));
+        assert!(!ed.search_focus, "`Esc` abandons the search, so it abandons the line");
+    }
+
+    #[test]
+    fn star_takes_the_status_line_too() {
+        let mut ed = editor("foo bar foo");
+        ed.apply(cmd(Action::SearchWord { forward: true }));
+        assert!(ed.search_focus);
+        assert_eq!(ed.status, "/foo");
     }
 
     #[test]
