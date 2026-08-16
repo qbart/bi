@@ -8,8 +8,9 @@
 
 **Built.**
 
-Covers literal matching with smartcase, match highlighting, and `:noh`. Regular
-expressions and `:s` are deferred; both build on what is here.
+Covers literal matching with smartcase, the status line's echo and match
+count, and opt-in highlighting. Regular expressions and `:s` are deferred; both
+build on what is here.
 
 ## The commands
 
@@ -19,7 +20,7 @@ expressions and `:s` are deferred; both build on what is here.
 | `?pat` `<CR>` | search backward |
 | `n` / `N` | repeat the last search / repeat it reversed |
 | `*` / `#` | search forward / backward for the word under the cursor |
-| `:noh` | stop highlighting matches |
+| `:hls` `:noh` | start / stop highlighting every match |
 
 ## Semantics
 
@@ -80,14 +81,28 @@ Action::EnterSearch { forward: bool, operator: Option<(Operator, Sink)>, count: 
 `Editor` holds it until `<CR>`, then applies either the motion or the operator
 over it. `Esc` on the search line discards both, changing nothing.
 
-## Highlighting
+## What a search leaves behind
 
-A search turns match highlighting on; `:noh` turns it off. The renderer already
-has `paint_range`, which the selection highlight uses, so this is a background
-colour over each match in the visible rows and nothing more.
+Not highlighting. A plain `/` in vim does not light the buffer up, and painting
+every match is noise you then have to clear. `:hls` turns highlighting on for
+the session and `:noh` off again; the renderer's pass is unchanged and still
+bounded by the viewport, like every other pass in `render`.
 
-Bounded by the viewport like every other pass in `render`: matches are found
-for the visible range only, never for the whole file.
+What it leaves is in the status line, and it is two things:
+
+- **The pattern**, prefixed with the direction being travelled rather than the
+  one that was typed — `N` after `/foo` echoes `?foo`, because that is the
+  command that would repeat the move you just made. It sits in the status
+  message, so it stays until something else has something to say.
+- **`[3/17]`** on the right: which match the cursor is on, out of how many.
+  Off a match it counts what is behind, so `[0/17]` means "in front of the
+  first" — vim's rule.
+
+The count is the one thing here that cannot be answered from the viewport, so
+it is the one place that scans the whole buffer. `Editor` caches the match
+positions against the pattern and `Buffer::edits()`, a counter every mutation
+bumps; the scan therefore runs when the text or the pattern changes rather than
+once a frame.
 
 ## Why not fuzzy
 

@@ -90,6 +90,10 @@ pub struct Buffer {
     /// Drained by tree-sitter / LSP once those exist.
     pub pending_edits: Vec<Edit>,
     history: History,
+    /// Bumped by every mutation, undo and redo included. A cache over the text
+    /// — the search count is the first — compares it to know it is stale.
+    /// Not a version anyone may reason about beyond "different means changed".
+    edits: u64,
 }
 
 impl Buffer {
@@ -99,6 +103,7 @@ impl Buffer {
             path: None,
             pending_edits: Vec::new(),
             history: History::default(),
+            edits: 0,
         }
     }
 
@@ -223,6 +228,7 @@ impl Buffer {
             self.rope.insert(start, text);
         }
 
+        self.edits += 1;
         let new_end = start + text.chars().count();
         self.pending_edits.push(Edit {
             start_byte,
@@ -1038,6 +1044,24 @@ impl Buffer {
             }
         }
         None
+    }
+
+    /// How many edits this buffer has seen. Only ever compared for equality:
+    /// a cache built over the text is stale when the number has moved.
+    pub fn edits(&self) -> u64 {
+        self.edits
+    }
+
+    /// Where every match in the whole buffer starts, in order.
+    ///
+    /// Unbounded on purpose — the status line's `[3/17]` cannot be answered
+    /// from the viewport. One pass, and `Editor` caches it against `edits()`
+    /// so it runs when the text or the pattern changes rather than per frame.
+    pub fn match_starts(&self, needle: &str, whole_word: bool) -> Vec<usize> {
+        self.matches_in(0, self.rope.len_chars(), needle, whole_word)
+            .into_iter()
+            .map(|(start, _)| start)
+            .collect()
     }
 
     /// Every match inside `start..end`, for the renderer to highlight.

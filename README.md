@@ -112,8 +112,19 @@ there is nothing to decide at yank time. A count goes before the quote: `3"p`.
 A search is a motion, so `d/foo`, `c/foo` and `y/foo` all work, and it is
 **exclusive** — `d/three` stops before the match. An all-lowercase pattern
 matches case-insensitively; a capital anywhere in it makes the search
-case-sensitive. Matches are highlighted until `:noh`. A bare `/` repeats the
-last pattern. Regular expressions and `:s` are not built yet.
+case-sensitive. A bare `/` repeats the last pattern. Regular expressions and
+`:s` are not built yet.
+
+Matches are **not** highlighted, which is vim's default and not the thing you
+want while reading code; `:hls` turns highlighting on and `:noh` off again.
+What a search leaves behind instead is in the status line: the pattern, with
+the prefix of the direction you are travelling — so `N` after `/foo` reads
+`?foo` — and `[3/17]` on the right, which match the cursor is on out of how
+many. The count follows the cursor and the text, and `[0/17]` means the cursor
+is in front of the first match.
+
+While the search line is being typed it takes the whole status line, so there
+is nothing else there to read the pattern against.
 
 **Scrolling**
 
@@ -259,7 +270,7 @@ afterwards repeats it.
 | `:wq` `:x` | write and quit |
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
 | `:e <path>` | edit another file |
-| `:noh` | stop highlighting search matches |
+| `:hls` `:noh` | start / stop highlighting every search match |
 | `:{n}` | go to line *n* |
 
 ## Layout

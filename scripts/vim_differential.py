@@ -193,6 +193,11 @@ CASES = [
     ("v r",            "abcdef\n",                 "vllrz"),
     ("V r",            "abc\ndef\n",               "Vjrz"),
 
+    # undo leaves a cursor, never a selection
+    ("C-v d then u",   "abcdef\nghijkl\nmnopqr\n", "l\x16jjldux"),
+    ("v d then u",     "abcdef\n",                 "vlldux"),
+    ("V d then u",     "abc\ndef\n",               "Vdux"),
+
     # replace mode
     ("R over text",    "abcdef\n",             "RXY\x1b"),
     ("R past the end", "ab\n",                 "RXYZ\x1b"),

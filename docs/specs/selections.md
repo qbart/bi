@@ -126,6 +126,14 @@ highest — a position that is not the state to restore. `Editor` now captures t
 set when a group opens (`undo_from`) and passes both ends at `commit`, so
 `apply_edit` needs no cursor at all.
 
+What comes back is **collapsed** unless the editor is in visual mode. The pair
+a revision recorded is whatever was live when the change started, which for a
+visual or blockwise operator is a selection with room in it — room that means
+nothing once the mode is normal again, and that the renderer would otherwise
+draw as a selection the user cannot act on. Vim leaves no selection behind an
+undo. The *number* of selections still survives, which is the part that makes
+undoing a multi-cursor edit give the cursors back.
+
 `History` stores plain `(anchor, head)` pairs rather than a `Selections`, which
 keeps it a leaf module: `Selections` knows about `Cursor`, and importing it
 there would tie the undo tree to the editor's idea of what a cursor is.

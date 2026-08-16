@@ -390,8 +390,14 @@ pub struct Editor {
     /// The last search, for `n`/`N` and the highlight pass. Beside
     /// `last_find`, and there for the same reason: it outlives `Input::reset`.
     pub last_search: Option<Search>,
-    /// Whether matches are highlighted. A search turns it on, `:noh` off.
+    /// Whether every match is highlighted. Off unless `:hls` asks for it —
+    /// vim does not light the buffer up on a plain `/`, and the status line's
+    /// `[3/17]` says how many there are without painting them.
     pub highlight_search: bool,
+    /// Match positions for the status line's count, and what they were built
+    /// from: the pattern, whether it was a whole-word search, and the buffer's
+    /// edit count. Any of the three moving makes it stale.
+    match_cache: Option<(String, bool, u64, Vec<usize>)>,
     /// An operator waiting for the search line to be finished.
     pending_search_op: Option<(Operator, Sink, usize)>,
     /// Height of the window the renderer last drew, which is all the scrolling
@@ -457,6 +463,7 @@ impl Editor {
             replaying: false,
             last_search: None,
             highlight_search: false,
+            match_cache: None,
             pending_search_op: None,
             viewport_height: 0,
             status: String::new(),
@@ -847,6 +854,9 @@ impl Editor {
             Motion::Search { reverse } => {
                 let search = self.last_search.clone()?;
                 let forward = search.forward != reverse;
+                // The echo follows the direction being travelled, not the one
+                // that was typed: `N` after `/foo` is a `?foo`.
+                self.echo_search(forward);
                 let at = self.selections.cursor().at;
                 let found = self.buffer.search(at, &search.pattern, forward, search.whole_word)?;
                 // Resolved to an absolute destination: the pattern is gone by
@@ -1038,14 +1048,14 @@ impl Editor {
             Action::Undo => {
                 let (before, after) = self.undo_bounds();
                 match self.buffer.undo(before, after) {
-                    Some(pairs) => self.selections = Selections::from_pairs(pairs),
+                    Some(pairs) => self.restore(pairs),
                     None => self.status = "already at oldest change".into(),
                 }
             }
             Action::Redo => {
                 let (before, after) = self.undo_bounds();
                 match self.buffer.redo(before, after) {
-                    Some(pairs) => self.selections = Selections::from_pairs(pairs),
+                    Some(pairs) => self.restore(pairs),
                     None => self.status = "already at newest change".into(),
                 }
             }
@@ -1310,7 +1320,6 @@ impl Editor {
                 } else {
                     self.last_search = Some(Search { pattern: query, whole_word: false, forward });
                 }
-                self.highlight_search = true;
                 self.run_search();
             }
             Action::SearchWord { forward } => {
@@ -1324,7 +1333,6 @@ impl Editor {
                     whole_word: true,
                     forward: *forward,
                 });
-                self.highlight_search = true;
                 self.run_search();
             }
 
@@ -1359,6 +1367,65 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.run_ex(&line);
             }
+        }
+    }
+
+    /// Puts back the selections a revision recorded.
+    ///
+    /// The recorded pair is whatever was live when the change started, which
+    /// for a visual or blockwise operator is a selection with room in it. That
+    /// room means nothing in normal mode — it is drawn as a selection the user
+    /// cannot act on, and vim leaves none after an undo — so outside visual
+    /// mode each one collapses onto the start of what came back. The *number*
+    /// of selections survives, which is what makes undoing a multi-cursor edit
+    /// give the cursors back.
+    fn restore(&mut self, pairs: Cursors) {
+        self.selections = Selections::from_pairs(pairs);
+        if self.mode.visual().is_some() {
+            return;
+        }
+        self.for_each_selection(|ed, sel| {
+            Selection::collapsed(ed.buffer.clamped(Cursor::at(sel.range().0), false))
+        });
+    }
+
+    /// Which match the cursor is on and how many there are, for the status
+    /// line. `None` when nothing has been searched for.
+    ///
+    /// The index is the match containing the cursor, or — when it sits on none
+    /// — how many are behind it, so `[0/17]` means "before the first" exactly
+    /// as it does in vim.
+    pub fn search_count(&mut self) -> Option<(usize, usize)> {
+        let search = self.last_search.clone()?;
+        let token = self.buffer.edits();
+        let stale = match &self.match_cache {
+            Some((pattern, whole_word, at, _)) => {
+                *pattern != search.pattern || *whole_word != search.whole_word || *at != token
+            }
+            None => true,
+        };
+        if stale {
+            let starts = self.buffer.match_starts(&search.pattern, search.whole_word);
+            self.match_cache = Some((search.pattern.clone(), search.whole_word, token, starts));
+        }
+
+        let (_, _, _, starts) = self.match_cache.as_ref()?;
+        let at = self.selections.cursor().at;
+        let width = search.pattern.chars().count();
+        let index = match starts.iter().position(|&start| at >= start && at < start + width) {
+            Some(i) => i + 1,
+            None => starts.iter().take_while(|&&start| start < at).count(),
+        };
+        Some((index, starts.len()))
+    }
+
+    /// What the status line echoes after a search — the pattern with the
+    /// prefix of the direction it is *currently* going, so `N` after `/foo`
+    /// reads `?foo`. Vim shows the command it would take to repeat the move.
+    fn echo_search(&mut self, forward: bool) {
+        if let Some(search) = &self.last_search {
+            let prefix = if forward { '/' } else { '?' };
+            self.status = format!("{prefix}{}", search.pattern);
         }
     }
 
@@ -1500,6 +1567,9 @@ impl Editor {
             "q" | "quit" | "qa" | "qall" => self.quit(force),
             "e" | "edit" => self.edit(arg, force),
             "noh" | "nohl" | "nohlsearch" => self.highlight_search = false,
+            // Off by default, because a plain `/` in vim does not light up the
+            // buffer. The count in the status line is what a search owes you.
+            "hls" | "hlsearch" => self.highlight_search = true,
             "wq" | "x" => {
                 if self.write(arg) {
                     self.quit(true);
@@ -2527,6 +2597,35 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_block_delete_leaves_a_cursor_rather_than_a_selection() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(ed.buffer.rope().to_string(), GRID);
+        assert_eq!(ed.selections.len(), 1);
+        assert!(
+            ed.selections.primary().is_collapsed(),
+            "vim leaves no selection behind an undo, and normal mode cannot act on one"
+        );
+        assert_eq!(ed.cursor().at, 1, "on the start of what came back");
+    }
+
+    #[test]
+    fn undoing_a_multi_cursor_edit_still_gives_the_cursors_back() {
+        let mut ed = with_cursors("one two three", &[0, 4, 8]);
+        ed.apply(cmd(Action::EnterInsert));
+        type_str(&mut ed, "X");
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer.rope().to_string(), "Xone Xtwo Xthree");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer.rope().to_string(), "one two three");
+        assert_eq!(ed.selections.len(), 3, "the cursors are part of what undo restores");
+        assert!(ed.selections.all().iter().all(|s| s.is_collapsed()));
+    }
+
+    #[test]
     fn r_reaches_every_selection_when_there_is_more_than_one() {
         let mut ed = visual("foo bar foo", 0, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Right)));
@@ -3083,13 +3182,63 @@ mod tests {
     }
 
     #[test]
-    fn searching_turns_highlighting_on_and_noh_turns_it_off() {
+    fn searching_leaves_highlighting_alone_and_hls_asks_for_it() {
         let mut ed = editor("foo foo");
-        assert!(!ed.highlight_search);
         search_for(&mut ed, "foo", true);
+        assert!(!ed.highlight_search, "a plain `/` does not light the buffer up, as in vim");
+
+        ed.run_ex("hls");
         assert!(ed.highlight_search);
         ed.run_ex("noh");
         assert!(!ed.highlight_search);
+    }
+
+    #[test]
+    fn the_status_line_echoes_the_search_with_the_direction_it_is_going() {
+        let mut ed = editor("a1a2a3");
+        search_for(&mut ed, "a", true);
+        assert_eq!(ed.status, "/a");
+
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
+        assert_eq!(ed.status, "/a", "`n` keeps going forward");
+
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: true })));
+        assert_eq!(ed.status, "?a", "`N` is the same pattern the other way");
+    }
+
+    #[test]
+    fn the_match_count_says_which_one_the_cursor_is_on() {
+        let mut ed = editor("a1a2a3");
+        search_for(&mut ed, "a", true);
+        assert_eq!(ed.search_count(), Some((2, 3)), "the search moved onto the second");
+
+        ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
+        assert_eq!(ed.search_count(), Some((3, 3)));
+
+        ed.set_cursor(Cursor::at(1));
+        assert_eq!(ed.search_count(), Some((1, 3)), "off a match, it counts what is behind");
+    }
+
+    #[test]
+    fn the_match_count_follows_an_edit() {
+        let mut ed = editor("a1a2a3");
+        search_for(&mut ed, "a", true);
+        assert_eq!(ed.search_count(), Some((2, 3)));
+
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Right),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(ed.search_count(), Some((0, 2)), "the cache is keyed on the edit count");
+    }
+
+    #[test]
+    fn there_is_no_count_before_anything_has_been_searched_for() {
+        let mut ed = editor("foo");
+        assert_eq!(ed.search_count(), None);
     }
 
     #[test]

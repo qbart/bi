@@ -349,7 +349,10 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     }
 
     frame.render_widget(Paragraph::new(lines), text_area);
-    frame.render_widget(status_line(ed, pending, status_area.width), status_area);
+    // Worked out here rather than inside the footer: it caches on `Editor` and
+    // so needs the mutable borrow the widget builders do not have.
+    let matches = ed.search_count();
+    frame.render_widget(status_line(ed, pending, matches, status_area.width), status_area);
 
     if matches!(ed.mode, Mode::Pick)
         && let Some(picker) = ed.picker.as_mut()
@@ -482,16 +485,26 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
     ));
 }
 
-fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
-    Paragraph::new(Line::from(status_spans(ed, pending, width)))
+fn status_line(
+    ed: &Editor,
+    pending: &str,
+    matches: Option<(usize, usize)>,
+    width: u16,
+) -> Paragraph<'static> {
+    Paragraph::new(Line::from(status_spans(ed, pending, matches, width)))
 }
 
 /// The footer, left to right: position, name, modified, status — then the
-/// pending keys and the mode, pushed to the right edge.
+/// match count, the pending keys and the mode, pushed to the right edge.
 ///
 /// Split out from [`status_line`] because a `Paragraph` cannot be read back,
 /// and the order is the thing worth guarding.
-fn status_spans(ed: &Editor, pending: &str, width: u16) -> Vec<Span<'static>> {
+fn status_spans(
+    ed: &Editor,
+    pending: &str,
+    matches: Option<(usize, usize)>,
+    width: u16,
+) -> Vec<Span<'static>> {
     if let Mode::Command(line) = &ed.mode {
         return vec![Span::raw(format!(":{line}"))];
     }
@@ -529,7 +542,14 @@ fn status_spans(ed: &Editor, pending: &str, width: u16) -> Vec<Span<'static>> {
     // may be scrolled off. Say how many.
     let cursors = ed.selections.len();
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
-    let keys = format!("{count}{pending}  ");
+    // `[3/17]` — which match the cursor is on, out of how many. Present for as
+    // long as there is a last search, which is how you find your way through
+    // one without every match being painted.
+    let found = match matches {
+        Some((at, total)) => format!("[{at}/{total}]  "),
+        None => String::new(),
+    };
+    let keys = format!("{count}{pending}  {found}");
 
     let mode = format!(" {} ", ed.mode.label());
     let mode_style = Style::default()
@@ -558,7 +578,7 @@ mod tests {
     #[test]
     fn the_footer_reads_position_then_name_then_mode_last() {
         let ed = Editor::empty();
-        let spans = status_spans(&ed, "", 80);
+        let spans = status_spans(&ed, "", None, 80);
 
         assert_eq!(spans[0].content.as_ref(), " 1:1 ", "position comes first");
         assert_eq!(spans[0].style.bg, Some(POSITION_BG), "and is set off by its own background");
@@ -571,10 +591,18 @@ mod tests {
     }
 
     #[test]
+    fn the_match_count_sits_on_the_right_just_before_the_mode() {
+        let ed = Editor::empty();
+        let spans = status_spans(&ed, "", Some((3, 17)), 80);
+        let tail: Vec<&str> = spans.iter().rev().take(2).map(|s| s.content.as_ref()).collect();
+        assert_eq!(tail, vec![" NORMAL ", "  [3/17]  "]);
+    }
+
+    #[test]
     fn the_footer_fills_the_width_exactly() {
         let ed = Editor::empty();
         let width: usize =
-            status_spans(&ed, "d3", 80).iter().map(|s| s.content.chars().count()).sum();
+            status_spans(&ed, "d3", None, 80).iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 80, "or the mode block would not touch the right edge");
     }
 
