@@ -38,6 +38,79 @@ pub struct Row {
     pub open: bool,
 }
 
+/// What the next paste will do with what is marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipMode {
+    #[default]
+    Copy,
+    Cut,
+}
+
+/// Paths marked for the next paste.
+///
+/// Session state rather than the tree's: you mark in one place and paste in
+/// another, and re-rooting must not lose what you marked. It is also why the
+/// marks show wherever those paths appear.
+#[derive(Debug, Clone, Default)]
+pub struct Clipboard {
+    paths: Vec<PathBuf>,
+    mode: ClipMode,
+}
+
+impl Clipboard {
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    pub fn mode(&self) -> ClipMode {
+        self.mode
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        self.paths.iter().any(|p| p == path)
+    }
+
+    /// Marks or unmarks `path`, and says what the set is for.
+    ///
+    /// One mode for the whole set, so a paste cannot both duplicate and destroy
+    /// on one keystroke. Pressing the *other* key converts what is already
+    /// marked rather than unmarking this one: "make these a move" is what you
+    /// meant, and a key that means two opposite things depending on state it
+    /// does not show you is the kind of thing that costs a file.
+    pub fn mark(&mut self, path: PathBuf, mode: ClipMode) {
+        if self.mode != mode && !self.paths.is_empty() {
+            self.mode = mode;
+            if !self.contains(&path) {
+                self.paths.push(path);
+            }
+            return;
+        }
+        self.mode = mode;
+        match self.paths.iter().position(|p| *p == path) {
+            Some(at) => drop(self.paths.remove(at)),
+            None => self.paths.push(path),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.paths.clear();
+    }
+
+    /// What the footer says, so the mode is never something you have to
+    /// remember.
+    pub fn summary(&self) -> String {
+        let verb = match self.mode {
+            ClipMode::Copy => "copy",
+            ClipMode::Cut => "move",
+        };
+        format!("{} to {verb}", self.paths.len())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Tree {
     root: PathBuf,
@@ -322,6 +395,42 @@ fn children_of(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Row> {
         dir_first.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     rows
+}
+
+/// Copies a file, or a whole directory, to a path that does not exist yet.
+///
+/// `std::fs` has no recursive copy, and a tree of files is exactly what a file
+/// tree is for.
+pub fn copy_into(source: &Path, target: &Path) -> std::io::Result<()> {
+    // `symlink_metadata`, so a link is copied as the link it is rather than
+    // being followed into whatever it points at — the rule the rows follow.
+    let meta = std::fs::symlink_metadata(source)?;
+    if !meta.is_dir() {
+        std::fs::copy(source, target)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        copy_into(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Moves a file or directory. A rename where the filesystems agree, and a copy
+/// followed by a delete where they do not — a rename across devices is not a
+/// rename, and the kernel says so rather than doing it for you.
+pub fn move_into(source: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_into(source, target)?;
+            match std::fs::symlink_metadata(source)?.is_dir() {
+                true => std::fs::remove_dir_all(source),
+                false => std::fs::remove_file(source),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +724,52 @@ mod tests {
         tree.select(1);
         tree.down();
         assert_eq!(tree.root(), was);
+    }
+
+    fn clip(paths: &[&str], mode: ClipMode) -> Clipboard {
+        let mut clipboard = Clipboard::default();
+        for path in paths {
+            clipboard.mark(PathBuf::from(path), mode);
+        }
+        clipboard
+    }
+
+    fn marked(clipboard: &Clipboard) -> Vec<String> {
+        clipboard.paths().iter().map(|p| p.display().to_string()).collect()
+    }
+
+    #[test]
+    fn marking_the_same_way_twice_takes_the_mark_off() {
+        let mut clipboard = clip(&["a.rs", "b.rs"], ClipMode::Copy);
+        assert_eq!(marked(&clipboard), ["a.rs", "b.rs"]);
+
+        clipboard.mark(PathBuf::from("a.rs"), ClipMode::Copy);
+
+        assert_eq!(marked(&clipboard), ["b.rs"]);
+    }
+
+    /// "Make these a move" is what the other key means. Unmarking on it would
+    /// be the same key doing two opposite things depending on state it does
+    /// not show you.
+    #[test]
+    fn marking_the_other_way_converts_the_set_rather_than_unmarking() {
+        let mut clipboard = clip(&["a.rs", "b.rs"], ClipMode::Copy);
+
+        clipboard.mark(PathBuf::from("a.rs"), ClipMode::Cut);
+
+        assert_eq!(marked(&clipboard), ["a.rs", "b.rs"], "still both");
+        assert_eq!(clipboard.mode(), ClipMode::Cut, "and both are a move now");
+        assert_eq!(clipboard.summary(), "2 to move");
+    }
+
+    #[test]
+    fn converting_picks_up_a_path_that_was_not_marked_yet() {
+        let mut clipboard = clip(&["a.rs"], ClipMode::Copy);
+
+        clipboard.mark(PathBuf::from("b.rs"), ClipMode::Cut);
+
+        assert_eq!(marked(&clipboard), ["a.rs", "b.rs"]);
+        assert_eq!(clipboard.mode(), ClipMode::Cut);
     }
 
     #[test]

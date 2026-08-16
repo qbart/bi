@@ -287,6 +287,8 @@ afterwards repeats it.
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
+| `:paste [<dir>]` | put what is marked into `<dir>`, or the selected directory |
+| `:paste-as <path>` | place the file a paste stopped on, and carry on |
 
 ### Windows and buffers
 
@@ -333,6 +335,10 @@ rather than making another. See [docs/specs/tree.md](docs/specs/tree.md).
 | `R` | re-read from disk |
 | `a` `r` | create / rename — each fills in a `:` line for you to agree to |
 | `dd` | delete outright. No undo for the filesystem; a directory with anything in it still wants `:delete!` |
+| `y` | yank the selected path into the register ring, so `p` in a file pastes it |
+| `c` `x` | mark for copying / for cutting, and unmark |
+| `p` | put what is marked into the selected directory |
+| `Esc` | forget what is marked |
 
 Enter on a file opens it in the last window focused before this one, so a tree
 pane is a sidebar that stays put and files land in whichever pane you reached it
@@ -344,6 +350,18 @@ you are reading, rooted at its directory with the file already selected, and
 `Chrome::tree_width` columns wide. That width is a starting point — the pane
 keeps its share of the terminal from then on, like every other pane. Pressed
 again, from anywhere, it puts the tree away.
+
+`c` and `x` build one set with one mode: pressing the other key converts
+everything rather than leaving a clipboard that both duplicates and destroys on
+a single `p`. Marked rows carry a `+` or a `~` in a column that is there whether
+anything is marked or not, so marking never shifts the tree sideways, and the
+footer says `2 to copy` or `3 to move` so the mode is never something you have
+to remember.
+
+A paste never overwrites. It stops on the first clash and offers the path on the
+`:` line — edit it and press Enter to place that one and carry on, or press Esc
+to abandon the rest. A cut clears the marks afterwards; a copy keeps them, so
+the same set can go somewhere else too.
 
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a

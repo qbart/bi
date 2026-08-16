@@ -15,7 +15,7 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
-use crate::tree::{Kind, Tree};
+use crate::tree::{ClipMode, Clipboard, Kind, Tree, copy_into, move_into};
 use crate::window::{
     Chrome, Content, ContentKind, Dir, Layout, Rect, Side, Text, Window, WindowId,
 };
@@ -438,6 +438,20 @@ pub struct Command {
     pub action: Action,
 }
 
+/// A paste stopped on a name it cannot use.
+///
+/// The cost of never overwriting anything: a paste can be half-done, and what
+/// is left has to wait somewhere while the command line asks for a name.
+#[derive(Debug, Clone)]
+pub struct Pasting {
+    /// Still to place, the head first.
+    queue: Vec<std::path::PathBuf>,
+    into: std::path::PathBuf,
+    mode: ClipMode,
+    /// How many landed before it stopped, for the message when it is abandoned.
+    done: usize,
+}
+
 /// Editor state that belongs to the session rather than to any one file or
 /// any one view of it — what a single keyboard has, regardless of what it is
 /// pointed at.
@@ -450,6 +464,12 @@ pub struct Session {
     /// Not per-buffer: yanking in one file and pasting in another is the
     /// point, so the ring outlives any single buffer.
     pub registers: Registers,
+    /// Paths marked in the tree for the next paste. Beside the registers, and
+    /// session state for the same reason: you mark in one place and put them
+    /// in another. See `docs/specs/tree.md`.
+    pub clipboard: Clipboard,
+    /// A paste waiting on a name for the file it stopped at.
+    pub pasting: Option<Pasting>,
     pub picker: Option<Picker>,
     pub mode: Mode,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
@@ -561,6 +581,10 @@ enum ExLine {
         path: String,
         force: bool,
     },
+    /// `:paste [<dir>]` — what is marked, into `<dir>` or the selected one.
+    Paste(Option<String>),
+    /// `:paste-as <path>` — place the one that stopped, and carry on.
+    PasteAs(String),
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -637,6 +661,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         },
         "delete" if !arg.is_empty() => ExLine::Delete { path: arg.into(), force },
         "delete" => ExLine::Error("delete what?".into()),
+        "paste" => ExLine::Paste((!arg.is_empty()).then(|| arg.to_string())),
+        "paste-as" if !arg.is_empty() => ExLine::PasteAs(arg.into()),
+        "paste-as" => ExLine::Error("paste it as what?".into()),
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         _ => match name.parse::<usize>() {
             Ok(row) => ExLine::Goto(row),
@@ -699,6 +726,14 @@ pub enum TreeCmd {
     Down,
     /// `dd` — delete the selected path outright, with no `:` line in between.
     Delete,
+    /// `y` — the selected path into the register ring.
+    Yank,
+    /// `c` / `x` — mark for the next paste, or take the mark off.
+    Mark(ClipMode),
+    /// `p` — put what is marked into the selected directory.
+    Paste,
+    /// `Esc` — forget what is marked.
+    ClearMarks,
     Refresh,
     ToggleHidden,
     /// `a` `r` `d` — fills the command line in and hands over.
@@ -1336,6 +1371,16 @@ impl Editor {
             TreeCmd::ToggleHidden => return tree.toggle_hidden(),
             TreeCmd::Prompt(op) => return self.prompt_file_op(op),
             TreeCmd::Delete => return self.delete_selected(),
+            TreeCmd::Yank => return self.yank_selected_path(),
+            TreeCmd::Mark(mode) => return self.mark_selected(mode),
+            TreeCmd::ClearMarks => {
+                if !self.session.clipboard.is_empty() {
+                    self.session.clipboard.clear();
+                    self.session.status = "marks cleared".into();
+                }
+                return;
+            }
+            TreeCmd::Paste => return self.paste_into_selected(),
             TreeCmd::Expand | TreeCmd::Enter => {}
         }
 
@@ -1564,7 +1609,11 @@ impl Editor {
                     self.session.mode = Mode::Normal;
                 }
             }
-            Action::CommandCancel => self.session.mode = Mode::Normal,
+            Action::CommandCancel => {
+                self.session.mode = Mode::Normal;
+                // The one `:` line that means something when abandoned.
+                self.abandon_paste();
+            }
             Action::CommandExecute => {
                 let Mode::Command(line) = std::mem::take(&mut self.session.mode) else {
                     return true;
@@ -1890,6 +1939,121 @@ impl Editor {
             .any(|b| b.buffer.path.as_deref() == Some(path) && b.buffer.is_modified())
     }
 
+    // ---- the clipboard ------------------------------------------------------
+
+    /// `y` — the selected path into the register ring.
+    ///
+    /// The existing ring rather than one of its own: the point is that `p` in
+    /// a text buffer then pastes the path. The tree produces for that ring and
+    /// never reads from it.
+    fn yank_selected_path(&mut self) {
+        let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
+        let path = row.path.display().to_string();
+        self.session.registers.push(Entry { text: path.clone(), kind: EntryKind::Charwise });
+        self.session.status = format!("yanked {path}");
+    }
+
+    /// `c` / `x` — mark the selected path, or take the mark off.
+    fn mark_selected(&mut self, mode: ClipMode) {
+        let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
+        let path = row.path.clone();
+        self.session.clipboard.mark(path, mode);
+        // Which mode the set is in should never be something you have to
+        // remember, so it is said every time it could have changed.
+        self.session.status = self.session.clipboard.summary();
+    }
+
+    /// `p` — put what is marked into the directory the cursor is standing in.
+    fn paste_into_selected(&mut self) {
+        let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
+        let into = match row.kind {
+            Kind::Dir => row.path.clone(),
+            _ => row.path.parent().unwrap_or(&row.path).to_path_buf(),
+        };
+        self.paste_into(&into);
+    }
+
+    fn paste_into(&mut self, into: &std::path::Path) {
+        if self.session.clipboard.is_empty() {
+            self.session.status = "nothing marked".into();
+            return;
+        }
+        let queue: Vec<std::path::PathBuf> = self.session.clipboard.paths().to_vec();
+
+        // A directory cannot hold itself. That is a loop rather than a
+        // mistake, and no name for the destination would fix it.
+        if let Some(source) = queue.iter().find(|source| into.starts_with(source)) {
+            self.session.status = format!("cannot paste \"{}\" into itself", source.display());
+            return;
+        }
+
+        let mode = self.session.clipboard.mode();
+        self.session.pasting = Some(Pasting { queue, into: into.to_path_buf(), mode, done: 0 });
+        self.run_paste(None);
+    }
+
+    /// Places what is queued until something is in the way.
+    ///
+    /// `rename` is the destination for the head of the queue when the command
+    /// line has just supplied one; otherwise each lands under its own name.
+    fn run_paste(&mut self, rename: Option<std::path::PathBuf>) {
+        let Some(mut pasting) = self.session.pasting.take() else { return };
+        let mut rename = rename;
+
+        while let Some(source) = pasting.queue.first().cloned() {
+            let target = match rename.take() {
+                Some(named) => named,
+                None => match source.file_name() {
+                    Some(name) => pasting.into.join(name),
+                    None => {
+                        pasting.queue.remove(0);
+                        continue;
+                    }
+                },
+            };
+
+            if target.exists() {
+                // Stop rather than overwrite, and ask. Esc on that line
+                // abandons the rest — see `Action::CommandCancel`.
+                self.session.mode = Mode::Command(format!("paste-as {}", target.display()));
+                self.session.pasting = Some(pasting);
+                return;
+            }
+
+            let result = match pasting.mode {
+                ClipMode::Copy => copy_into(&source, &target),
+                ClipMode::Cut => move_into(&source, &target),
+            };
+            if let Err(e) = result {
+                self.session.status = format!("{e}");
+                self.session.clipboard.clear();
+                return;
+            }
+            pasting.queue.remove(0);
+            pasting.done += 1;
+        }
+
+        let verb = match pasting.mode {
+            ClipMode::Copy => "copied",
+            ClipMode::Cut => "moved",
+        };
+        // A cut is spent — the sources are not there any more. A copy is not,
+        // so the same set can go to a second place.
+        if pasting.mode == ClipMode::Cut {
+            self.session.clipboard.clear();
+        }
+        self.session.status = format!("{} {verb} into {}", pasting.done, pasting.into.display());
+        self.refresh_trees();
+    }
+
+    /// `Esc` on the conflict line. Abandons what is left rather than skipping
+    /// one, which is why there is no skip: ten clashes would be ten decisions.
+    fn abandon_paste(&mut self) {
+        let Some(pasting) = self.session.pasting.take() else { return };
+        self.session.status = format!("paste abandoned after {}", pasting.done);
+        self.refresh_trees();
+    }
+
     /// `dd` — deletes the selected path with no `:` line in between.
     ///
     /// Irreversible: there is no undo for the filesystem and nothing is moved
@@ -1951,6 +2115,11 @@ impl Editor {
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Rename { from, to } => self.rename_path(&from, &to),
             ExLine::Delete { path, force } => self.delete_path(&path, force),
+            ExLine::Paste(dir) => match dir {
+                Some(dir) => self.paste_into(std::path::Path::new(&dir)),
+                None => self.paste_into_selected(),
+            },
+            ExLine::PasteAs(path) => self.run_paste(Some(path.into())),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
 
@@ -3705,6 +3874,11 @@ mod tests {
             self
         }
 
+        fn dir(self, rel: &str) -> Self {
+            std::fs::create_dir_all(self.0.join(rel)).unwrap();
+            self
+        }
+
         fn path(&self) -> &str {
             self.0.to_str().unwrap()
         }
@@ -3939,6 +4113,145 @@ mod tests {
         let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
         let path = format!("{}/a.rs", d.path());
         assert_eq!(line, &format!("rename {path} {path}"), "edit the second one");
+    }
+
+    // ---- the clipboard ------------------------------------------------------
+
+    fn marked(ed: &Editor) -> Vec<String> {
+        ed.session
+            .clipboard
+            .paths()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The tree produces for the register ring and never consumes from it: the
+    /// point is that `p` in a *text* buffer then pastes the path.
+    #[test]
+    fn y_yanks_the_selected_path_into_the_register_ring() {
+        let d = ScratchDir::new("yank").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Yank);
+
+        let want = format!("{}/a.rs", d.path());
+        assert_eq!(ed.session.registers.front().unwrap().text, want);
+        assert!(ed.session.status.contains(&want), "says what it took: {}", ed.session.status);
+    }
+
+    #[test]
+    fn c_and_x_mark_and_the_footer_says_which() {
+        let d = ScratchDir::new("mark").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+
+        assert_eq!(marked(&ed), ["a.rs", "b.rs"]);
+        assert_eq!(ed.session.status, "2 to copy");
+
+        tree_key(&mut ed, TreeCmd::ClearMarks);
+        assert!(ed.session.clipboard.is_empty(), "Esc clears them");
+    }
+
+    #[test]
+    fn p_copies_the_marked_files_into_the_selected_directory() {
+        let d = ScratchDir::new("paste-copy").file("a.rs").dir("pkg");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed); // pkg/ sorts first
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 1 });
+
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        assert!(std::path::Path::new(&format!("{}/pkg/a.rs", d.path())).is_file());
+        assert!(std::path::Path::new(&format!("{}/a.rs", d.path())).is_file(), "still there");
+        assert!(!ed.session.clipboard.is_empty(), "a copy keeps the set for a second place");
+    }
+
+    #[test]
+    fn p_moves_a_cut_and_forgets_it_afterwards() {
+        let d = ScratchDir::new("paste-cut").file("a.rs").dir("pkg");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Cut));
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 1 });
+
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        assert!(std::path::Path::new(&format!("{}/pkg/a.rs", d.path())).is_file());
+        assert!(!std::path::Path::new(&format!("{}/a.rs", d.path())).exists(), "moved");
+        assert!(ed.session.clipboard.is_empty(), "the sources are not there any more");
+    }
+
+    #[test]
+    fn a_conflict_stops_the_paste_and_offers_the_name_on_the_command_line() {
+        let d = ScratchDir::new("paste-clash").file("a.rs").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed); // pkg/
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 1 });
+
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        let Mode::Command(line) = &ed.session.mode else {
+            panic!("no prompt: {:?}", ed.session.mode)
+        };
+        assert_eq!(line, &format!("paste-as {}/pkg/a.rs", d.path()));
+    }
+
+    #[test]
+    fn paste_as_places_the_one_that_stopped_and_carries_on() {
+        let d = ScratchDir::new("paste-as").file("a.rs").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 1 });
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        ex(&mut ed, &format!("paste-as {}/pkg/renamed.rs", d.path()));
+
+        assert!(std::path::Path::new(&format!("{}/pkg/renamed.rs", d.path())).is_file());
+        assert!(ed.session.pasting.is_none(), "and the paste is finished");
+    }
+
+    /// Esc aborts the run rather than skipping one file, which is why there is
+    /// no skip: ten clashes would otherwise be ten decisions.
+    #[test]
+    fn escape_on_the_conflict_line_abandons_the_rest_of_the_paste() {
+        let d = ScratchDir::new("paste-abort").file("a.rs").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 1 });
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        ed.apply(cmd(Action::CommandCancel));
+
+        assert!(ed.session.pasting.is_none());
+        assert!(ed.session.status.contains("abandoned"), "{}", ed.session.status);
+    }
+
+    /// A loop rather than a mistake: no name for the destination fixes it.
+    #[test]
+    fn a_directory_cannot_be_pasted_inside_itself() {
+        let d = ScratchDir::new("paste-loop").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed); // pkg/
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy));
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        assert!(ed.session.status.contains("into itself"), "{}", ed.session.status);
+        assert!(!std::path::Path::new(&format!("{}/pkg/pkg", d.path())).exists());
     }
 
     /// `dd` is the one thing in the tree with no `:` line in front of it.

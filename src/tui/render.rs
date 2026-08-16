@@ -14,7 +14,7 @@ use bee::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
 use bee::picker::{Picker, PickerKind};
 use bee::selection::Selections;
 use bee::syntax::{Span as HlSpan, Syntax};
-use bee::tree::{Kind, Tree};
+use bee::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
 use bee::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
@@ -320,38 +320,71 @@ const TREE_DIR: Color = Color::Blue;
 /// A symlink. Cyan, again following `ls`.
 const TREE_LINK: Color = Color::Cyan;
 
+/// Marked to copy, and marked to cut. Yellow says "noted"; red says "this one
+/// is leaving".
+const MARK_COPY: Color = Color::Yellow;
+const MARK_CUT: Color = Color::Red;
+
+/// Everything to the left of a row's name: the mark column, the indent and the
+/// open/closed marker.
+///
+/// Split out because the alignment is the part worth guarding, and a
+/// `Paragraph` cannot be read back.
+fn tree_row_parts(row: &TreeRow, mark: Option<ClipMode>) -> (String, String) {
+    // One column, always, so marking something does not shift the tree
+    // sideways under the cursor.
+    let mark = match mark {
+        Some(ClipMode::Copy) => '+',
+        Some(ClipMode::Cut) => '~',
+        None => ' ',
+    };
+    let marker = match (row.kind, row.open) {
+        (Kind::Dir, true) => "▾ ",
+        (Kind::Dir, false) => "▸ ",
+        _ => "  ",
+    };
+    let name = match row.kind {
+        Kind::Dir => format!("{}/", row.name),
+        Kind::Link => format!("{}@", row.name),
+        Kind::File => row.name.clone(),
+    };
+    (format!("{mark}{}{marker}", "  ".repeat(row.depth)), name)
+}
+
 /// One window's tree. Returns where the terminal cursor belongs.
 ///
 /// The glyphs are chosen here rather than in the core, which hands over depth
 /// and kind and nothing that looks like anything — README decision #6 for a
 /// second subsystem. No gutter and no highlighting: a row is not a line, so it
 /// has no line number, and a path has no syntax.
-fn render_tree(frame: &mut Frame, tree: &Tree, area: Rect, focused: bool) -> Option<(u16, u16)> {
+fn render_tree(
+    frame: &mut Frame,
+    tree: &Tree,
+    clipboard: &Clipboard,
+    area: Rect,
+    focused: bool,
+) -> Option<(u16, u16)> {
     let rows = tree.rows();
     let last = (tree.scroll() + area.height as usize).min(rows.len());
     let mut cursor_at = None;
     let mut lines = Vec::with_capacity(area.height as usize);
 
     for (index, row) in rows.iter().enumerate().take(last).skip(tree.scroll()) {
-        let marker = match (row.kind, row.open) {
-            (Kind::Dir, true) => "▾ ",
-            (Kind::Dir, false) => "▸ ",
-            _ => "  ",
-        };
-        let indent = "  ".repeat(row.depth);
-        let name = match row.kind {
-            Kind::Dir => format!("{}/", row.name),
-            Kind::Link => format!("{}@", row.name),
-            Kind::File => row.name.clone(),
-        };
+        let mark = clipboard.contains(&row.path).then(|| clipboard.mode());
+        let (indent, name) = tree_row_parts(row, mark);
 
         let style = match row.kind {
             Kind::Dir => Style::default().fg(TREE_DIR).add_modifier(Modifier::BOLD),
             Kind::Link => Style::default().fg(TREE_LINK),
             Kind::File => Style::default(),
         };
+        let mark_style = match mark {
+            Some(ClipMode::Copy) => Style::default().fg(MARK_COPY).add_modifier(Modifier::BOLD),
+            Some(ClipMode::Cut) => Style::default().fg(MARK_CUT).add_modifier(Modifier::BOLD),
+            None => Style::default(),
+        };
 
-        let spans = vec![Span::raw(format!("{indent}{marker}")), Span::styled(name, style)];
+        let spans = vec![Span::styled(indent.clone(), mark_style), Span::styled(name, style)];
         if index != tree.selected() {
             lines.push(Line::from(spans));
             continue;
@@ -363,7 +396,7 @@ fn render_tree(frame: &mut Frame, tree: &Tree, area: Rect, focused: bool) -> Opt
         let bg = if focused { SELECTION_BG } else { CURSOR_LINE_BG };
         lines.push(fill_line(spans, bg, area.width as usize));
         if focused {
-            let col = (indent.chars().count() + marker.chars().count()) as u16;
+            let col = indent.chars().count() as u16;
             cursor_at = Some((
                 area.x + col.min(area.width.saturating_sub(1)),
                 area.y + lines.len() as u16 - 1,
@@ -386,7 +419,9 @@ fn render_window(
 ) -> Option<(u16, u16)> {
     let (text, buffer, syntax) = match ed.pane(id)? {
         Pane::Text { text, buffer, syntax, .. } => (text, buffer, syntax),
-        Pane::Tree { tree, .. } => return render_tree(frame, tree, text_area, focused),
+        Pane::Tree { tree, .. } => {
+            return render_tree(frame, tree, &ed.session.clipboard, text_area, focused);
+        }
     };
     let (scroll, selections) = (text.scroll, &text.selections);
 
@@ -856,6 +891,29 @@ mod tests {
         let line = window_status(&ed, ed.focus(), false, 40);
         let text: String = line.iter().map(|s| s.content.to_string()).collect();
         assert!(!text.contains("NORMAL"), "{text:?}");
+    }
+
+    /// The mark column is one character wide whether anything is marked or
+    /// not, so marking a file does not shift the tree sideways under you.
+    #[test]
+    fn a_marked_row_is_flagged_without_moving_the_ones_around_it() {
+        let row = TreeRow {
+            path: "src/lib.rs".into(),
+            name: "lib.rs".into(),
+            depth: 1,
+            kind: Kind::File,
+            open: false,
+        };
+
+        let (plain, name) = tree_row_parts(&row, None);
+        assert_eq!(plain, "     ", "mark column, one level of indent, no marker");
+        assert_eq!(name, "lib.rs");
+
+        let (copy, _) = tree_row_parts(&row, Some(ClipMode::Copy));
+        let (cut, _) = tree_row_parts(&row, Some(ClipMode::Cut));
+        assert_eq!(copy, "+    ");
+        assert_eq!(cut, "~    ");
+        assert_eq!(copy.chars().count(), plain.chars().count(), "same width either way");
     }
 
     /// A tree has no status row: its own first row already names the root, and

@@ -14,6 +14,7 @@ use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
 use crate::registers::Sink;
+use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
 
 #[derive(Default)]
@@ -327,6 +328,13 @@ impl Input {
             KeyCode::Char('-') => TreeCmd::Up,
             KeyCode::Char('+') => TreeCmd::Down,
             KeyCode::Char('R') => TreeCmd::Refresh,
+
+            KeyCode::Char('y') => TreeCmd::Yank,
+            KeyCode::Char('c') => TreeCmd::Mark(ClipMode::Copy),
+            KeyCode::Char('x') => TreeCmd::Mark(ClipMode::Cut),
+            KeyCode::Char('p') => TreeCmd::Paste,
+            // The only way out that is not the right key on every one of them.
+            KeyCode::Esc => TreeCmd::ClearMarks,
 
             // These three only fill the command line in; the work is done by
             // `:create`, `:rename` and `:delete`, which are ordinary ex
@@ -914,7 +922,7 @@ mod tests {
     /// edits or enters insert mode can reach a pane sitting on a filesystem.
     #[test]
     fn nothing_in_a_tree_enters_insert_or_edits() {
-        for c in ['i', 'A', 'I', 'o', 'O', 'c', 'x', 'p', 'v', 'V', 'u', 's'] {
+        for c in ['i', 'A', 'I', 'o', 'O', 'v', 'V', 'u', 's'] {
             assert!(in_tree(&c.to_string()).is_none(), "{c:?} did something in a tree");
         }
     }
