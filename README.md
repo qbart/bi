@@ -308,6 +308,11 @@ Closing a window discards nothing, so it never asks about unsaved changes: the
 buffer stays in the list. Deleting a buffer closes no windows either — a window
 showing it falls through to the next one.
 
+`:set number` is session-wide, where vim scopes `'number'` per window. That is
+deliberate: the gutter is a reading preference rather than a fact about one
+view, so one value governs every pane. The cost is that you cannot number one
+pane and leave its neighbour bare.
+
 ### Line numbers
 
 `:set number {n}` decides what the gutter shows. `:set number=5` works too,
@@ -418,9 +423,6 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - No horizontal scrolling — long lines clip.
 - No moving a window around the tree (`Ctrl-W x` / `r` / `H J K L`), and no tab
   pages. The split tree is the shape that would carry both.
-- `'number'` is session-wide where vim scopes it per window — one pane numbered
-  and its neighbour not is waiting on the config language, like every other
-  option. See [docs/specs/windows.md](docs/specs/windows.md).
 - No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
   `docs/specs/registers.md`.
 - Rust is the only grammar. Adding one is a line in `syntax.rs`, but each is a
@@ -467,9 +469,8 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 LSP, which hangs off the same `pending_edits` drain that tree-sitter and the
 window fixup now share — `Editor::settle` is where `textDocument/didChange`
 goes. Before that, the config-language decision (RECOMMENDATION.md, "what
-actually bites you" #1) is still unmade and getting less cheap: the keymap in
-`input.rs`, the highlight table in `tui/render.rs` and now `'number'`'s scope
-are all waiting for it.
+actually bites you" #1) is still unmade and still cheap: the keymap in
+`input.rs` and the highlight table in `tui/render.rs` are both waiting for it.
 
 Previously, on windows: `Editor` became a session holding a buffer list and a
 tree of windows, with the editing commands moved onto a `View` that binds one

@@ -475,11 +475,13 @@ pub struct Session {
     pub highlight_search: bool,
     /// What the gutter shows. `:set number`.
     ///
-    /// Session-wide, though vim scopes `'number'` per window. One pane
-    /// numbered and its neighbour not is a real thing to want, but it is an
-    /// options problem, and the options table is still waiting on the config
-    /// language — so this is the first field to claim window scope once there
-    /// is somewhere to configure it from.
+    /// Session-wide by choice, where vim scopes `'number'` per window.
+    ///
+    /// A gutter that is numbered in one pane and not in its neighbour makes the
+    /// same file read differently depending on where you opened it, and the
+    /// setting is a reading preference rather than anything about the view. One
+    /// value, and every window obeys it. Not a placeholder for a per-window
+    /// option later — see `docs/specs/windows.md`.
     pub line_numbers: LineNumbers,
     /// Whether the status line belongs to the search.
     ///

@@ -74,10 +74,23 @@ already handles.
 
 ## Where it lives
 
-`Editor` owns the setting, `render` asks. The rules are in the library so a
+`Session` owns the setting, `render` asks. The rules are in the library so a
 second frontend gets them for free, and because "what does row 12 show" is not
 a question about terminals.
 
+**It is session-wide, where vim scopes `'number'` per window.** The second
+divergence from vim on this page, and a decision rather than a step not yet
+taken. The gutter is a reading preference — how you like files to look — not a
+fact about one particular view of one, so scoping it per window would mean the
+same file reads differently depending on which pane you opened it in, and that
+every new split inherits its numbering from whichever window it was born from.
+Both answer a question nobody asked.
+
+The cost is that there is no way to number one pane and leave its neighbour
+bare. See [windows.md](windows.md).
+
 `:set` arrives with it, and starts with exactly one option. A real options table
 wants the config layer that `editor.rs` has been waiting for; until then, one
-match arm and an honest error for anything else is the whole of it.
+match arm and an honest error for anything else is the whole of it. Note that
+the config layer does not change the scope decision above — a per-window
+override is something to refuse, not something to get around to.

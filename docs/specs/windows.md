@@ -160,12 +160,20 @@ else. Putting the tree on `Buffer` would move the drain inside the buffer and
 break that promise on the way past. The entry keeps the tree beside the text it
 belongs to and the drain where it was.
 
-**`line_numbers` stays global**, though vim's `'number'` is window-local. One
-window numbered and its neighbour not is a real thing to want, but it is an
-options problem, and the options table is waiting on the config language that
-`editor.rs` has been waiting on since `:set` arrived. Written down so it is a
-decision: `LineNumbers` is the first field to claim window scope when there is
-somewhere to configure it from.
+**`line_numbers` is global, and stays global.** Vim scopes `'number'` per
+window; bee does not, and this is a decision rather than a step not yet taken.
+
+The gutter is a reading preference — how you like files to look — not a fact
+about a particular view of one. Scoping it per window means the same file reads
+differently depending on which pane you happened to open it in, and that every
+new split inherits a setting from whichever window it was born from. Both are
+answers to a question nobody asked. One value, every window obeys it, and
+`:set number` needs no notion of *where*.
+
+The cost is real and small: there is no way to number one pane and leave its
+neighbour bare. Written down so the divergence is a decision rather than an
+accident, in the same spirit as `:set number`'s own departure from vim's
+boolean — see [line-numbers.md](line-numbers.md).
 
 **Ids are stable, not positions.**
 
