@@ -525,29 +525,106 @@ struct BufferEntry {
 
 /// A command that reaches past the view it was typed in.
 ///
-/// `View` borrows the buffer and the window from the lists these commands
-/// change, so they cannot run inside one. `View::run_ex` hands them back and
-/// `Editor::apply` runs them once the view is dropped.
+/// Ex lines used to arrive this way too, discovered mid-flight inside a view.
+/// They are parsed before dispatch now — see [`Editor::run_ex`] — so what is
+/// left is the picker, which genuinely cannot know what it is choosing for
+/// until a row is accepted: a register pick pastes into the buffer the view
+/// already holds, and a buffer pick reaches the list that view was borrowed
+/// from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Escalation {
-    /// `:e <path>` — edits another file. Bare `:e` reloads, which a view can
-    /// do on its own.
+    Buffer(BufferCmd),
+}
+
+/// A parsed `:` line.
+///
+/// The split that matters is which arms need a rope: those are the last four,
+/// and they are the only ones that cannot run in a window holding a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExLine {
+    Window(WindowCmd),
+    Buffer(BufferCmd),
+    /// `:e <path>`. Bare `:e` is [`ExLine::Reload`], which is a different job.
     Edit {
         path: String,
+    },
+    Quit {
         force: bool,
     },
-    Buffer(BufferCmd),
-    Window(WindowCmd),
     /// `:qa` — every buffer has to agree, not just this one.
     QuitAll {
         force: bool,
     },
     /// `:wa` — writes every modified buffer.
     WriteAll,
-    /// `:q` — closes this window, and quits only from the last one.
-    Quit {
+    Highlight(bool),
+    Set(String),
+    Unknown(String),
+    /// Parsed, but cannot run — carrying its own message, already phrased.
+    Error(String),
+
+    Write(String),
+    WriteQuit(String),
+    /// Bare `:e` — re-read this file from disk.
+    Reload {
         force: bool,
     },
+    /// `:42`.
+    Goto(usize),
+}
+
+/// Splits a `:` line into a command and its argument. `None` for a blank line,
+/// which is not an error and not a command.
+fn parse_ex(line: &str) -> Option<ExLine> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let (cmd, arg) = match line.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, a.trim()),
+        None => (line, ""),
+    };
+    let force = cmd.ends_with('!');
+    let name = cmd.trim_end_matches('!');
+    let split = |dir| {
+        ExLine::Window(WindowCmd::Split { dir, path: (!arg.is_empty()).then(|| arg.to_string()) })
+    };
+
+    Some(match name {
+        "w" | "write" => ExLine::Write(arg.into()),
+        // The `a` forms mean "every buffer", which they genuinely do.
+        "wa" | "wall" => ExLine::WriteAll,
+        "qa" | "qall" => ExLine::QuitAll { force },
+        "q" | "quit" => ExLine::Quit { force },
+        "sp" | "split" | "new" => split(Dir::Horizontal),
+        "vs" | "vsp" | "vsplit" | "vnew" => split(Dir::Vertical),
+        "clo" | "close" => ExLine::Window(WindowCmd::Close),
+        "on" | "only" => ExLine::Window(WindowCmd::Only),
+        // Bare `:e` reloads this buffer; with a path it changes what the
+        // window shows, which is two different jobs under one name.
+        "e" | "edit" if arg.is_empty() => ExLine::Reload { force },
+        "e" | "edit" => ExLine::Edit { path: arg.into() },
+        "bn" | "bnext" => ExLine::Buffer(BufferCmd::Next),
+        "bp" | "bprev" | "bprevious" => ExLine::Buffer(BufferCmd::Prev),
+        "bd" | "bdelete" => ExLine::Buffer(BufferCmd::Delete { force }),
+        "ls" | "buffers" => ExLine::Buffer(BufferCmd::List),
+        "b" | "buffer" => match arg {
+            "" => ExLine::Error("which buffer?".into()),
+            "#" => ExLine::Buffer(BufferCmd::Alternate),
+            partial => ExLine::Buffer(BufferCmd::Named(partial.into())),
+        },
+        "noh" | "nohl" | "nohlsearch" => ExLine::Highlight(false),
+        // Off by default, because a plain `/` in vim does not light up the
+        // buffer. The count in the status line is what a search owes you.
+        "hls" | "hlsearch" => ExLine::Highlight(true),
+        "set" => ExLine::Set(arg.into()),
+        "wq" | "x" => ExLine::WriteQuit(arg.into()),
+        _ => match name.parse::<usize>() {
+            Ok(row) => ExLine::Goto(row),
+            Err(_) => ExLine::Unknown(name.into()),
+        },
+    })
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -1178,72 +1255,158 @@ impl Editor {
     fn escalate(&mut self, escalation: Escalation) {
         match escalation {
             Escalation::Buffer(cmd) => self.run_buffer_cmd(cmd),
-            Escalation::Window(cmd) => self.run_window_cmd(cmd),
-            // Closes the window when more than one is open, and quits only from
-            // the last — which is what vim does, and what makes `:qa` mean
-            // something different from `:q`.
-            Escalation::Quit { force } => {
-                if self.windows.len() > 1 {
-                    self.close_window(self.focus);
-                } else if self.buffer().is_some_and(Buffer::is_modified) && !force {
-                    self.session.status = "unsaved changes (use `:q!` to discard)".into();
-                } else {
-                    self.session.quit = true;
-                }
+        }
+    }
+
+    /// Runs `f` in the focused window's view, or says why it could not.
+    ///
+    /// The one place "this pane holds no text" is turned into a message, so no
+    /// caller has to remember that a window might be a tree.
+    fn in_view<T>(&mut self, f: impl FnOnce(&mut View) -> T) -> Option<T> {
+        match self.focused() {
+            Some(mut view) => Some(f(&mut view)),
+            None => {
+                self.session.status = "no buffer in this window".into();
+                None
             }
-            Escalation::Edit { path, force } => {
-                let modified = self.buffer().is_some_and(Buffer::is_modified);
-                // No longer refuses on unsaved changes: the old buffer goes
-                // hidden with its history and its modified flag intact, so
-                // nothing is discarded. Bare `:e` — reload from disk — still
-                // refuses, and is handled in the view.
-                let _ = (modified, force);
-                match self.open_path(&path) {
-                    Ok(id) => {
-                        let focus = self.focus;
-                        self.show(focus, id);
-                        self.session.status = format!("\"{}\" loaded", self.name_of(id));
-                    }
-                    Err(e) => self.session.status = format!("{e:#}"),
-                }
+        }
+    }
+
+    /// Closes the window when more than one is open, and quits only from the
+    /// last — which is what vim does, and what makes `:qa` mean something
+    /// different from `:q`.
+    fn quit(&mut self, force: bool) {
+        if self.windows.len() > 1 {
+            self.close_window(self.focus);
+        } else if self.buffer().is_some_and(Buffer::is_modified) && !force {
+            self.session.status = "unsaved changes (use `:q!` to discard)".into();
+        } else {
+            self.session.quit = true;
+        }
+    }
+
+    /// Every buffer has to agree, not just the focused one.
+    fn quit_all(&mut self, force: bool) {
+        let unsaved = self.buffers.iter().find(|b| b.buffer.is_modified()).map(|b| b.id);
+        match unsaved {
+            Some(id) if !force => {
+                self.session.status =
+                    format!("\"{}\" has unsaved changes (use `:qa!`)", self.name_of(id));
             }
-            Escalation::QuitAll { force } => {
-                let unsaved = self.buffers.iter().find(|b| b.buffer.is_modified()).map(|b| b.id);
-                match unsaved {
-                    Some(id) if !force => {
-                        self.session.status =
-                            format!("\"{}\" has unsaved changes (use `:qa!`)", self.name_of(id));
-                    }
-                    _ => self.session.quit = true,
-                }
-            }
-            Escalation::WriteAll => {
-                let ids: Vec<BufferId> = self
-                    .buffers
-                    .iter()
-                    .filter(|b| b.buffer.is_modified() && b.buffer.path.is_some())
-                    .map(|b| b.id)
-                    .collect();
-                if ids.is_empty() {
-                    self.session.status = "nothing to write".into();
+            _ => self.session.quit = true,
+        }
+    }
+
+    fn write_all(&mut self) {
+        let ids: Vec<BufferId> = self
+            .buffers
+            .iter()
+            .filter(|b| b.buffer.is_modified() && b.buffer.path.is_some())
+            .map(|b| b.id)
+            .collect();
+        if ids.is_empty() {
+            self.session.status = "nothing to write".into();
+            return;
+        }
+        let mut written = 0;
+        for id in &ids {
+            let entry = self.entry_mut(*id);
+            // No selections to record for a buffer nobody is looking at, and
+            // the ones for a buffer in view have not moved.
+            let pairs = entry.last.clone();
+            match entry.buffer.save(pairs.clone(), pairs) {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    self.session.status = format!("error: {e:#}");
                     return;
                 }
-                let mut written = 0;
-                for id in &ids {
-                    let entry = self.entry_mut(*id);
-                    // No selections to record for a buffer nobody is looking
-                    // at, and the ones for a buffer in view have not moved.
-                    let pairs = entry.last.clone();
-                    match entry.buffer.save(pairs.clone(), pairs) {
-                        Ok(()) => written += 1,
-                        Err(e) => {
-                            self.session.status = format!("error: {e:#}");
-                            return;
-                        }
+            }
+        }
+        self.session.status = format!("{written} written");
+    }
+
+    /// `:e <path>` — shows another file here.
+    ///
+    /// No longer refuses on unsaved changes: the old buffer goes hidden with
+    /// its history and its modified flag intact, so nothing is discarded. Bare
+    /// `:e` — reload from disk — still refuses, and needs a view.
+    fn edit_path(&mut self, path: &str) {
+        match self.open_path(path) {
+            Ok(id) => {
+                let focus = self.focus;
+                self.show(focus, id);
+                self.session.status = format!("\"{}\" loaded", self.name_of(id));
+            }
+            Err(e) => self.session.status = format!("{e:#}"),
+        }
+    }
+
+    /// Runs a `:` line.
+    ///
+    /// Parsed before anything is dispatched, rather than discovered inside a
+    /// view: a tree window has no view for a `:` line to land in, and the
+    /// window and buffer commands no longer have to travel back out as
+    /// escalations to reach the lists they change. See `docs/specs/tree.md`.
+    pub fn run_ex(&mut self, line: &str) {
+        let Some(parsed) = parse_ex(line) else { return };
+        match parsed {
+            ExLine::Window(cmd) => self.run_window_cmd(cmd),
+            ExLine::Buffer(cmd) => self.run_buffer_cmd(cmd),
+            ExLine::Edit { path } => self.edit_path(&path),
+            ExLine::Quit { force } => self.quit(force),
+            ExLine::QuitAll { force } => self.quit_all(force),
+            ExLine::WriteAll => self.write_all(),
+            ExLine::Highlight(on) => self.session.highlight_search = on,
+            ExLine::Set(arg) => self.set_option(&arg),
+            ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
+            ExLine::Error(message) => self.session.status = message,
+
+            // The rest need the rope, and so need a view.
+            ExLine::Write(path) => {
+                self.in_view(|view| view.write(&path));
+            }
+            ExLine::Reload { force } => {
+                self.in_view(|view| view.edit(force));
+            }
+            ExLine::Goto(row) => {
+                self.in_view(|view| view.goto_row(row));
+            }
+            ExLine::WriteQuit(path) => {
+                if self.in_view(|view| view.write(&path)) == Some(true) {
+                    self.quit(true);
+                }
+            }
+        }
+    }
+
+    /// `:set <option> <value>`, or `:set <option>=<value>` — vim's spelling,
+    /// which the fingers type without asking.
+    ///
+    /// One option so far. A real options table wants the config layer this
+    /// file has been waiting for; until then a match arm and an honest error
+    /// for everything else is the whole of it.
+    fn set_option(&mut self, arg: &str) {
+        let (name, value) = match arg.split_once(['=', ' ']) {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => (arg.trim(), ""),
+        };
+
+        match name {
+            "number" => {
+                if value.is_empty() {
+                    self.session.status = format!("number={}", self.session.line_numbers.setting());
+                    return;
+                }
+                match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
+                    Some(lines) => self.session.line_numbers = lines,
+                    None => {
+                        self.session.status =
+                            format!("number takes 0 (off), -1 (relative) or a count: {value}");
                     }
                 }
-                self.session.status = format!("{written} written");
             }
+            "" => self.session.status = "set what?".into(),
+            _ => self.session.status = format!("unknown option: {name}"),
         }
     }
 
@@ -1286,6 +1449,13 @@ impl Editor {
         match cmd.action {
             Action::Buffer(buffer_cmd) => return self.run_buffer_cmd(buffer_cmd),
             Action::Window(window_cmd) => return self.run_window_cmd(window_cmd),
+            // The `:` line is read here rather than inside the view, because
+            // half of what it can say reaches the lists a view is borrowed
+            // from — and because a tree window has no view at all.
+            Action::CommandExecute => {
+                let Mode::Command(line) = std::mem::take(&mut self.session.mode) else { return };
+                return self.run_ex(&line);
+            }
             _ => {}
         }
         // A tree window has no view, so nothing text-shaped can run in it.
@@ -1396,15 +1566,6 @@ impl Editor {
     pub fn scroll_to_cursor(&mut self, height: usize) {
         if let Some(mut view) = self.focused() {
             view.scroll_to_cursor(height);
-        }
-    }
-
-    #[cfg(test)]
-    fn run_ex(&mut self, line: &str) {
-        // The view is dropped before `escalate`, which needs the lists it
-        // borrowed from.
-        if let Some(escalation) = self.focused().and_then(|mut view| view.run_ex(line)) {
-            self.escalate(escalation);
         }
     }
 }
@@ -2302,17 +2463,8 @@ impl View<'_> {
                 }
             }
             Action::CommandCancel => self.session.mode = Mode::Normal,
-            Action::CommandExecute => {
-                let line = match &self.session.mode {
-                    Mode::Command(line) => line.clone(),
-                    _ => return None,
-                };
-                self.session.mode = Mode::Normal;
-                escalation = self.run_ex(&line);
-            }
-
             // Handled by `Editor` before this view was built.
-            Action::Buffer(_) | Action::Window(_) => {}
+            Action::CommandExecute | Action::Buffer(_) | Action::Window(_) => {}
         }
         escalation
     }
@@ -2505,108 +2657,10 @@ impl View<'_> {
 
     /// The `:` commands. Deliberately tiny — this is not where the editor gets
     /// interesting, and a real command table wants the config layer first.
-    fn run_ex(&mut self, line: &str) -> Option<Escalation> {
-        let line = line.trim();
-        if line.is_empty() {
-            return None;
-        }
-
-        let (cmd, arg) = match line.split_once(char::is_whitespace) {
-            Some((c, a)) => (c, a.trim()),
-            None => (line, ""),
-        };
-        let force = cmd.ends_with('!');
-        let name = cmd.trim_end_matches('!');
-
-        match name {
-            "w" | "write" => {
-                self.write(arg);
-            }
-            // The `a` forms mean "every buffer", which they now genuinely do.
-            "wa" | "wall" => return Some(Escalation::WriteAll),
-            "qa" | "qall" => return Some(Escalation::QuitAll { force }),
-            "q" | "quit" => return Some(Escalation::Quit { force }),
-            "sp" | "split" | "new" => {
-                let path = (!arg.is_empty()).then(|| arg.to_string());
-                return Some(Escalation::Window(WindowCmd::Split { dir: Dir::Horizontal, path }));
-            }
-            "vs" | "vsp" | "vsplit" | "vnew" => {
-                let path = (!arg.is_empty()).then(|| arg.to_string());
-                return Some(Escalation::Window(WindowCmd::Split { dir: Dir::Vertical, path }));
-            }
-            "clo" | "close" => return Some(Escalation::Window(WindowCmd::Close)),
-            "on" | "only" => return Some(Escalation::Window(WindowCmd::Only)),
-            // Bare `:e` reloads this buffer, which is a view's own business.
-            // With a path it changes which buffer the window shows, which is
-            // the session's.
-            "e" | "edit" if arg.is_empty() => self.edit(force),
-            "e" | "edit" => return Some(Escalation::Edit { path: arg.into(), force }),
-            "bn" | "bnext" => return Some(Escalation::Buffer(BufferCmd::Next)),
-            "bp" | "bprev" | "bprevious" => return Some(Escalation::Buffer(BufferCmd::Prev)),
-            "bd" | "bdelete" => return Some(Escalation::Buffer(BufferCmd::Delete { force })),
-            "ls" | "buffers" => return Some(Escalation::Buffer(BufferCmd::List)),
-            "b" | "buffer" => {
-                let cmd = match arg {
-                    "" => {
-                        self.session.status = "which buffer?".into();
-                        return None;
-                    }
-                    "#" => BufferCmd::Alternate,
-                    partial => BufferCmd::Named(partial.into()),
-                };
-                return Some(Escalation::Buffer(cmd));
-            }
-            "noh" | "nohl" | "nohlsearch" => self.session.highlight_search = false,
-            // Off by default, because a plain `/` in vim does not light up the
-            // buffer. The count in the status line is what a search owes you.
-            "hls" | "hlsearch" => self.session.highlight_search = true,
-            "set" => self.set_option(arg),
-            "wq" | "x" => {
-                if self.write(arg) {
-                    return Some(Escalation::Quit { force: true });
-                }
-            }
-            _ => {
-                if let Ok(n) = name.parse::<usize>() {
-                    let cursor = self.buffer.at_row(n.saturating_sub(1), false);
-                    *self.selections = Selections::single(cursor);
-                } else {
-                    self.session.status = format!("not a command: {name}");
-                }
-            }
-        }
-        None
-    }
-
-    /// `:set <option> <value>`, or `:set <option>=<value>` — vim's spelling,
-    /// which the fingers type without asking.
-    ///
-    /// One option so far. A real options table wants the config layer this
-    /// file has been waiting for; until then a match arm and an honest error
-    /// for everything else is the whole of it.
-    fn set_option(&mut self, arg: &str) {
-        let (name, value) = match arg.split_once(['=', ' ']) {
-            Some((name, value)) => (name.trim(), value.trim()),
-            None => (arg.trim(), ""),
-        };
-
-        match name {
-            "number" => {
-                if value.is_empty() {
-                    self.session.status = format!("number={}", self.session.line_numbers.setting());
-                    return;
-                }
-                match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
-                    Some(lines) => self.session.line_numbers = lines,
-                    None => {
-                        self.session.status =
-                            format!("number takes 0 (off), -1 (relative) or a count: {value}");
-                    }
-                }
-            }
-            "" => self.session.status = "set what?".into(),
-            _ => self.session.status = format!("unknown option: {name}"),
-        }
+    /// `:42` — put the cursor on that row.
+    fn goto_row(&mut self, row: usize) {
+        let cursor = self.buffer.at_row(row.saturating_sub(1), false);
+        *self.selections = Selections::single(cursor);
     }
 
     /// Returns whether the write succeeded.
@@ -3090,6 +3144,17 @@ mod tests {
 
     fn ex(ed: &mut Editor, line: &str) {
         ed.run_ex(line);
+    }
+
+    /// A line that parses but cannot run says what it wanted, not that it was
+    /// never a command. Easy to lose when the parse moved out of the view.
+    #[test]
+    fn a_command_missing_its_argument_says_what_it_wanted() {
+        let mut ed = editor("hello");
+
+        ex(&mut ed, "b");
+
+        assert_eq!(ed.session.status, "which buffer?");
     }
 
     #[test]
