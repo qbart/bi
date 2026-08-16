@@ -31,7 +31,7 @@ pub enum VisualKind {
 
 /// What the gutter shows. `:set number`.
 ///
-/// See `docs/specs/line-numbers.md`. The rules live here rather than in the
+/// See `docs/specs/number.md`. The rules live here rather than in the
 /// renderer because "what does row 12 show" is not a question about terminals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineNumbers {

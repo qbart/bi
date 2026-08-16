@@ -308,11 +308,6 @@ Closing a window discards nothing, so it never asks about unsaved changes: the
 buffer stays in the list. Deleting a buffer closes no windows either — a window
 showing it falls through to the next one.
 
-`:set number` is session-wide, where vim scopes `'number'` per window. That is
-deliberate: the gutter is a reading preference rather than a fact about one
-view, so one value governs every pane. The cost is that you cannot number one
-pane and leave its neighbour bare.
-
 ### Line numbers
 
 `:set number {n}` decides what the gutter shows. `:set number=5` works too,
@@ -328,7 +323,11 @@ since that is vim's spelling.
 The line the cursor is on always shows its own absolute number, whatever the
 mode — it is the one number a relative gutter cannot tell you, and the one
 `:{n}` needs. The gutter keeps the width of the largest line number in every
-mode, so moving the cursor never slides the file sideways.
+mode, so moving the cursor never slides the file sideways; each window sizes
+its own, since that depends on the file in the pane.
+
+See [docs/specs/number.md](docs/specs/number.md), including why the option takes
+a value rather than being a boolean, and why it is session-wide.
 
 Vim spells this as two booleans, `number` and `relativenumber`, because a
 boolean cannot say "every fifth". One option that takes a value says all three
