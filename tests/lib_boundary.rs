@@ -52,7 +52,7 @@ impl Session {
     }
 
     fn text(&self) -> String {
-        self.editor.buffer().rope().to_string()
+        self.editor.buffer().unwrap().rope().to_string()
     }
 }
 
@@ -136,7 +136,7 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
     assert_eq!(s.text(), "Xalpha");
 
     let other = *s.editor.window_ids().iter().find(|&&id| id != s.editor.focus()).unwrap();
-    assert_eq!(s.editor.pane(other).buffer.rope().to_string(), "Xalpha");
+    assert_eq!(s.editor.pane(other).unwrap().buffer.rope().to_string(), "Xalpha");
 
     s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Focus(Side::Right)) });
     assert_eq!(s.editor.focus(), other, "switched by geometry");
@@ -227,10 +227,10 @@ fn arrow_keys_move_without_any_terminal_types_involved() {
     let mut s = Session::new("ab\ncd");
     s.press(Key::code(KeyCode::Home));
     s.press(Key::code(KeyCode::Up));
-    assert_eq!(s.editor.cursor_row(), 0);
-    assert_eq!(s.editor.cursor_col(), 0);
+    assert_eq!(s.editor.cursor_row().unwrap(), 0);
+    assert_eq!(s.editor.cursor_col().unwrap(), 0);
 
     s.press(Key::code(KeyCode::Down));
     s.press(Key::code(KeyCode::End));
-    assert_eq!(s.editor.cursor_row(), 1);
+    assert_eq!(s.editor.cursor_row().unwrap(), 1);
 }

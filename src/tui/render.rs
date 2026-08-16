@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use bee::buffer::Cursor;
 use bee::editor::{Editor, LineNumbers, Mode, VisualKind};
 use bee::picker::{Picker, PickerKind};
+use bee::selection::Selections;
 use bee::syntax::{Span as HlSpan, Syntax};
 use bee::window::{Chrome, Rect as CoreRect, WindowId};
 
@@ -308,9 +309,9 @@ fn render_window(
     text_area: Rect,
     focused: bool,
 ) -> Option<(u16, u16)> {
-    let pane = ed.pane(id);
-    let (buffer, scroll) = (pane.buffer, pane.window.scroll);
-    let selections = &pane.window.selections;
+    let pane = ed.pane(id)?;
+    let (buffer, scroll) = (pane.buffer, pane.text.scroll);
+    let selections = &pane.text.selections;
 
     let total = buffer.line_count();
     let gutter = gutter_width(ed, buffer);
@@ -479,7 +480,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Paragr
 /// Split out for the same reason [`status_spans`] is: a `Paragraph` cannot be
 /// read back, and what the row says is the thing worth guarding.
 fn window_status_text(ed: &Editor, id: WindowId, width: u16) -> String {
-    let pane = ed.pane(id);
+    let Some(pane) = ed.pane(id) else { return String::new() };
     let name = pane
         .buffer
         .path
@@ -487,7 +488,7 @@ fn window_status_text(ed: &Editor, id: WindowId, width: u16) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "[No Name]".into());
 
-    let cursor = pane.window.selections.cursor();
+    let cursor = pane.text.selections.cursor();
     let left = format!(" {name}{}", if pane.buffer.is_modified() { " [+]" } else { "" });
     let right = format!("{}:{} ", pane.buffer.row_at(cursor) + 1, pane.buffer.col_at(cursor) + 1);
 
@@ -669,7 +670,7 @@ fn status_spans(
     // Several cursors is a state you cannot otherwise tell from the mode: the
     // label still says NORMAL, and the only other sign is coloured cells that
     // may be scrolled off. Say how many.
-    let cursors = ed.selections().len();
+    let cursors = ed.selections().map_or(0, Selections::len);
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
     let keys = format!("{count}{pending}  ");
 
@@ -720,7 +721,7 @@ mod tests {
         assert!(row.ends_with("1:1 "), "position is pushed to the right edge: {row:?}");
         assert_eq!(row.chars().count(), 30, "and it fills the pane");
 
-        ed.buffer_mut().insert_str(Cursor::at(0), "x");
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
         assert!(window_status_text(&ed, ed.focus(), 30).contains("[+]"), "modified is marked");
     }
 
@@ -740,21 +741,21 @@ mod tests {
     #[test]
     fn the_gutter_keeps_its_width_in_every_mode_but_off() {
         let mut ed = Editor::empty();
-        ed.buffer_mut().insert_str(Cursor::at(0), &"x\n".repeat(120));
-        let numbered = gutter_width(&ed, ed.buffer());
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), &"x\n".repeat(120));
+        let numbered = gutter_width(&ed, ed.buffer().unwrap());
         assert_eq!(numbered, 4, "121 lines, so three digits and a space");
 
         ed.session.line_numbers = LineNumbers::Relative;
         assert_eq!(
-            gutter_width(&ed, ed.buffer()),
+            gutter_width(&ed, ed.buffer().unwrap()),
             numbered,
             "or the file slides sideways as you move"
         );
         ed.session.line_numbers = LineNumbers::Every(10);
-        assert_eq!(gutter_width(&ed, ed.buffer()), numbered);
+        assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), numbered);
 
         ed.session.line_numbers = LineNumbers::Off;
-        assert_eq!(gutter_width(&ed, ed.buffer()), 0, "the column is gone, not blank");
+        assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), 0, "the column is gone, not blank");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
-use crate::window::{Chrome, Dir, Layout, Rect, Side, Window, WindowId};
+use crate::window::{Chrome, Content, Dir, Layout, Rect, Side, Text, Window, WindowId};
 
 /// Charwise, linewise or blockwise.
 ///
@@ -614,6 +614,7 @@ pub struct Editor {
 /// One window and what it shows, borrowed to be drawn.
 pub struct Pane<'a> {
     pub window: &'a Window,
+    pub text: &'a Text,
     pub buffer: &'a Buffer,
     pub syntax: Option<&'a Syntax>,
 }
@@ -629,7 +630,18 @@ pub struct View<'a> {
     pub id: BufferId,
     pub buffer: &'a mut Buffer,
     pub syntax: &'a mut Option<Syntax>,
-    pub window: &'a mut Window,
+    pub selections: &'a mut Selections,
+    pub scroll: &'a mut usize,
+    /// Which window this is, for the commands that name one.
+    ///
+    /// The window itself cannot come too — borrowing it whole and borrowing the
+    /// selections inside it are the same borrow. So the geometry is unpacked
+    /// beside them: `height` mutably, because `scroll_to_cursor` records the
+    /// room it was given for `Ctrl-D` to halve later, and `width` by value,
+    /// because only the frontend sets that.
+    pub window: WindowId,
+    pub height: &'a mut usize,
+    pub width: usize,
     pub session: &'a mut Session,
 }
 
@@ -739,44 +751,48 @@ impl Editor {
         self.windows.iter_mut().find(|w| w.id == id)
     }
 
-    /// The focused window's buffer. Always valid: the buffer list is never
-    /// empty and every window names a buffer in it.
-    pub fn buffer(&self) -> &Buffer {
-        &self.entry(self.window().buffer).buffer
+    /// The focused window's buffer, when it is showing one.
+    ///
+    /// `None` for a tree pane. The buffer list is still never empty — what
+    /// stopped being true when trees arrived is that every *window* names
+    /// something in it. See `docs/specs/tree.md`.
+    pub fn buffer(&self) -> Option<&Buffer> {
+        Some(&self.entry(self.window().buffer()?).buffer)
     }
 
-    pub fn buffer_mut(&mut self) -> &mut Buffer {
-        let id = self.window().buffer;
-        &mut self.entry_mut(id).buffer
+    pub fn buffer_mut(&mut self) -> Option<&mut Buffer> {
+        let id = self.window().buffer()?;
+        Some(&mut self.entry_mut(id).buffer)
     }
 
     pub fn syntax(&self) -> Option<&Syntax> {
-        self.entry(self.window().buffer).syntax.as_ref()
+        self.entry(self.window().buffer()?).syntax.as_ref()
     }
 
-    pub fn selections(&self) -> &Selections {
-        &self.window().selections
+    pub fn selections(&self) -> Option<&Selections> {
+        Some(&self.window().text()?.selections)
     }
 
     /// Everything needed to *draw* one window, borrowed immutably.
     ///
     /// A renderer draws windows it is not editing, so it cannot go through
     /// `View` — that would mean borrowing the session mutably to read a rope.
-    pub fn pane(&self, id: WindowId) -> Pane<'_> {
-        let window = self.window_of(id).expect("pane of a window that is not open");
-        let entry = self.entry(window.buffer);
-        Pane { window, buffer: &entry.buffer, syntax: entry.syntax.as_ref() }
+    pub fn pane(&self, id: WindowId) -> Option<Pane<'_>> {
+        let window = self.window_of(id)?;
+        let text = window.text()?;
+        let entry = self.entry(text.buffer);
+        Some(Pane { window, text, buffer: &entry.buffer, syntax: entry.syntax.as_ref() })
     }
 
     /// The block's span on one row of a given window.
     pub fn block_span_in(&self, id: WindowId, row: usize) -> (usize, usize) {
-        let pane = self.pane(id);
-        span_of_block_at(pane.buffer, &pane.window.selections, self.session.block_to_eol, row)
+        let Some(pane) = self.pane(id) else { return (0, 0) };
+        span_of_block_at(pane.buffer, &pane.text.selections, self.session.block_to_eol, row)
     }
 
     /// First visible row of the focused window.
     pub fn scroll(&self) -> usize {
-        self.window().scroll
+        self.window().text().map_or(0, |text| text.scroll)
     }
 
     fn entry(&self, id: BufferId) -> &BufferEntry {
@@ -794,27 +810,35 @@ impl Editor {
     ///
     /// Three disjoint fields of `self`, which is what lets the editing commands
     /// hold all of them mutably — the thing an accessor per field cannot do.
-    pub fn view(&mut self, id: WindowId) -> View<'_> {
-        let window = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == id)
-            .expect("view of a window that is not open");
+    /// `None` when that window holds a tree, which is the compiler-checked
+    /// form of "the editing commands never see one".
+    pub fn view(&mut self, id: WindowId) -> Option<View<'_>> {
+        let window = self.windows.iter_mut().find(|w| w.id == id)?;
+        let (window_id, width) = (window.id, window.width);
+        // Destructured rather than borrowed whole: `height` and the selections
+        // live in different fields, and only splitting them lets the view hold
+        // both at once.
+        let Window { content, height, .. } = window;
+        let Content::Text(text) = content else { return None };
         let entry = self
             .buffers
             .iter_mut()
-            .find(|b| b.id == window.buffer)
+            .find(|b| b.id == text.buffer)
             .expect("a window's buffer is always in the list");
-        View {
+        Some(View {
             id: entry.id,
             buffer: &mut entry.buffer,
             syntax: &mut entry.syntax,
-            window,
+            selections: &mut text.selections,
+            scroll: &mut text.scroll,
+            window: window_id,
+            height,
+            width,
             session: &mut self.session,
-        }
+        })
     }
 
-    pub fn focused(&mut self) -> View<'_> {
+    pub fn focused(&mut self) -> Option<View<'_>> {
         self.view(self.focus)
     }
 
@@ -873,13 +897,18 @@ impl Editor {
     /// Points a window at another buffer, saving where it was and restoring
     /// where it last was in the one it is entering.
     fn show(&mut self, window: WindowId, to: BufferId) {
-        let Some(from) = self.window_of(window).map(|w| w.buffer) else { return };
-        if from == to {
+        let Some(current) = self.window_of(window) else { return };
+        let from = current.buffer();
+        if from == Some(to) {
             return;
         }
 
-        let leaving = self.window_of(window).map(|w| w.selections.as_pairs()).unwrap_or_default();
-        self.entry_mut(from).last = leaving;
+        // Leaving a buffer writes where this window was into the entry, whether
+        // what replaces it is another buffer or a tree.
+        if let Some(from) = from {
+            let leaving = current.text().map(|text| text.selections.as_pairs()).unwrap_or_default();
+            self.entry_mut(from).last = leaving;
+        }
 
         // Clamped, because the file may have been edited from another window
         // since this one last looked at it — and unlike a live window, there
@@ -892,24 +921,24 @@ impl Editor {
             .map(|&(anchor, head)| (anchor.min(len), head.min(len)))
             .collect();
 
+        let mut text = Text::new(to);
+        if !last.is_empty() {
+            text.selections = Selections::from_pairs(last);
+        }
         let window = self.window_mut_of(window).expect("checked above");
-        window.alt = Some(from);
-        window.buffer = to;
-        window.scroll = 0;
-        window.selections =
-            if last.is_empty() { Selections::default() } else { Selections::from_pairs(last) };
+        window.show(Content::Text(text));
     }
 
     fn run_buffer_cmd(&mut self, cmd: BufferCmd) {
         let focus = self.focus;
         let ids = self.buffer_ids();
-        let current = self.window().buffer;
-        let at = ids.iter().position(|&id| id == current).unwrap_or(0);
+        let current = self.window().buffer();
+        let at = current.and_then(|id| ids.iter().position(|&i| i == id)).unwrap_or(0);
 
         let target = match cmd {
             BufferCmd::Next => Some(ids[(at + 1) % ids.len()]),
             BufferCmd::Prev => Some(ids[(at + ids.len() - 1) % ids.len()]),
-            BufferCmd::Alternate => match self.window().alt {
+            BufferCmd::Alternate => match self.window().alt_buffer() {
                 Some(alt) if ids.contains(&alt) => Some(alt),
                 _ => {
                     self.session.status = "no alternate buffer".into();
@@ -944,7 +973,12 @@ impl Editor {
                 None
             }
             BufferCmd::Delete { force } => {
-                self.delete_buffer(current, force);
+                match current {
+                    Some(id) => self.delete_buffer(id, force),
+                    // A tree pane shows no buffer, so there is nothing here to
+                    // delete — unlike `:bn`, which is a request to show one.
+                    None => self.session.status = "no buffer in this window".into(),
+                }
                 None
             }
         };
@@ -970,8 +1004,9 @@ impl Editor {
         let name = self.name_of(id);
 
         // The list is never empty: deleting the last buffer leaves a fresh one
-        // in its place, so `Editor::buffer()` is always valid and no path has
-        // to handle a session with nothing open.
+        // in its place, so no path has to handle a session with nothing open.
+        // (A window may still show no buffer — that is a tree, not an empty
+        // list.)
         let heir = if ids.len() == 1 {
             let fresh = self.fresh_buffer_id();
             let buffer = Buffer::empty();
@@ -987,13 +1022,13 @@ impl Editor {
         };
 
         for window in 0..self.windows.len() {
-            if self.windows[window].buffer == id {
+            if self.windows[window].buffer() == Some(id) {
                 let w = self.windows[window].id;
                 self.show(w, heir);
             }
             // A stable id that resolves to nothing is the one way it is worse
             // than an index, which at least fails loudly.
-            if self.windows[window].alt == Some(id) {
+            if self.windows[window].alt_buffer() == Some(id) {
                 self.windows[window].alt = None;
             }
         }
@@ -1033,15 +1068,17 @@ impl Editor {
             WindowCmd::Split { dir, path } => {
                 // The buffer first: a failure to open must not leave a split
                 // showing the wrong file.
+                // `None` means a bare split, which duplicates whatever this
+                // window holds rather than naming a buffer to go and find.
                 let buffer = match path {
                     Some(path) => match self.open_path(&path) {
-                        Ok(id) => id,
+                        Ok(id) => Some(id),
                         Err(e) => {
                             self.session.status = format!("{e:#}");
                             return;
                         }
                     },
-                    None => self.window().buffer,
+                    None => None,
                 };
 
                 let new = self.fresh_window_id();
@@ -1060,7 +1097,7 @@ impl Editor {
                 window.id = new;
                 self.windows.push(window);
                 self.focus = new;
-                if buffer != self.window().buffer {
+                if let Some(buffer) = buffer {
                     self.show(new, buffer);
                 }
             }
@@ -1105,8 +1142,8 @@ impl Editor {
         };
         // Its cursor is worth keeping: reopening a split on the same file
         // should land where the closed one was looking.
-        if let Some(window) = self.window_of(id) {
-            let (buffer, pairs) = (window.buffer, window.selections.as_pairs());
+        if let Some(text) = self.window_of(id).and_then(Window::text) {
+            let (buffer, pairs) = (text.buffer, text.selections.as_pairs());
             self.entry_mut(buffer).last = pairs;
         }
         self.windows.retain(|w| w.id != id);
@@ -1122,11 +1159,12 @@ impl Editor {
     fn anchor_of(&self, id: WindowId, side: Side) -> u16 {
         let Some(window) = self.window_of(id) else { return 0 };
         let Some(rect) = self.layout.rect_of(id, self.area, &self.chrome) else { return 0 };
-        let buffer = &self.entry(window.buffer).buffer;
-        let cursor = window.selections.cursor();
+        let Some(text) = window.text() else { return 0 };
+        let buffer = &self.entry(text.buffer).buffer;
+        let cursor = text.selections.cursor();
         match side {
             Side::Left | Side::Right => {
-                let row = buffer.row_at(cursor).saturating_sub(window.scroll);
+                let row = buffer.row_at(cursor).saturating_sub(text.scroll);
                 rect.y + (row as u16).min(rect.height.saturating_sub(1))
             }
             Side::Up | Side::Down => {
@@ -1147,14 +1185,14 @@ impl Editor {
             Escalation::Quit { force } => {
                 if self.windows.len() > 1 {
                     self.close_window(self.focus);
-                } else if self.buffer().is_modified() && !force {
+                } else if self.buffer().is_some_and(Buffer::is_modified) && !force {
                     self.session.status = "unsaved changes (use `:q!` to discard)".into();
                 } else {
                     self.session.quit = true;
                 }
             }
             Escalation::Edit { path, force } => {
-                let modified = self.buffer().is_modified();
+                let modified = self.buffer().is_some_and(Buffer::is_modified);
                 // No longer refuses on unsaved changes: the old buffer goes
                 // hidden with its history and its modified flag intact, so
                 // nothing is discarded. Bare `:e` — reload from disk — still
@@ -1232,7 +1270,9 @@ impl Editor {
         if let Some(window) = self.window_mut_of(id) {
             window.width = width;
         }
-        self.view(id).scroll_to_cursor(height);
+        if let Some(mut view) = self.view(id) {
+            view.scroll_to_cursor(height);
+        }
     }
 
     /// Runs a command against the focused window.
@@ -1248,7 +1288,8 @@ impl Editor {
             Action::Window(window_cmd) => return self.run_window_cmd(window_cmd),
             _ => {}
         }
-        if let Some(escalation) = self.focused().apply(cmd) {
+        // A tree window has no view, so nothing text-shaped can run in it.
+        if let Some(escalation) = self.focused().and_then(|mut view| view.apply(cmd)) {
             self.escalate(escalation);
         }
     }
@@ -1266,6 +1307,7 @@ impl Editor {
     /// text every time a line was inserted above it, which is precisely what a
     /// second window on one file exists to avoid.
     pub fn settle(&mut self) {
+        let focus = self.focus;
         for entry in &mut self.buffers {
             let edits = std::mem::take(&mut entry.buffer.pending_edits);
             if edits.is_empty() {
@@ -1275,14 +1317,21 @@ impl Editor {
                 syntax.update(entry.buffer.rope(), &edits);
             }
 
-            for window in self.windows.iter_mut().filter(|w| w.buffer == entry.id) {
+            // Text windows only: a tree pane shows no rope and has nothing in
+            // it that an edit could move.
+            for window in self.windows.iter_mut() {
                 // The window that made the edit already has the right cursor:
                 // the command that moved the text moved it too. Mapping it
                 // again would double-count.
-                if window.id == self.focus {
+                if window.id == focus {
                     continue;
                 }
-                let mapped: Vec<Selection> = window
+                let Some(text) = window.text_mut() else { continue };
+                if text.buffer != entry.id {
+                    continue;
+                }
+
+                let mapped: Vec<Selection> = text
                     .selections
                     .all()
                     .iter()
@@ -1291,55 +1340,70 @@ impl Editor {
                         head: Cursor::at(edits.iter().fold(s.head.at, |at, e| e.map(at))),
                     })
                     .collect();
-                window.selections.set(mapped);
+                text.selections.set(mapped);
 
                 // The scroll row follows the text above it, so a line inserted
                 // over the top of an unfocused pane does not slide its view.
                 let start = entry
                     .buffer
                     .rope()
-                    .line_to_char(window.scroll.min(entry.buffer.line_count().saturating_sub(1)));
+                    .line_to_char(text.scroll.min(entry.buffer.line_count().saturating_sub(1)));
                 let moved = edits.iter().fold(start, |at, e| e.map(at));
-                window.scroll = entry.buffer.row_at(Cursor::at(moved));
+                text.scroll = entry.buffer.row_at(Cursor::at(moved));
             }
         }
     }
 
-    pub fn cursor(&self) -> Cursor {
-        self.selections().cursor()
+    /// `None` in a tree pane, which has a selected row but no cursor.
+    pub fn cursor(&self) -> Option<Cursor> {
+        Some(self.selections()?.cursor())
     }
 
-    pub fn cursor_row(&self) -> usize {
-        self.buffer().row_at(self.cursor())
+    pub fn cursor_row(&self) -> Option<usize> {
+        Some(self.buffer()?.row_at(self.cursor()?))
     }
 
-    pub fn cursor_col(&self) -> usize {
-        self.buffer().col_at(self.cursor())
+    pub fn cursor_col(&self) -> Option<usize> {
+        Some(self.buffer()?.col_at(self.cursor()?))
     }
 
     pub fn set_cursor(&mut self, cursor: Cursor) {
-        self.focused().set_cursor(cursor);
+        if let Some(mut view) = self.focused() {
+            view.set_cursor(cursor);
+        }
     }
 
+    /// No block where there is no selection, which is not the same as a lie
+    /// about where one is — hence a empty list rather than a zero span.
     pub fn block_spans(&self) -> Vec<(usize, usize)> {
-        spans_of_block(self.buffer(), self.selections(), self.session.block_to_eol)
+        let (Some(buffer), Some(selections)) = (self.buffer(), self.selections()) else {
+            return Vec::new();
+        };
+        spans_of_block(buffer, selections, self.session.block_to_eol)
     }
 
     pub fn block_span_at(&self, row: usize) -> (usize, usize) {
-        span_of_block_at(self.buffer(), self.selections(), self.session.block_to_eol, row)
+        let (Some(buffer), Some(selections)) = (self.buffer(), self.selections()) else {
+            return (0, 0);
+        };
+        span_of_block_at(buffer, selections, self.session.block_to_eol, row)
     }
 
     pub fn search_count(&mut self) -> Option<(usize, usize)> {
-        self.focused().search_count()
+        self.focused().and_then(|mut view| view.search_count())
     }
 
     pub fn scroll_to_cursor(&mut self, height: usize) {
-        self.focused().scroll_to_cursor(height);
+        if let Some(mut view) = self.focused() {
+            view.scroll_to_cursor(height);
+        }
     }
 
     #[cfg(test)]
     fn run_ex(&mut self, line: &str) {
-        if let Some(escalation) = self.focused().run_ex(line) {
+        // The view is dropped before `escalate`, which needs the lists it
+        // borrowed from.
+        if let Some(escalation) = self.focused().and_then(|mut view| view.run_ex(line)) {
             self.escalate(escalation);
         }
     }
@@ -1361,7 +1425,7 @@ impl View<'_> {
             return None;
         }
         if self.session.undo_from.is_empty() {
-            self.session.undo_from = self.window.selections.as_pairs();
+            self.session.undo_from = self.selections.as_pairs();
         }
         self.record(&cmd);
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
@@ -1387,7 +1451,7 @@ impl View<'_> {
         // Insert and replace are the exceptions: both hold the group open until
         // Esc, so a typing run — or a whole `R` session — comes back in one `u`.
         if !matches!(self.session.mode, Mode::Insert | Mode::Replace) {
-            let after = self.window.selections.as_pairs();
+            let after = self.selections.as_pairs();
             self.buffer.commit_undo(std::mem::take(&mut self.session.undo_from), after);
         }
         escalation
@@ -1431,7 +1495,7 @@ impl View<'_> {
     }
 
     fn selection_extent(&self) -> Extent {
-        let selection = self.window.selections.primary();
+        let selection = self.selections.primary();
         let (lo, hi) = selection.range();
         match self.session.mode.visual() {
             Some(VisualKind::Line) => {
@@ -1448,15 +1512,15 @@ impl View<'_> {
     }
 
     fn block_columns(&self) -> (usize, usize) {
-        block_columns_of(self.buffer, &self.window.selections)
+        block_columns_of(self.buffer, self.selections)
     }
 
     pub fn block_spans(&self) -> Vec<(usize, usize)> {
-        spans_of_block(self.buffer, &self.window.selections, self.session.block_to_eol)
+        spans_of_block(self.buffer, self.selections, self.session.block_to_eol)
     }
 
     pub fn block_span_at(&self, row: usize) -> (usize, usize) {
-        span_of_block_at(self.buffer, &self.window.selections, self.session.block_to_eol, row)
+        span_of_block_at(self.buffer, self.selections, self.session.block_to_eol, row)
     }
 
     /// The char at `(row, col)`, clamped to the row.
@@ -1475,7 +1539,7 @@ impl View<'_> {
         if self.session.mode.visual() == Some(VisualKind::Block) {
             return self.block_spans();
         }
-        self.window.selections.all().iter().flat_map(|selection| self.rows_of(*selection)).collect()
+        self.selections.all().iter().flat_map(|selection| self.rows_of(*selection)).collect()
     }
 
     /// One span per row a selection touches, clipped to that row's content.
@@ -1544,11 +1608,10 @@ impl View<'_> {
                     (end > start).then(|| Selection::at(at))
                 })
                 .collect();
-            self.window.selections.set(cursors);
+            self.selections.set(cursors);
         } else {
             self.session.mode = Mode::Normal;
-            self.window.selections =
-                Selections::single(self.buffer.clamped(Cursor::at(top_left), false));
+            *self.selections = Selections::single(self.buffer.clamped(Cursor::at(top_left), false));
         }
     }
 
@@ -1558,7 +1621,7 @@ impl View<'_> {
     /// the column so what is appended lines up. Vim pads on `Esc`, bee pads on
     /// entry — the same edit, visible while it is being typed into.
     fn block_insert_columns(&mut self, append: bool) -> Vec<Cursor> {
-        let (lo, hi) = self.window.selections.primary().range();
+        let (lo, hi) = self.selections.primary().range();
         let (first, last) =
             (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi)));
         let (left, right) = self.block_columns();
@@ -1661,7 +1724,7 @@ impl View<'_> {
     /// already processed. Skipping this is the bug where the second cursor of a
     /// multi-cursor insert ends up one character short per preceding cursor.
     fn for_each_selection(&mut self, mut f: impl FnMut(&mut View, Selection) -> Selection) {
-        let mut list: Vec<Selection> = self.window.selections.all().to_vec();
+        let mut list: Vec<Selection> = self.selections.all().to_vec();
         let mut order: Vec<usize> = (0..list.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(list[i].range().0));
 
@@ -1680,7 +1743,7 @@ impl View<'_> {
             done.push(i);
         }
 
-        self.window.selections.set(list);
+        self.selections.set(list);
     }
 
     /// The selections to record as a revision's `before` and `after`.
@@ -1689,13 +1752,13 @@ impl View<'_> {
     /// group closes, so a group that spans several commands — a typing run —
     /// still reports where it started.
     fn undo_bounds(&mut self) -> (Cursors, Cursors) {
-        let after = self.window.selections.as_pairs();
+        let after = self.selections.as_pairs();
         (std::mem::take(&mut self.session.undo_from), after)
     }
 
     /// The primary cursor — what a single-cursor operation acts on.
     pub fn cursor(&self) -> Cursor {
-        self.window.selections.cursor()
+        self.selections.cursor()
     }
 
     pub fn cursor_row(&self) -> usize {
@@ -1708,7 +1771,7 @@ impl View<'_> {
 
     /// Collapses to a single cursor at `cursor`.
     pub fn set_cursor(&mut self, cursor: Cursor) {
-        self.window.selections = Selections::single(cursor);
+        *self.selections = Selections::single(cursor);
     }
 
     /// Substitutes `;` / `,` with the find they repeat, and remembers any find
@@ -1732,7 +1795,7 @@ impl View<'_> {
                 // The echo follows the direction being travelled, not the one
                 // that was typed: `N` after `/foo` is a `?foo`.
                 self.echo_search(forward);
-                let at = self.window.selections.cursor().at;
+                let at = self.selections.cursor().at;
                 let found = self.buffer.search(at, &search.pattern, forward, search.whole_word)?;
                 // Resolved to an absolute destination: the pattern is gone by
                 // the time `Buffer` sees it, so hand over a line-free jump.
@@ -1872,7 +1935,7 @@ impl View<'_> {
                 let stepping_back = matches!(self.session.mode, Mode::Insert | Mode::Replace);
                 self.session.mode = Mode::Normal;
                 self.session.replaced.clear();
-                self.window.selections.collapse_each();
+                self.selections.collapse_each();
                 self.for_each_selection(|ed, sel| {
                     let head = if stepping_back && ed.buffer.col_at(sel.head) > 0 {
                         Cursor::at(sel.head.at - 1)
@@ -1958,7 +2021,7 @@ impl View<'_> {
             Action::EnterVisual(kind) => {
                 // The same key again leaves, as in vim.
                 self.session.mode = if self.session.mode == Mode::Visual(*kind) {
-                    self.window.selections.collapse_each();
+                    self.selections.collapse_each();
                     Mode::Normal
                 } else {
                     Mode::Visual(*kind)
@@ -1966,7 +2029,7 @@ impl View<'_> {
                 if *kind == VisualKind::Block {
                     // The rectangle is derived from one selection's corners,
                     // so a block is single-selection by construction.
-                    self.window.selections.collapse_to_primary();
+                    self.selections.collapse_to_primary();
                     self.session.block_to_eol = false;
                 }
             }
@@ -1974,14 +2037,14 @@ impl View<'_> {
                 self.for_each_selection(|_, sel| sel.flipped());
             }
             Action::SwapCorners => {
-                let selection = self.window.selections.primary();
+                let selection = self.selections.primary();
                 let (anchor_row, head_row) =
                     (self.buffer.row_at(selection.anchor), self.buffer.row_at(selection.head));
                 let (anchor_col, head_col) =
                     (self.buffer.col_at(selection.anchor), self.buffer.col_at(selection.head));
                 let anchor = self.at_row_col(anchor_row, head_col);
                 let head = self.at_row_col(head_row, anchor_col);
-                *self.window.selections.primary_mut() = Selection { anchor, head };
+                *self.selections.primary_mut() = Selection { anchor, head };
                 // The head chose the right edge, and it no longer does.
                 self.session.block_to_eol = false;
             }
@@ -1994,7 +2057,7 @@ impl View<'_> {
                     self.session.status = "no line reaches the block".into();
                     return None;
                 }
-                self.window.selections.set(cursors.into_iter().map(Selection::collapsed).collect());
+                self.selections.set(cursors.into_iter().map(Selection::collapsed).collect());
             }
             Action::ReplaceSelection(ch) => {
                 let ch = *ch;
@@ -2061,7 +2124,7 @@ impl View<'_> {
             }
 
             Action::AddCursorNextMatch => {
-                let primary = self.window.selections.primary();
+                let primary = self.selections.primary();
                 // The selection itself when there is one, otherwise the word
                 // under the cursor — so it works in both normal and visual.
                 let (start, end) = if primary.is_collapsed() {
@@ -2091,7 +2154,7 @@ impl View<'_> {
                 // the match: collapsing the range onto its head would leave it
                 // on the last character, so typing would land inside the word
                 // rather than in front of it.
-                self.window.selections.push(match self.session.mode.visual() {
+                self.selections.push(match self.session.mode.visual() {
                     Some(_) => {
                         Selection { anchor: Cursor::at(found), head: Cursor::at(found + width - 1) }
                     }
@@ -2099,7 +2162,7 @@ impl View<'_> {
                 });
             }
             Action::AddCursorLine { below } => {
-                let primary = self.window.selections.primary();
+                let primary = self.selections.primary();
                 let row = self.buffer.row_at(primary.head);
                 let target = if *below { row + 1 } else { row.wrapping_sub(1) };
                 if *below && target >= self.buffer.line_count() || !*below && row == 0 {
@@ -2110,9 +2173,9 @@ impl View<'_> {
                 let col = self.buffer.col_at(primary.head);
                 let line_start = self.buffer.rope().line_to_char(target);
                 let col = col.min(self.buffer.line_len(target).saturating_sub(1));
-                self.window.selections.push(Selection::at(line_start + col));
+                self.selections.push(Selection::at(line_start + col));
             }
-            Action::CollapseCursors => self.window.selections.collapse_to_primary(),
+            Action::CollapseCursors => self.selections.collapse_to_primary(),
             // Intercepted in `apply`, which has to run before the undo group
             // and the change recorder see it.
             Action::RepeatChange { .. } => {}
@@ -2203,7 +2266,7 @@ impl View<'_> {
                 self.run_search();
             }
             Action::SearchWord { forward } => {
-                let at = self.window.selections.cursor();
+                let at = self.selections.cursor();
                 let Some((start, end)) = self.buffer.word_at(at) else {
                     self.session.status = "no word under the cursor".into();
                     return None;
@@ -2218,7 +2281,7 @@ impl View<'_> {
 
             Action::ScrollLine { down } => self.scroll_by(if *down { 1 } else { -1 }, false),
             Action::ScrollHalfPage { down } => {
-                let half = (self.window.height / 2).max(1) as isize;
+                let half = (*self.height / 2).max(1) as isize;
                 self.scroll_by(if *down { half } else { -half }, true);
             }
 
@@ -2264,7 +2327,7 @@ impl View<'_> {
     /// of selections survives, which is what makes undoing a multi-cursor edit
     /// give the cursors back.
     fn restore(&mut self, pairs: Cursors) {
-        self.window.selections = Selections::from_pairs(pairs);
+        *self.selections = Selections::from_pairs(pairs);
         if self.session.mode.visual().is_some() {
             return;
         }
@@ -2300,7 +2363,7 @@ impl View<'_> {
         }
 
         let (_, _, _, _, starts) = self.session.match_cache.as_ref()?;
-        let at = self.window.selections.cursor().at;
+        let at = self.selections.cursor().at;
         let width = search.pattern.chars().count();
         let index = match starts.iter().position(|&start| at >= start && at < start + width) {
             Some(i) => i + 1,
@@ -2356,21 +2419,21 @@ impl View<'_> {
     /// Moves the window by `lines`, and the cursor with it when `follow` — or
     /// when the window would otherwise leave the cursor behind.
     fn scroll_by(&mut self, lines: isize, follow: bool) {
-        let height = self.window.height;
+        let height = *self.height;
         if height == 0 {
             return;
         }
         let last = self.buffer.line_count().saturating_sub(1);
         let max_scroll = self.buffer.line_count().saturating_sub(height);
-        self.window.scroll = self.window.scroll.saturating_add_signed(lines).min(max_scroll);
+        (*self.scroll) = (*self.scroll).saturating_add_signed(lines).min(max_scroll);
 
-        let row = self.buffer.row_at(self.window.selections.cursor());
+        let row = self.buffer.row_at(self.selections.cursor());
         // The cursor has to end up inside the window *including* the scrolloff
         // margin. Leave it in the margin and `scroll_to_cursor` — which runs
         // every frame — immediately drags the window back, undoing the scroll.
         let margin = Self::margin(height);
-        let top = (self.window.scroll + margin).min(last);
-        let bottom = (self.window.scroll + height).saturating_sub(margin + 1).min(last);
+        let top = ((*self.scroll) + margin).min(last);
+        let bottom = ((*self.scroll) + height).saturating_sub(margin + 1).min(last);
 
         let wanted = if follow {
             // `Ctrl-D`/`Ctrl-U` keep the cursor's place within the window.
@@ -2426,8 +2489,8 @@ impl View<'_> {
                 // so `.` and a later bare `p` repeat the entry you chose rather
                 // than whatever happened to be most recent.
                 self.session.registers.push(entry.clone());
-                let landed = self.buffer.paste(self.window.selections.cursor(), &entry, before, 1);
-                self.window.selections = Selections::single(landed);
+                let landed = self.buffer.paste(self.selections.cursor(), &entry, before, 1);
+                *self.selections = Selections::single(landed);
                 None
             }
             // The ring is right here; the buffer list is not. Escalates for the
@@ -2506,7 +2569,7 @@ impl View<'_> {
             _ => {
                 if let Ok(n) = name.parse::<usize>() {
                     let cursor = self.buffer.at_row(n.saturating_sub(1), false);
-                    self.window.selections = Selections::single(cursor);
+                    *self.selections = Selections::single(cursor);
                 } else {
                     self.session.status = format!("not a command: {name}");
                 }
@@ -2586,10 +2649,10 @@ impl View<'_> {
             return;
         }
 
-        let at = self.window.selections.cursor();
+        let at = self.selections.cursor();
         match self.buffer.reload(at) {
             Ok(cursor) => {
-                self.window.selections = Selections::single(cursor);
+                *self.selections = Selections::single(cursor);
                 self.reload_syntax();
                 let name =
                     self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
@@ -2604,18 +2667,18 @@ impl View<'_> {
         if height == 0 {
             return;
         }
-        self.window.height = height;
-        let row = self.buffer.row_at(self.window.selections.cursor());
+        *self.height = height;
+        let row = self.buffer.row_at(self.selections.cursor());
         let margin = Self::margin(height);
 
-        if row < self.window.scroll + margin {
-            self.window.scroll = row.saturating_sub(margin);
-        } else if row + margin >= self.window.scroll + height {
-            self.window.scroll = row + margin + 1 - height;
+        if row < (*self.scroll) + margin {
+            (*self.scroll) = row.saturating_sub(margin);
+        } else if row + margin >= (*self.scroll) + height {
+            (*self.scroll) = row + margin + 1 - height;
         }
 
         let max_scroll = self.buffer.line_count().saturating_sub(height);
-        self.window.scroll = self.window.scroll.min(max_scroll);
+        (*self.scroll) = (*self.scroll).min(max_scroll);
     }
 }
 
@@ -2631,11 +2694,11 @@ mod tests {
     fn editor(text: &str) -> Editor {
         let mut ed = Editor::empty();
         if !text.is_empty() {
-            let from = ed.cursor();
-            let at = ed.buffer_mut().insert_str(from, text);
+            let from = ed.cursor().unwrap();
+            let at = ed.buffer_mut().unwrap().insert_str(from, text);
             ed.set_cursor(at);
-            let pairs = ed.selections().as_pairs();
-            ed.buffer_mut().commit_undo(pairs.clone(), pairs);
+            let pairs = ed.selections().unwrap().as_pairs();
+            ed.buffer_mut().unwrap().commit_undo(pairs.clone(), pairs);
         }
         ed.set_cursor(Cursor::at(0));
         ed
@@ -2655,10 +2718,10 @@ mod tests {
     fn a_counted_command_undoes_as_one_unit() {
         let mut ed = editor("abcdef");
         ed.apply(operate_n(Operator::Delete, Motion::Right, 5));
-        assert_eq!(ed.buffer().rope().to_string(), "f");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "f");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef", "5x is one unit, not five");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef", "5x is one unit, not five");
     }
 
     #[test]
@@ -2667,10 +2730,10 @@ mod tests {
         ed.apply(cmd(Action::EnterInsert));
         type_str(&mut ed, "hello");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "hello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "", "all five chars, not one");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "", "all five chars, not one");
     }
 
     /// `o` edits *and* enters insert mode. The newline it inserts belongs to the
@@ -2681,10 +2744,10 @@ mod tests {
         ed.apply(cmd(Action::OpenLineBelow));
         type_str(&mut ed, "bc");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "a\nbc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\nbc");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "a", "the newline went back too");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a", "the newline went back too");
     }
 
     #[test]
@@ -2695,7 +2758,7 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "a", "one undo reaches the delete");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a", "one undo reaches the delete");
     }
 
     #[test]
@@ -2704,10 +2767,10 @@ mod tests {
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "def");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "def");
 
         ed.apply(Command { count: 3, action: Action::Undo });
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef");
     }
 
     fn operate(op: Operator, motion: Motion, count: usize) -> Command {
@@ -2723,10 +2786,10 @@ mod tests {
     fn dw_deletes_a_word_and_undoes_in_one_step() {
         let mut ed = editor("foo bar baz");
         ed.apply(operate(Operator::Delete, Motion::WordForward, 2));
-        assert_eq!(ed.buffer().rope().to_string(), "baz");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "baz");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "foo bar baz", "both words, one undo");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo bar baz", "both words, one undo");
     }
 
     #[test]
@@ -2734,11 +2797,11 @@ mod tests {
         let mut ed = editor("foo bar");
         ed.apply(operate(Operator::Change, Motion::WordForward, 1));
         assert_eq!(ed.session.mode, Mode::Insert);
-        assert_eq!(ed.buffer().rope().to_string(), " bar");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), " bar");
 
         type_str(&mut ed, "xyz");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "xyz bar");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "xyz bar");
     }
 
     /// The change and everything typed into it are one undo step, the same rule
@@ -2751,7 +2814,7 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "foo bar");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo bar");
     }
 
     #[test]
@@ -2759,10 +2822,10 @@ mod tests {
         let mut ed = editor("abc");
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(operate(Operator::Delete, Motion::WordBackward, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "bc", "b at char 0 did nothing");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "bc", "b at char 0 did nothing");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "abc", "one undo still reaches the x");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc", "one undo still reaches the x");
     }
 
     fn paste(before: bool, count: usize) -> Command {
@@ -2773,20 +2836,20 @@ mod tests {
     fn yank_then_paste_round_trips() {
         let mut ed = editor("foo bar");
         ed.apply(operate(Operator::Yank, Motion::WordForward, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "foo bar", "yank changed nothing");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo bar", "yank changed nothing");
 
         ed.apply(paste(false, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "ffoo oo bar");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ffoo oo bar");
     }
 
     #[test]
     fn a_delete_fills_the_ring_so_p_puts_it_back() {
         let mut ed = editor("one\ntwo");
         ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "two");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two");
 
         ed.apply(paste(true, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "one\ntwo", "linewise, so above");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\ntwo", "linewise, so above");
     }
 
     /// The whole point of `"_`: the text goes, the ring is untouched.
@@ -2805,11 +2868,11 @@ mod tests {
                 sink: Sink::BlackHole,
             },
         });
-        assert_eq!(ed.buffer().rope().to_string(), "keep", "the junk line is gone");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "keep", "the junk line is gone");
 
         ed.apply(paste(false, 1));
         assert_eq!(
-            ed.buffer().rope().to_string(),
+            ed.buffer().unwrap().rope().to_string(),
             "keep\nkeep",
             "the ring still holds the yank, not the junk"
         );
@@ -2819,7 +2882,7 @@ mod tests {
     fn pasting_from_an_empty_ring_says_so() {
         let mut ed = editor("abc");
         ed.apply(paste(false, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "abc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc");
         assert_eq!(ed.session.status, "nothing to paste");
     }
 
@@ -2828,10 +2891,10 @@ mod tests {
         let mut ed = editor("abc");
         ed.apply(operate(Operator::Yank, Motion::Right, 1));
         ed.apply(paste(false, 3));
-        assert_eq!(ed.buffer().rope().to_string(), "aaaabc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "aaaabc");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "abc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc");
     }
 
     /// Undo puts the text back in the buffer and leaves the ring alone, as vim
@@ -2841,10 +2904,10 @@ mod tests {
         let mut ed = editor("one\ntwo");
         ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "one\ntwo");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\ntwo");
 
         ed.apply(paste(true, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "one\none\ntwo");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\none\ntwo");
     }
 
     // ---- picker ------------------------------------------------------------
@@ -2863,7 +2926,7 @@ mod tests {
     fn ed_with_ring() -> Editor {
         let mut ed = editor("alpha\nbeta\ngamma");
         for row in 0..3 {
-            let c = ed.buffer().at_row(row, false);
+            let c = ed.buffer().unwrap().at_row(row, false);
             ed.set_cursor(c);
             ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
         }
@@ -2893,7 +2956,7 @@ mod tests {
     #[test]
     fn accepting_pastes_the_chosen_entry_not_the_most_recent() {
         let mut ed = ed_with_ring();
-        let c = ed.buffer().at_row(0, false);
+        let c = ed.buffer().unwrap().at_row(0, false);
         ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
@@ -2901,7 +2964,7 @@ mod tests {
         assert_eq!(ed.session.mode, Mode::Normal);
         assert!(ed.session.picker.is_none());
         assert_eq!(
-            ed.buffer().rope().to_string(),
+            ed.buffer().unwrap().rope().to_string(),
             "alpha\nalpha\nbeta\ngamma",
             "the third-newest entry, chosen by moving down twice"
         );
@@ -2910,11 +2973,11 @@ mod tests {
     #[test]
     fn typing_in_the_picker_filters_what_accept_takes() {
         let mut ed = ed_with_ring();
-        let c = ed.buffer().at_row(0, false);
+        let c = ed.buffer().unwrap().at_row(0, false);
         ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickChar('b'), Action::PickChar('e'), Action::PickAccept]);
-        assert_eq!(ed.buffer().rope().to_string(), "beta\nalpha\nbeta\ngamma");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "beta\nalpha\nbeta\ngamma");
     }
 
     /// Choosing promotes the entry, so a plain `p` afterwards repeats it — this
@@ -2922,26 +2985,26 @@ mod tests {
     #[test]
     fn accepting_moves_the_entry_to_the_front_of_the_ring() {
         let mut ed = ed_with_ring();
-        let c = ed.buffer().at_row(0, false);
+        let c = ed.buffer().unwrap().at_row(0, false);
         ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickNext, Action::PickAccept]);
 
         assert_eq!(ed.session.registers.front().unwrap().text, "alpha\n");
         ed.apply(paste(true, 1));
-        assert_eq!(ed.buffer().rope().to_string(), "alpha\nalpha\nalpha\nbeta\ngamma");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "alpha\nalpha\nalpha\nbeta\ngamma");
     }
 
     #[test]
     fn cancelling_leaves_the_buffer_and_the_ring_alone() {
         let mut ed = ed_with_ring();
-        let before = ed.buffer().rope().to_string();
+        let before = ed.buffer().unwrap().rope().to_string();
         ed.apply(open_register_picker(false));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickCancel]);
 
         assert_eq!(ed.session.mode, Mode::Normal);
         assert!(ed.session.picker.is_none());
-        assert_eq!(ed.buffer().rope().to_string(), before);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), before);
         assert_eq!(ed.session.registers.front().unwrap().text, "gamma\n");
     }
 
@@ -2960,15 +3023,15 @@ mod tests {
     #[test]
     fn a_picked_paste_is_one_undo_step() {
         let mut ed = ed_with_ring();
-        let before = ed.buffer().rope().to_string();
-        let c = ed.buffer().at_row(0, false);
+        let before = ed.buffer().unwrap().rope().to_string();
+        let c = ed.buffer().unwrap().at_row(0, false);
         ed.set_cursor(c);
         ed.apply(open_register_picker(true));
         pick_keys(&mut ed, &[Action::PickNext, Action::PickAccept]);
-        assert_ne!(ed.buffer().rope().to_string(), before);
+        assert_ne!(ed.buffer().unwrap().rope().to_string(), before);
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), before);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), before);
     }
 
     #[test]
@@ -2977,7 +3040,7 @@ mod tests {
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
         ed.apply(cmd(Action::Undo));
         ed.apply(cmd(Action::Redo));
-        assert_eq!(ed.buffer().rope().to_string(), "bc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "bc");
     }
 
     #[test]
@@ -3033,11 +3096,11 @@ mod tests {
     fn e_rereads_the_file_from_disk() {
         let f = Scratch::new("reload.txt", "before\n");
         let mut ed = opened(&f);
-        assert_eq!(ed.buffer().rope().to_string(), "before\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "before\n");
 
         f.write("after\n");
         ex(&mut ed, "e");
-        assert_eq!(ed.buffer().rope().to_string(), "after\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "after\n");
     }
 
     #[test]
@@ -3050,7 +3113,7 @@ mod tests {
         ex(&mut ed, "e");
         assert!(ed.session.status.contains("unsaved changes"), "got: {}", ed.session.status);
         assert!(
-            ed.buffer().rope().to_string().contains("local edit"),
+            ed.buffer().unwrap().rope().to_string().contains("local edit"),
             "the buffer must be left alone when the reload is refused",
         );
     }
@@ -3062,8 +3125,8 @@ mod tests {
         type_str(&mut ed, "local edit");
 
         ex(&mut ed, "e!");
-        assert_eq!(ed.buffer().rope().to_string(), "on disk\n");
-        assert!(!ed.buffer().is_modified(), "a fresh read is not a modified buffer");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "on disk\n");
+        assert!(!ed.buffer().unwrap().is_modified(), "a fresh read is not a modified buffer");
     }
 
     #[test]
@@ -3071,16 +3134,16 @@ mod tests {
         let f = Scratch::new("history.txt", "one\n");
         let mut ed = opened(&f);
         type_str(&mut ed, "typed");
-        let pairs = ed.selections().as_pairs();
-        ed.buffer_mut().commit_undo(pairs.clone(), pairs);
+        let pairs = ed.selections().unwrap().as_pairs();
+        ed.buffer_mut().unwrap().commit_undo(pairs.clone(), pairs);
 
         f.write("two\n");
         ex(&mut ed, "e!");
-        assert_eq!(ed.buffer().rope().to_string(), "two\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two\n");
 
         // Undoing here must not resurrect text from the previous file.
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "two\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two\n");
     }
 
     #[test]
@@ -3090,26 +3153,26 @@ mod tests {
         let mut ed = opened(&a);
 
         ex(&mut ed, &format!("e {}", b.path()));
-        assert_eq!(ed.buffer().rope().to_string(), "file b\n");
-        assert_eq!(ed.buffer().path.as_deref(), Some(std::path::Path::new(b.path())));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "file b\n");
+        assert_eq!(ed.buffer().unwrap().path.as_deref(), Some(std::path::Path::new(b.path())));
     }
 
     #[test]
     fn a_shorter_file_does_not_leave_the_cursor_past_the_end() {
         let f = Scratch::new("shrink.txt", "one\ntwo\nthree\nfour\n");
         let mut ed = opened(&f);
-        let c = ed.buffer().at_row(3, false);
+        let c = ed.buffer().unwrap().at_row(3, false);
         ed.set_cursor(c);
 
         f.write("x\n");
         ex(&mut ed, "e!");
         assert!(
-            ed.cursor().at <= ed.buffer().rope().len_chars(),
+            ed.cursor().unwrap().at <= ed.buffer().unwrap().rope().len_chars(),
             "cursor {} is past the end of a {}-char buffer",
-            ed.cursor().at,
-            ed.buffer().rope().len_chars(),
+            ed.cursor().unwrap().at,
+            ed.buffer().unwrap().rope().len_chars(),
         );
-        assert_eq!(ed.cursor_row(), 0);
+        assert_eq!(ed.cursor_row().unwrap(), 0);
     }
 
     #[test]
@@ -3122,7 +3185,7 @@ mod tests {
         ex(&mut ed, "e!");
 
         // A tree left over from the old text would disagree with the rope.
-        let rope = ed.buffer().rope();
+        let rope = ed.buffer().unwrap().rope();
         let spans = ed.syntax().as_ref().unwrap().highlights(rope, 0..rope.len_bytes());
         assert!(
             spans.iter().all(|s| s.end_byte <= rope.len_bytes()),
@@ -3133,11 +3196,11 @@ mod tests {
     #[test]
     fn e_on_a_buffer_with_no_file_name_reports_rather_than_panicking() {
         let mut ed = editor("scratch");
-        let pairs = ed.selections().as_pairs();
-        ed.buffer_mut().commit_undo(pairs.clone(), pairs);
+        let pairs = ed.selections().unwrap().as_pairs();
+        ed.buffer_mut().unwrap().commit_undo(pairs.clone(), pairs);
         ex(&mut ed, "e");
         assert!(!ed.session.status.is_empty(), "should say something");
-        assert_eq!(ed.buffer().rope().to_string(), "scratch");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "scratch");
     }
 
     #[test]
@@ -3207,7 +3270,7 @@ mod tests {
 
         ex(&mut ed, "wa");
         assert_eq!(f.read(), "Xtext\n");
-        assert!(!ed.buffer().is_modified());
+        assert!(!ed.buffer().unwrap().is_modified());
 
         ex(&mut ed, "qall");
         assert!(ed.session.quit);
@@ -3225,7 +3288,7 @@ mod tests {
         ed.apply(cmd(Action::InsertChar('X')));
         ed.apply(cmd(Action::EnterNormal));
         ex(&mut ed, &format!("e {}", b.path()));
-        assert_eq!(ed.buffer().rope().to_string(), "b\n", "looking at the second file");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n", "looking at the second file");
 
         ex(&mut ed, "qa");
         assert!(!ed.session.quit, "the hidden buffer still has unsaved changes");
@@ -3273,7 +3336,7 @@ mod tests {
 
         assert_eq!(ed.window_ids().len(), 2);
         assert_eq!(ed.buffer_ids().len(), 1, "one file, two views of it");
-        assert_eq!(ed.pane(other(&ed)).window.buffer, ed.window().buffer);
+        assert_eq!(Some(ed.pane(other(&ed)).unwrap().text.buffer), ed.window().buffer());
     }
 
     /// Vim copies the cursor into the new window, so the split lands on the
@@ -3281,12 +3344,12 @@ mod tests {
     #[test]
     fn a_split_lands_where_you_were_reading() {
         let mut ed = editor("one\ntwo\nthree\nfour\n");
-        let at = ed.buffer().at_row(2, false);
+        let at = ed.buffer().unwrap().at_row(2, false);
         ed.set_cursor(at);
 
         split(&mut ed, Dir::Horizontal);
-        assert_eq!(ed.cursor_row(), 2, "the new window");
-        assert_eq!(ed.pane(other(&ed)).window.selections.cursor(), at, "and the old one");
+        assert_eq!(ed.cursor_row().unwrap(), 2, "the new window");
+        assert_eq!(ed.pane(other(&ed)).unwrap().text.selections.cursor(), at, "and the old one");
     }
 
     /// The reason `Edit` carries a char range at all: a window that did not
@@ -3294,12 +3357,18 @@ mod tests {
     #[test]
     fn editing_in_one_window_moves_the_cursor_in_the_other() {
         let mut ed = editor("one\ntwo\nthree\nfour\n");
-        let at = ed.buffer().at_row(2, false);
+        let at = ed.buffer().unwrap().at_row(2, false);
         ed.set_cursor(at);
         split(&mut ed, Dir::Horizontal);
 
         let watcher = other(&ed);
-        assert_eq!(ed.pane(watcher).buffer.row_at(ed.pane(watcher).window.selections.cursor()), 2);
+        assert_eq!(
+            ed.pane(watcher)
+                .unwrap()
+                .buffer
+                .row_at(ed.pane(watcher).unwrap().text.selections.cursor()),
+            2
+        );
 
         // Insert a line above everything, from the focused window.
         ed.set_cursor(Cursor::at(0));
@@ -3308,9 +3377,9 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
         ed.settle();
 
-        let pane = ed.pane(watcher);
+        let pane = ed.pane(watcher).unwrap();
         assert_eq!(
-            pane.buffer.row_at(pane.window.selections.cursor()),
+            pane.buffer.row_at(pane.text.selections.cursor()),
             3,
             "the other window followed the text down, rather than staying on row 2",
         );
@@ -3321,7 +3390,7 @@ mod tests {
     #[test]
     fn an_undo_in_one_window_moves_the_other_too() {
         let mut ed = editor("one\ntwo\nthree\nfour\n");
-        let at = ed.buffer().at_row(2, false);
+        let at = ed.buffer().unwrap().at_row(2, false);
         ed.set_cursor(at);
         split(&mut ed, Dir::Horizontal);
         let watcher = other(&ed);
@@ -3331,14 +3400,14 @@ mod tests {
         ed.apply(cmd(Action::InsertNewline));
         ed.apply(cmd(Action::EnterNormal));
         ed.settle();
-        let moved = ed.pane(watcher).window.selections.cursor();
+        let moved = ed.pane(watcher).unwrap().text.selections.cursor();
 
         ed.apply(cmd(Action::Undo));
         ed.settle();
 
-        let pane = ed.pane(watcher);
-        assert_ne!(pane.window.selections.cursor(), moved, "it moved back");
-        assert_eq!(pane.buffer.row_at(pane.window.selections.cursor()), 2);
+        let pane = ed.pane(watcher).unwrap();
+        assert_ne!(pane.text.selections.cursor(), moved, "it moved back");
+        assert_eq!(pane.buffer.row_at(pane.text.selections.cursor()), 2);
     }
 
     #[test]
@@ -3347,15 +3416,15 @@ mod tests {
         split(&mut ed, Dir::Vertical);
         let watcher = other(&ed);
 
-        let at = ed.buffer().at_row(150, false);
+        let at = ed.buffer().unwrap().at_row(150, false);
         ed.set_cursor(at);
         sized(&mut ed);
         for id in ed.window_ids() {
             ed.size_window(id, 40, 20);
         }
 
-        assert!(ed.window().scroll > 100, "the focused window followed its cursor");
-        assert_eq!(ed.pane(watcher).window.scroll, 0, "and the other one stayed put");
+        assert!(ed.window().text().unwrap().scroll > 100, "the focused window followed its cursor");
+        assert_eq!(ed.pane(watcher).unwrap().text.scroll, 0, "and the other one stayed put");
     }
 
     #[test]
@@ -3366,7 +3435,7 @@ mod tests {
         ed.apply(cmd(Action::Window(WindowCmd::Close)));
         assert_eq!(ed.window_ids().len(), 1);
         assert_eq!(ed.buffer_ids().len(), 1);
-        assert_eq!(ed.buffer().rope().to_string(), "text\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "text\n");
     }
 
     /// Closing discards nothing — the buffer stays in the list — so it has no
@@ -3380,7 +3449,7 @@ mod tests {
 
         ed.apply(cmd(Action::Window(WindowCmd::Close)));
         assert_eq!(ed.window_ids().len(), 1, "closed without complaint");
-        assert!(ed.buffer().is_modified(), "and the changes are still there");
+        assert!(ed.buffer().unwrap().is_modified(), "and the changes are still there");
     }
 
     #[test]
@@ -3488,9 +3557,9 @@ mod tests {
 
         ex(&mut ed, &format!("vs {}", b.path()));
         assert_eq!(ed.window_ids().len(), 2);
-        assert_eq!(ed.buffer().rope().to_string(), "b\n", "the new window shows it");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n", "the new window shows it");
         assert_eq!(
-            ed.pane(other(&ed)).buffer.rope().to_string(),
+            ed.pane(other(&ed)).unwrap().buffer.rope().to_string(),
             "a\n",
             "and the old one is untouched",
         );
@@ -3531,7 +3600,7 @@ mod tests {
 
         ex(&mut ed, &format!("e {}", a.path()));
         assert_eq!(ed.buffer_ids().len(), 2, "back to the first, not a third copy of it");
-        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n");
     }
 
     /// Two live ropes over one path is the bug reuse exists to prevent: an edit
@@ -3548,8 +3617,8 @@ mod tests {
         ex(&mut ed, &format!("e {}", b.path()));
         ex(&mut ed, &format!("e {}", a.path()));
 
-        assert_eq!(ed.buffer().rope().to_string(), "Xa\n");
-        assert!(ed.buffer().is_modified(), "and it is still dirty");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xa\n");
+        assert!(ed.buffer().unwrap().is_modified(), "and it is still dirty");
     }
 
     #[test]
@@ -3562,12 +3631,12 @@ mod tests {
 
         // Nothing is discarded — the old buffer goes hidden, dirty and intact.
         ex(&mut ed, &format!("e {}", b.path()));
-        assert_eq!(ed.buffer().rope().to_string(), "b\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n");
 
         // But a reload still throws work away, so it still refuses.
         ex(&mut ed, &format!("e {}", a.path()));
         ex(&mut ed, "e");
-        assert_eq!(ed.buffer().rope().to_string(), "Xa\n", "`:e` refused");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xa\n", "`:e` refused");
         assert!(ed.session.status.contains("unsaved"));
     }
 
@@ -3580,7 +3649,7 @@ mod tests {
         ex(&mut ed, &format!("e {}", b.path()));
         ex(&mut ed, &format!("e {}", c.path()));
 
-        let text = |ed: &Editor| ed.buffer().rope().to_string();
+        let text = |ed: &Editor| ed.buffer().unwrap().rope().to_string();
         assert_eq!(text(&ed), "c\n");
 
         ex(&mut ed, "bn");
@@ -3597,15 +3666,15 @@ mod tests {
         let b = Scratch::new("place_b.txt", "b\n");
         let mut ed = opened(&a);
 
-        let at = ed.buffer().at_row(2, false);
+        let at = ed.buffer().unwrap().at_row(2, false);
         ed.set_cursor(at);
-        assert_eq!(ed.cursor_row(), 2);
+        assert_eq!(ed.cursor_row().unwrap(), 2);
 
         ex(&mut ed, &format!("e {}", b.path()));
-        assert_eq!(ed.cursor_row(), 0, "a different file, so a different place");
+        assert_eq!(ed.cursor_row().unwrap(), 0, "a different file, so a different place");
 
         ex(&mut ed, "bp");
-        assert_eq!(ed.cursor_row(), 2, "back where we were reading");
+        assert_eq!(ed.cursor_row().unwrap(), 2, "back where we were reading");
     }
 
     #[test]
@@ -3616,9 +3685,9 @@ mod tests {
         ex(&mut ed, &format!("e {}", b.path()));
 
         ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
-        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n");
         ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
-        assert_eq!(ed.buffer().rope().to_string(), "b\n", "and back — it is a swap");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n", "and back — it is a swap");
     }
 
     #[test]
@@ -3629,11 +3698,11 @@ mod tests {
         ex(&mut ed, &format!("e {}", b.path()));
 
         ex(&mut ed, "b alpha");
-        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n");
 
         // Both paths contain "uniq_", so this is ambiguous and must not guess.
         ex(&mut ed, "b uniq_");
-        assert_eq!(ed.buffer().rope().to_string(), "a\n", "stayed put");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n", "stayed put");
         assert!(ed.session.status.contains("more than one"), "{}", ed.session.status);
 
         ex(&mut ed, "b nowhere");
@@ -3649,7 +3718,11 @@ mod tests {
 
         ex(&mut ed, "bd");
         assert_eq!(ed.buffer_ids().len(), 1);
-        assert_eq!(ed.buffer().rope().to_string(), "a\n", "the window fell to the next one");
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "a\n",
+            "the window fell to the next one"
+        );
     }
 
     #[test]
@@ -3660,11 +3733,11 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
 
         ex(&mut ed, "bd");
-        assert_eq!(ed.buffer().rope().to_string(), "Xtext\n", "still here");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xtext\n", "still here");
         assert!(ed.session.status.contains("unsaved"));
 
         ex(&mut ed, "bd!");
-        assert_eq!(ed.buffer().rope().to_string(), "", "discarded for a fresh buffer");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "", "discarded for a fresh buffer");
     }
 
     /// The list is never empty, so `Editor::buffer()` is always valid and no
@@ -3676,8 +3749,8 @@ mod tests {
 
         ex(&mut ed, "bd");
         assert_eq!(ed.buffer_ids().len(), 1);
-        assert_eq!(ed.buffer().rope().to_string(), "");
-        assert_eq!(ed.buffer().path, None, "and it is a no-name buffer");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "");
+        assert_eq!(ed.buffer().unwrap().path, None, "and it is a no-name buffer");
     }
 
     /// A stable id that resolves to nothing is the one way it is worse than an
@@ -3692,17 +3765,17 @@ mod tests {
         ex(&mut ed, &format!("e {}", c.path()));
 
         // Alternate is b; delete it out from under the slot.
-        assert_eq!(ed.window().alt.map(|id| ed.name_of(id)), Some(b.path().to_string()));
+        assert_eq!(ed.window().alt_buffer().map(|id| ed.name_of(id)), Some(b.path().to_string()));
         ex(&mut ed, "b dangle_b");
         ex(&mut ed, "bd");
 
         assert!(!ed.buffer_ids().iter().any(|&id| ed.name_of(id).contains("dangle_b")));
-        assert_eq!(ed.window().alt, None, "the slot that named it was cleared");
+        assert_eq!(ed.window().alt_buffer(), None, "the slot that named it was cleared");
 
-        let showing = ed.buffer().rope().to_string();
+        let showing = ed.buffer().unwrap().rope().to_string();
         ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
         assert_eq!(ed.session.status, "no alternate buffer");
-        assert_eq!(ed.buffer().rope().to_string(), showing, "and nothing moved");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), showing, "and nothing moved");
     }
 
     #[test]
@@ -3719,7 +3792,7 @@ mod tests {
         // First row is the first buffer in the list.
         ed.apply(cmd(Action::PickAccept));
         assert_eq!(ed.session.mode, Mode::Normal);
-        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n");
     }
 
     #[test]
@@ -3741,12 +3814,16 @@ mod tests {
 
     fn with_cursors(text: &str, positions: &[usize]) -> Editor {
         let mut ed = editor(text);
-        ed.window_mut().selections.set(positions.iter().map(|&p| Selection::at(p)).collect());
+        ed.window_mut()
+            .text_mut()
+            .unwrap()
+            .selections
+            .set(positions.iter().map(|&p| Selection::at(p)).collect());
         ed
     }
 
     fn heads(ed: &Editor) -> Vec<usize> {
-        ed.selections().all().iter().map(|s| s.head.at).collect()
+        ed.selections().unwrap().all().iter().map(|s| s.head.at).collect()
     }
 
     #[test]
@@ -3755,7 +3832,7 @@ mod tests {
         let mut ed = with_cursors("aa bb cc", &[0, 3, 6]);
         ed.session.mode = Mode::Insert;
         ed.apply(cmd(Action::InsertChar('X')));
-        assert_eq!(ed.buffer().rope().to_string(), "Xaa Xbb Xcc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xaa Xbb Xcc");
     }
 
     /// The reason edits run highest-position-first: an insert at 0 shifts
@@ -3766,7 +3843,7 @@ mod tests {
         let mut ed = with_cursors("....|....|", &[4, 9]);
         ed.session.mode = Mode::Insert;
         ed.apply(cmd(Action::InsertChar('#')));
-        assert_eq!(ed.buffer().rope().to_string(), "....#|....#|");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "....#|....#|");
         assert_eq!(heads(&ed), vec![5, 11], "each cursor sits after what it typed");
     }
 
@@ -3786,7 +3863,7 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "  ");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "  ");
     }
 
     #[test]
@@ -3797,9 +3874,13 @@ mod tests {
         ed.session.mode = Mode::Normal;
         ed.apply(cmd(Action::EnterNormal));
 
-        assert_eq!(ed.buffer().rope().to_string(), "Xaa Xbb Xcc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xaa Xbb Xcc");
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "aa bb cc", "one u, not one per cursor",);
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "aa bb cc",
+            "one u, not one per cursor",
+        );
     }
 
     #[test]
@@ -3812,14 +3893,14 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.selections().len(), 1, "collided cursors are one cursor");
+        assert_eq!(ed.selections().unwrap().len(), 1, "collided cursors are one cursor");
     }
 
     #[test]
     fn the_primary_cursor_is_what_the_viewport_and_status_line_follow() {
         let ed = with_cursors("one\ntwo\nthree", &[0, 8]);
-        assert_eq!(ed.cursor().at, ed.selections().primary().head.at);
-        assert!(ed.cursor_row() <= 2);
+        assert_eq!(ed.cursor().unwrap().at, ed.selections().unwrap().primary().head.at);
+        assert!(ed.cursor_row().unwrap() <= 2);
     }
 
     /// Undo restores the whole selection set, not just one cursor. Without
@@ -3831,11 +3912,11 @@ mod tests {
         ed.session.mode = Mode::Insert;
         ed.apply(cmd(Action::InsertChar('X')));
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "Xaa Xbb");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xaa Xbb");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "aa bb");
-        assert_eq!(ed.selections().len(), 2, "both cursors come back");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "aa bb");
+        assert_eq!(ed.selections().unwrap().len(), 2, "both cursors come back");
         assert_eq!(heads(&ed), vec![0, 3]);
     }
 
@@ -3853,7 +3934,7 @@ mod tests {
         let mut ed = visual("hello world", 0, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
-        let sel = ed.selections().primary();
+        let sel = ed.selections().unwrap().primary();
         assert_eq!(sel.anchor.at, 0, "the anchor stays where the selection began");
         assert_eq!(sel.head.at, 2);
     }
@@ -3864,7 +3945,7 @@ mod tests {
         assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
         ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
         assert_eq!(ed.session.mode, Mode::Normal);
-        assert!(ed.selections().primary().is_collapsed());
+        assert!(ed.selections().unwrap().primary().is_collapsed());
     }
 
     #[test]
@@ -3879,9 +3960,9 @@ mod tests {
         let mut ed = visual("hello world", 2, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
-        let before = ed.selections().primary();
+        let before = ed.selections().unwrap().primary();
         ed.apply(cmd(Action::SwapEnds));
-        let after = ed.selections().primary();
+        let after = ed.selections().unwrap().primary();
         assert_eq!(after.anchor.at, before.head.at);
         assert_eq!(after.head.at, before.anchor.at);
         assert_eq!(after.range(), before.range(), "the range is unchanged");
@@ -3893,7 +3974,7 @@ mod tests {
         let mut ed = visual("hello", 0, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "llo", "both h and e");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "llo", "both h and e");
         assert_eq!(ed.session.mode, Mode::Normal, "and it drops back to normal");
     }
 
@@ -3901,7 +3982,7 @@ mod tests {
     fn a_linewise_operator_takes_whole_lines_whatever_the_columns() {
         let mut ed = visual("one\ntwo\nthree", 5, VisualKind::Line);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "one\nthree");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nthree");
     }
 
     #[test]
@@ -3917,7 +3998,7 @@ mod tests {
         let mut ed = visual("hello", 0, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "hello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello");
         assert_eq!(ed.session.registers.front().unwrap().text, "he");
     }
 
@@ -3937,11 +4018,11 @@ mod tests {
             object: TextObject::Word { big: false },
             around: false,
         }));
-        let sel = ed.selections().primary();
+        let sel = ed.selections().unwrap().primary();
         assert_eq!((sel.anchor.at, sel.head.at), (4, 6), "the head sits on the last char");
 
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "foo  baz");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo  baz");
     }
 
     // ---- blockwise visual --------------------------------------------------
@@ -3965,7 +4046,7 @@ mod tests {
     fn a_block_is_one_span_per_row_between_its_corners() {
         let ed = block(GRID, 1, 2, 2);
         let text: Vec<String> =
-            ed.block_spans().iter().map(|&(s, e)| ed.buffer().slice(s, e)).collect();
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer().unwrap().slice(s, e)).collect();
         assert_eq!(text, vec!["bcd", "hij", "nop"], "columns 1..3 of every row");
     }
 
@@ -3977,7 +4058,7 @@ mod tests {
             ed.apply(cmd(Action::Move(Motion::Left)));
         }
         let text: Vec<String> =
-            ed.block_spans().iter().map(|&(s, e)| ed.buffer().slice(s, e)).collect();
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer().unwrap().slice(s, e)).collect();
         assert_eq!(text, vec!["def", "jkl", "pqr"]);
     }
 
@@ -3985,8 +4066,8 @@ mod tests {
     fn deleting_a_block_cuts_the_same_columns_from_every_row() {
         let mut ed = block(GRID, 1, 2, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "adef\ngjkl\nmpqr");
-        assert_eq!(ed.cursor().at, 1, "and lands on the top-left corner");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "adef\ngjkl\nmpqr");
+        assert_eq!(ed.cursor().unwrap().at, 1, "and lands on the top-left corner");
         assert_eq!(ed.session.mode, Mode::Normal);
     }
 
@@ -3997,7 +4078,7 @@ mod tests {
         let entry = ed.session.registers.front().unwrap();
         assert_eq!(entry.kind, EntryKind::Blockwise);
         assert_eq!(entry.text, "bc\nhi\nno", "rows joined, no terminator");
-        assert_eq!(ed.buffer().rope().to_string(), GRID);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), GRID);
     }
 
     #[test]
@@ -4013,7 +4094,7 @@ mod tests {
         // A yank leaves visual mode, so the cut needs its own block.
         let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::BlackHole }));
-        assert_eq!(ed.buffer().rope().to_string(), "abcf\ngh\nmnor");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcf\ngh\nmnor");
     }
 
     #[test]
@@ -4021,7 +4102,7 @@ mod tests {
         let mut ed = block("abcdef\ngh\nmnopqr", 1, 2, 0);
         ed.apply(cmd(Action::Move(Motion::LineEnd)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "a\ng\nm", "ragged, not a column");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\ng\nm", "ragged, not a column");
     }
 
     #[test]
@@ -4031,7 +4112,7 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::LineStart)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "acdef\ng\nmopqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "acdef\ng\nmopqr");
     }
 
     #[test]
@@ -4039,9 +4120,9 @@ mod tests {
         let mut ed = block(GRID, 1, 2, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Change, sink: Sink::Ring }));
         assert_eq!(ed.session.mode, Mode::Insert);
-        assert_eq!(ed.selections().len(), 3);
+        assert_eq!(ed.selections().unwrap().len(), 3);
         type_str(&mut ed, "X");
-        assert_eq!(ed.buffer().rope().to_string(), "aXdef\ngXjkl\nmXpqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "aXdef\ngXjkl\nmXpqr");
     }
 
     #[test]
@@ -4050,7 +4131,7 @@ mod tests {
         ed.apply(cmd(Action::BlockInsert { append: false }));
         assert_eq!(ed.session.mode, Mode::Insert);
         type_str(&mut ed, "-");
-        assert_eq!(ed.buffer().rope().to_string(), "a-bcdef\ng-hijkl\nm-nopqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a-bcdef\ng-hijkl\nm-nopqr");
     }
 
     #[test]
@@ -4058,7 +4139,7 @@ mod tests {
         let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
         ed.apply(cmd(Action::BlockInsert { append: false }));
         type_str(&mut ed, "-");
-        assert_eq!(ed.buffer().rope().to_string(), "abc-def\ngh\nmno-pqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc-def\ngh\nmno-pqr");
     }
 
     #[test]
@@ -4066,7 +4147,7 @@ mod tests {
         let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
         ed.apply(cmd(Action::BlockInsert { append: true }));
         type_str(&mut ed, "|");
-        assert_eq!(ed.buffer().rope().to_string(), "abcde|f\ngh   |\nmnopq|r");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcde|f\ngh   |\nmnopq|r");
     }
 
     #[test]
@@ -4075,18 +4156,24 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::LineEnd)));
         ed.apply(cmd(Action::BlockInsert { append: true }));
         type_str(&mut ed, ";");
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef;\ngh;\nmnopqr;");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef;\ngh;\nmnopqr;");
     }
 
     #[test]
     fn swapping_corners_keeps_the_rows_and_swaps_the_columns() {
         let mut ed = block(GRID, 1, 2, 2);
         ed.apply(cmd(Action::SwapCorners));
-        let sel = ed.selections().primary();
-        assert_eq!((ed.buffer().row_at(sel.anchor), ed.buffer().col_at(sel.anchor)), (0, 3));
-        assert_eq!((ed.buffer().row_at(sel.head), ed.buffer().col_at(sel.head)), (2, 1));
+        let sel = ed.selections().unwrap().primary();
+        assert_eq!(
+            (ed.buffer().unwrap().row_at(sel.anchor), ed.buffer().unwrap().col_at(sel.anchor)),
+            (0, 3)
+        );
+        assert_eq!(
+            (ed.buffer().unwrap().row_at(sel.head), ed.buffer().unwrap().col_at(sel.head)),
+            (2, 1)
+        );
         let text: Vec<String> =
-            ed.block_spans().iter().map(|&(s, e)| ed.buffer().slice(s, e)).collect();
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer().unwrap().slice(s, e)).collect();
         assert_eq!(text, vec!["bcd", "hij", "nop"], "the same rectangle either way round");
     }
 
@@ -4094,7 +4181,7 @@ mod tests {
     fn r_over_a_block_overwrites_every_character_in_it() {
         let mut ed = block(GRID, 1, 2, 1);
         ed.apply(cmd(Action::ReplaceSelection('.')));
-        assert_eq!(ed.buffer().rope().to_string(), "a..def\ng..jkl\nm..pqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a..def\ng..jkl\nm..pqr");
         assert_eq!(ed.session.mode, Mode::Normal);
     }
 
@@ -4103,7 +4190,7 @@ mod tests {
         let mut ed = visual("abc\ndef", 1, VisualKind::Char);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::ReplaceSelection('.')));
-        assert_eq!(ed.buffer().rope().to_string(), "a..\n..f");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a..\n..f");
     }
 
     #[test]
@@ -4112,13 +4199,13 @@ mod tests {
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         ed.apply(cmd(Action::Undo));
 
-        assert_eq!(ed.buffer().rope().to_string(), GRID);
-        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), GRID);
+        assert_eq!(ed.selections().unwrap().len(), 1);
         assert!(
-            ed.selections().primary().is_collapsed(),
+            ed.selections().unwrap().primary().is_collapsed(),
             "vim leaves no selection behind an undo, and normal mode cannot act on one"
         );
-        assert_eq!(ed.cursor().at, 1, "on the start of what came back");
+        assert_eq!(ed.cursor().unwrap().at, 1, "on the start of what came back");
     }
 
     #[test]
@@ -4127,12 +4214,12 @@ mod tests {
         ed.apply(cmd(Action::EnterInsert));
         type_str(&mut ed, "X");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "Xone Xtwo Xthree");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xone Xtwo Xthree");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "one two three");
-        assert_eq!(ed.selections().len(), 3, "the cursors are part of what undo restores");
-        assert!(ed.selections().all().iter().all(|s| s.is_collapsed()));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two three");
+        assert_eq!(ed.selections().unwrap().len(), 3, "the cursors are part of what undo restores");
+        assert!(ed.selections().unwrap().all().iter().all(|s| s.is_collapsed()));
     }
 
     #[test]
@@ -4141,19 +4228,19 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::AddCursorNextMatch));
-        assert_eq!(ed.selections().len(), 2);
+        assert_eq!(ed.selections().unwrap().len(), 2);
         ed.apply(cmd(Action::ReplaceSelection('.')));
-        assert_eq!(ed.buffer().rope().to_string(), "... bar ...");
-        assert_eq!(ed.selections().len(), 2, "and the cursors survive it");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "... bar ...");
+        assert_eq!(ed.selections().unwrap().len(), 2, "and the cursors survive it");
     }
 
     #[test]
     fn a_block_is_single_selection_so_entering_one_drops_the_extra_cursors() {
         let mut ed = editor(GRID);
         ed.apply(cmd(Action::AddCursorLine { below: true }));
-        assert_eq!(ed.selections().len(), 2);
+        assert_eq!(ed.selections().unwrap().len(), 2);
         ed.apply(cmd(Action::EnterVisual(VisualKind::Block)));
-        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.selections().unwrap().len(), 1);
     }
 
     #[test]
@@ -4162,7 +4249,7 @@ mod tests {
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
         ed.set_cursor(Cursor::at(4)); // row 0, column 4
         ed.apply(cmd(Action::Paste { before: false, count: 1 }));
-        assert_eq!(ed.buffer().rope().to_string(), "abcdebcf\nghijkhil\nmnopqnor");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdebcf\nghijkhil\nmnopqnor");
     }
 
     #[test]
@@ -4171,18 +4258,22 @@ mod tests {
         ed.session.registers.push(Entry { text: "bc\nhi\nno".into(), kind: EntryKind::Blockwise });
         ed.set_cursor(Cursor::at(1));
         ed.apply(cmd(Action::Paste { before: true, count: 1 }));
-        assert_eq!(ed.buffer().rope().to_string(), "xbcy\n hi\n no");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "xbcy\n hi\n no");
     }
 
     #[test]
     fn a_repeated_block_operator_cuts_the_same_rectangle_again() {
         let mut ed = block(GRID, 1, 1, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "adef\ngjkl\nmnopqr");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "adef\ngjkl\nmnopqr");
 
         ed.set_cursor(Cursor::at(11)); // row 2, column 1
         ed.apply(cmd(Action::RepeatChange { count: None }));
-        assert_eq!(ed.buffer().rope().to_string(), "adef\ngjkl\nmpqr", "one row, two columns");
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "adef\ngjkl\nmpqr",
+            "one row, two columns"
+        );
     }
 
     // ---- replace mode ------------------------------------------------------
@@ -4199,14 +4290,14 @@ mod tests {
     #[test]
     fn r_overwrites_rather_than_inserting() {
         let ed = replaced("abcdef", "XY");
-        assert_eq!(ed.buffer().rope().to_string(), "XYcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XYcdef");
     }
 
     #[test]
     fn replace_past_the_end_of_the_line_appends() {
         // Vim does not let it eat the newline.
         let ed = replaced("ab\nnext", "XYZ");
-        assert_eq!(ed.buffer().rope().to_string(), "XYZ\nnext");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XYZ\nnext");
     }
 
     /// The one thing `R` has that overwriting alone does not: Backspace puts
@@ -4215,21 +4306,21 @@ mod tests {
     #[test]
     fn backspace_in_replace_mode_restores_what_was_overwritten() {
         let mut ed = replaced("abcdef", "XY");
-        assert_eq!(ed.buffer().rope().to_string(), "XYcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XYcdef");
 
         ed.apply(cmd(Action::ReplaceBackspace));
-        assert_eq!(ed.buffer().rope().to_string(), "Xbcdef", "the b came back");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xbcdef", "the b came back");
         ed.apply(cmd(Action::ReplaceBackspace));
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef", "and the a");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef", "and the a");
     }
 
     #[test]
     fn backspacing_past_an_appended_char_removes_it_rather_than_restoring() {
         let mut ed = replaced("ab", "XYZ");
-        assert_eq!(ed.buffer().rope().to_string(), "XYZ");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XYZ");
         // The Z was appended past the end, so there is nothing to put back.
         ed.apply(cmd(Action::ReplaceBackspace));
-        assert_eq!(ed.buffer().rope().to_string(), "XY");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XY");
     }
 
     #[test]
@@ -4239,7 +4330,7 @@ mod tests {
         assert_eq!(ed.session.mode, Mode::Normal);
         // Nothing to pop, so this must not put stale characters back.
         ed.apply(cmd(Action::ReplaceBackspace));
-        assert_eq!(ed.buffer().rope().to_string(), "XYcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XYcdef");
     }
 
     #[test]
@@ -4247,7 +4338,7 @@ mod tests {
         let mut ed = replaced("abcdef", "XY");
         ed.apply(cmd(Action::EnterNormal));
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef");
     }
 
     // ---- multi-cursor ------------------------------------------------------
@@ -4256,7 +4347,7 @@ mod tests {
     fn ctrl_n_puts_a_cursor_on_the_next_occurrence() {
         let mut ed = editor("foo bar foo baz foo");
         ed.apply(cmd(Action::AddCursorNextMatch));
-        assert_eq!(ed.selections().len(), 2);
+        assert_eq!(ed.selections().unwrap().len(), 2);
         assert_eq!(heads(&ed), vec![0, 8], "at the start of the match, not its end");
 
         ed.apply(cmd(Action::AddCursorNextMatch));
@@ -4273,7 +4364,7 @@ mod tests {
         ed.apply(cmd(Action::AddCursorNextMatch));
         ed.session.mode = Mode::Insert;
         ed.apply(cmd(Action::InsertChar('X')));
-        assert_eq!(ed.buffer().rope().to_string(), "Xfoo\nXfoo\nXfoo");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xfoo\nXfoo\nXfoo");
     }
 
     #[test]
@@ -4288,7 +4379,7 @@ mod tests {
     fn a_word_with_no_other_occurrence_says_so_rather_than_adding_a_cursor() {
         let mut ed = editor("unique word");
         ed.apply(cmd(Action::AddCursorNextMatch));
-        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.selections().unwrap().len(), 1);
         assert!(!ed.session.status.is_empty());
     }
 
@@ -4297,7 +4388,7 @@ mod tests {
         let mut ed = editor("hello\nworld\nthere");
         ed.set_cursor(Cursor::at(3));
         ed.apply(cmd(Action::AddCursorLine { below: true }));
-        assert_eq!(ed.selections().len(), 2);
+        assert_eq!(ed.selections().unwrap().len(), 2);
         assert_eq!(heads(&ed), vec![3, 9], "same column, next row");
     }
 
@@ -4305,7 +4396,7 @@ mod tests {
     fn adding_a_cursor_past_the_last_line_reports_rather_than_wrapping() {
         let mut ed = editor("only one line");
         ed.apply(cmd(Action::AddCursorLine { below: true }));
-        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.selections().unwrap().len(), 1);
         assert!(!ed.session.status.is_empty());
     }
 
@@ -4314,7 +4405,7 @@ mod tests {
         let mut ed = editor("longer line\nab");
         ed.set_cursor(Cursor::at(9));
         ed.apply(cmd(Action::AddCursorLine { below: true }));
-        let row1 = ed.buffer().rope().line_to_char(1);
+        let row1 = ed.buffer().unwrap().rope().line_to_char(1);
         assert_eq!(heads(&ed), vec![9, row1 + 1], "clamped onto the short line");
     }
 
@@ -4323,10 +4414,10 @@ mod tests {
         let mut ed = editor("foo foo foo");
         ed.apply(cmd(Action::AddCursorNextMatch));
         ed.apply(cmd(Action::AddCursorNextMatch));
-        assert_eq!(ed.selections().len(), 3);
+        assert_eq!(ed.selections().unwrap().len(), 3);
 
         ed.apply(cmd(Action::CollapseCursors));
-        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.selections().unwrap().len(), 1);
     }
 
     #[test]
@@ -4340,7 +4431,7 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "a\nb\nc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\nb\nc");
     }
 
     #[test]
@@ -4351,13 +4442,13 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::AddCursorNextMatch));
 
-        assert_eq!(ed.selections().len(), 2);
+        assert_eq!(ed.selections().unwrap().len(), 2);
         assert!(
-            ed.selections().all().iter().all(|s| !s.is_collapsed()),
+            ed.selections().unwrap().all().iter().all(|s| !s.is_collapsed()),
             "both are ranges, because visual mode is about ranges",
         );
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), " ");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), " ");
     }
 
     // ---- `.` ---------------------------------------------------------------
@@ -4375,11 +4466,11 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "bcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "bcdef");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "cdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "cdef");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "def", "and again");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "def", "and again");
     }
 
     #[test]
@@ -4388,10 +4479,10 @@ mod tests {
         ed.apply(cmd(Action::EnterInsert));
         type_str(&mut ed, "AB");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "ABhello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ABhello");
 
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "AABBhello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "AABBhello");
     }
 
     /// The reason `typed` holds actions rather than a string: a backspace can
@@ -4404,10 +4495,10 @@ mod tests {
         ed.apply(cmd(Action::Backspace));
         type_str(&mut ed, "c");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.buffer().rope().to_string(), "achello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "achello");
 
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "aacchello");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "aacchello");
     }
 
     #[test]
@@ -4419,7 +4510,7 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "two three");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two three");
 
         // Neither of these is a change.
         ed.apply(cmd(Action::Move(Motion::Right)));
@@ -4433,7 +4524,7 @@ mod tests {
         // `dw` again, from where the motion left the cursor — verified against
         // vim, which gives the same.
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "tthree", "still the delete");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "tthree", "still the delete");
     }
 
     #[test]
@@ -4446,9 +4537,9 @@ mod tests {
             sink: Sink::Ring,
         }));
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().rope().to_string(), "abcdef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdef");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "bcdef", "the delete, not the undo");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "bcdef", "the delete, not the undo");
     }
 
     #[test]
@@ -4460,9 +4551,9 @@ mod tests {
             count: 3,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "defghi");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "defghi");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "ghi", "three more");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ghi", "three more");
     }
 
     #[test]
@@ -4475,14 +4566,14 @@ mod tests {
             sink: Sink::Ring,
         }));
         ed.apply(cmd(Action::RepeatChange { count: Some(3) }));
-        assert_eq!(ed.buffer().rope().to_string(), "ef");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ef");
     }
 
     #[test]
     fn dot_with_nothing_recorded_says_so() {
         let mut ed = editor("abc");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "abc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc");
         assert!(!ed.session.status.is_empty());
     }
 
@@ -4495,10 +4586,10 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "defgh");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "defgh");
 
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "gh", "three more characters");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "gh", "three more characters");
     }
 
     #[test]
@@ -4507,10 +4598,10 @@ mod tests {
         ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
-        assert_eq!(ed.buffer().rope().to_string(), "3\n4\n5");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "3\n4\n5");
 
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "5", "two more lines");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "5", "two more lines");
     }
 
     #[test]
@@ -4525,7 +4616,7 @@ mod tests {
         }));
         dot(&mut ed);
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "aa", "two at a time, three times");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "aa", "two at a time, three times");
     }
 
     #[test]
@@ -4537,9 +4628,9 @@ mod tests {
             count: 1,
             sink: Sink::Ring,
         }));
-        assert_eq!(ed.buffer().rope().to_string(), "x x x");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "x x x");
         dot(&mut ed);
-        assert_eq!(ed.buffer().rope().to_string(), "  ");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "  ");
     }
 
     // ---- pre-existing bugs `.` uncovered ----------------------------------
@@ -4552,9 +4643,9 @@ mod tests {
         let mut ed = editor("hello");
         ed.apply(cmd(Action::EnterInsert));
         type_str(&mut ed, "AB");
-        assert_eq!(ed.cursor_col(), 2, "past the B while inserting");
+        assert_eq!(ed.cursor_col().unwrap(), 2, "past the B while inserting");
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.cursor_col(), 1, "back onto the B");
+        assert_eq!(ed.cursor_col().unwrap(), 1, "back onto the B");
     }
 
     #[test]
@@ -4563,7 +4654,7 @@ mod tests {
         ed.set_cursor(Cursor::at(3));
         ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
         ed.apply(cmd(Action::EnterNormal));
-        assert_eq!(ed.cursor_col(), 3, "only insert steps back");
+        assert_eq!(ed.cursor_col().unwrap(), 3, "only insert steps back");
     }
 
     // ---- search ------------------------------------------------------------
@@ -4580,7 +4671,7 @@ mod tests {
     fn a_search_lands_on_the_first_character_of_the_match() {
         let mut ed = editor("one two three");
         search_for(&mut ed, "three", true);
-        assert_eq!(ed.cursor().at, 8);
+        assert_eq!(ed.cursor().unwrap().at, 8);
     }
 
     #[test]
@@ -4588,7 +4679,7 @@ mod tests {
         let mut ed = editor("one two");
         ed.set_cursor(Cursor::at(6));
         search_for(&mut ed, "one", true);
-        assert_eq!(ed.cursor().at, 0);
+        assert_eq!(ed.cursor().unwrap().at, 0);
     }
 
     #[test]
@@ -4596,7 +4687,7 @@ mod tests {
         let mut ed = editor("one two three");
         ed.set_cursor(Cursor::at(12));
         search_for(&mut ed, "two", false);
-        assert_eq!(ed.cursor().at, 4);
+        assert_eq!(ed.cursor().unwrap().at, 4);
     }
 
     #[test]
@@ -4604,11 +4695,11 @@ mod tests {
         let mut ed = editor("a1a2a3");
         ed.set_cursor(Cursor::at(5));
         search_for(&mut ed, "a", false);
-        assert_eq!(ed.cursor().at, 4, "backward to the third a");
+        assert_eq!(ed.cursor().unwrap().at, 4, "backward to the third a");
         ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
-        assert_eq!(ed.cursor().at, 2, "n keeps going backward");
+        assert_eq!(ed.cursor().unwrap().at, 2, "n keeps going backward");
         ed.apply(cmd(Action::Move(Motion::Search { reverse: true })));
-        assert_eq!(ed.cursor().at, 4, "N reverses");
+        assert_eq!(ed.cursor().unwrap().at, 4, "N reverses");
     }
 
     /// A search is a motion, which is most of why it is worth having.
@@ -4624,7 +4715,7 @@ mod tests {
             ed.apply(cmd(Action::SearchChar(c)));
         }
         ed.apply(cmd(Action::SearchExecute));
-        assert_eq!(ed.buffer().rope().to_string(), "three four", "stops before the match");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "three four", "stops before the match");
     }
 
     #[test]
@@ -4633,20 +4724,20 @@ mod tests {
         // only candidate rather than on it.
         let mut ed = editor("bar FOO");
         search_for(&mut ed, "foo", true);
-        assert_eq!(ed.cursor().at, 4, "an all-lowercase pattern ignores case");
+        assert_eq!(ed.cursor().unwrap().at, 4, "an all-lowercase pattern ignores case");
 
         // Two candidates, differing only in case: a capital in the pattern
         // makes it skip the lowercase one.
         let mut ed = editor("x foo Foo");
         search_for(&mut ed, "Foo", true);
-        assert_eq!(ed.cursor().at, 6, "a capital makes it case-sensitive");
+        assert_eq!(ed.cursor().unwrap().at, 6, "a capital makes it case-sensitive");
     }
 
     #[test]
     fn star_matches_whole_words_only() {
         let mut ed = editor("foo\nfoobar\nfoo");
         ed.apply(cmd(Action::SearchWord { forward: true }));
-        assert_eq!(ed.cursor_row(), 2, "skipped foobar");
+        assert_eq!(ed.cursor_row().unwrap(), 2, "skipped foobar");
     }
 
     #[test]
@@ -4654,7 +4745,7 @@ mod tests {
         let mut ed = editor("abc");
         ed.set_cursor(Cursor::at(1));
         search_for(&mut ed, "zzz", true);
-        assert_eq!(ed.cursor().at, 1);
+        assert_eq!(ed.cursor().unwrap().at, 1);
         assert!(ed.session.status.contains("not found"), "got: {}", ed.session.status);
     }
 
@@ -4662,9 +4753,9 @@ mod tests {
     fn a_bare_search_repeats_the_last_pattern() {
         let mut ed = editor("a1a2a3");
         search_for(&mut ed, "a", true);
-        assert_eq!(ed.cursor().at, 2);
+        assert_eq!(ed.cursor().unwrap().at, 2);
         search_for(&mut ed, "", true);
-        assert_eq!(ed.cursor().at, 4, "the empty pattern reuses the last one");
+        assert_eq!(ed.cursor().unwrap().at, 4, "the empty pattern reuses the last one");
     }
 
     #[test]
@@ -4678,7 +4769,7 @@ mod tests {
         ed.apply(cmd(Action::SearchChar('t')));
         ed.apply(cmd(Action::SearchCancel));
         assert_eq!(ed.session.mode, Mode::Normal);
-        assert_eq!(ed.buffer().rope().to_string(), "one two", "the operator went with it");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two", "the operator went with it");
     }
 
     #[test]
@@ -4798,9 +4889,9 @@ mod tests {
         }));
         ed.apply(cmd(Action::SearchChar('X')));
         ed.apply(cmd(Action::SearchExecute));
-        assert_eq!(ed.buffer().rope().to_string(), "XbXc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "XbXc");
         ed.apply(cmd(Action::RepeatChange { count: None }));
-        assert_eq!(ed.buffer().rope().to_string(), "Xc");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xc");
     }
 
     // ---- scrolling ---------------------------------------------------------
@@ -4819,7 +4910,7 @@ mod tests {
         assert_eq!(ed.scroll(), 0);
         ed.apply(cmd(Action::ScrollLine { down: true }));
         assert_eq!(ed.scroll(), 1, "the window moved one line");
-        assert_eq!(ed.cursor_row(), 4, "and the cursor was pushed clear of the scrolloff");
+        assert_eq!(ed.cursor_row().unwrap(), 4, "and the cursor was pushed clear of the scrolloff");
     }
 
     #[test]
@@ -4841,7 +4932,7 @@ mod tests {
         // The cursor would keep its place in the window at row 4, but that is
         // the very top of the new window and scrolloff pushes it clear. Vim
         // with `scrolloff=3` lands in the same place — checked through a pty.
-        assert_eq!(ed.cursor_row(), 7);
+        assert_eq!(ed.cursor_row().unwrap(), 7);
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub struct Row {
     pub open: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct Tree {
     root: PathBuf,
     /// Directories the user has opened. Paths rather than row indices, so

@@ -8,6 +8,7 @@
 
 use crate::buffer::BufferId;
 use crate::selection::Selections;
+use crate::tree::Tree;
 
 /// A window's identity, stable across splits and closes.
 ///
@@ -17,7 +18,44 @@ use crate::selection::Selections;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u32);
 
-/// One view onto one buffer.
+/// What a window is showing.
+///
+/// The tree lives in the window rather than in a list beside the buffers,
+/// because the reason buffers are shared does not apply to it: two ropes over
+/// one path would diverge, and a tree has no document to diverge. What two tree
+/// panes would share is expansion state, and wanting a different one is why you
+/// opened the second pane. See `docs/specs/tree.md`.
+#[derive(Debug, Clone)]
+pub enum Content {
+    Text(Text),
+    Tree(Tree),
+}
+
+impl Content {
+    /// The buffer behind this content, if it is text at all.
+    pub fn buffer(&self) -> Option<BufferId> {
+        match self {
+            Content::Text(text) => Some(text.buffer),
+            Content::Tree(_) => None,
+        }
+    }
+}
+
+/// A window's view onto a buffer: which one, and where in it.
+///
+/// The cursor and the scroll row sit in here rather than on [`Window`] so that a
+/// tree pane cannot carry a `Selections` that means nothing. It is also what
+/// lets `Editor::view` hand out the selections directly and refuse a tree
+/// outright, so the editing commands never learn that trees exist.
+#[derive(Debug, Clone)]
+pub struct Text {
+    pub buffer: BufferId,
+    pub selections: Selections,
+    /// First visible row.
+    pub scroll: usize,
+}
+
+/// One view onto one buffer, or onto one directory.
 ///
 /// Everything here is per-view rather than per-file: two windows on one buffer
 /// have their own cursor and their own scroll, which is the point of opening
@@ -25,12 +63,13 @@ pub struct WindowId(pub u32);
 #[derive(Debug, Clone)]
 pub struct Window {
     pub id: WindowId,
-    pub buffer: BufferId,
-    /// The buffer this window showed before, for `Ctrl-^` and `:b#`.
-    pub alt: Option<BufferId>,
-    pub selections: Selections,
-    /// First visible row.
-    pub scroll: usize,
+    pub content: Content,
+    /// What this window showed before, for `Ctrl-^` and `:b#`.
+    ///
+    /// A whole `Content` rather than a `BufferId`, because opening a file from a
+    /// tree in a single-window session displaces the tree, and `Ctrl-^` has to
+    /// bring it back with its expansion rather than re-reading the directory.
+    pub alt: Option<Content>,
     /// The text area the frontend last drew, which is all the scrolling
     /// commands need — and the reason they need no viewport type.
     pub height: usize,
@@ -39,15 +78,60 @@ pub struct Window {
 
 impl Window {
     pub fn new(id: WindowId, buffer: BufferId) -> Self {
-        Self {
-            id,
-            buffer,
-            alt: None,
-            selections: Selections::default(),
-            scroll: 0,
-            height: 0,
-            width: 0,
+        Self::showing(id, Content::Text(Text::new(buffer)))
+    }
+
+    pub fn showing(id: WindowId, content: Content) -> Self {
+        Self { id, content, alt: None, height: 0, width: 0 }
+    }
+
+    /// The buffer this window shows, if it shows one at all.
+    pub fn buffer(&self) -> Option<BufferId> {
+        self.content.buffer()
+    }
+
+    /// The buffer this window showed before, for `Ctrl-^` and `:b#`.
+    pub fn alt_buffer(&self) -> Option<BufferId> {
+        self.alt.as_ref().and_then(Content::buffer)
+    }
+
+    pub fn text(&self) -> Option<&Text> {
+        match &self.content {
+            Content::Text(text) => Some(text),
+            Content::Tree(_) => None,
         }
+    }
+
+    pub fn text_mut(&mut self) -> Option<&mut Text> {
+        match &mut self.content {
+            Content::Text(text) => Some(text),
+            Content::Tree(_) => None,
+        }
+    }
+
+    pub fn tree(&self) -> Option<&Tree> {
+        match &self.content {
+            Content::Tree(tree) => Some(tree),
+            Content::Text(_) => None,
+        }
+    }
+
+    pub fn tree_mut(&mut self) -> Option<&mut Tree> {
+        match &mut self.content {
+            Content::Tree(tree) => Some(tree),
+            Content::Text(_) => None,
+        }
+    }
+
+    /// Shows `content`, keeping what was here as the alternate.
+    pub fn show(&mut self, content: Content) {
+        self.alt = Some(std::mem::replace(&mut self.content, content));
+    }
+}
+
+impl Text {
+    pub fn new(buffer: BufferId) -> Self {
+        Self { buffer, selections: Selections::default(), scroll: 0 }
     }
 }
 

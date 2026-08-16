@@ -108,9 +108,8 @@ pub struct View<'a> {
     pub syntax: &'a mut Option<Syntax>,
     pub selections: &'a mut Selections,
     pub scroll: &'a mut usize,
-    /// Geometry, copied — a command reads the room it has and never resizes it.
     pub window: WindowId,
-    pub height: usize,
+    pub height: &'a mut usize,
     pub width: usize,
     pub session: &'a mut Session,
 }
@@ -118,8 +117,16 @@ pub struct View<'a> {
 
 That is the borrow split `View` exists to pay once, applied one level deeper. The
 37 `self.window.selections` and 10 `self.window.scroll` sites become
-`self.selections` and `*self.scroll` — shorter than what they replace — and the
-3 `self.window.height` sites read a copy.
+`self.selections` and `*self.scroll` — shorter than what they replace.
+
+**Corrected.** This first had `height` and `width` as plain copies, on the
+grounds that "a command reads the room it has and never resizes it". Half wrong:
+`scroll_to_cursor` *records* the height it was handed, which is where `Ctrl-D`
+later reads the page size from, so a copy loses the write and every scrolling
+test fails. `height` is borrowed mutably; `width` really is a copy, because only
+the frontend sets it. Both come out of the same destructure — `content` and
+`height` are different fields of `Window`, so splitting them is what lets the
+view hold the selections and the geometry at once.
 
 **`alt` carries a whole `Content`, not a `BufferId`.** It has to: opening a file
 from a tree in a single-window session replaces the tree, and `Ctrl-^` must bring
