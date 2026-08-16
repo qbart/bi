@@ -692,6 +692,10 @@ pub enum TreeCmd {
     Enter,
     /// `-` — re-root at the parent directory.
     Up,
+    /// `+` — re-root at the selected directory, the inverse of `-`.
+    Down,
+    /// `dd` — delete the selected path outright, with no `:` line in between.
+    Delete,
     Refresh,
     ToggleHidden,
     /// `a` `r` `d` — fills the command line in and hands over.
@@ -706,7 +710,6 @@ pub enum TreeCmd {
 pub enum FileOp {
     Create,
     Rename,
-    Delete,
 }
 
 /// Which buffer a window should show, and what to do to the list.
@@ -1284,9 +1287,11 @@ impl Editor {
             TreeCmd::HalfPage { down } => return tree.step(down, (height / 2).max(1)),
             TreeCmd::Collapse => return tree.collapse(),
             TreeCmd::Up => return tree.up(),
+            TreeCmd::Down => return tree.down(),
             TreeCmd::Refresh => return tree.refresh(),
             TreeCmd::ToggleHidden => return tree.toggle_hidden(),
             TreeCmd::Prompt(op) => return self.prompt_file_op(op),
+            TreeCmd::Delete => return self.delete_selected(),
             TreeCmd::Expand | TreeCmd::Enter => {}
         }
 
@@ -1787,7 +1792,24 @@ impl Editor {
             .any(|b| b.buffer.path.as_deref() == Some(path) && b.buffer.is_modified())
     }
 
-    /// `a` `r` `d` — puts the selected path on the command line and leaves it
+    /// `dd` — deletes the selected path with no `:` line in between.
+    ///
+    /// Irreversible: there is no undo for the filesystem and nothing is moved
+    /// aside first. What survives is `delete_path`'s two guards — a directory
+    /// with anything in it, and an open buffer with unsaved changes, both still
+    /// want `:delete!` — and the root row, which is the directory you are
+    /// standing in and never what `dd` meant.
+    fn delete_selected(&mut self) {
+        let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
+        if row.depth == 0 {
+            self.session.status = "that is the root of this tree".into();
+            return;
+        }
+        let path = row.path.display().to_string();
+        self.delete_path(&path, false);
+    }
+
+    /// `a` `r` — puts the selected path on the command line and leaves it
     /// there.
     ///
     /// A prefilled line *is* the confirmation: the editor has no prompt
@@ -1806,7 +1828,6 @@ impl Editor {
                 format!("create {}/", dir.display())
             }
             FileOp::Rename => format!("rename {path} {path}"),
-            FileOp::Delete => format!("delete {path}"),
         };
         self.session.status.clear();
         self.session.mode = Mode::Command(line);
@@ -3815,10 +3836,63 @@ mod tests {
         let mut ed = Editor::open(d.path()).unwrap();
         select_first_entry(&mut ed);
 
-        tree_key(&mut ed, TreeCmd::Prompt(FileOp::Delete));
+        tree_key(&mut ed, TreeCmd::Prompt(FileOp::Rename));
 
         let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
-        assert_eq!(line, &format!("delete {}/a.rs", d.path()));
+        let path = format!("{}/a.rs", d.path());
+        assert_eq!(line, &format!("rename {path} {path}"), "edit the second one");
+    }
+
+    /// `dd` is the one thing in the tree with no `:` line in front of it.
+    #[test]
+    fn dd_deletes_the_selected_file_outright() {
+        let d = ScratchDir::new("dd").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Delete);
+
+        assert!(!std::path::Path::new(&format!("{}/a.rs", d.path())).exists());
+        assert_eq!(ed.window().tree().unwrap().rows().len(), 1, "and the row is gone");
+    }
+
+    /// The root row is the directory you are standing in, and never what `dd`
+    /// meant — the two guards in `:delete` cannot catch this one.
+    #[test]
+    fn dd_refuses_the_root_of_the_tree() {
+        let d = ScratchDir::new("dd-root").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        tree_key(&mut ed, TreeCmd::Delete);
+
+        assert!(std::path::Path::new(d.path()).is_dir(), "{}", ed.session.status);
+        assert_eq!(ed.session.status, "that is the root of this tree");
+    }
+
+    /// `dd` keeps `:delete`'s guards: a directory with anything in it still
+    /// wants the bang, typed out in full.
+    #[test]
+    fn dd_still_refuses_a_directory_with_anything_in_it() {
+        let d = ScratchDir::new("dd-dir").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Delete);
+
+        assert!(std::path::Path::new(&format!("{}/pkg", d.path())).is_dir());
+        assert!(ed.session.status.contains("not empty"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn plus_re_roots_into_the_selected_directory() {
+        let d = ScratchDir::new("plus").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Down);
+
+        let tree = ed.window().tree().unwrap();
+        assert_eq!(tree.root(), std::path::Path::new(&format!("{}/pkg", d.path())));
     }
 
     #[test]

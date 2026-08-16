@@ -35,6 +35,9 @@ pub struct Input {
     /// `Ctrl-W` has been typed and is waiting for the key that says what to do
     /// with a window. Not a key on its own — the start of one.
     window_pending: bool,
+    /// `d` has been typed in a tree and is waiting to see whether the next key
+    /// is the second `d`. Not a key on its own, the same way `Ctrl-W` is not.
+    delete_pending: bool,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
 }
@@ -143,6 +146,9 @@ impl Input {
         }
         if self.window_pending {
             s.push_str("^W");
+        }
+        if self.delete_pending {
+            s.push('d');
         }
         s
     }
@@ -266,6 +272,18 @@ impl Input {
         if self.window_pending {
             return self.window_key(key);
         }
+        // `dd` is the whole key. Anything else drops it rather than being
+        // swallowed, which is the rule `Ctrl-W` already follows — and here it
+        // is what stops a mistyped `d` from deleting on the next keystroke.
+        if std::mem::take(&mut self.delete_pending) {
+            return match key.code {
+                KeyCode::Char('d') => self.plain(Action::Tree(TreeCmd::Delete)),
+                _ => {
+                    self.reset();
+                    None
+                }
+            };
+        }
         let ctrl = key.mods.ctrl;
         let count = self.count.unwrap_or(1).max(1);
         let g = std::mem::take(&mut self.g_pending);
@@ -299,6 +317,7 @@ impl Input {
             KeyCode::Char('h') | KeyCode::Left => TreeCmd::Collapse,
             KeyCode::Enter => TreeCmd::Enter,
             KeyCode::Char('-') => TreeCmd::Up,
+            KeyCode::Char('+') => TreeCmd::Down,
             KeyCode::Char('R') => TreeCmd::Refresh,
 
             // These three only fill the command line in; the work is done by
@@ -306,7 +325,12 @@ impl Input {
             // commands. `d` is free here because `Ctrl-D` was matched above.
             KeyCode::Char('a') => TreeCmd::Prompt(FileOp::Create),
             KeyCode::Char('r') => TreeCmd::Prompt(FileOp::Rename),
-            KeyCode::Char('d') => TreeCmd::Prompt(FileOp::Delete),
+            // `d` is the start of `dd`, not a key. Deleting is the one thing
+            // here that no `:` line stands in front of.
+            KeyCode::Char('d') => {
+                self.delete_pending = true;
+                return None;
+            }
 
             // Everything else, Esc included, drops what was pending and does
             // nothing — which is what an allowlist means.
@@ -880,13 +904,30 @@ mod tests {
         }
     }
 
-    /// `a`, `r` and `d` are the exception, and they edit nothing themselves —
-    /// each one only puts a `:` line up for you to agree to.
+    /// `a` and `r` edit nothing themselves — each only puts a `:` line up for
+    /// you to agree to.
     #[test]
     fn the_file_op_keys_ask_before_anything_happens() {
         assert_eq!(tree_action("a"), Action::Tree(TreeCmd::Prompt(FileOp::Create)));
         assert_eq!(tree_action("r"), Action::Tree(TreeCmd::Prompt(FileOp::Rename)));
-        assert_eq!(tree_action("d"), Action::Tree(TreeCmd::Prompt(FileOp::Delete)));
+    }
+
+    /// `dd` is the exception, and it is a whole key: one `d` does nothing, and
+    /// anything that is not the second `d` drops it rather than being
+    /// swallowed — the rule `Ctrl-W` already follows.
+    #[test]
+    fn dd_is_one_key_and_a_lone_d_is_not() {
+        assert!(in_tree("d").is_none(), "armed, not fired");
+        assert_eq!(tree_action("dd"), Action::Tree(TreeCmd::Delete));
+
+        assert!(in_tree("dj").is_none(), "a mistyped d does not delete on the next key");
+        assert!(in_tree("dx").is_none());
+    }
+
+    #[test]
+    fn minus_and_plus_re_root_in_opposite_directions() {
+        assert_eq!(tree_action("-"), Action::Tree(TreeCmd::Up));
+        assert_eq!(tree_action("+"), Action::Tree(TreeCmd::Down));
     }
 
     /// What it does let through: the window prefix and the command line, so a

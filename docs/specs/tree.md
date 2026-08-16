@@ -255,19 +255,28 @@ l / Right       expand a directory; on a file, open it
 h / Left        collapse; already collapsed, go to the parent row
 Enter           a directory toggles, a file opens
 -               re-root at the parent directory
++               re-root at the selected directory
 R               re-read from disk
 gh              show or hide dotfiles
 a               create — prefills the command line
 r               rename — prefills the command line
-d               delete — prefills the command line
+dd              delete, with no `:` line in between
 Ctrl-W …        every window key, unchanged
 :               the command line
 Ctrl-^          the alternate content, tree or file
 ```
 
 Nothing else. `/` is not in the list because the tree has no search, and neither
-are `i`, `a`'s normal-mode meaning, `d`'s operator, `p` or `x` — an allowlist
-does not have to name what it excludes.
+are `i`, `a`'s normal-mode meaning, `p` or `x` — an allowlist does not have to
+name what it excludes.
+
+`-` and `+` are inverses, and the pair is the reason the tree does not only get
+wider as you use it: `+` scopes to the directory you are standing in — the one
+holding the file, when the cursor is on a file — keeping expansion so that `+`
+then `-` is a round trip rather than a reset. `.` was the other candidate for
+scoping in and was turned down for the reason `gh` beat it earlier: it means
+repeat in every other pane, and a key that changes meaning per pane is worse
+than one that reads as the opposite of the key beside it.
 
 `h` collapsing and then walking to the parent is one key doing the thing you
 meant either way: on an open directory there is something to close, and
@@ -328,12 +337,30 @@ looking at.
 
 `a` opens the command line on `create <selected directory>/`. `r` opens it on
 `rename <path> <path>` with the cursor at the end, so backspacing the basename
-and typing a new one is the rename. `d` opens it on `delete <path>`.
+and typing a new one is the rename.
 
 **A prefilled command line is the confirmation.** The editor has no prompt
 machinery and gains none here: you see the path, and Enter is the assent. Where
 that is not enough — a directory with contents — the guard is `!`, which is how
 `:q` and `:e` already refuse.
+
+**`dd` is the exception, and deletes outright.** It is vim's spelling for
+removing the thing under the cursor, and the fast path is what a file tree is
+for; a `:` line in front of every deletion is the kind of friction that gets a
+feature stopped being used. The trade is real and worth writing down: there is
+no undo for the filesystem and nothing is moved aside first, so a mistyped `dd`
+on a file is a file gone.
+
+Three things blunt it. `dd` is a whole key, so one `d` does nothing and any key
+that is not the second `d` drops it rather than being swallowed — the rule
+`Ctrl-W` already follows, and the reason an armed `d` shows in the footer.
+`:delete`'s two guards survive: a directory with anything in it and an open
+buffer with unsaved changes both still want `:delete!` typed out in full. And
+the root row is refused, because it is the directory you are standing in and
+never what `dd` meant.
+
+There is no key for a *prompted* delete any more. `:delete <path>` is still
+there for the times you want to read the path before agreeing to it.
 
 **`:create` makes intermediate directories** and refuses a path that exists.
 Refusing to create `src/a/b/c.rs` because `src/a/b` is missing is a message that

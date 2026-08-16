@@ -235,6 +235,30 @@ impl Tree {
         }
     }
 
+    /// Re-roots at the selected directory, the inverse of [`Tree::up`]. `+`.
+    ///
+    /// On a file it takes the directory holding it, so the key means "scope to
+    /// what I am standing in" wherever the cursor is. Expansion is kept: what
+    /// was open below stays open, which is what makes `+` then `-` a round
+    /// trip rather than a reset.
+    pub fn down(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let root = match row.kind {
+            Kind::Dir => row.path.clone(),
+            _ => match row.path.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => return,
+            },
+        };
+        // The root row, or a file sitting directly in it. Nowhere to go, and
+        // rebuilding would only throw the selection at row 0 for nothing.
+        if root == self.root {
+            return;
+        }
+        self.root = root;
+        self.rebuild();
+    }
+
     /// Re-reads every open directory from disk. `R`.
     ///
     /// The same walk as any other change, because `rebuild` never caches: what
@@ -545,6 +569,52 @@ mod tests {
         tree.up();
 
         assert_eq!(tree.root(), was.parent().unwrap(), "and `-` has a parent to find");
+    }
+
+    #[test]
+    fn going_down_re_roots_at_the_selected_directory_and_keeps_expansion() {
+        let d = ScratchDir::new("down").file("src/tui/render.rs").file("Cargo.toml");
+        let mut tree = Tree::new(d.path()).unwrap();
+        expand_at(&mut tree, 1);
+        expand_at(&mut tree, 2);
+        assert_eq!(shown(&tree), ["src/", "  tui/", "    render.rs", "Cargo.toml"]);
+
+        tree.select(1);
+        tree.down();
+
+        assert_eq!(tree.root(), d.path().join("src"));
+        assert_eq!(shown(&tree), ["tui/", "  render.rs"], "tui/ is still open");
+        assert_eq!(tree.selected(), 0, "standing on the new root");
+    }
+
+    /// So `+` means "scope to what I am standing in" wherever the cursor is,
+    /// rather than only on the directory rows.
+    #[test]
+    fn going_down_on_a_file_takes_the_directory_holding_it() {
+        let d = ScratchDir::new("down-file").file("src/lib.rs");
+        let mut tree = Tree::new(d.path()).unwrap();
+        expand_at(&mut tree, 1);
+
+        tree.select(2);
+        tree.down();
+
+        assert_eq!(tree.root(), d.path().join("src"));
+    }
+
+    #[test]
+    fn going_down_at_the_root_has_nowhere_to_go() {
+        let d = ScratchDir::new("down-root").file("Cargo.toml");
+        let mut tree = Tree::new(d.path()).unwrap();
+        let was = tree.root().to_path_buf();
+
+        tree.select(0);
+        tree.down();
+        assert_eq!(tree.root(), was);
+
+        // A top-level file's directory is the root already.
+        tree.select(1);
+        tree.down();
+        assert_eq!(tree.root(), was);
     }
 
     #[test]

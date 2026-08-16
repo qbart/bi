@@ -324,10 +324,11 @@ of a file and into the tree above it. See [docs/specs/tree.md](docs/specs/tree.m
 | `l` / `→` | open a directory, or open the file under the cursor |
 | `h` / `←` | close a directory, or step to the parent row |
 | `Enter` | a directory toggles, a file opens |
-| `-` | re-root at the parent directory |
+| `-` `+` | re-root at the parent directory / at the one you are standing in |
 | `gh` | show or hide dotfiles |
 | `R` | re-read from disk |
-| `a` `r` `d` | create, rename, delete — each fills in a `:` line for you to agree to |
+| `a` `r` | create / rename — each fills in a `:` line for you to agree to |
+| `dd` | delete outright. No undo for the filesystem; a directory with anything in it still wants `:delete!` |
 
 Enter on a file opens it in the last window focused before this one, so `:vs .`
 is a sidebar that stays put; with one window it opens in place and `Ctrl-^`
