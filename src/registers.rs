@@ -20,6 +20,10 @@ pub enum EntryKind {
     /// Whole lines. Always stored with a trailing newline, even when it came
     /// from a final line that had none.
     Linewise,
+    /// A rectangle. Rows are joined with `\n` and there is no trailing one —
+    /// the newlines separate the rows of the block rather than terminating
+    /// lines of the buffer, which is what makes it go back in as a rectangle.
+    Blockwise,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -173,6 +173,26 @@ CASES = [
     ("V then c",       "one\ntwo\n",           "VcZ\x1b"),
     ("v across lines",  "one\ntwo\n",          "vjd"),
 
+    # blockwise visual. \x16 is Ctrl-V.
+    ("C-v d",          "abcdef\nghijkl\nmnopqr\n", "l\x16jjld"),
+    ("C-v y then p",   "abcdef\nghijkl\nmnopqr\n", "l\x16jjly$p"),
+    ("C-v y then P",   "abcdef\nghijkl\nmnopqr\n", "l\x16jjlyllP"),
+    ("C-v over short", "abcdef\ngh\nmnopqr\n",     "3l\x16jjd"),
+    ("C-v $ d",        "abcdef\ngh\nmnopqr\n",     "l\x16jj$d"),
+    ("C-v c",          "abcdef\nghijkl\n",         "l\x16jlcZZ\x1b"),
+    ("C-v I",          "abcdef\nghijkl\nmnopqr\n", "l\x16jjIZ\x1b"),
+    ("C-v I short",    "abcdef\ngh\nmnopqr\n",     "3l\x16jjIZ\x1b"),
+    ("C-v A",          "abcdef\nghijkl\nmnopqr\n", "l\x16jjAZ\x1b"),
+    ("C-v A short",    "abcdef\ngh\nmnopqr\n",     "3l\x16jjAZ\x1b"),
+    ("C-v $ A",        "abcdef\ngh\nmnopqr\n",     "l\x16jj$AZ\x1b"),
+    ("C-v r",          "abcdef\nghijkl\nmnopqr\n", "l\x16jjlrz"),
+    ("C-v o",          "abcdef\nghijkl\nmnopqr\n", "2l\x16jlohd"),
+    ("C-v O",          "abcdef\nghijkl\nmnopqr\n", "2l\x16jlOhd"),
+    ("C-v then d .",   "abcdef\nghijkl\nmnopqr\n", "l\x16jldj0l."),
+    ("C-v esc",        "abcdef\nghijkl\n",         "l\x16jl\x1bx"),
+    ("v r",            "abcdef\n",                 "vllrz"),
+    ("V r",            "abc\ndef\n",               "Vjrz"),
+
     # replace mode
     ("R over text",    "abcdef\n",             "RXY\x1b"),
     ("R past the end", "ab\n",                 "RXYZ\x1b"),

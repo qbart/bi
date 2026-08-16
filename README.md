@@ -154,7 +154,7 @@ tree, so undoing and then typing keeps the old branch rather than discarding it
 
 | Key | Does |
 |---|---|
-| `v` `V` | charwise / linewise visual mode |
+| `v` `V` `Ctrl-V` | charwise / linewise / blockwise visual mode |
 | `R` | replace mode |
 | `Esc`, `Ctrl-C` | back to normal mode, or cancel a half-typed command |
 | `:` | ex command line |
@@ -171,10 +171,32 @@ expect.
 | `d` `x` | delete the selection |
 | `c` `s` | change it |
 | `y` | yank it |
+| `r{char}` | overwrite every selected character |
 | `o` | swap the ends, to adjust the other one |
 | `iw` `i(` … | make that text object the selection |
 
 Charwise selections include the character under the cursor, as in vim.
+
+### Blockwise visual
+
+`Ctrl-V` selects a rectangle. Motions move one corner and the block follows, so
+`Ctrl-V` `3j` `5l` is a four-by-six block.
+
+| Key | Does |
+|---|---|
+| `d` `x` `c` `s` `y` `r{char}` | as above, over the rectangle |
+| `I` `A` | insert at the left / right edge of every row |
+| `$` | ragged right edge — every row to its own end |
+| `O` | swap the columns and keep the rows (`o` swaps corners diagonally) |
+| `p` `P` | a yanked block goes back in as a rectangle |
+
+Rows too short to reach the block are skipped rather than mangled — except by
+`A`, which pads them out so what you append lines up. A block yanks as one
+register entry (`▚` in the picker) that remembers it was a rectangle.
+
+`c` and `I`/`A` leave a cursor on every row, so the text appears on all of them
+as you type. Vim replicates it when you press `Esc` instead; the file ends up
+the same either way.
 
 ### Multiple cursors
 

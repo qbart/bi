@@ -297,6 +297,14 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             }
             let cols = match ed.mode.visual() {
                 Some(VisualKind::Line) => 0..raw.chars().count().max(1),
+                // A rectangle says nothing about char ranges, so the block
+                // reads its own spans rather than the selection's range.
+                Some(VisualKind::Block) => {
+                    let line_start = ed.buffer.rope().line_to_char(row);
+                    let (start, end) = ed.block_span_at(row);
+                    let (from, to) = (start - line_start, end - line_start);
+                    display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
+                }
                 _ => {
                     let line_start = ed.buffer.rope().line_to_char(row);
                     let from = lo.saturating_sub(line_start).min(raw.chars().count());

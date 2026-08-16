@@ -12,7 +12,7 @@ into selections only at the moment something acts on it.
 
 ## Status
 
-**Specified.** Nothing below is built yet.
+**Built**, and checked against vim through `scripts/vim_differential.py`.
 
 Scope is vim parity: select, adjust, `d` `x` `c` `y`, `I` `A`, `r`, `$`, a
 blockwise register kind so `p` puts a rectangle back, and `.`.

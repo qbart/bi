@@ -849,6 +849,34 @@ impl Buffer {
                 let landed = if before { row } else { row + 1 };
                 self.at_row(landed, false)
             }
+            EntryKind::Blockwise => {
+                let row = self.row_at(at);
+                let col = self.col_at(at);
+                // `p` goes after the char under the cursor, as charwise does.
+                let col = if before { col } else { (col + 1).min(self.line_len(row)) };
+
+                for (i, piece) in entry.text.split('\n').enumerate() {
+                    let target = row + i;
+                    // The block can reach past the last line; grow the buffer
+                    // rather than piling every remaining row onto the end.
+                    if target >= self.rope.len_lines() {
+                        let end = self.rope.len_chars();
+                        self.apply_edit(end, end, "\n");
+                    }
+                    // Recomputed per row: each insert shifts everything below
+                    // it, so nothing may be cached across the loop.
+                    let line_start = self.rope.line_to_char(target);
+                    let len = self.line_len(target);
+                    // A row shorter than the column is padded out to it, or
+                    // the text would slide left and stop being a rectangle.
+                    let pad = col.saturating_sub(len);
+                    let text = format!("{}{}", " ".repeat(pad), piece.repeat(count));
+                    let start = line_start + col.min(len);
+                    self.apply_edit(start, start, &text);
+                }
+
+                self.clamped(Cursor::at(self.rope.line_to_char(row) + col), false)
+            }
         }
     }
 

@@ -85,7 +85,7 @@ impl Input {
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
-            Mode::Visual(_) => self.visual(key),
+            Mode::Visual(kind) => self.visual(key, *kind),
             Mode::Insert => Self::insert(key),
             Mode::Replace => Self::replace(key),
             Mode::Command(_) => Self::command_line(key),
@@ -212,6 +212,7 @@ impl Input {
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
+            KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(VisualKind::Block)),
             KeyCode::Char('e') if ctrl => self.plain(Action::ScrollLine { down: true }),
             KeyCode::Char('y') if ctrl => self.plain(Action::ScrollLine { down: false }),
             KeyCode::Char('d') if ctrl => self.plain(Action::ScrollHalfPage { down: true }),
@@ -490,8 +491,9 @@ impl Input {
 
     /// Visual mode. Falls through to `normal` for everything it does not
     /// claim, so every motion and text object works unchanged.
-    fn visual(&mut self, key: Key) -> Option<Command> {
+    fn visual(&mut self, key: Key, kind: VisualKind) -> Option<Command> {
         let ctrl = key.mods.ctrl;
+        let block = kind == VisualKind::Block;
 
         // Esc has to be claimed here. Normal mode's Esc only clears the pending
         // keymap state and resolves to no command at all, which would leave
@@ -502,7 +504,9 @@ impl Input {
         }
         // `Ctrl-N` in visual selects the next occurrence of the selection,
         // which is the multi-cursor idiom people expect from other editors.
-        if ctrl && key.code == KeyCode::Char('n') {
+        // Not in a block: the rectangle is derived from one selection's
+        // corners, so a second one has nothing to say.
+        if ctrl && key.code == KeyCode::Char('n') && !block {
             return self.plain(Action::AddCursorNextMatch);
         }
 
@@ -511,6 +515,13 @@ impl Input {
         };
         if ctrl {
             return self.normal(key);
+        }
+
+        // `r` over a selection overwrites every character in it, so it does not
+        // fall through to normal mode's one-character form.
+        if self.replace_pending {
+            self.reset();
+            return Some(Command { count: 1, action: Action::ReplaceSelection(c) });
         }
 
         // `i`/`a` name a text object here rather than entering insert mode, and
@@ -552,6 +563,17 @@ impl Input {
                 self.reset();
                 Some(Command { count: 1, action: Action::SwapEnds })
             }
+            // Vim's `O` is `o` outside a block, and the horizontal flip inside
+            // one.
+            'O' => {
+                self.reset();
+                let action = if block { Action::SwapCorners } else { Action::SwapEnds };
+                Some(Command { count: 1, action })
+            }
+            // Only blockwise gives `I`/`A` a meaning of their own; elsewhere
+            // they are normal mode's, which is what vim does too.
+            'I' if block => self.plain(Action::BlockInsert { append: false }),
+            'A' if block => self.plain(Action::BlockInsert { append: true }),
             'v' => self.plain(Action::EnterVisual(VisualKind::Char)),
             'V' => self.plain(Action::EnterVisual(VisualKind::Line)),
             _ => self.normal(key),

@@ -12,15 +12,20 @@ use crate::buffer::{Buffer, Cursor};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
-use crate::registers::{EntryKind, Registers, Sink};
+use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
 
-/// Charwise or linewise. Blockwise is deferred — see `docs/specs/selections.md`.
+/// Charwise, linewise or blockwise.
+///
+/// Blockwise is a rectangle rather than a range: the mode is the flag, the
+/// primary selection's two corners are the rectangle, and the per-row spans
+/// are derived on demand. See `docs/specs/blockwise.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualKind {
     Char,
     Line,
+    Block,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +56,7 @@ impl Mode {
             Mode::Replace => "REPLACE",
             Mode::Visual(VisualKind::Char) => "VISUAL",
             Mode::Visual(VisualKind::Line) => "V-LINE",
+            Mode::Visual(VisualKind::Block) => "V-BLOCK",
             Mode::Command(_) => "COMMAND",
             Mode::Search { .. } => "SEARCH",
             Mode::Pick => "PICK",
@@ -105,6 +111,16 @@ pub enum Action {
     EnterVisual(VisualKind),
     /// `o` — swap which end of the selection the motions move.
     SwapEnds,
+    /// `O` in blockwise — swap the columns and keep the rows.
+    SwapCorners,
+    /// `I` / `A` in blockwise — a cursor on every row of the block, then
+    /// insert mode. Multi-cursor does the rest.
+    BlockInsert {
+        append: bool,
+    },
+    /// `r{char}` over a selection — every selected character, not just the one
+    /// under the cursor.
+    ReplaceSelection(char),
     /// An operator over whatever is selected. Visual mode's `d`, `c`, `y`.
     OperateSelection {
         op: Operator,
@@ -223,6 +239,11 @@ pub struct Search {
 pub enum Extent {
     Chars(usize),
     Lines(usize),
+    /// A rectangle needs both dimensions, since neither implies the other.
+    Block {
+        rows: usize,
+        cols: usize,
+    },
 }
 
 /// The last change, in the form that replays it.
@@ -258,6 +279,8 @@ impl Action {
             | Action::EnterInsertLineEnd
             | Action::OpenLineBelow
             | Action::OpenLineAbove
+            | Action::BlockInsert { .. }
+            | Action::ReplaceSelection(_)
             | Action::EnterReplace => true,
             _ => false,
         }
@@ -290,6 +313,7 @@ impl Action {
             | Action::EnterInsertLineEnd
             | Action::OpenLineBelow
             | Action::OpenLineAbove
+            | Action::BlockInsert { .. }
             | Action::EnterReplace => true,
             _ => false,
         }
@@ -346,6 +370,11 @@ pub struct Editor {
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
+    /// `$` in blockwise visual — the right edge is each row's own line end.
+    ///
+    /// A flag rather than a column because no column can say it. Vim calls the
+    /// same thing `curswant = MAXCOL`.
+    block_to_eol: bool,
     /// What replace mode has overwritten, newest last, one entry per selection
     /// per keystroke. Backspace pops it to put the original characters back.
     replaced: Vec<Vec<Option<char>>>,
@@ -420,6 +449,7 @@ impl Editor {
             syntax: None,
             mode: Mode::Normal,
             last_find: None,
+            block_to_eol: false,
             replaced: Vec::new(),
             undo_from: Vec::new(),
             last_change: None,
@@ -510,8 +540,165 @@ impl Editor {
                 let rows = self.buffer.row_at(Cursor::at(hi)) - self.buffer.row_at(Cursor::at(lo));
                 Extent::Lines(rows + 1)
             }
+            Some(VisualKind::Block) => {
+                let rows = self.buffer.row_at(Cursor::at(hi)) - self.buffer.row_at(Cursor::at(lo));
+                let (left, right) = self.block_columns();
+                Extent::Block { rows: rows + 1, cols: right + 1 - left }
+            }
             _ => Extent::Chars(hi - lo + 1),
         }
+    }
+
+    /// The block's left and right columns, from the corners of the primary
+    /// selection. Inclusive of the right, as charwise visual is.
+    fn block_columns(&self) -> (usize, usize) {
+        let selection = self.selections.primary();
+        let a = self.buffer.col_at(selection.anchor);
+        let b = self.buffer.col_at(selection.head);
+        (a.min(b), a.max(b))
+    }
+
+    /// One `(start, end)` char range per row the block covers, top to bottom.
+    ///
+    /// Rows too short to reach the left edge come back empty and stay in the
+    /// list: a block is a rectangle even where the text is not, and dropping
+    /// them would lose the shape a yanked block has to keep.
+    pub fn block_spans(&self) -> Vec<(usize, usize)> {
+        let (lo, hi) = self.selections.primary().range();
+        let (first, last) =
+            (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi)));
+        (first..=last).map(|row| self.block_span_at(row)).collect()
+    }
+
+    /// The block's span on one row. What the renderer asks, a row at a time —
+    /// building the whole list per visible row would put the block's height
+    /// into the cost of a frame, which is the one thing rendering here avoids.
+    pub fn block_span_at(&self, row: usize) -> (usize, usize) {
+        let (left, right) = self.block_columns();
+        let start = self.buffer.rope().line_to_char(row);
+        let len = self.buffer.line_len(row);
+        let from = left.min(len);
+        let to = if self.block_to_eol { len } else { (right + 1).min(len) };
+        (start + from, start + to.max(from))
+    }
+
+    /// The char at `(row, col)`, clamped to the row.
+    fn at_row_col(&self, row: usize, col: usize) -> Cursor {
+        let row = row.min(self.buffer.line_count() - 1);
+        let start = self.buffer.rope().line_to_char(row);
+        Cursor::at(start + col.min(self.buffer.line_len(row).saturating_sub(1)))
+    }
+
+    /// What is selected, as one span per row and never crossing a terminator.
+    ///
+    /// `r` is the caller: it overwrites characters, and a newline is not one it
+    /// may overwrite. Blockwise is the interesting case — and it is the only
+    /// one that is a single selection, so the others fold over the whole set.
+    fn selection_spans(&self) -> Vec<(usize, usize)> {
+        if self.mode.visual() == Some(VisualKind::Block) {
+            return self.block_spans();
+        }
+        self.selections.all().iter().flat_map(|selection| self.rows_of(*selection)).collect()
+    }
+
+    /// One span per row a selection touches, clipped to that row's content.
+    fn rows_of(&self, selection: Selection) -> Vec<(usize, usize)> {
+        let (lo, hi) = match self.mode.visual() {
+            Some(VisualKind::Line) => {
+                self.buffer.line_range(selection.range().0, selection.range().1, false)
+            }
+            _ => selection.inclusive_range(self.buffer.rope().len_chars()),
+        };
+        let (first, last) =
+            (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi.max(lo))));
+
+        (first..=last)
+            .map(|row| {
+                let start = self.buffer.rope().line_to_char(row);
+                let end = start + self.buffer.line_len(row);
+                (start.max(lo), end.min(hi))
+            })
+            .filter(|(start, end)| end > start)
+            .collect()
+    }
+
+    /// Cuts or copies the rectangle.
+    ///
+    /// Not routed through `for_each_selection`, because the selections it would
+    /// iterate do not exist yet — the block is derived, and this is the moment
+    /// it becomes real.
+    fn operate_block(&mut self, op: Operator, sink: Sink) {
+        let spans = self.block_spans();
+        if sink == Sink::Ring {
+            let rows: Vec<String> =
+                spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
+            // One entry, not one per row: what was taken is a rectangle, and
+            // pasting it back has to know that.
+            self.registers.push(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise });
+        }
+
+        let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
+        if op != Operator::Yank {
+            // Bottom to top: a cut shifts everything below it and nothing
+            // above, so descending order keeps every span's position valid
+            // without a correction pass.
+            for &(start, end) in spans.iter().rev() {
+                if end > start {
+                    self.buffer.operate_range(Cursor::at(start), op, start, end, false);
+                }
+            }
+        }
+
+        if op == Operator::Change {
+            // A cursor per row rather than vim's replicate-on-Esc: the cursors
+            // are real here, so the text lands on every row as it is typed.
+            //
+            // Each left edge has moved by everything cut above it. A row too
+            // short to reach the block gets no cursor, as `I` skips it.
+            self.mode = Mode::Insert;
+            let mut removed = 0;
+            let cursors: Vec<Selection> = spans
+                .iter()
+                .filter_map(|&(start, end)| {
+                    let at = start - removed;
+                    removed += end - start;
+                    (end > start).then(|| Selection::at(at))
+                })
+                .collect();
+            self.selections.set(cursors);
+        } else {
+            self.mode = Mode::Normal;
+            self.selections = Selections::single(self.buffer.clamped(Cursor::at(top_left), false));
+        }
+    }
+
+    /// Where the block's cursors go for `I` and `A`.
+    ///
+    /// `I` skips a row that does not reach the left edge; `A` pads one out to
+    /// the column so what is appended lines up. Vim pads on `Esc`, bee pads on
+    /// entry — the same edit, visible while it is being typed into.
+    fn block_insert_columns(&mut self, append: bool) -> Vec<Cursor> {
+        let (lo, hi) = self.selections.primary().range();
+        let (first, last) =
+            (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi)));
+        let (left, right) = self.block_columns();
+
+        let mut cursors = Vec::new();
+        for row in first..=last {
+            let len = self.buffer.line_len(row);
+            let start = self.buffer.rope().line_to_char(row);
+            if append {
+                let col = if self.block_to_eol { len } else { right + 1 };
+                if col > len {
+                    let at = Cursor::at(start + len);
+                    self.buffer.insert_str(at, &" ".repeat(col - len));
+                }
+                cursors.push(Cursor::at(self.buffer.rope().line_to_char(row) + col));
+            } else if left <= len {
+                cursors.push(Cursor::at(start + left));
+            }
+        }
+        cursors
     }
 
     /// Replays the last change. `count`, when the user typed one on the `.`
@@ -552,6 +739,7 @@ impl Editor {
         let kind = match extent {
             Extent::Chars(_) => VisualKind::Char,
             Extent::Lines(_) => VisualKind::Line,
+            Extent::Block { .. } => VisualKind::Block,
         };
         self.mode = Mode::Visual(kind);
         self.for_each_selection(|ed, sel| {
@@ -560,6 +748,15 @@ impl Editor {
                 Extent::Lines(n) => {
                     let row = ed.buffer.row_at(sel.head) + n - 1;
                     ed.buffer.at_row(row.min(ed.buffer.line_count() - 1), false)
+                }
+                // The far corner, not a distance along the text: a block is
+                // cut from the same rectangle wherever it is repeated.
+                Extent::Block { rows, cols } => {
+                    let row =
+                        (ed.buffer.row_at(sel.head) + rows - 1).min(ed.buffer.line_count() - 1);
+                    let col = ed.buffer.col_at(sel.head) + cols - 1;
+                    let line_start = ed.buffer.rope().line_to_char(row);
+                    Cursor::at(line_start + col.min(ed.buffer.line_len(row).saturating_sub(1)))
                 }
             };
             Selection { anchor: sel.head, head }
@@ -679,6 +876,11 @@ impl Editor {
         match action {
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
+                // `$` in a block is a ragged right edge rather than a column,
+                // and any other motion gives the edge back to the head.
+                if self.mode.visual() == Some(VisualKind::Block) {
+                    self.block_to_eol = m == Motion::LineEnd;
+                }
                 let visual = self.mode.visual().is_some();
                 self.for_each_selection(|ed, sel| {
                     let head = ed.buffer.moved(sel.head, m, eol);
@@ -873,9 +1075,58 @@ impl Editor {
                 } else {
                     Mode::Visual(*kind)
                 };
+                if *kind == VisualKind::Block {
+                    // The rectangle is derived from one selection's corners,
+                    // so a block is single-selection by construction.
+                    self.selections.collapse_to_primary();
+                    self.block_to_eol = false;
+                }
             }
             Action::SwapEnds => {
                 self.for_each_selection(|_, sel| sel.flipped());
+            }
+            Action::SwapCorners => {
+                let selection = self.selections.primary();
+                let (anchor_row, head_row) =
+                    (self.buffer.row_at(selection.anchor), self.buffer.row_at(selection.head));
+                let (anchor_col, head_col) =
+                    (self.buffer.col_at(selection.anchor), self.buffer.col_at(selection.head));
+                let anchor = self.at_row_col(anchor_row, head_col);
+                let head = self.at_row_col(head_row, anchor_col);
+                *self.selections.primary_mut() = Selection { anchor, head };
+                // The head chose the right edge, and it no longer does.
+                self.block_to_eol = false;
+            }
+            Action::BlockInsert { append } => {
+                let cursors = self.block_insert_columns(*append);
+                self.mode = Mode::Insert;
+                if cursors.is_empty() {
+                    // Every row was too short for `I`. Nothing to insert into.
+                    self.mode = Mode::Normal;
+                    self.status = "no line reaches the block".into();
+                    return;
+                }
+                self.selections.set(cursors.into_iter().map(Selection::collapsed).collect());
+            }
+            Action::ReplaceSelection(ch) => {
+                let ch = *ch;
+                let spans = self.selection_spans();
+                // Length-preserving, so the order does not matter and no shift
+                // correction is needed — unlike every other edit here.
+                for (start, end) in spans {
+                    self.buffer.replace_chars(Cursor::at(start), ch, end - start);
+                }
+                // Every selection collapses onto its own start, which keeps a
+                // multi-cursor visual `r` multi-cursor.
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.clamped(Cursor::at(sel.range().0), false))
+                });
+                self.mode = Mode::Normal;
+            }
+            Action::OperateSelection { op, sink }
+                if self.mode.visual() == Some(VisualKind::Block) =>
+            {
+                self.operate_block(*op, *sink);
             }
             Action::OperateSelection { op, sink } => {
                 let (op, sink) = (*op, *sink);
@@ -1188,7 +1439,11 @@ impl Editor {
             .iter()
             .map(|e| Item {
                 text: e.text.clone(),
-                badge: (e.kind == EntryKind::Linewise).then_some('¶'),
+                badge: match e.kind {
+                    EntryKind::Linewise => Some('¶'),
+                    EntryKind::Blockwise => Some('▚'),
+                    EntryKind::Charwise => None,
+                },
             })
             .collect();
         self.picker = Some(Picker::new(kind, items));
@@ -2070,6 +2325,218 @@ mod tests {
 
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         assert_eq!(ed.buffer.rope().to_string(), "foo  baz");
+    }
+
+    // ---- blockwise visual --------------------------------------------------
+
+    /// A block from `at`, extended `rows` down and `cols` right — the two
+    /// motions a `Ctrl-V` selection is made of.
+    fn block(text: &str, at: usize, rows: usize, cols: usize) -> Editor {
+        let mut ed = visual(text, at, VisualKind::Block);
+        for _ in 0..rows {
+            ed.apply(cmd(Action::Move(Motion::Down)));
+        }
+        for _ in 0..cols {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ed
+    }
+
+    const GRID: &str = "abcdef\nghijkl\nmnopqr";
+
+    #[test]
+    fn a_block_is_one_span_per_row_between_its_corners() {
+        let ed = block(GRID, 1, 2, 2);
+        let text: Vec<String> =
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer.slice(s, e)).collect();
+        assert_eq!(text, vec!["bcd", "hij", "nop"], "columns 1..3 of every row");
+    }
+
+    #[test]
+    fn a_block_drawn_upwards_and_leftwards_is_the_same_rectangle() {
+        let mut ed = visual(GRID, 19, VisualKind::Block); // 'r', bottom right
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Move(Motion::Up)));
+            ed.apply(cmd(Action::Move(Motion::Left)));
+        }
+        let text: Vec<String> =
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer.slice(s, e)).collect();
+        assert_eq!(text, vec!["def", "jkl", "pqr"]);
+    }
+
+    #[test]
+    fn deleting_a_block_cuts_the_same_columns_from_every_row() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "adef\ngjkl\nmpqr");
+        assert_eq!(ed.cursor().at, 1, "and lands on the top-left corner");
+        assert_eq!(ed.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_yanked_block_is_a_blockwise_entry_of_its_rows() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+        let entry = ed.registers.front().unwrap();
+        assert_eq!(entry.kind, EntryKind::Blockwise);
+        assert_eq!(entry.text, "bc\nhi\nno", "rows joined, no terminator");
+        assert_eq!(ed.buffer.rope().to_string(), GRID);
+    }
+
+    #[test]
+    fn a_row_too_short_for_the_block_keeps_its_place_but_loses_nothing() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+        assert_eq!(
+            ed.registers.front().unwrap().text,
+            "de\n\npq",
+            "the short row is empty, not missing — the rectangle keeps its shape"
+        );
+
+        // A yank leaves visual mode, so the cut needs its own block.
+        let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::BlackHole }));
+        assert_eq!(ed.buffer.rope().to_string(), "abcf\ngh\nmnor");
+    }
+
+    #[test]
+    fn dollar_takes_every_row_to_its_own_end() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 1, 2, 0);
+        ed.apply(cmd(Action::Move(Motion::LineEnd)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "a\ng\nm", "ragged, not a column");
+    }
+
+    #[test]
+    fn a_motion_after_dollar_gives_the_edge_back_to_the_head() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 1, 2, 0);
+        ed.apply(cmd(Action::Move(Motion::LineEnd)));
+        ed.apply(cmd(Action::Move(Motion::LineStart)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "acdef\ng\nmopqr");
+    }
+
+    #[test]
+    fn changing_a_block_puts_a_cursor_on_every_row() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Change, sink: Sink::Ring }));
+        assert_eq!(ed.mode, Mode::Insert);
+        assert_eq!(ed.selections.len(), 3);
+        type_str(&mut ed, "X");
+        assert_eq!(ed.buffer.rope().to_string(), "aXdef\ngXjkl\nmXpqr");
+    }
+
+    #[test]
+    fn block_insert_puts_a_cursor_at_the_left_edge_of_every_row() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::BlockInsert { append: false }));
+        assert_eq!(ed.mode, Mode::Insert);
+        type_str(&mut ed, "-");
+        assert_eq!(ed.buffer.rope().to_string(), "a-bcdef\ng-hijkl\nm-nopqr");
+    }
+
+    #[test]
+    fn block_insert_skips_a_row_that_does_not_reach_the_block() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
+        ed.apply(cmd(Action::BlockInsert { append: false }));
+        type_str(&mut ed, "-");
+        assert_eq!(ed.buffer.rope().to_string(), "abc-def\ngh\nmno-pqr");
+    }
+
+    #[test]
+    fn block_append_pads_a_short_row_so_the_text_lines_up() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 3, 2, 1);
+        ed.apply(cmd(Action::BlockInsert { append: true }));
+        type_str(&mut ed, "|");
+        assert_eq!(ed.buffer.rope().to_string(), "abcde|f\ngh   |\nmnopq|r");
+    }
+
+    #[test]
+    fn block_append_after_dollar_lands_at_each_line_end() {
+        let mut ed = block("abcdef\ngh\nmnopqr", 1, 2, 0);
+        ed.apply(cmd(Action::Move(Motion::LineEnd)));
+        ed.apply(cmd(Action::BlockInsert { append: true }));
+        type_str(&mut ed, ";");
+        assert_eq!(ed.buffer.rope().to_string(), "abcdef;\ngh;\nmnopqr;");
+    }
+
+    #[test]
+    fn swapping_corners_keeps_the_rows_and_swaps_the_columns() {
+        let mut ed = block(GRID, 1, 2, 2);
+        ed.apply(cmd(Action::SwapCorners));
+        let sel = ed.selections.primary();
+        assert_eq!((ed.buffer.row_at(sel.anchor), ed.buffer.col_at(sel.anchor)), (0, 3));
+        assert_eq!((ed.buffer.row_at(sel.head), ed.buffer.col_at(sel.head)), (2, 1));
+        let text: Vec<String> =
+            ed.block_spans().iter().map(|&(s, e)| ed.buffer.slice(s, e)).collect();
+        assert_eq!(text, vec!["bcd", "hij", "nop"], "the same rectangle either way round");
+    }
+
+    #[test]
+    fn r_over_a_block_overwrites_every_character_in_it() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::ReplaceSelection('.')));
+        assert_eq!(ed.buffer.rope().to_string(), "a..def\ng..jkl\nm..pqr");
+        assert_eq!(ed.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn r_over_a_charwise_selection_spans_lines_without_eating_the_newline() {
+        let mut ed = visual("abc\ndef", 1, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::ReplaceSelection('.')));
+        assert_eq!(ed.buffer.rope().to_string(), "a..\n..f");
+    }
+
+    #[test]
+    fn r_reaches_every_selection_when_there_is_more_than_one() {
+        let mut ed = visual("foo bar foo", 0, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(ed.selections.len(), 2);
+        ed.apply(cmd(Action::ReplaceSelection('.')));
+        assert_eq!(ed.buffer.rope().to_string(), "... bar ...");
+        assert_eq!(ed.selections.len(), 2, "and the cursors survive it");
+    }
+
+    #[test]
+    fn a_block_is_single_selection_so_entering_one_drops_the_extra_cursors() {
+        let mut ed = editor(GRID);
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        assert_eq!(ed.selections.len(), 2);
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Block)));
+        assert_eq!(ed.selections.len(), 1);
+    }
+
+    #[test]
+    fn pasting_a_block_puts_a_rectangle_back() {
+        let mut ed = block(GRID, 1, 2, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+        ed.set_cursor(Cursor::at(4)); // row 0, column 4
+        ed.apply(cmd(Action::Paste { before: false, count: 1 }));
+        assert_eq!(ed.buffer.rope().to_string(), "abcdebcf\nghijkhil\nmnopqnor");
+    }
+
+    #[test]
+    fn pasting_a_block_pads_short_rows_and_grows_the_buffer() {
+        let mut ed = editor("xy");
+        ed.registers.push(Entry { text: "bc\nhi\nno".into(), kind: EntryKind::Blockwise });
+        ed.set_cursor(Cursor::at(1));
+        ed.apply(cmd(Action::Paste { before: true, count: 1 }));
+        assert_eq!(ed.buffer.rope().to_string(), "xbcy\n hi\n no");
+    }
+
+    #[test]
+    fn a_repeated_block_operator_cuts_the_same_rectangle_again() {
+        let mut ed = block(GRID, 1, 1, 1);
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
+        assert_eq!(ed.buffer.rope().to_string(), "adef\ngjkl\nmnopqr");
+
+        ed.set_cursor(Cursor::at(11)); // row 2, column 1
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+        assert_eq!(ed.buffer.rope().to_string(), "adef\ngjkl\nmpqr", "one row, two columns");
     }
 
     // ---- replace mode ------------------------------------------------------
