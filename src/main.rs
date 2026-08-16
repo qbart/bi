@@ -70,9 +70,9 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
             // fires twice.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(key) = tui::keys::translate(key)
-                    && let Some(cmd) = input.on_key(key, &ed.mode)
+                    && let Some(cmd) = input.on_key(key, &ed.session.mode)
                 {
-                    ed.status.clear();
+                    ed.session.status.clear();
                     ed.apply(cmd);
                 }
                 // Feed the parse tree. LSP will hang off the same drain.
@@ -82,7 +82,7 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
             _ => {}
         }
 
-        if ed.quit {
+        if ed.session.quit {
             return Ok(());
         }
     }

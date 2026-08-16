@@ -220,9 +220,9 @@ fn styled_line(
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
 fn gutter_width(ed: &Editor) -> usize {
-    match ed.line_numbers {
+    match ed.session.line_numbers {
         LineNumbers::Off => 0,
-        _ => format!("{}", ed.buffer.line_count()).len() + 1,
+        _ => format!("{}", ed.buffer().line_count()).len() + 1,
     }
 }
 
@@ -232,34 +232,34 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
     ed.scroll_to_cursor(text_area.height as usize);
 
-    let total = ed.buffer.line_count();
+    let total = ed.buffer().line_count();
     let gutter = gutter_width(ed);
-    let cursor = ed.selections.cursor();
-    let cursor_row = ed.buffer.row_at(cursor);
+    let cursor = ed.selections().cursor();
+    let cursor_row = ed.buffer().row_at(cursor);
 
     let mut lines = Vec::with_capacity(text_area.height as usize);
     let mut cursor_screen_col = 0;
 
     // One query for the whole visible range, then partition per line. Bounded
     // by terminal height, never by file size.
-    let last_row = (ed.scroll + text_area.height as usize).min(total);
-    let highlights = ed.syntax.as_ref().map(|syntax| {
-        let rope = ed.buffer.rope();
-        let from = rope.line_to_byte(ed.scroll.min(rope.len_lines()));
+    let last_row = (ed.scroll() + text_area.height as usize).min(total);
+    let highlights = ed.syntax().map(|syntax| {
+        let rope = ed.buffer().rope();
+        let from = rope.line_to_byte(ed.scroll().min(rope.len_lines()));
         let to = rope.line_to_byte(last_row.min(rope.len_lines()));
         (syntax, syntax.highlights(rope, from..to))
     });
 
-    for row in ed.scroll..last_row {
-        let raw = ed.buffer.rope().line(row).to_string();
+    for row in ed.scroll()..last_row {
+        let raw = ed.buffer().rope().line(row).to_string();
         let raw = raw.trim_end_matches(['\n', '\r']);
 
         if row == cursor_row {
-            cursor_screen_col = display_col(raw, ed.buffer.col_at(cursor));
+            cursor_screen_col = display_col(raw, ed.buffer().col_at(cursor));
         }
 
         // A blank cell where a number is not due, so the text stays put.
-        let mut spans = match ed.line_numbers.label_for(row, cursor_row) {
+        let mut spans = match ed.session.line_numbers.label_for(row, cursor_row) {
             _ if gutter == 0 => Vec::new(),
             Some(n) => vec![Span::styled(
                 format!("{n:>width$} ", width = gutter - 1),
@@ -273,7 +273,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         };
         match &highlights {
             Some((syntax, all)) => {
-                let line_start = ed.buffer.rope().line_to_byte(row);
+                let line_start = ed.buffer().rope().line_to_byte(row);
                 let line_end = line_start + raw.len();
                 let mine: Vec<HlSpan> = all
                     .iter()
@@ -286,13 +286,13 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         }
         // Search matches, under the selection so a selected match still reads
         // as selected. Bounded by the row, like every other pass here.
-        if ed.highlight_search
-            && let Some(search) = &ed.last_search
+        if ed.session.highlight_search
+            && let Some(search) = &ed.session.last_search
         {
-            let line_start = ed.buffer.rope().line_to_char(row);
+            let line_start = ed.buffer().rope().line_to_char(row);
             let line_end = line_start + raw.chars().count();
             for (start, end) in
-                ed.buffer.matches_in(line_start, line_end, &search.pattern, search.whole_word)
+                ed.buffer().matches_in(line_start, line_end, &search.pattern, search.whole_word)
             {
                 let from = display_col(raw, start.saturating_sub(line_start));
                 let to = display_col(raw, (end - line_start).min(raw.chars().count()));
@@ -303,31 +303,31 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         // Selected columns on this row, in screen columns and offset past the
         // gutter. Charwise includes the character under the head; linewise
         // covers the row whatever the columns are.
-        for selection in ed.selections.all() {
+        for selection in ed.selections().all() {
             // A collapsed selection still covers something in visual mode — one
             // character for `v`, the whole line for `V` — so only skip it
             // outside visual, where it is a plain cursor.
-            if selection.is_collapsed() && ed.mode.visual().is_none() {
+            if selection.is_collapsed() && ed.session.mode.visual().is_none() {
                 continue;
             }
             let (lo, hi) = selection.range();
             let (first, last) =
-                (ed.buffer.row_at(Cursor::at(lo)), ed.buffer.row_at(Cursor::at(hi)));
+                (ed.buffer().row_at(Cursor::at(lo)), ed.buffer().row_at(Cursor::at(hi)));
             if row < first || row > last {
                 continue;
             }
-            let cols = match ed.mode.visual() {
+            let cols = match ed.session.mode.visual() {
                 Some(VisualKind::Line) => 0..raw.chars().count().max(1),
                 // A rectangle says nothing about char ranges, so the block
                 // reads its own spans rather than the selection's range.
                 Some(VisualKind::Block) => {
-                    let line_start = ed.buffer.rope().line_to_char(row);
+                    let line_start = ed.buffer().rope().line_to_char(row);
                     let (start, end) = ed.block_span_at(row);
                     let (from, to) = (start - line_start, end - line_start);
                     display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
                 }
                 _ => {
-                    let line_start = ed.buffer.rope().line_to_char(row);
+                    let line_start = ed.buffer().rope().line_to_char(row);
                     let from = lo.saturating_sub(line_start).min(raw.chars().count());
                     let to = if row < last {
                         raw.chars().count()
@@ -343,16 +343,16 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
         // The terminal's own cursor sits on the primary head; the others have
         // to be painted or they are invisible.
-        if ed.selections.len() > 1 {
-            for (i, selection) in ed.selections.all().iter().enumerate() {
-                if i == ed.selections.primary_index() {
+        if ed.selections().len() > 1 {
+            for (i, selection) in ed.selections().all().iter().enumerate() {
+                if i == ed.selections().primary_index() {
                     continue;
                 }
                 let head = selection.head;
-                if ed.buffer.row_at(head) != row {
+                if ed.buffer().row_at(head) != row {
                     continue;
                 }
-                let col = display_col(raw, ed.buffer.col_at(head)) + gutter;
+                let col = display_col(raw, ed.buffer().col_at(head)) + gutter;
                 spans = paint_range(spans, col..col + 1, EXTRA_CURSOR_BG);
             }
         }
@@ -375,14 +375,14 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     let matches = ed.search_count();
     frame.render_widget(status_line(ed, pending, matches, status_area.width), status_area);
 
-    if matches!(ed.mode, Mode::Pick)
-        && let Some(picker) = ed.picker.as_mut()
+    if matches!(ed.session.mode, Mode::Pick)
+        && let Some(picker) = ed.session.picker.as_mut()
     {
         render_picker(frame, picker, text_area);
         return;
     }
 
-    match &ed.mode {
+    match &ed.session.mode {
         Mode::Command(line) => {
             frame.set_cursor_position((
                 status_area.x + 1 + line.chars().count() as u16,
@@ -392,7 +392,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         _ => {
             frame.set_cursor_position((
                 text_area.x + (gutter + cursor_screen_col) as u16,
-                text_area.y + (cursor_row - ed.scroll) as u16,
+                text_area.y + (cursor_row - ed.scroll()) as u16,
             ));
         }
     }
@@ -530,18 +530,18 @@ fn status_spans(
     matches: Option<(usize, usize)>,
     width: u16,
 ) -> Vec<Span<'static>> {
-    if let Mode::Command(line) = &ed.mode {
+    if let Mode::Command(line) = &ed.session.mode {
         return vec![Span::raw(format!(":{line}"))];
     }
-    if let Mode::Search { query, forward } = &ed.mode {
+    if let Mode::Search { query, forward } = &ed.session.mode {
         let prefix = if *forward { '/' } else { '?' };
         return vec![Span::raw(format!("{prefix}{query}"))];
     }
     // The search keeps the line after `<CR>` too, for as long as the keys are
     // still the search. The pattern reads the same as it did while it was
     // being typed, which is the point: nothing else moves in or out around it.
-    if ed.search_focus {
-        let left = Span::raw(ed.status.clone());
+    if ed.session.search_focus {
+        let left = Span::raw(ed.session.status.clone());
         let right = match matches {
             Some((at, total)) => format!("[{at}/{total}] "),
             None => String::new(),
@@ -556,7 +556,7 @@ fn status_spans(
     }
 
     let name = ed
-        .buffer
+        .buffer()
         .path
         .as_ref()
         .map(|p| p.display().to_string())
@@ -564,32 +564,32 @@ fn status_spans(
 
     let position = format!(
         " {}:{} ",
-        ed.buffer.row_at(ed.selections.cursor()) + 1,
-        ed.buffer.col_at(ed.selections.cursor()) + 1
+        ed.buffer().row_at(ed.selections().cursor()) + 1,
+        ed.buffer().col_at(ed.selections().cursor()) + 1
     );
 
     let mut spans = vec![
         Span::styled(position, Style::default().fg(Color::Gray).bg(POSITION_BG)),
         Span::raw(format!(" {name}")),
         Span::styled(
-            if ed.buffer.is_modified() { " [+]" } else { "" },
+            if ed.buffer().is_modified() { " [+]" } else { "" },
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
-        Span::styled(ed.status.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(ed.session.status.clone(), Style::default().fg(Color::Cyan)),
     ];
 
     // Several cursors is a state you cannot otherwise tell from the mode: the
     // label still says NORMAL, and the only other sign is coloured cells that
     // may be scrolled off. Say how many.
-    let cursors = ed.selections.len();
+    let cursors = ed.selections().len();
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
     let keys = format!("{count}{pending}  ");
 
-    let mode = format!(" {} ", ed.mode.label());
+    let mode = format!(" {} ", ed.session.mode.label());
     let mode_style = Style::default()
         .fg(Color::Black)
-        .bg(match ed.mode {
+        .bg(match ed.session.mode {
             Mode::Insert => Color::Green,
             Mode::Pick => Color::Magenta,
             _ => Color::Blue,
@@ -628,24 +628,24 @@ mod tests {
     #[test]
     fn the_gutter_keeps_its_width_in_every_mode_but_off() {
         let mut ed = Editor::empty();
-        ed.buffer.insert_str(Cursor::at(0), &"x\n".repeat(120));
+        ed.buffer_mut().insert_str(Cursor::at(0), &"x\n".repeat(120));
         let numbered = gutter_width(&ed);
         assert_eq!(numbered, 4, "121 lines, so three digits and a space");
 
-        ed.line_numbers = LineNumbers::Relative;
+        ed.session.line_numbers = LineNumbers::Relative;
         assert_eq!(gutter_width(&ed), numbered, "or the file slides sideways as you move");
-        ed.line_numbers = LineNumbers::Every(10);
+        ed.session.line_numbers = LineNumbers::Every(10);
         assert_eq!(gutter_width(&ed), numbered);
 
-        ed.line_numbers = LineNumbers::Off;
+        ed.session.line_numbers = LineNumbers::Off;
         assert_eq!(gutter_width(&ed), 0, "the column is gone, not blank");
     }
 
     #[test]
     fn a_search_takes_the_whole_footer_and_puts_the_count_on_the_right() {
         let mut ed = Editor::empty();
-        ed.search_focus = true;
-        ed.status = "/foo".into();
+        ed.session.search_focus = true;
+        ed.session.status = "/foo".into();
 
         let spans = status_spans(&ed, "", Some((3, 17)), 20);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();

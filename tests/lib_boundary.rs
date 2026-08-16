@@ -26,7 +26,7 @@ impl Session {
     }
 
     fn press(&mut self, key: Key) {
-        if let Some(cmd) = self.input.on_key(key, &self.editor.mode) {
+        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode) {
             self.editor.apply(cmd);
         }
         self.editor.sync_syntax();
@@ -51,7 +51,7 @@ impl Session {
     }
 
     fn text(&self) -> String {
-        self.editor.buffer.rope().to_string()
+        self.editor.buffer().rope().to_string()
     }
 }
 
@@ -95,16 +95,16 @@ fn yank_and_paste_travel_through_the_register_ring() {
 #[test]
 fn modes_are_observable_from_outside() {
     let mut s = Session::new("");
-    assert_eq!(s.editor.mode, Mode::Normal);
+    assert_eq!(s.editor.session.mode, Mode::Normal);
 
     s.press(Key::char('i'));
-    assert_eq!(s.editor.mode, Mode::Insert);
+    assert_eq!(s.editor.session.mode, Mode::Insert);
 
     s.press(Key::code(KeyCode::Esc));
-    assert_eq!(s.editor.mode, Mode::Normal);
+    assert_eq!(s.editor.session.mode, Mode::Normal);
 
     s.press(Key::char(':'));
-    assert!(matches!(s.editor.mode, Mode::Command(_)));
+    assert!(matches!(s.editor.session.mode, Mode::Command(_)));
 }
 
 /// The modules `lib.rs` declares. Kept as a literal list rather than a
