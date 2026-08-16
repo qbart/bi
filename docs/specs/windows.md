@@ -11,13 +11,17 @@ and closing a window leaves its buffer loaded.
 
 ## Status
 
-**Designed, not built.**
+**Built.**
 
-Scope is splitting, closing, resizing and switching windows; a buffer list with
-cycling, deletion and a picker; and the `Editor` refactor all three require.
+Splitting, closing, resizing and switching windows; a buffer list with cycling,
+deletion and a picker; and the `Editor` refactor all three required.
 Deliberately out: moving windows around the tree (`Ctrl-W x` / `r` / `H J K L`)
 and tab pages. The tree is the shape that would carry them, and neither has
 earned its complexity yet.
+
+Two things below were wrong when this was written and are corrected in place,
+marked **Corrected**: what the refactor cost the tests, and what an unrecognised
+`Ctrl-W` key does.
 
 ## The refactor comes first
 
@@ -62,7 +66,13 @@ underneath it. Because `buffer` and `syntax` keep their names as fields, the 73
 `self.window.scroll` (19), and the session fields → `self.session.*` (~40).
 Roughly 95 mechanical edits, every one of them a compiler error until it is
 done. `Editor` keeps `pub fn buffer(&self) -> &Buffer` delegating to the focused
-window, which is what keeps the 193 test sites compiling untouched.
+window.
+
+**Corrected.** That accessor does *not* leave the 193 test sites untouched, as
+this first claimed: `ed.buffer` is field syntax and a method needs `ed.buffer()`.
+They all changed. It was still a one-pass substitution — 117 of the 137 in
+`editor.rs` are `ed.buffer().rope()`, and only five sites across the tree needed
+`buffer_mut()` — but the claim that they compiled unchanged was simply wrong.
 
 ### What `View` is not
 
@@ -254,8 +264,9 @@ being readable.
 
 **The frontend keeps the status row.** `layout` returns whole panes; the
 frontend decides how much of a pane is text and calls
-`ed.scroll_to_cursor(id, text_height)`, which is the contract that exists today
-with a window id added. Reserving the row in the core would bake a terminal
+`ed.size_window(id, width, text_height)`, which is `scroll_to_cursor`'s
+contract with a window id and a width added — the width because a window has to
+know its own for horizontal scrolling to ever be possible. Reserving the row in the core would bake a terminal
 convention into geometry, and a GUI frontend would have to work around it.
 
 **Cells are distributed by weight with the remainder going left to right**, so
@@ -439,8 +450,14 @@ not the focused one, and names the first that fails.
 
 `Ctrl-W` is not a key, it is the start of one. `Input` gains a prefix state
 beside the `[count] operator [count] motion` machine it already runs: `Ctrl-W`
-arms it, the next key resolves it, and anything unrecognised drops it with a
-message rather than being swallowed. `Esc` cancels, as it does everywhere else.
+arms it, the next key resolves it, and anything unrecognised drops it rather
+than being swallowed. `Esc` cancels, as it does everywhere else.
+
+**Corrected.** This first said an unrecognised key drops the prefix *with a
+message*. The keymap has no way to produce one — it returns `Option<Command>`
+and nothing else — and inventing an action for it would be a worse trade than
+the silence. Dropping quietly is what every other unrecognised key in
+`input.rs` already does.
 
 It reports itself through `pending_display()` — the same channel that shows a
 half-typed `d2`, so a pane you have armed by accident says so in the footer.
@@ -484,14 +501,23 @@ covers both paths.
 `render` becomes a loop:
 
 ```rust
-let panes = ed.layout(area.into(), Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 });
-for (id, pane) in panes {
-    let [text, status] = split_off_last_row(pane);
-    ed.scroll_to_cursor(id, text.height as usize);
-    render_window(frame, ed, id, text, id == ed.focus);
-    window_status(frame, ed, id, status, id == ed.focus);
+let panes = ed.layout(to_core(body), CHROME);
+
+// Every window learns its size before anything is drawn, so scrolling has
+// settled by the time the first pane is formatted.
+for &(id, rect) in &panes {
+    ed.size_window(id, rect.width as usize, rect.height.saturating_sub(1) as usize);
 }
-render_footer(frame, ed, footer_area, pending);
+
+for &(id, rect) in &panes {
+    let [text, status] = split_off_last_row(rect);
+    render_window(frame, ed, id, text, id == ed.focus());
+    window_status(frame, ed, id, status, id == ed.focus());
+    if rect.x > body.x {
+        draw_rule(frame, rect);   // the column the layout reserved
+    }
+}
+render_footer(frame, ed, footer, pending);
 ```
 
 The body of today's `render` becomes `render_window`, reading a given window's

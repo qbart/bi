@@ -3,7 +3,8 @@
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
-Status: modal editing, undo, registers, and tree-sitter highlighting for Rust.
+Status: modal editing, undo, registers, tree-sitter highlighting for Rust, a
+buffer list, and split windows.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -119,10 +120,10 @@ Matches are **not** highlighted, which is vim's default and not the thing you
 want while reading code; `:hls` turns highlighting on and `:noh` off again.
 
 What a search leaves behind is the status line. While one is live the footer
-is the search and nothing else — no file name, no mode, no position — showing
-the pattern with the prefix of the direction you are travelling, so `N` after
-`/foo` reads `?foo`, and `[3/17]` at the right: which match the cursor is on
-out of how many. `[0/17]` means it is in front of the first.
+is the search and nothing else — not even the mode block — showing the pattern
+with the prefix of the direction you are travelling, so `N` after `/foo` reads
+`?foo`, and `[3/17]` at the right: which match the cursor is on out of how
+many. `[0/17]` means it is in front of the first.
 
 A search stays live while the keys are still the search — `n`, `N`, another
 `/`. The first key that is anything else hands the footer back, and the count
@@ -268,14 +269,44 @@ afterwards repeats it.
 | Command | Does |
 |---|---|
 | `:w` `:w <path>` | write |
-| `:q` `:q!` | quit, refusing if there are unsaved changes unless forced |
-| `:wa` `:qa` `:qa!` | vim's all-buffers forms; aliases until there is more than one buffer |
+| `:q` `:q!` | close this window; from the last one, quit — refusing unsaved changes unless forced |
+| `:wa` `:qa` `:qa!` | every buffer, including ones no window is showing |
 | `:wq` `:x` | write and quit |
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
-| `:e <path>` | edit another file |
+| `:e <path>` | open another file, reusing its buffer if it is already open |
+| `:sp [path]` `:vs [path]` | split horizontally / vertically; bare, the new window duplicates this one |
+| `:close` `:only` | close this window / every other one |
+| `:bn` `:bp` | cycle the buffer list, wrapping |
+| `:b <partial>` `:b#` | switch by path substring / to the alternate buffer |
+| `:ls` `:buffers` | pick from the open buffers |
+| `:bd` `:bd!` | delete this buffer, refusing unsaved changes unless forced |
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
+
+### Windows and buffers
+
+`Ctrl-W` starts a window command; a count in front belongs to the resize forms.
+See [docs/specs/windows.md](docs/specs/windows.md).
+
+| Key | Does |
+|---|---|
+| `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
+| `Ctrl-W h j k l` | focus the window in that direction |
+| `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
+| `Ctrl-W c` `Ctrl-W q` | close this window |
+| `Ctrl-W o` | close every other window |
+| `Ctrl-W + -` `Ctrl-W < >` | taller / shorter, wider / narrower |
+| `Ctrl-W =` | equalise every pane |
+| `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
+
+Two windows may show one buffer, with their own cursor and their own scroll.
+An edit in one moves the other's cursor *with the text* rather than clamping it
+— including an undo, which reaches them through the same edit log.
+
+Closing a window discards nothing, so it never asks about unsaved changes: the
+buffer stays in the list. Deleting a buffer closes no windows either — a window
+showing it falls through to the next one.
 
 ### Line numbers
 
@@ -351,7 +382,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
    `Buffer`, so `w` and `dw` cannot drift apart. The cursor is a `Cursor` value
    rather than a field for the same reason an operator needs to ask where a
    motion *would* land without going there — and it is the shape visual mode
-   (anchor + head) and split windows (one per view) will need.
+   (anchor + head) and split windows (one per view) needed — and both now use.
 4. **Registers are a ring, not named slots.** Vim makes you pick one of 36
    slots at yank time, which is the wrong moment — you rarely know yet whether
    a thing is worth keeping. Every `y`/`d`/`c`/`x` captures automatically into
@@ -385,7 +416,11 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - Display width counts chars, so CJK and combining chars misalign the cursor.
   Needs `unicode-width` and a grapheme walk.
 - No horizontal scrolling — long lines clip.
-- Single buffer, no window splits.
+- No moving a window around the tree (`Ctrl-W x` / `r` / `H J K L`), and no tab
+  pages. The split tree is the shape that would carry both.
+- `'number'` is session-wide where vim scopes it per window — one pane numbered
+  and its neighbour not is waiting on the config language, like every other
+  option. See [docs/specs/windows.md](docs/specs/windows.md).
 - No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
   `docs/specs/registers.md`.
 - Rust is the only grammar. Adding one is a line in `syntax.rs`, but each is a
@@ -429,13 +464,14 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 
 ## Next
 
-LSP, which hangs off the same `pending_edits` drain that tree-sitter now uses —
-`Editor::sync_syntax` is where `textDocument/didChange` goes. Before that, the
-config-language decision (RECOMMENDATION.md, "what actually bites you" #1) is
-still unmade and still cheap: the keymap in `input.rs` and the highlight table
-in `tui/render.rs` are both waiting for it.
+LSP, which hangs off the same `pending_edits` drain that tree-sitter and the
+window fixup now share — `Editor::settle` is where `textDocument/didChange`
+goes. Before that, the config-language decision (RECOMMENDATION.md, "what
+actually bites you" #1) is still unmade and getting less cheap: the keymap in
+`input.rs`, the highlight table in `tui/render.rs` and now `'number'`'s scope
+are all waiting for it.
 
-Previously, on tree-sitter: `pending_edits`
-feeds `Tree::edit` + `Parser::parse` with the old tree; highlight queries then
-map to styles in `tui/render.rs`. Deliberately *not* yet: a config language or a plugin
-system.
+Previously, on windows: `Editor` became a session holding a buffer list and a
+tree of windows, with the editing commands moved onto a `View` that binds one
+buffer and one window for the length of a command. Deliberately *not* yet: a
+config language or a plugin system.
