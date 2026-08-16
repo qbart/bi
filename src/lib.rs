@@ -26,3 +26,4 @@ pub mod picker;
 pub mod registers;
 pub mod selection;
 pub mod syntax;
+pub mod window;

@@ -122,6 +122,7 @@ const LIB_MODULES: &[&str] = &[
     "registers.rs",
     "selection.rs",
     "syntax.rs",
+    "window.rs",
 ];
 
 /// A lib and a bin in one package share a dependency list, so the compiler will

@@ -84,6 +84,14 @@ fn class_of(c: char) -> CharClass {
     }
 }
 
+/// A buffer's identity within a session, stable across deletions.
+///
+/// Handed out monotonically and never reused. `:bd` in the middle of the list
+/// must not silently repoint every window one file to the left, which is
+/// exactly what an index into a `Vec` would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BufferId(pub u32);
+
 pub struct Buffer {
     rope: Rope,
     pub path: Option<PathBuf>,
