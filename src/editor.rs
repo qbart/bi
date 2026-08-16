@@ -1490,10 +1490,14 @@ impl Editor {
         let name = cmd.trim_end_matches('!');
 
         match name {
-            "w" | "write" => {
+            // The `a` forms mean "every buffer" in vim. There is one buffer
+            // here, so they are aliases — kept because the fingers that type
+            // `:wa` type it everywhere, and they will still be right when a
+            // buffer list exists.
+            "w" | "write" | "wa" | "wall" => {
                 self.write(arg);
             }
-            "q" | "quit" => self.quit(force),
+            "q" | "quit" | "qa" | "qall" => self.quit(force),
             "e" | "edit" => self.edit(arg, force),
             "noh" | "nohl" | "nohlsearch" => self.highlight_search = false,
             "wq" | "x" => {
@@ -1987,6 +1991,9 @@ mod tests {
         fn write(&self, text: &str) {
             std::fs::write(&self.0, text).unwrap();
         }
+        fn read(&self) -> String {
+            std::fs::read_to_string(&self.0).unwrap()
+        }
         fn path(&self) -> &str {
             self.0.to_str().unwrap()
         }
@@ -2115,6 +2122,36 @@ mod tests {
         ex(&mut ed, "e");
         assert!(!ed.status.is_empty(), "should say something");
         assert_eq!(ed.buffer.rope().to_string(), "scratch");
+    }
+
+    #[test]
+    fn qa_and_wa_are_the_all_buffers_forms_of_q_and_w() {
+        let f = Scratch::new("all.txt", "text\n");
+        let mut ed = opened(&f);
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ex(&mut ed, "qa");
+        assert!(!ed.quit, "unsaved changes refuse `:qa` as they refuse `:q`");
+
+        ex(&mut ed, "wa");
+        assert_eq!(f.read(), "Xtext\n");
+        assert!(!ed.buffer.is_modified());
+
+        ex(&mut ed, "qall");
+        assert!(ed.quit);
+    }
+
+    #[test]
+    fn qa_bang_discards_like_q_bang() {
+        let f = Scratch::new("force.txt", "text\n");
+        let mut ed = opened(&f);
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ex(&mut ed, "qa!");
+        assert!(ed.quit);
+        assert_eq!(f.read(), "text\n", "and the file is untouched");
     }
 
     // ---- commands across several selections --------------------------------

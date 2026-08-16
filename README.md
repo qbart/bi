@@ -255,6 +255,7 @@ afterwards repeats it.
 |---|---|
 | `:w` `:w <path>` | write |
 | `:q` `:q!` | quit, refusing if there are unsaved changes unless forced |
+| `:wa` `:qa` `:qa!` | vim's all-buffers forms; aliases until there is more than one buffer |
 | `:wq` `:x` | write and quit |
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
 | `:e <path>` | edit another file |
