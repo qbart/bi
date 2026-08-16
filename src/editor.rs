@@ -264,6 +264,12 @@ pub enum Action {
     CommandBackspace,
     CommandExecute,
     CommandCancel,
+
+    /// Changes which buffer the focused window shows, or the list itself.
+    ///
+    /// Handled by `Editor` before a `View` is built, because a view borrows
+    /// from the very list these change.
+    Buffer(BufferCmd),
 }
 
 impl Action {
@@ -502,6 +508,54 @@ struct BufferEntry {
     /// whoever drains it destroys it for the others. Putting the tree on
     /// `Buffer` would move the drain inside the buffer and break that.
     syntax: Option<Syntax>,
+    /// Where the last window to leave this buffer was looking.
+    ///
+    /// Without it, cycling forward and back through three files loses your
+    /// place in all of them, which makes buffer cycling something you use
+    /// once. When two windows show one buffer, the last to leave is what this
+    /// remembers — there is no better answer, and it costs nothing to say
+    /// which one wins.
+    last: Cursors,
+}
+
+/// A command that reaches past the view it was typed in.
+///
+/// `View` borrows the buffer and the window from the lists these commands
+/// change, so they cannot run inside one. `View::run_ex` hands them back and
+/// `Editor::apply` runs them once the view is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Escalation {
+    /// `:e <path>` — edits another file. Bare `:e` reloads, which a view can
+    /// do on its own.
+    Edit {
+        path: String,
+        force: bool,
+    },
+    Buffer(BufferCmd),
+    /// `:qa` — every buffer has to agree, not just this one.
+    QuitAll {
+        force: bool,
+    },
+    /// `:wa` — writes every modified buffer.
+    WriteAll,
+}
+
+/// Which buffer a window should show, and what to do to the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferCmd {
+    Next,
+    Prev,
+    /// `Ctrl-^` / `:b#`.
+    Alternate,
+    /// `:b <partial>` — matched against the path.
+    Named(String),
+    /// `:ls` — the picker over the list.
+    List,
+    /// A row accepted from that picker, as a position in the list.
+    Chosen(usize),
+    Delete {
+        force: bool,
+    },
 }
 
 /// The session: every open buffer, every window onto them, and the state that
@@ -511,6 +565,7 @@ pub struct Editor {
     windows: Vec<Window>,
     layout: Layout,
     focus: WindowId,
+    next_buffer: u32,
     pub session: Session,
 }
 
@@ -595,10 +650,16 @@ impl Editor {
     fn with_buffer(buffer: Buffer) -> Self {
         let (buffer_id, window_id) = (BufferId(0), WindowId(0));
         Self {
-            buffers: vec![BufferEntry { id: buffer_id, syntax: syntax_for(&buffer), buffer }],
+            buffers: vec![BufferEntry {
+                id: buffer_id,
+                syntax: syntax_for(&buffer),
+                buffer,
+                last: Vec::new(),
+            }],
             windows: vec![Window::new(window_id, buffer_id)],
             layout: Layout::new(window_id),
             focus: window_id,
+            next_buffer: 1,
             session: Session::default(),
         }
     }
@@ -689,6 +750,260 @@ impl Editor {
         self.view(self.focus)
     }
 
+    // ---- the buffer list ----------------------------------------------------
+
+    /// Every open buffer, in the order they were opened.
+    ///
+    /// That order is vim's buffer numbering without the numbers: what `:bn`
+    /// walks and what the picker lists.
+    pub fn buffer_ids(&self) -> Vec<BufferId> {
+        self.buffers.iter().map(|b| b.id).collect()
+    }
+
+    /// A buffer's name for the status line and the picker.
+    pub fn name_of(&self, id: BufferId) -> String {
+        self.buffers
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.buffer.path.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "[No Name]".into())
+    }
+
+    pub fn is_modified(&self, id: BufferId) -> bool {
+        self.buffers.iter().find(|b| b.id == id).is_some_and(|b| b.buffer.is_modified())
+    }
+
+    fn fresh_buffer_id(&mut self) -> BufferId {
+        let id = BufferId(self.next_buffer);
+        self.next_buffer += 1;
+        id
+    }
+
+    /// The buffer for `path`, opening the file only if it is not already open.
+    ///
+    /// Reuse is not an optimisation: two live ropes over one path would let a
+    /// window edit text another window cannot see, and one of them would win
+    /// on the next `:w`.
+    fn open_path(&mut self, path: &str) -> Result<BufferId> {
+        let wanted = std::path::Path::new(path);
+        if let Some(entry) = self.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(wanted))
+        {
+            return Ok(entry.id);
+        }
+        let buffer = Buffer::open(path)?;
+        let id = self.fresh_buffer_id();
+        self.buffers.push(BufferEntry {
+            id,
+            syntax: syntax_for(&buffer),
+            buffer,
+            last: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    /// Points a window at another buffer, saving where it was and restoring
+    /// where it last was in the one it is entering.
+    fn show(&mut self, window: WindowId, to: BufferId) {
+        let Some(from) = self.window_of(window).map(|w| w.buffer) else { return };
+        if from == to {
+            return;
+        }
+
+        let leaving = self.window_of(window).map(|w| w.selections.as_pairs()).unwrap_or_default();
+        self.entry_mut(from).last = leaving;
+
+        // Clamped, because the file may have been edited from another window
+        // since this one last looked at it — and unlike a live window, there
+        // was nothing here to shift through those edits.
+        let len = self.entry(to).buffer.rope().len_chars();
+        let last: Cursors = self
+            .entry(to)
+            .last
+            .iter()
+            .map(|&(anchor, head)| (anchor.min(len), head.min(len)))
+            .collect();
+
+        let window = self.window_mut_of(window).expect("checked above");
+        window.alt = Some(from);
+        window.buffer = to;
+        window.scroll = 0;
+        window.selections =
+            if last.is_empty() { Selections::default() } else { Selections::from_pairs(last) };
+    }
+
+    fn run_buffer_cmd(&mut self, cmd: BufferCmd) {
+        let focus = self.focus;
+        let ids = self.buffer_ids();
+        let current = self.window().buffer;
+        let at = ids.iter().position(|&id| id == current).unwrap_or(0);
+
+        let target = match cmd {
+            BufferCmd::Next => Some(ids[(at + 1) % ids.len()]),
+            BufferCmd::Prev => Some(ids[(at + ids.len() - 1) % ids.len()]),
+            BufferCmd::Alternate => match self.window().alt {
+                Some(alt) if ids.contains(&alt) => Some(alt),
+                _ => {
+                    self.session.status = "no alternate buffer".into();
+                    None
+                }
+            },
+            BufferCmd::Chosen(i) => ids.get(i).copied(),
+            BufferCmd::Named(ref partial) => {
+                let hits: Vec<BufferId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.name_of(id).contains(partial.as_str()))
+                    .collect();
+                match hits.len() {
+                    1 => Some(hits[0]),
+                    0 => {
+                        self.session.status = format!("no buffer matching \"{partial}\"");
+                        None
+                    }
+                    // Names them rather than guessing: picking one of several
+                    // would silently open the wrong file.
+                    _ => {
+                        let names: Vec<String> = hits.iter().map(|&id| self.name_of(id)).collect();
+                        self.session.status =
+                            format!("more than one buffer matches: {}", names.join(", "));
+                        None
+                    }
+                }
+            }
+            BufferCmd::List => {
+                self.open_buffer_picker();
+                None
+            }
+            BufferCmd::Delete { force } => {
+                self.delete_buffer(current, force);
+                None
+            }
+        };
+
+        if let Some(target) = target {
+            self.show(focus, target);
+            self.session.status = self.name_of(target);
+        }
+    }
+
+    /// Removes a buffer from the list, leaving every window open.
+    ///
+    /// Deleting a file should not rearrange the screen: a window showing the
+    /// deleted buffer falls to the next one in the list instead of closing.
+    fn delete_buffer(&mut self, id: BufferId, force: bool) {
+        if self.is_modified(id) && !force {
+            self.session.status = "unsaved changes (use `:bd!` to discard)".into();
+            return;
+        }
+
+        let ids = self.buffer_ids();
+        let at = ids.iter().position(|&b| b == id).unwrap_or(0);
+        let name = self.name_of(id);
+
+        // The list is never empty: deleting the last buffer leaves a fresh one
+        // in its place, so `Editor::buffer()` is always valid and no path has
+        // to handle a session with nothing open.
+        let heir = if ids.len() == 1 {
+            let fresh = self.fresh_buffer_id();
+            let buffer = Buffer::empty();
+            self.buffers.push(BufferEntry {
+                id: fresh,
+                syntax: syntax_for(&buffer),
+                buffer,
+                last: Vec::new(),
+            });
+            fresh
+        } else {
+            ids[(at + 1) % ids.len()]
+        };
+
+        for window in 0..self.windows.len() {
+            if self.windows[window].buffer == id {
+                let w = self.windows[window].id;
+                self.show(w, heir);
+            }
+            // A stable id that resolves to nothing is the one way it is worse
+            // than an index, which at least fails loudly.
+            if self.windows[window].alt == Some(id) {
+                self.windows[window].alt = None;
+            }
+        }
+
+        self.buffers.retain(|b| b.id != id);
+        self.session.status = format!("\"{name}\" deleted");
+    }
+
+    fn open_buffer_picker(&mut self) {
+        let items = self
+            .buffer_ids()
+            .into_iter()
+            .map(|id| Item { text: self.name_of(id), badge: self.is_modified(id).then_some('+') })
+            .collect();
+        self.session.picker = Some(Picker::new(PickerKind::Buffer, items));
+        self.session.mode = Mode::Pick;
+    }
+
+    /// Runs what a view handed back because it could not run it itself.
+    fn escalate(&mut self, escalation: Escalation) {
+        match escalation {
+            Escalation::Buffer(cmd) => self.run_buffer_cmd(cmd),
+            Escalation::Edit { path, force } => {
+                let modified = self.buffer().is_modified();
+                // No longer refuses on unsaved changes: the old buffer goes
+                // hidden with its history and its modified flag intact, so
+                // nothing is discarded. Bare `:e` — reload from disk — still
+                // refuses, and is handled in the view.
+                let _ = (modified, force);
+                match self.open_path(&path) {
+                    Ok(id) => {
+                        let focus = self.focus;
+                        self.show(focus, id);
+                        self.session.status = format!("\"{}\" loaded", self.name_of(id));
+                    }
+                    Err(e) => self.session.status = format!("{e:#}"),
+                }
+            }
+            Escalation::QuitAll { force } => {
+                let unsaved = self.buffers.iter().find(|b| b.buffer.is_modified()).map(|b| b.id);
+                match unsaved {
+                    Some(id) if !force => {
+                        self.session.status =
+                            format!("\"{}\" has unsaved changes (use `:qa!`)", self.name_of(id));
+                    }
+                    _ => self.session.quit = true,
+                }
+            }
+            Escalation::WriteAll => {
+                let ids: Vec<BufferId> = self
+                    .buffers
+                    .iter()
+                    .filter(|b| b.buffer.is_modified() && b.buffer.path.is_some())
+                    .map(|b| b.id)
+                    .collect();
+                if ids.is_empty() {
+                    self.session.status = "nothing to write".into();
+                    return;
+                }
+                let mut written = 0;
+                for id in &ids {
+                    let entry = self.entry_mut(*id);
+                    // No selections to record for a buffer nobody is looking
+                    // at, and the ones for a buffer in view have not moved.
+                    let pairs = entry.last.clone();
+                    match entry.buffer.save(pairs.clone(), pairs) {
+                        Ok(()) => written += 1,
+                        Err(e) => {
+                            self.session.status = format!("error: {e:#}");
+                            return;
+                        }
+                    }
+                }
+                self.session.status = format!("{written} written");
+            }
+        }
+    }
+
     // ---- what the frontend and embedders call -------------------------------
 
     /// Lays the window tree out in `area` and returns one rect per window, in
@@ -711,8 +1026,21 @@ impl Editor {
         self.view(id).scroll_to_cursor(height);
     }
 
+    /// Runs a command against the focused window.
+    ///
+    /// Two entry points, both explicit. Commands that change the buffer list or
+    /// the window tree are matched here, *before* a view exists, because a view
+    /// borrows from what they change. Everything else goes through the view,
+    /// which hands back anything it discovered mid-flight — an ex line is only
+    /// read once it is already running inside one.
     pub fn apply(&mut self, cmd: Command) {
-        self.focused().apply(cmd);
+        if let Action::Buffer(buffer_cmd) = cmd.action {
+            self.run_buffer_cmd(buffer_cmd);
+            return;
+        }
+        if let Some(escalation) = self.focused().apply(cmd) {
+            self.escalate(escalation);
+        }
     }
 
     /// Drains each buffer's edit log into its parse tree. Called once per key,
@@ -763,7 +1091,9 @@ impl Editor {
 
     #[cfg(test)]
     fn run_ex(&mut self, line: &str) {
-        self.focused().run_ex(line);
+        if let Some(escalation) = self.focused().run_ex(line) {
+            self.escalate(escalation);
+        }
     }
 }
 
@@ -774,19 +1104,22 @@ impl View<'_> {
         *self.syntax = syntax_for(self.buffer);
     }
 
-    pub fn apply(&mut self, cmd: Command) {
+    /// Returns anything the command turned out to need the session for — an ex
+    /// line is only read once it is already running in here.
+    pub fn apply(&mut self, cmd: Command) -> Option<Escalation> {
         if let Action::RepeatChange { count } = cmd.action {
             self.session.search_focus = false;
             self.repeat_change(count);
-            return;
+            return None;
         }
         if self.session.undo_from.is_empty() {
             self.session.undo_from = self.window.selections.as_pairs();
         }
         self.record(&cmd);
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
+        let mut escalation = None;
         for _ in 0..n {
-            self.apply_once(&cmd.action);
+            escalation = self.apply_once(&cmd.action).or(escalation);
         }
         // Decided per command rather than inside the search actions, because
         // what ends it is *anything else* — one place to say so, and no way
@@ -809,6 +1142,7 @@ impl View<'_> {
             let after = self.window.selections.as_pairs();
             self.buffer.commit_undo(std::mem::take(&mut self.session.undo_from), after);
         }
+        escalation
     }
 
     /// Notes what `.` would replay.
@@ -1012,11 +1346,13 @@ impl View<'_> {
 
         self.session.replaying = true;
 
+        // Nothing `.` can replay escalates: a change is text, and the commands
+        // that reach the session are not recorded as one.
         match change.extent {
             // A visual operator repeats over the same extent from here, since
             // there is no selection any more.
             Some(extent) => self.repeat_over(&change, extent),
-            None => self.apply(change.command.clone()),
+            None => drop(self.apply(change.command.clone())),
         }
         for action in &change.typed {
             self.apply(Command { count: 1, action: action.clone() });
@@ -1171,12 +1507,15 @@ impl View<'_> {
         }
     }
 
-    fn apply_once(&mut self, action: &Action) {
+    fn apply_once(&mut self, action: &Action) -> Option<Escalation> {
         let eol = self.session.mode.allows_eol();
+        // Only the two arms that reach past this view set it; every other arm
+        // is a statement, which is what keeps the dispatch table readable.
+        let mut escalation = None;
 
         match action {
             Action::Move(m) => {
-                let Some(m) = self.resolve_find(*m) else { return };
+                let m = self.resolve_find(*m)?;
                 // `$` in a block is a ragged right edge rather than a column,
                 // and any other motion gives the edge back to the head.
                 if self.session.mode.visual() == Some(VisualKind::Block) {
@@ -1195,7 +1534,7 @@ impl View<'_> {
                 });
             }
             Action::Operate { op, target, count, sink } => {
-                let Some(target) = self.resolve_find_target(*target) else { return };
+                let target = self.resolve_find_target(*target)?;
                 let (op, count, sink) = (*op, *count, *sink);
                 self.for_each_selection(|ed, sel| {
                     match ed.buffer.operate(sel.head, op, target, count) {
@@ -1217,7 +1556,7 @@ impl View<'_> {
                 // entry is still owned by the ring.
                 let Some(entry) = self.session.registers.front().cloned() else {
                     self.session.status = "nothing to paste".into();
-                    return;
+                    return None;
                 };
                 let (before, count) = (*before, *count);
                 self.for_each_selection(|ed, sel| {
@@ -1254,7 +1593,7 @@ impl View<'_> {
                 }
             }
             Action::PickCancel => self.close_picker(),
-            Action::PickAccept => self.accept_pick(),
+            Action::PickAccept => escalation = self.accept_pick(),
 
             Action::EnterInsert => self.session.mode = Mode::Insert,
             Action::EnterInsertAfter => {
@@ -1405,7 +1744,7 @@ impl View<'_> {
                     // Every row was too short for `I`. Nothing to insert into.
                     self.session.mode = Mode::Normal;
                     self.session.status = "no line reaches the block".into();
-                    return;
+                    return None;
                 }
                 self.window.selections.set(cursors.into_iter().map(Selection::collapsed).collect());
             }
@@ -1482,7 +1821,7 @@ impl View<'_> {
                         Some(range) => range,
                         None => {
                             self.session.status = "no word under the cursor".into();
-                            return;
+                            return None;
                         }
                     }
                 } else {
@@ -1492,11 +1831,11 @@ impl View<'_> {
                 let needle = self.buffer.slice(start, end);
                 let Some(found) = self.buffer.find_next(primary.head.at, &needle) else {
                     self.session.status = format!("no more matches for \"{needle}\"");
-                    return;
+                    return None;
                 };
                 if found == start {
                     self.session.status = "only one match".into();
-                    return;
+                    return None;
                 }
                 let width = needle.chars().count();
                 // A selection with room in it is only meaningful in visual
@@ -1517,7 +1856,7 @@ impl View<'_> {
                 let target = if *below { row + 1 } else { row.wrapping_sub(1) };
                 if *below && target >= self.buffer.line_count() || !*below && row == 0 {
                     self.session.status = "no line there".into();
-                    return;
+                    return None;
                 }
                 // Keeps the column, which is what makes a column of cursors.
                 let col = self.buffer.col_at(primary.head);
@@ -1561,7 +1900,7 @@ impl View<'_> {
                 self.session.replaced.push(overwritten);
             }
             Action::ReplaceBackspace => {
-                let Some(overwritten) = self.session.replaced.pop() else { return };
+                let overwritten = self.session.replaced.pop()?;
                 let mut i = 0;
                 self.for_each_selection(|ed, sel| {
                     let original = overwritten.get(i).copied().flatten();
@@ -1600,14 +1939,14 @@ impl View<'_> {
             }
             Action::SearchCancel => self.cancel_search(),
             Action::SearchExecute => {
-                let Mode::Search { query, forward } = &self.session.mode else { return };
+                let Mode::Search { query, forward } = &self.session.mode else { return None };
                 let (query, forward) = (query.clone(), *forward);
                 self.session.mode = Mode::Normal;
                 if query.is_empty() {
                     // A bare `/` repeats the last pattern, as in vim.
                     if self.session.last_search.is_none() {
                         self.session.pending_search_op = None;
-                        return;
+                        return None;
                     }
                 } else {
                     self.session.last_search =
@@ -1619,7 +1958,7 @@ impl View<'_> {
                 let at = self.window.selections.cursor();
                 let Some((start, end)) = self.buffer.word_at(at) else {
                     self.session.status = "no word under the cursor".into();
-                    return;
+                    return None;
                 };
                 self.session.last_search = Some(Search {
                     pattern: self.buffer.slice(start, end),
@@ -1655,12 +1994,16 @@ impl View<'_> {
             Action::CommandExecute => {
                 let line = match &self.session.mode {
                     Mode::Command(line) => line.clone(),
-                    _ => return,
+                    _ => return None,
                 };
                 self.session.mode = Mode::Normal;
-                self.run_ex(&line);
+                escalation = self.run_ex(&line);
             }
+
+            // Handled by `Editor` before this view was built.
+            Action::Buffer(_) => {}
         }
+        escalation
     }
 
     /// Puts back the selections a revision recorded.
@@ -1823,32 +2166,38 @@ impl View<'_> {
         self.session.mode = Mode::Normal;
     }
 
-    fn accept_pick(&mut self) {
+    fn accept_pick(&mut self) -> Option<Escalation> {
         let picker = self.session.picker.take();
         self.session.mode = Mode::Normal;
-        let Some(picker) = picker else { return };
-        let Some(entry) = picker.selected().and_then(|i| self.session.registers.get(i)).cloned()
-        else {
-            return;
-        };
+        let picker = picker?;
+        let chosen = picker.selected()?;
         match picker.kind {
             PickerKind::Register { before } => {
+                let entry = self.session.registers.get(chosen).cloned()?;
                 // Push before pasting: move-to-front makes this the ring's head,
                 // so `.` and a later bare `p` repeat the entry you chose rather
                 // than whatever happened to be most recent.
                 self.session.registers.push(entry.clone());
                 let landed = self.buffer.paste(self.window.selections.cursor(), &entry, before, 1);
                 self.window.selections = Selections::single(landed);
+                None
             }
+            // The ring is right here; the buffer list is not. Escalates for the
+            // same reason `:b` does.
+            //
+            // A position rather than an id because the rows were built from the
+            // list in order, and the list cannot change while the picker holds
+            // every key.
+            PickerKind::Buffer => Some(Escalation::Buffer(BufferCmd::Chosen(chosen))),
         }
     }
 
     /// The `:` commands. Deliberately tiny — this is not where the editor gets
     /// interesting, and a real command table wants the config layer first.
-    fn run_ex(&mut self, line: &str) {
+    fn run_ex(&mut self, line: &str) -> Option<Escalation> {
         let line = line.trim();
         if line.is_empty() {
-            return;
+            return None;
         }
 
         let (cmd, arg) = match line.split_once(char::is_whitespace) {
@@ -1859,15 +2208,33 @@ impl View<'_> {
         let name = cmd.trim_end_matches('!');
 
         match name {
-            // The `a` forms mean "every buffer" in vim. There is one buffer
-            // here, so they are aliases — kept because the fingers that type
-            // `:wa` type it everywhere, and they will still be right when a
-            // buffer list exists.
-            "w" | "write" | "wa" | "wall" => {
+            "w" | "write" => {
                 self.write(arg);
             }
-            "q" | "quit" | "qa" | "qall" => self.quit(force),
-            "e" | "edit" => self.edit(arg, force),
+            // The `a` forms mean "every buffer", which they now genuinely do.
+            "wa" | "wall" => return Some(Escalation::WriteAll),
+            "qa" | "qall" => return Some(Escalation::QuitAll { force }),
+            "q" | "quit" => self.quit(force),
+            // Bare `:e` reloads this buffer, which is a view's own business.
+            // With a path it changes which buffer the window shows, which is
+            // the session's.
+            "e" | "edit" if arg.is_empty() => self.edit(force),
+            "e" | "edit" => return Some(Escalation::Edit { path: arg.into(), force }),
+            "bn" | "bnext" => return Some(Escalation::Buffer(BufferCmd::Next)),
+            "bp" | "bprev" | "bprevious" => return Some(Escalation::Buffer(BufferCmd::Prev)),
+            "bd" | "bdelete" => return Some(Escalation::Buffer(BufferCmd::Delete { force })),
+            "ls" | "buffers" => return Some(Escalation::Buffer(BufferCmd::List)),
+            "b" | "buffer" => {
+                let cmd = match arg {
+                    "" => {
+                        self.session.status = "which buffer?".into();
+                        return None;
+                    }
+                    "#" => BufferCmd::Alternate,
+                    partial => BufferCmd::Named(partial.into()),
+                };
+                return Some(Escalation::Buffer(cmd));
+            }
             "noh" | "nohl" | "nohlsearch" => self.session.highlight_search = false,
             // Off by default, because a plain `/` in vim does not light up the
             // buffer. The count in the status line is what a search owes you.
@@ -1887,6 +2254,7 @@ impl View<'_> {
                 }
             }
         }
+        None
     }
 
     /// `:set <option> <value>`, or `:set <option>=<value>` — vim's spelling,
@@ -1946,29 +2314,22 @@ impl View<'_> {
         }
     }
 
-    /// `:e` reloads, `:e!` reloads discarding changes, `:e <path>` edits
-    /// another file.
+    /// `:e` reloads this buffer from disk; `:e!` reloads discarding changes.
     ///
-    /// The parse tree has to be rebuilt rather than patched: it belongs to text
-    /// that no longer exists, and `<path>` can change the language outright.
-    fn edit(&mut self, path: &str, force: bool) {
+    /// Still refuses when the buffer is modified, unlike `:e <path>`: this one
+    /// genuinely throws work away, where opening another file merely hides
+    /// this one.
+    ///
+    /// The parse tree has to be rebuilt rather than patched — it belongs to
+    /// text that no longer exists.
+    fn edit(&mut self, force: bool) {
         if self.buffer.is_modified() && !force {
             self.session.status = "unsaved changes (use `:e!` to discard)".into();
             return;
         }
 
         let at = self.window.selections.cursor();
-        let result = if path.is_empty() {
-            self.buffer.reload(at)
-        } else {
-            Buffer::open(path).map(|buf| {
-                *self.buffer = buf;
-                // A different file, so the old position means nothing.
-                Cursor::default()
-            })
-        };
-
-        match result {
+        match self.buffer.reload(at) {
             Ok(cursor) => {
                 self.window.selections = Selections::single(cursor);
                 self.reload_syntax();
@@ -2600,6 +2961,239 @@ mod tests {
 
         ex(&mut ed, "qall");
         assert!(ed.session.quit);
+    }
+
+    /// The point of the `a` forms, now that they are not aliases: they answer
+    /// for buffers no window is showing.
+    #[test]
+    fn qa_and_wa_reach_a_buffer_nobody_is_looking_at() {
+        let a = Scratch::new("qa_a.txt", "a\n");
+        let b = Scratch::new("qa_b.txt", "b\n");
+        let mut ed = opened(&a);
+
+        // Dirty the first buffer, then move the only window off it.
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.buffer().rope().to_string(), "b\n", "looking at the second file");
+
+        ex(&mut ed, "qa");
+        assert!(!ed.session.quit, "the hidden buffer still has unsaved changes");
+        assert!(
+            ed.session.status.contains("qa_a.txt"),
+            "and `:qa` names it: {}",
+            ed.session.status
+        );
+
+        ex(&mut ed, "wa");
+        assert_eq!(a.read(), "Xa\n", "`:wa` wrote the buffer no window is showing");
+
+        ex(&mut ed, "qa");
+        assert!(ed.session.quit);
+    }
+
+    // ---- the buffer list ---------------------------------------------------
+
+    #[test]
+    fn e_on_an_open_path_reuses_the_buffer_rather_than_loading_it_twice() {
+        let a = Scratch::new("reuse_a.txt", "a\n");
+        let b = Scratch::new("reuse_b.txt", "b\n");
+        let mut ed = opened(&a);
+
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.buffer_ids().len(), 2);
+
+        ex(&mut ed, &format!("e {}", a.path()));
+        assert_eq!(ed.buffer_ids().len(), 2, "back to the first, not a third copy of it");
+        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+    }
+
+    /// Two live ropes over one path is the bug reuse exists to prevent: an edit
+    /// made through one would be invisible to the other, and `:w` would pick a
+    /// winner.
+    #[test]
+    fn a_reused_buffer_keeps_the_edits_made_in_it() {
+        let a = Scratch::new("keep_a.txt", "a\n");
+        let b = Scratch::new("keep_b.txt", "b\n");
+        let mut ed = opened(&a);
+
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+        ex(&mut ed, &format!("e {}", b.path()));
+        ex(&mut ed, &format!("e {}", a.path()));
+
+        assert_eq!(ed.buffer().rope().to_string(), "Xa\n");
+        assert!(ed.buffer().is_modified(), "and it is still dirty");
+    }
+
+    #[test]
+    fn e_with_a_path_no_longer_refuses_over_unsaved_changes() {
+        let a = Scratch::new("hide_a.txt", "a\n");
+        let b = Scratch::new("hide_b.txt", "b\n");
+        let mut ed = opened(&a);
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        // Nothing is discarded — the old buffer goes hidden, dirty and intact.
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.buffer().rope().to_string(), "b\n");
+
+        // But a reload still throws work away, so it still refuses.
+        ex(&mut ed, &format!("e {}", a.path()));
+        ex(&mut ed, "e");
+        assert_eq!(ed.buffer().rope().to_string(), "Xa\n", "`:e` refused");
+        assert!(ed.session.status.contains("unsaved"));
+    }
+
+    #[test]
+    fn bn_and_bp_cycle_the_list_and_wrap() {
+        let a = Scratch::new("cyc_a.txt", "a\n");
+        let b = Scratch::new("cyc_b.txt", "b\n");
+        let c = Scratch::new("cyc_c.txt", "c\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+        ex(&mut ed, &format!("e {}", c.path()));
+
+        let text = |ed: &Editor| ed.buffer().rope().to_string();
+        assert_eq!(text(&ed), "c\n");
+
+        ex(&mut ed, "bn");
+        assert_eq!(text(&ed), "a\n", "past the end and round to the front");
+        ex(&mut ed, "bp");
+        assert_eq!(text(&ed), "c\n", "and back the other way");
+        ex(&mut ed, "bp");
+        assert_eq!(text(&ed), "b\n");
+    }
+
+    #[test]
+    fn cycling_away_and_back_keeps_your_place() {
+        let a = Scratch::new("place_a.txt", "one\ntwo\nthree\nfour\n");
+        let b = Scratch::new("place_b.txt", "b\n");
+        let mut ed = opened(&a);
+
+        let at = ed.buffer().at_row(2, false);
+        ed.set_cursor(at);
+        assert_eq!(ed.cursor_row(), 2);
+
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.cursor_row(), 0, "a different file, so a different place");
+
+        ex(&mut ed, "bp");
+        assert_eq!(ed.cursor_row(), 2, "back where we were reading");
+    }
+
+    #[test]
+    fn ctrl_caret_swaps_between_the_last_two() {
+        let a = Scratch::new("alt_a.txt", "a\n");
+        let b = Scratch::new("alt_b.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.buffer().rope().to_string(), "b\n", "and back — it is a swap");
+    }
+
+    #[test]
+    fn b_with_a_partial_path_matches_one_buffer_or_says_which() {
+        let a = Scratch::new("uniq_alpha.txt", "a\n");
+        let b = Scratch::new("uniq_beta.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        ex(&mut ed, "b alpha");
+        assert_eq!(ed.buffer().rope().to_string(), "a\n");
+
+        // Both paths contain "uniq_", so this is ambiguous and must not guess.
+        ex(&mut ed, "b uniq_");
+        assert_eq!(ed.buffer().rope().to_string(), "a\n", "stayed put");
+        assert!(ed.session.status.contains("more than one"), "{}", ed.session.status);
+
+        ex(&mut ed, "b nowhere");
+        assert!(ed.session.status.contains("no buffer matching"));
+    }
+
+    #[test]
+    fn bd_falls_through_to_the_next_buffer_without_closing_anything() {
+        let a = Scratch::new("del_a.txt", "a\n");
+        let b = Scratch::new("del_b.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        ex(&mut ed, "bd");
+        assert_eq!(ed.buffer_ids().len(), 1);
+        assert_eq!(ed.buffer().rope().to_string(), "a\n", "the window fell to the next one");
+    }
+
+    #[test]
+    fn bd_refuses_over_unsaved_changes_until_forced() {
+        let f = Scratch::new("del_dirty.txt", "text\n");
+        let mut ed = opened(&f);
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ex(&mut ed, "bd");
+        assert_eq!(ed.buffer().rope().to_string(), "Xtext\n", "still here");
+        assert!(ed.session.status.contains("unsaved"));
+
+        ex(&mut ed, "bd!");
+        assert_eq!(ed.buffer().rope().to_string(), "", "discarded for a fresh buffer");
+    }
+
+    /// The list is never empty, so `Editor::buffer()` is always valid and no
+    /// path has to handle a session with nothing open.
+    #[test]
+    fn deleting_the_last_buffer_leaves_a_fresh_one() {
+        let f = Scratch::new("last.txt", "text\n");
+        let mut ed = opened(&f);
+
+        ex(&mut ed, "bd");
+        assert_eq!(ed.buffer_ids().len(), 1);
+        assert_eq!(ed.buffer().rope().to_string(), "");
+        assert_eq!(ed.buffer().path, None, "and it is a no-name buffer");
+    }
+
+    /// A stable id that resolves to nothing is the one way it is worse than an
+    /// index, which at least fails loudly.
+    #[test]
+    fn deleting_a_buffer_clears_it_from_the_alternate_slot() {
+        let a = Scratch::new("dangle_a.txt", "a\n");
+        let b = Scratch::new("dangle_b.txt", "b\n");
+        let c = Scratch::new("dangle_c.txt", "c\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+        ex(&mut ed, &format!("e {}", c.path()));
+
+        // Alternate is b; delete it out from under the slot.
+        assert_eq!(ed.window().alt.map(|id| ed.name_of(id)), Some(b.path().to_string()));
+        ex(&mut ed, "b dangle_b");
+        ex(&mut ed, "bd");
+
+        assert!(!ed.buffer_ids().iter().any(|&id| ed.name_of(id).contains("dangle_b")));
+        assert_eq!(ed.window().alt, None, "the slot that named it was cleared");
+
+        let showing = ed.buffer().rope().to_string();
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.session.status, "no alternate buffer");
+        assert_eq!(ed.buffer().rope().to_string(), showing, "and nothing moved");
+    }
+
+    #[test]
+    fn ls_opens_the_picker_over_the_list_and_accepting_switches() {
+        let a = Scratch::new("pick_a.txt", "a\n");
+        let b = Scratch::new("pick_b.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        ex(&mut ed, "ls");
+        assert_eq!(ed.session.mode, Mode::Pick);
+        assert!(ed.session.picker.is_some());
+
+        // First row is the first buffer in the list.
+        ed.apply(cmd(Action::PickAccept));
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.buffer().rope().to_string(), "a\n");
     }
 
     #[test]

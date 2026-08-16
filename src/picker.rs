@@ -26,6 +26,12 @@ pub struct Item {
 pub enum PickerKind {
     /// `before` mirrors `p` versus `P`.
     Register { before: bool },
+    /// `:ls` over the open buffers, in list order.
+    ///
+    /// Vim prints a table you read a number out of and retype into `:b`; here
+    /// the list is the chooser, and the number vim makes you carry never has to
+    /// exist. The cost is that `:ls` has nothing to say to a script.
+    Buffer,
 }
 
 pub struct Picker {

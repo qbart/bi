@@ -9,7 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::editor::{Action, Command, Mode, VisualKind};
+use crate::editor::{Action, BufferCmd, Command, Mode, VisualKind};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
@@ -217,6 +217,9 @@ impl Input {
             KeyCode::Char('y') if ctrl => self.plain(Action::ScrollLine { down: false }),
             KeyCode::Char('d') if ctrl => self.plain(Action::ScrollHalfPage { down: true }),
             KeyCode::Char('u') if ctrl => self.plain(Action::ScrollHalfPage { down: false }),
+            // Not every terminal sends this one, which is why `:b#` exists
+            // beside it rather than only underneath it.
+            KeyCode::Char('^') if ctrl => self.plain(Action::Buffer(BufferCmd::Alternate)),
             KeyCode::Down if ctrl && key.mods.alt => {
                 self.plain(Action::AddCursorLine { below: true })
             }
@@ -682,6 +685,13 @@ mod tests {
 
     fn ctrl(c: char) -> Key {
         Key::ctrl(c)
+    }
+
+    #[test]
+    fn ctrl_caret_asks_for_the_alternate_buffer() {
+        let mut input = Input::default();
+        let cmd = input.on_key(ctrl('^'), &Mode::Normal).expect("Ctrl-^ produced no command");
+        assert_eq!(cmd.action, Action::Buffer(BufferCmd::Alternate));
     }
 
     /// Feeds `keys` and returns the one command they produce, asserting that
