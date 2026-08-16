@@ -263,7 +263,8 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         if id == focus {
             cursor_at = at;
         }
-        frame.render_widget(window_status(ed, id, id == focus, status.width), status);
+        let row = window_status(ed, id, id == focus, status.width);
+        frame.render_widget(Paragraph::new(Line::from(row)), status);
 
         // The rule in the column the layout reserved to the left of this pane.
         if rect.x > body.x {
@@ -531,44 +532,91 @@ fn render_window(
 ///
 /// Reverse-video when focused, dim when not. This is the focus indicator,
 /// which is why the panes need no borders around them.
-fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Paragraph<'static> {
+/// A root's last component, or the whole path when it has none — `/` has to
+/// be called something.
+fn name_of_root(root: &std::path::Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// The colour a mode announces itself in. One table, wherever it is drawn.
+fn mode_style(mode: &Mode) -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(match mode {
+            Mode::Insert => Color::Green,
+            Mode::Pick => Color::Magenta,
+            _ => Color::Blue,
+        })
+        .add_modifier(Modifier::BOLD)
+}
+
+/// One window's status row.
+///
+/// The focused one ends with the mode, so what you are typing and where you
+/// are typing it read as one line rather than two places on the screen. The
+/// rest is reverse-video against dim, which is the focus indicator windows.md
+/// picked instead of borders.
+fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Span<'static>> {
     let style = if focused {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Paragraph::new(Line::from(Span::styled(window_status_text(ed, id, width), style)))
+    let left = window_status_text(ed, id, focused);
+    let right = if focused { format!(" {} ", ed.session.mode.label()) } else { String::new() };
+
+    let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
+    let mut spans = vec![Span::styled(left, style), Span::styled(" ".repeat(pad), style)];
+    if focused {
+        spans.push(Span::styled(right, mode_style(&ed.session.mode)));
+    }
+    spans
 }
 
 /// Name and modified marker at the left, `row:col` pushed to the right edge.
 ///
 /// Split out for the same reason [`status_spans`] is: a `Paragraph` cannot be
 /// read back, and what the row says is the thing worth guarding.
-fn window_status_text(ed: &Editor, id: WindowId, width: u16) -> String {
-    let (left, right) = match ed.pane(id) {
+fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
+    let (name, at) = match ed.pane(id) {
         None => return String::new(),
-        // A tree names its root and counts rows, where a file names itself and
-        // counts row:col. Nothing to modify, so no modified marker.
+        // A tree counts rows where a file counts row:col, and names itself the
+        // same way a file does — by its last component. A sidebar is thirty
+        // columns wide, and a root path spends all of them being truncated
+        // into something you cannot read anyway.
         Some(Pane::Tree { tree, .. }) => (
-            format!(" {} [tree]", tree.root().display()),
-            format!("{}/{} ", tree.selected() + 1, tree.rows().len()),
+            format!("{}/ [tree]", name_of_root(tree.root())),
+            format!("{}/{}", tree.selected() + 1, tree.rows().len()),
         ),
         Some(Pane::Text { text, buffer, .. }) => {
+            // The file name, not the path. Which `main.rs` it is belongs to the
+            // picker; a pane thirty columns wide has no room to say it twice.
             let name = buffer
                 .path
                 .as_ref()
-                .map(|p| p.display().to_string())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".into());
             let cursor = text.selections.cursor();
             (
-                format!(" {name}{}", if buffer.is_modified() { " [+]" } else { "" }),
-                format!("{}:{} ", buffer.row_at(cursor) + 1, buffer.col_at(cursor) + 1),
+                format!("{name}{}", if buffer.is_modified() { " [+]" } else { "" }),
+                format!("{}:{}", buffer.row_at(cursor) + 1, buffer.col_at(cursor) + 1),
             )
         }
     };
 
-    let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
-    format!("{left}{}{right}", " ".repeat(pad))
+    // The focused pane leads with where the cursor is, because that is what you
+    // want from the window you are typing in; the others lead with what they
+    // are, because that is what you want from a window you are not.
+    //
+    // The modified marker rides with the name in both. It matters *most* on a
+    // pane you are not looking at.
+    match focused {
+        true => format!(" {at}  {name}"),
+        false => format!(" {name}  {at}"),
+    }
 }
 
 /// The entry's first line, tab-expanded and elided to fit one row.
@@ -749,22 +797,13 @@ fn status_spans(
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
     let keys = format!("{count}{pending}  ");
 
-    let mode = format!(" {} ", ed.session.mode.label());
-    let mode_style = Style::default()
-        .fg(Color::Black)
-        .bg(match ed.session.mode {
-            Mode::Insert => Color::Green,
-            Mode::Pick => Color::Magenta,
-            _ => Color::Blue,
-        })
-        .add_modifier(Modifier::BOLD);
-
+    // The mode lives on the focused window's row now, beside the position it
+    // applies to. What is left here is the session's: messages, half-typed
+    // keys, and the `:` and `/` lines above.
     let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_width = keys.chars().count() + mode.chars().count();
-    let pad = (width as usize).saturating_sub(left_width + right_width);
+    let pad = (width as usize).saturating_sub(left_width + keys.chars().count());
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(keys, Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(mode, mode_style));
 
     spans
 }
@@ -774,30 +813,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_footer_reads_message_first_and_mode_last() {
+    fn the_footer_reads_the_message_and_no_longer_carries_the_mode() {
         let mut ed = Editor::empty();
         ed.session.status = "written".into();
-        let spans = status_spans(&ed, "", None, 80);
+        let footer: String =
+            status_spans(&ed, "", None, 80).iter().map(|s| s.content.to_string()).collect();
 
-        assert_eq!(spans[1].content.as_ref(), "written", "the message comes first");
-
-        let mode = spans.last().unwrap();
-        assert_eq!(mode.content.as_ref(), " NORMAL ", "the mode sits at the right edge");
-        assert_eq!(mode.style.bg, Some(Color::Blue));
+        assert!(footer.contains("written"), "the message is the footer's job: {footer:?}");
+        assert!(!footer.contains("NORMAL"), "the mode moved to the active window: {footer:?}");
     }
 
-    /// Name and position moved out of the footer and onto each window's own
-    /// row, so an unfocused pane says what it is showing.
+    /// The active pane leads with where the cursor is and ends with the mode.
+    /// Its name is the file name — the path is what the picker is for, and a
+    /// pane thirty columns wide has no room to repeat it.
     #[test]
-    fn each_window_says_what_it_is_showing_and_where() {
-        let mut ed = Editor::empty();
-        let row = window_status_text(&ed, ed.focus(), 30);
-        assert!(row.starts_with(" [No Name]"), "{row:?}");
-        assert!(row.ends_with("1:1 "), "position is pushed to the right edge: {row:?}");
-        assert_eq!(row.chars().count(), 30, "and it fills the pane");
+    fn the_active_window_leads_with_the_position_and_ends_with_the_mode() {
+        let mut ed = Editor::open("src/main.rs").unwrap();
+        let row = window_status_text(&ed, ed.focus(), true);
+
+        assert!(row.starts_with(" 1:1"), "position first: {row:?}");
+        assert!(row.contains("main.rs"), "{row:?}");
+        assert!(!row.contains('/'), "the name alone, not the path: {row:?}");
+
+        let line = window_status(&ed, ed.focus(), true, 40);
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.ends_with(" NORMAL "), "and the mode at the right edge: {text:?}");
+        assert_eq!(text.chars().count(), 40, "filling the pane");
 
         ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
-        assert!(window_status_text(&ed, ed.focus(), 30).contains("[+]"), "modified is marked");
+        assert!(window_status_text(&ed, ed.focus(), true).contains("[+]"), "modified is marked");
+    }
+
+    /// An unfocused pane leads with what it *is*, because that is what you
+    /// want from a window you are not typing in. No mode: there is one, and it
+    /// belongs to the window that has the cursor.
+    #[test]
+    fn an_inactive_window_leads_with_its_name_and_carries_no_mode() {
+        let ed = Editor::open("src/main.rs").unwrap();
+        let row = window_status_text(&ed, ed.focus(), false);
+
+        assert!(row.starts_with(" main.rs"), "name first: {row:?}");
+        assert!(row.trim_end().ends_with("1:1"), "then the position: {row:?}");
+
+        let line = window_status(&ed, ed.focus(), false, 40);
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(!text.contains("NORMAL"), "{text:?}");
     }
 
     /// A tree pane names its root and counts rows, where a file names itself
@@ -810,11 +870,13 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
 
         let ed = Editor::open(&dir).unwrap();
-        let row = window_status_text(&ed, ed.focus(), 60);
+        let row = window_status_text(&ed, ed.focus(), true);
 
+        assert!(row.starts_with(" 1/3"), "the root row, of root plus two entries: {row:?}");
         assert!(row.contains("[tree]"), "{row:?}");
-        assert!(row.contains(&dir.display().to_string()), "{row:?}");
-        assert!(row.ends_with("1/3 "), "the root row, of root plus two entries: {row:?}");
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(row.contains(&format!("{name}/")), "named like a file, not pathed: {row:?}");
+        assert!(!row.contains("/tmp"), "a sidebar has no room for a root path: {row:?}");
         assert!(!row.contains("[+]"), "nothing to modify: {row:?}");
 
         let _ = std::fs::remove_dir_all(&dir);

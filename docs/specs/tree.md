@@ -513,8 +513,16 @@ two spaces for a file, `@` after a link. Two columns of indent per level.
   tree hiding it would make `Ctrl-W h` a guess.
 - **The terminal cursor** goes at the first character of the selected row's name
   when a tree is focused, so the terminal's own cursor agrees with the highlight.
-- **The status row** is the root's display path, `[tree]`, and `row/total` where
-  a file shows `row:col`. No modified marker; there is nothing to modify.
+- **The status row** names the root by its last component, marks it `[tree]`,
+  and counts `row/total` where a file counts `row:col`. No modified marker;
+  there is nothing to modify.
+
+  **Corrected.** This first said the root's *display path*. A sidebar is thirty
+  columns wide and spent all of them truncating one into something unreadable,
+  which running it made obvious — and the pane's own first row was already
+  saying the last component anyway. It reads like a file's row now: focused,
+  the count comes first and the mode block ends the line; unfocused, the name
+  comes first and it is dim.
 
 The footer is untouched. It carries the mode, messages and the `:` line, none of
 which are per-window.

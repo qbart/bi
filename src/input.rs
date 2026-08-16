@@ -311,6 +311,10 @@ impl Input {
             }
             KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
             KeyCode::Char('^') if ctrl => return self.plain(Action::Buffer(BufferCmd::Alternate)),
+            // Asking to see a buffer here, which is what `:bn` means in a tree.
+            KeyCode::Char('i') if ctrl => return self.plain(Action::Buffer(BufferCmd::Next)),
+            KeyCode::Char('o') if ctrl => return self.plain(Action::Buffer(BufferCmd::Prev)),
+            KeyCode::Tab => return self.plain(Action::Buffer(BufferCmd::Next)),
 
             KeyCode::Char('j') | KeyCode::Down => TreeCmd::Select { down: true, count },
             KeyCode::Char('k') | KeyCode::Up => TreeCmd::Select { down: false, count },
@@ -381,6 +385,13 @@ impl Input {
             // The tree on this file's directory. In a tree the same key goes
             // up a level, which is the same move one step further out.
             KeyCode::Char('-') => self.plain(Action::Tree(TreeCmd::Up)),
+            // Vim spells its jump list this way; bee has no jump list and
+            // these are the keys the fingers reach for. Checked before the
+            // plain `i` and `o`, which would otherwise swallow them — and
+            // `Tab` is listed because it *is* Ctrl-I, byte for byte.
+            KeyCode::Char('i') if ctrl => self.plain(Action::Buffer(BufferCmd::Next)),
+            KeyCode::Char('o') if ctrl => self.plain(Action::Buffer(BufferCmd::Prev)),
+            KeyCode::Tab => self.plain(Action::Buffer(BufferCmd::Next)),
             // The start of a key, not a key. Any count already typed stays,
             // because it belongs to the resize forms.
             KeyCode::Char('w') if ctrl => {
@@ -944,6 +955,33 @@ mod tests {
         assert_eq!(cmd.action, Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }));
 
         assert_eq!(tree_action(":"), Action::EnterCommandMode);
+    }
+
+    /// Vim spells the jump list this way, not the buffer list — but bee has no
+    /// jump list, and these are the keys the fingers reach for. Ctrl-I *is*
+    /// Tab: both are 0x09, and no terminal bee talks to tells them apart, so
+    /// binding one binds the other whether or not you meant to.
+    #[test]
+    fn ctrl_i_and_ctrl_o_cycle_the_buffer_list() {
+        let mut input = Input::default();
+        let next = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Text).unwrap();
+        assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
+
+        let tab = Key::code(KeyCode::Tab);
+        let same = input.on_key(tab, &Mode::Normal, ContentKind::Text).unwrap();
+        assert_eq!(same.action, Action::Buffer(BufferCmd::Next), "Tab is the same key");
+
+        let prev = input.on_key(ctrl('o'), &Mode::Normal, ContentKind::Text).unwrap();
+        assert_eq!(prev.action, Action::Buffer(BufferCmd::Prev));
+    }
+
+    /// They reach the buffer list from a tree pane too, which is a request to
+    /// show a buffer there — the same thing `:bn` means.
+    #[test]
+    fn the_buffer_keys_work_from_a_tree_as_well() {
+        let mut input = Input::default();
+        let next = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree).unwrap();
+        assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
     }
 
     #[test]

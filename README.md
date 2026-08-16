@@ -304,6 +304,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W + -` `Ctrl-W < >` | taller / shorter, wider / narrower |
 | `Ctrl-W =` | equalise every pane |
 | `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
+| `Ctrl-I` `Ctrl-O` | cycle the buffer list forwards / backwards. `Ctrl-I` is `Tab`, byte for byte |
 
 Two windows may show one buffer, with their own cursor and their own scroll.
 An edit in one moves the other's cursor *with the text* rather than clamping it
@@ -345,6 +346,26 @@ keeps its share of the terminal from then on, like every other pane.
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a
 filesystem. Nothing in it enters insert mode, so a tree never can be.
+
+### Status rows
+
+Each window carries its own. The focused one leads with the position and ends
+with the mode, so what you are typing and where you are typing it read as one
+line; the rest lead with the name, dimmed, because what you want from a window
+you are not typing in is what it *is*.
+
+```
+ 12:5  editor.rs [+]                                            NORMAL
+ main.rs  1:1
+ src/ [tree]  3/12
+```
+
+Names are file names. Which `main.rs` it is belongs to the picker, and a pane
+thirty columns wide has no room to say it twice. The modified marker rides with
+the name in both, because it matters most on a pane you are not looking at.
+
+The footer underneath is the session's: messages, half-typed keys, the cursor
+count, and the `:` and `/` lines.
 
 ### Line numbers
 

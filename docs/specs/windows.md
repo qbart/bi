@@ -558,6 +558,13 @@ The global footer keeps the mode block, messages, `:` and the live search, and
 `search.md`'s rule that a live search owns the whole footer is untouched —
 it owns the footer, which was never the window's row.
 
+**Corrected.** The mode block is not the footer's any more. It sits at the right
+of the *focused* window's status row, beside the position it applies to, so
+what you are typing and where you are typing it are one line rather than two
+places on the screen. The focused row also leads with `row:col` where the others
+lead with the name, and the names are file names rather than paths. The footer
+keeps everything else, and `search.md`'s rule is still untouched.
+
 ## Tests
 
 The tree is pure and tests without a terminal: splitting produces the expected
