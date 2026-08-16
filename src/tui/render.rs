@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bee::buffer::Cursor;
 use bee::editor::{Editor, LineNumbers, Mode, VisualKind};
-use bee::picker::Picker;
+use bee::picker::{Picker, PickerKind};
 use bee::syntax::{Span as HlSpan, Syntax};
 use bee::window::{Chrome, Rect as CoreRect, WindowId};
 
@@ -523,7 +523,10 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
     let outer = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(" registers ");
+        .title(match picker.kind {
+            PickerKind::Register { .. } => " registers ",
+            PickerKind::Buffer => " buffers ",
+        });
     let inner = outer.inner(rect);
     frame.render_widget(outer, rect);
     if inner.height < 3 {
