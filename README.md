@@ -274,7 +274,29 @@ afterwards repeats it.
 | `:e` `:e!` | reload from disk, refusing if modified unless forced |
 | `:e <path>` | edit another file |
 | `:hls` `:noh` | start / stop highlighting every search match |
+| `:set lines {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
+
+### Line numbers
+
+`:set lines {n}` decides what the gutter shows. `:set lines=5` works too, since
+that is vim's spelling.
+
+| Value | Gutter |
+|---|---|
+| `0` | none at all — the column is gone, not blank |
+| `-1` | relative to the cursor line |
+| `1` | every line, which is the default |
+| `5` | every fifth line, the rest blank |
+
+The line the cursor is on always shows its own absolute number, whatever the
+mode — it is the one number a relative gutter cannot tell you, and the one
+`:{n}` needs. The gutter keeps the width of the largest line number in every
+mode, so moving the cursor never slides the file sideways.
+
+This is not vim's `lines`, which is the height of the terminal. `lines` is the
+word that means "the numbers down the side" to everyone who has not read
+`:help options`, and the terminal already knows how tall it is.
 
 ## Layout
 

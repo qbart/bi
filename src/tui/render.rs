@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bee::buffer::Cursor;
-use bee::editor::{Editor, Mode, VisualKind};
+use bee::editor::{Editor, LineNumbers, Mode, VisualKind};
 use bee::picker::Picker;
 use bee::syntax::{Span as HlSpan, Syntax};
 
@@ -213,6 +213,19 @@ fn styled_line(
     out
 }
 
+/// Columns the gutter takes: the widest line number plus a space, or none at
+/// all when it is off.
+///
+/// Fixed across modes on purpose — sizing it to the largest *relative* label
+/// would make the gutter change width as the cursor moves, sliding every line
+/// of the file sideways while you scroll.
+fn gutter_width(ed: &Editor) -> usize {
+    match ed.line_numbers {
+        LineNumbers::Off => 0,
+        _ => format!("{}", ed.buffer.line_count()).len() + 1,
+    }
+}
+
 pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     let [text_area, status_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
@@ -220,7 +233,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     ed.scroll_to_cursor(text_area.height as usize);
 
     let total = ed.buffer.line_count();
-    let gutter = format!("{total}").len() + 1;
+    let gutter = gutter_width(ed);
     let cursor = ed.selections.cursor();
     let cursor_row = ed.buffer.row_at(cursor);
 
@@ -245,11 +258,19 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             cursor_screen_col = display_col(raw, ed.buffer.col_at(cursor));
         }
 
-        let number = Span::styled(
-            format!("{:>width$} ", row + 1, width = gutter - 1),
-            Style::default().fg(if row == cursor_row { Color::Yellow } else { Color::DarkGray }),
-        );
-        let mut spans = vec![number];
+        // A blank cell where a number is not due, so the text stays put.
+        let mut spans = match ed.line_numbers.label_for(row, cursor_row) {
+            _ if gutter == 0 => Vec::new(),
+            Some(n) => vec![Span::styled(
+                format!("{n:>width$} ", width = gutter - 1),
+                Style::default().fg(if row == cursor_row {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            )],
+            None => vec![Span::raw(" ".repeat(gutter))],
+        };
         match &highlights {
             Some((syntax, all)) => {
                 let line_start = ed.buffer.rope().line_to_byte(row);
@@ -602,6 +623,22 @@ mod tests {
         let mode = spans.last().unwrap();
         assert_eq!(mode.content.as_ref(), " NORMAL ", "the mode sits at the right edge");
         assert_eq!(mode.style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn the_gutter_keeps_its_width_in_every_mode_but_off() {
+        let mut ed = Editor::empty();
+        ed.buffer.insert_str(Cursor::at(0), &"x\n".repeat(120));
+        let numbered = gutter_width(&ed);
+        assert_eq!(numbered, 4, "121 lines, so three digits and a space");
+
+        ed.line_numbers = LineNumbers::Relative;
+        assert_eq!(gutter_width(&ed), numbered, "or the file slides sideways as you move");
+        ed.line_numbers = LineNumbers::Every(10);
+        assert_eq!(gutter_width(&ed), numbered);
+
+        ed.line_numbers = LineNumbers::Off;
+        assert_eq!(gutter_width(&ed), 0, "the column is gone, not blank");
     }
 
     #[test]

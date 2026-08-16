@@ -28,6 +28,60 @@ pub enum VisualKind {
     Block,
 }
 
+/// What the gutter shows. `:set lines`.
+///
+/// See `docs/specs/line-numbers.md`. The rules live here rather than in the
+/// renderer because "what does row 12 show" is not a question about terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineNumbers {
+    Off,
+    Relative,
+    /// Every `n`th line. `Every(1)` is plain numbering, and the default.
+    Every(usize),
+}
+
+impl Default for LineNumbers {
+    fn default() -> Self {
+        Self::Every(1)
+    }
+}
+
+impl LineNumbers {
+    /// From the number the user typed. `None` for one that means nothing.
+    pub fn from_setting(n: i64) -> Option<Self> {
+        match n {
+            0 => Some(Self::Off),
+            -1 => Some(Self::Relative),
+            n if n > 0 => Some(Self::Every(n as usize)),
+            _ => None,
+        }
+    }
+
+    /// The same number back, for `:set lines` to report.
+    pub fn setting(self) -> i64 {
+        match self {
+            Self::Off => 0,
+            Self::Relative => -1,
+            Self::Every(n) => n as i64,
+        }
+    }
+
+    /// What to print beside `row`. `None` is a blank gutter cell.
+    ///
+    /// The cursor's own row always shows its absolute number: it is the one
+    /// number a relative gutter cannot tell you, and the one `:{n}` needs.
+    pub fn label_for(self, row: usize, cursor_row: usize) -> Option<usize> {
+        if row == cursor_row {
+            return (self != Self::Off).then_some(row + 1);
+        }
+        match self {
+            Self::Off => None,
+            Self::Relative => Some(row.abs_diff(cursor_row)),
+            Self::Every(n) => ((row + 1) % n.max(1) == 0).then_some(row + 1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -412,6 +466,8 @@ pub struct Editor {
     /// vim does not light the buffer up on a plain `/`, and the status line's
     /// `[3/17]` says how many there are without painting them.
     pub highlight_search: bool,
+    /// What the gutter shows. `:set lines`.
+    pub line_numbers: LineNumbers,
     /// Whether the status line belongs to the search.
     ///
     /// True while the search line is being typed and for as long as the keys
@@ -488,6 +544,7 @@ impl Editor {
             replaying: false,
             last_search: None,
             highlight_search: false,
+            line_numbers: LineNumbers::default(),
             search_focus: false,
             match_cache: None,
             pending_search_op: None,
@@ -1603,6 +1660,7 @@ impl Editor {
             // Off by default, because a plain `/` in vim does not light up the
             // buffer. The count in the status line is what a search owes you.
             "hls" | "hlsearch" => self.highlight_search = true,
+            "set" => self.set_option(arg),
             "wq" | "x" => {
                 if self.write(arg) {
                     self.quit(true);
@@ -1616,6 +1674,37 @@ impl Editor {
                     self.status = format!("not a command: {name}");
                 }
             }
+        }
+    }
+
+    /// `:set <option> <value>`, or `:set <option>=<value>` — vim's spelling,
+    /// which the fingers type without asking.
+    ///
+    /// One option so far. A real options table wants the config layer this
+    /// file has been waiting for; until then a match arm and an honest error
+    /// for everything else is the whole of it.
+    fn set_option(&mut self, arg: &str) {
+        let (name, value) = match arg.split_once(['=', ' ']) {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => (arg.trim(), ""),
+        };
+
+        match name {
+            "lines" => {
+                if value.is_empty() {
+                    self.status = format!("lines={}", self.line_numbers.setting());
+                    return;
+                }
+                match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
+                    Some(lines) => self.line_numbers = lines,
+                    None => {
+                        self.status =
+                            format!("lines takes 0 (off), -1 (relative) or a count: {value}");
+                    }
+                }
+            }
+            "" => self.status = "set what?".into(),
+            _ => self.status = format!("unknown option: {name}"),
         }
     }
 
@@ -2225,6 +2314,61 @@ mod tests {
         ex(&mut ed, "e");
         assert!(!ed.status.is_empty(), "should say something");
         assert_eq!(ed.buffer.rope().to_string(), "scratch");
+    }
+
+    #[test]
+    fn set_lines_takes_off_relative_and_a_count() {
+        let mut ed = editor("one\ntwo\nthree");
+        assert_eq!(ed.line_numbers, LineNumbers::Every(1), "every line, by default");
+
+        ex(&mut ed, "set lines 0");
+        assert_eq!(ed.line_numbers, LineNumbers::Off);
+        ex(&mut ed, "set lines -1");
+        assert_eq!(ed.line_numbers, LineNumbers::Relative);
+        ex(&mut ed, "set lines 5");
+        assert_eq!(ed.line_numbers, LineNumbers::Every(5));
+        // Vim's spelling, which the fingers type without asking.
+        ex(&mut ed, "set lines=10");
+        assert_eq!(ed.line_numbers, LineNumbers::Every(10));
+    }
+
+    #[test]
+    fn set_reports_and_refuses_rather_than_guessing() {
+        let mut ed = editor("one");
+        ex(&mut ed, "set lines 5");
+
+        ex(&mut ed, "set lines");
+        assert_eq!(ed.status, "lines=5", "no value asks rather than sets");
+
+        ex(&mut ed, "set lines -3");
+        assert_eq!(ed.line_numbers, LineNumbers::Every(5), "left alone");
+        assert!(ed.status.contains("-3"));
+
+        ex(&mut ed, "set wrap");
+        assert_eq!(ed.status, "unknown option: wrap");
+    }
+
+    #[test]
+    fn relative_numbers_count_away_from_the_cursor_in_both_directions() {
+        let lines = LineNumbers::Relative;
+        assert_eq!(lines.label_for(10, 10), Some(11), "the cursor row shows where it is");
+        assert_eq!(lines.label_for(7, 10), Some(3));
+        assert_eq!(lines.label_for(13, 10), Some(3));
+    }
+
+    #[test]
+    fn a_count_numbers_every_nth_line_and_the_one_the_cursor_is_on() {
+        let lines = LineNumbers::Every(5);
+        assert_eq!(lines.label_for(4, 0), Some(5), "line 5 is a multiple");
+        assert_eq!(lines.label_for(5, 0), None, "line 6 is not");
+        assert_eq!(lines.label_for(5, 5), Some(6), "except when the cursor is on it");
+        assert_eq!(LineNumbers::Every(1).label_for(5, 0), Some(6), "1 numbers everything");
+    }
+
+    #[test]
+    fn off_labels_nothing_at_all() {
+        assert_eq!(LineNumbers::Off.label_for(3, 3), None, "not even the cursor row");
+        assert_eq!(LineNumbers::Off.label_for(3, 0), None);
     }
 
     #[test]

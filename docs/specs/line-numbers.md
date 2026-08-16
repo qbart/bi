@@ -6,7 +6,7 @@ sparse ruler — are one option apart.
 
 ## Status
 
-**Specified.** Nothing below is built yet.
+**Built.**
 
 ## The option
 
