@@ -36,6 +36,11 @@ const EXTRA_CURSOR_BG: Color = Color::Magenta;
 /// can sit inside one.
 const SEARCH_BG: Color = Color::Indexed(58);
 
+/// Background for the row:col readout in the footer. Grey rather than a hue:
+/// it marks the field as its own without competing with the mode block at the
+/// other end of the line, which is the one thing there that should shout.
+const POSITION_BG: Color = Color::Indexed(238);
+
 /// Repaints the background of the columns in `cols` within an already-built
 /// line, leaving the foreground alone.
 ///
@@ -470,12 +475,21 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
 }
 
 fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
+    Paragraph::new(Line::from(status_spans(ed, pending, width)))
+}
+
+/// The footer, left to right: position, name, modified, status — then the
+/// pending keys and the mode, pushed to the right edge.
+///
+/// Split out from [`status_line`] because a `Paragraph` cannot be read back,
+/// and the order is the thing worth guarding.
+fn status_spans(ed: &Editor, pending: &str, width: u16) -> Vec<Span<'static>> {
     if let Mode::Command(line) = &ed.mode {
-        return Paragraph::new(Line::from(format!(":{line}")));
+        return vec![Span::raw(format!(":{line}"))];
     }
     if let Mode::Search { query, forward } = &ed.mode {
         let prefix = if *forward { '/' } else { '?' };
-        return Paragraph::new(Line::from(format!("{prefix}{query}")));
+        return vec![Span::raw(format!("{prefix}{query}"))];
     }
 
     let name = ed
@@ -485,17 +499,14 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "[No Name]".into());
 
-    let mode_style = Style::default()
-        .fg(Color::Black)
-        .bg(match ed.mode {
-            Mode::Insert => Color::Green,
-            Mode::Pick => Color::Magenta,
-            _ => Color::Blue,
-        })
-        .add_modifier(Modifier::BOLD);
+    let position = format!(
+        " {}:{} ",
+        ed.buffer.row_at(ed.selections.cursor()) + 1,
+        ed.buffer.col_at(ed.selections.cursor()) + 1
+    );
 
     let mut spans = vec![
-        Span::styled(format!(" {} ", ed.mode.label()), mode_style),
+        Span::styled(position, Style::default().fg(Color::Gray).bg(POSITION_BG)),
         Span::raw(format!(" {name}")),
         Span::styled(
             if ed.buffer.is_modified() { " [+]" } else { "" },
@@ -510,26 +521,54 @@ fn status_line(ed: &Editor, pending: &str, width: u16) -> Paragraph<'static> {
     // may be scrolled off. Say how many.
     let cursors = ed.selections.len();
     let count = if cursors > 1 { format!("{cursors} cursors  ") } else { String::new() };
+    let keys = format!("{count}{pending}  ");
 
-    let right = format!(
-        "{}{}  {}:{} ",
-        count,
-        pending,
-        ed.buffer.row_at(ed.selections.cursor()) + 1,
-        ed.buffer.col_at(ed.selections.cursor()) + 1
-    );
+    let mode = format!(" {} ", ed.mode.label());
+    let mode_style = Style::default()
+        .fg(Color::Black)
+        .bg(match ed.mode {
+            Mode::Insert => Color::Green,
+            Mode::Pick => Color::Magenta,
+            _ => Color::Blue,
+        })
+        .add_modifier(Modifier::BOLD);
 
     let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad = (width as usize).saturating_sub(left_width + right.chars().count());
+    let right_width = keys.chars().count() + mode.chars().count();
+    let pad = (width as usize).saturating_sub(left_width + right_width);
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(keys, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(mode, mode_style));
 
-    Paragraph::new(Line::from(spans))
+    spans
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_footer_reads_position_then_name_then_mode_last() {
+        let ed = Editor::empty();
+        let spans = status_spans(&ed, "", 80);
+
+        assert_eq!(spans[0].content.as_ref(), " 1:1 ", "position comes first");
+        assert_eq!(spans[0].style.bg, Some(POSITION_BG), "and is set off by its own background");
+        assert_eq!(spans[1].content.as_ref(), " [No Name]");
+        assert_eq!(spans[2].content.as_ref(), "", "nothing typed yet, so no modified sign");
+
+        let mode = spans.last().unwrap();
+        assert_eq!(mode.content.as_ref(), " NORMAL ", "the mode sits at the right edge");
+        assert_eq!(mode.style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn the_footer_fills_the_width_exactly() {
+        let ed = Editor::empty();
+        let width: usize =
+            status_spans(&ed, "d3", 80).iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(width, 80, "or the mode block would not touch the right edge");
+    }
 
     #[test]
     fn the_cursor_line_is_padded_to_the_full_width() {
