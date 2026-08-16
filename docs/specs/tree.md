@@ -336,6 +336,20 @@ current file's directory, select the file, and narrow it to
 `Chrome::tree_width`. Under the window prefix because it makes a window, which
 is where every other key that makes one lives.
 
+**There is one tree, and `Ctrl-W e` toggles it.** Pressed with a tree open —
+from the tree or from anywhere else — it puts that one away rather than opening
+a second. Two trees are two of the same thing, and the second is never the one
+you wanted; a tree is a place you look things up, not a document you might want
+two views of. `-` follows the same rule from the other side: with a tree open it
+moves focus to it, and only opens one when there is none.
+
+Closing means closing the window, except when it is the last one — that can
+never close, so it shows a buffer instead. Which is what Enter on a file already
+does from a `bee .` session, and leaves a session that still has a window in it.
+
+The escape hatch is still there: `:e <dir>`, `:sp <dir>` and `:vs <dir>` name a
+path outright, and someone who types two of them has asked for two trees.
+
 The width is `Chrome`'s rather than the core's, for the reason `min_width` is:
 how wide a tree wants to be is a judgement about reading, and a core that
 hard-coded thirty columns would be asserting one on every frontend. It is a
@@ -513,16 +527,18 @@ two spaces for a file, `@` after a link. Two columns of indent per level.
   tree hiding it would make `Ctrl-W h` a guess.
 - **The terminal cursor** goes at the first character of the selected row's name
   when a tree is focused, so the terminal's own cursor agrees with the highlight.
-- **The status row** names the root by its last component, marks it `[tree]`,
-  and counts `row/total` where a file counts `row:col`. No modified marker;
-  there is nothing to modify.
+- **There is no status row.** A tree pane keeps its whole rect.
 
-  **Corrected.** This first said the root's *display path*. A sidebar is thirty
-  columns wide and spent all of them truncating one into something unreadable,
-  which running it made obvious — and the pane's own first row was already
-  saying the last component anyway. It reads like a file's row now: focused,
-  the count comes first and the mode block ends the line; unfocused, the name
-  comes first and it is dim.
+  **Corrected, twice.** This first gave the tree the root's *display path* and a
+  `row/total` count. A thirty-column sidebar spent all of them truncating the
+  path into something unreadable, so it became the last component — and then the
+  last component was exactly what the pane's own first row was already saying,
+  which left the row saying nothing a glance at the pane did not. So it is gone,
+  and `render` hands a tree pane the row the status would have taken.
+
+  What the row was really carrying was the mode, and that belongs to the window
+  with the cursor in it. A tree usually has the cursor and no text to type into,
+  which is another way of saying the same thing.
 
 The footer is untouched. It carries the mode, messages and the `:` line, none of
 which are per-window.

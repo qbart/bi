@@ -15,7 +15,7 @@ use bee::picker::{Picker, PickerKind};
 use bee::selection::Selections;
 use bee::syntax::{Span as HlSpan, Syntax};
 use bee::tree::{Kind, Tree};
-use bee::window::{Chrome, Rect as CoreRect, WindowId};
+use bee::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
 
@@ -247,24 +247,35 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         ed.layout(to_core(body), CHROME).into_iter().map(|(id, rect)| (id, to_tui(rect))).collect();
 
     // Every window is told its size before anything is drawn, so scrolling has
-    // settled by the time the first pane is formatted.
+    // settled by the time the first pane is formatted. A tree keeps its whole
+    // pane: it has no status row, because its first row already names the root
+    // and a sidebar cannot spare a line to say so twice.
     for &(id, rect) in &panes {
-        ed.size_window(id, rect.width as usize, rect.height.saturating_sub(1) as usize);
+        let height = match ed.content_kind_of(id) {
+            Some(ContentKind::Tree) => rect.height,
+            _ => rect.height.saturating_sub(1),
+        };
+        ed.size_window(id, rect.width as usize, height as usize);
     }
 
     let focus = ed.focus();
     let mut cursor_at = None;
 
     for &(id, rect) in &panes {
-        let [text, status] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rect);
+        let tree = ed.content_kind_of(id) == Some(ContentKind::Tree);
+        let [body_area, status] = match tree {
+            true => [rect, Rect { height: 0, ..rect }],
+            false => Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rect),
+        };
 
-        let at = render_window(frame, ed, id, text, id == focus);
+        let at = render_window(frame, ed, id, body_area, id == focus);
         if id == focus {
             cursor_at = at;
         }
-        let row = window_status(ed, id, id == focus, status.width);
-        frame.render_widget(Paragraph::new(Line::from(row)), status);
+        if !tree {
+            let row = window_status(ed, id, id == focus, status.width);
+            frame.render_widget(Paragraph::new(Line::from(row)), status);
+        }
 
         // The rule in the column the layout reserved to the left of this pane.
         if rect.x > body.x {
@@ -532,14 +543,6 @@ fn render_window(
 ///
 /// Reverse-video when focused, dim when not. This is the focus indicator,
 /// which is why the panes need no borders around them.
-/// A root's last component, or the whole path when it has none — `/` has to
-/// be called something.
-fn name_of_root(root: &std::path::Path) -> String {
-    root.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string())
-}
-
 /// The colour a mode announces itself in. One table, wherever it is drawn.
 fn mode_style(mode: &Mode) -> Style {
     Style::default()
@@ -580,16 +583,11 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
 /// Split out for the same reason [`status_spans`] is: a `Paragraph` cannot be
 /// read back, and what the row says is the thing worth guarding.
 fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
+    // Text panes only: a tree has no status row at all, because its own first
+    // row already names the root and a sidebar cannot spare a line to repeat
+    // it. See `render`, which gives a tree pane its whole rect.
     let (name, at) = match ed.pane(id) {
-        None => return String::new(),
-        // A tree counts rows where a file counts row:col, and names itself the
-        // same way a file does — by its last component. A sidebar is thirty
-        // columns wide, and a root path spends all of them being truncated
-        // into something you cannot read anyway.
-        Some(Pane::Tree { tree, .. }) => (
-            format!("{}/ [tree]", name_of_root(tree.root())),
-            format!("{}/{}", tree.selected() + 1, tree.rows().len()),
-        ),
+        None | Some(Pane::Tree { .. }) => return String::new(),
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
             // picker; a pane thirty columns wide has no room to say it twice.
@@ -860,24 +858,17 @@ mod tests {
         assert!(!text.contains("NORMAL"), "{text:?}");
     }
 
-    /// A tree pane names its root and counts rows, where a file names itself
-    /// and counts row:col. There is nothing to modify, so no marker for it.
+    /// A tree has no status row: its own first row already names the root, and
+    /// a thirty-column sidebar cannot spare a line to say it twice.
     #[test]
-    fn a_tree_pane_says_its_root_and_which_row_it_is_on() {
+    fn a_tree_pane_has_no_status_row() {
         let dir = std::env::temp_dir().join(format!("bee-status-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
 
         let ed = Editor::open(&dir).unwrap();
-        let row = window_status_text(&ed, ed.focus(), true);
 
-        assert!(row.starts_with(" 1/3"), "the root row, of root plus two entries: {row:?}");
-        assert!(row.contains("[tree]"), "{row:?}");
-        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(row.contains(&format!("{name}/")), "named like a file, not pathed: {row:?}");
-        assert!(!row.contains("/tmp"), "a sidebar has no room for a root path: {row:?}");
-        assert!(!row.contains("[+]"), "nothing to modify: {row:?}");
+        assert_eq!(window_status_text(&ed, ed.focus(), true), "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

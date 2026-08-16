@@ -296,7 +296,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | Key | Does |
 |---|---|
 | `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
-| `Ctrl-W e` | a tree beside this file, rooted at its directory with it selected |
+| `Ctrl-W e` | show or hide the tree beside this file, rooted at its directory with it selected |
 | `Ctrl-W h j k l` | focus the window in that direction |
 | `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
 | `Ctrl-W c` `Ctrl-W q` | close this window |
@@ -318,8 +318,9 @@ showing it falls through to the next one.
 
 `bee .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
 and which one you meant is a question for the disk. `-` goes the other way, out
-of a file and into the tree above it, and `Ctrl-W e` does the same into a pane
-beside it. See [docs/specs/tree.md](docs/specs/tree.md).
+of a file and into the tree above it, and `Ctrl-W e` shows or hides one in a
+pane beside it. There is only ever one tree: `-` goes to the one that is open
+rather than making another. See [docs/specs/tree.md](docs/specs/tree.md).
 
 | Key | Does |
 |---|---|
@@ -341,7 +342,8 @@ its expansion intact.
 `Ctrl-W e` is the shortcut for that layout: it opens the tree beside the file
 you are reading, rooted at its directory with the file already selected, and
 `Chrome::tree_width` columns wide. That width is a starting point — the pane
-keeps its share of the terminal from then on, like every other pane.
+keeps its share of the terminal from then on, like every other pane. Pressed
+again, from anywhere, it puts the tree away.
 
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a
@@ -357,8 +359,10 @@ you are not typing in is what it *is*.
 ```
  12:5  editor.rs [+]                                            NORMAL
  main.rs  1:1
- src/ [tree]  3/12
 ```
+
+A tree pane has no status row at all — its own first row already names the root,
+and a sidebar cannot spare a line to say so twice.
 
 Names are file names. Which `main.rs` it is belongs to the picker, and a pane
 thirty columns wide has no room to say it twice. The modified marker rides with

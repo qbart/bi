@@ -350,7 +350,7 @@ now has.
 :sp[lit] [path]     split horizontally — the new window is above
 :vs[plit] [path]    split vertically — the new window is left
 Ctrl-W s, Ctrl-W v  the same two
-Ctrl-W e            a file tree beside this window — see tree.md
+Ctrl-W e            show or hide the file tree — see tree.md
 Ctrl-W h j k l      focus the window in that direction
 Ctrl-W w, Ctrl-W W  cycle focus forwards, backwards
 Ctrl-W c, :close    close this window
@@ -557,6 +557,9 @@ Each window's status row carries its own filename, modified marker and row:col.
 The global footer keeps the mode block, messages, `:` and the live search, and
 `search.md`'s rule that a live search owns the whole footer is untouched —
 it owns the footer, which was never the window's row.
+
+**Corrected.** A tree pane has no status row at all — see tree.md. The rest of
+this applies to the panes that do.
 
 **Corrected.** The mode block is not the footer's any more. It sits at the right
 of the *focused* window's status row, beside the position it applies to, so

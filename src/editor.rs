@@ -894,6 +894,22 @@ impl Editor {
         self.window().content.kind()
     }
 
+    /// What a given window holds, for a frontend deciding how to draw it.
+    pub fn content_kind_of(&self, id: WindowId) -> Option<ContentKind> {
+        Some(self.window_of(id)?.content.kind())
+    }
+
+    /// The window holding the tree, if one is open.
+    ///
+    /// There is at most one: `Ctrl-W e` toggles it rather than opening a
+    /// second, and `-` goes to the one that exists. A tree is a place you look
+    /// things up, and two of them is two of the same thing.
+    pub fn tree_window(&self) -> Option<WindowId> {
+        self.window_ids()
+            .into_iter()
+            .find(|id| self.window_of(*id).is_some_and(|w| w.tree().is_some()))
+    }
+
     pub fn focus(&self) -> WindowId {
         self.focus
     }
@@ -1242,6 +1258,27 @@ impl Editor {
         self.layout.leaves()
     }
 
+    /// Puts the tree away.
+    ///
+    /// Closing the window, unless it is the last one — that one can never
+    /// close, so it shows a buffer instead. Which is what Enter on a file does
+    /// from a `bee .` session, and leaves a session that still has a window.
+    fn close_tree(&mut self, id: WindowId) {
+        if self.windows.len() > 1 {
+            self.close_window(id);
+            return;
+        }
+        match self.window_mut_of(id).and_then(|w| w.alt.take()) {
+            Some(alt) => self.window_mut_of(id).expect("checked above").content = alt,
+            None => {
+                let first = self.buffer_ids()[0];
+                if let Some(window) = self.window_mut_of(id) {
+                    window.content = Content::Text(Text::new(first));
+                }
+            }
+        }
+    }
+
     /// Moves focus, remembering where it came from.
     ///
     /// Every focus change goes through here, so `previous` cannot drift out of
@@ -1274,9 +1311,13 @@ impl Editor {
         let height = self.window().height;
         if self.window().tree().is_none() {
             // `-` is the same key in the other direction: out of the file and
-            // into the tree on the directory holding it.
+            // into the tree on the directory holding it — or, when one is
+            // already open somewhere, simply over to it. One tree.
             if cmd == TreeCmd::Up {
-                self.show_tree_here();
+                match self.tree_window() {
+                    Some(open) => self.set_focus(open),
+                    None => self.show_tree_here(),
+                }
             }
             return;
         }
@@ -1381,15 +1422,19 @@ impl Editor {
             }
 
             WindowCmd::Tree => {
+                // One tree, so the key that opened it is the key that puts it
+                // away. Two trees are two of the same thing, and the second is
+                // never the one you wanted.
+                if let Some(open) = self.tree_window() {
+                    return self.close_tree(open);
+                }
+
                 // Rooted before the split, because it is a fact about the
                 // window you are leaving rather than the one being made.
                 let path = self.buffer().and_then(|b| b.path.clone());
-                let root = match (self.window().tree(), path.as_ref().and_then(|p| p.parent())) {
-                    // Already a tree: duplicate where it is looking, the way
-                    // `Ctrl-W v` duplicates a window rather than refusing.
-                    (Some(tree), _) => tree.root().to_path_buf(),
-                    (None, Some(parent)) => parent.to_path_buf(),
-                    (None, None) => std::env::current_dir().unwrap_or_default(),
+                let root = match path.as_ref().and_then(|p| p.parent()) {
+                    Some(parent) => parent.to_path_buf(),
+                    None => std::env::current_dir().unwrap_or_default(),
                 };
                 let tree = match Tree::new(&root) {
                     Ok(tree) => tree,
@@ -3993,20 +4038,71 @@ mod tests {
         assert!(wide > sidebar, "it grew with the terminal rather than staying put");
     }
 
-    /// Duplicating rather than refusing, which is what `Ctrl-W v` does with a
-    /// window and costs nothing to be consistent with.
+    /// One tree, and the same key that opened it puts it away. Two trees are
+    /// two of the same thing, and the second one is never the one you wanted.
     #[test]
-    fn ctrl_w_e_from_a_tree_roots_the_new_one_where_this_one_is() {
-        let d = ScratchDir::new("sidebar-tree").file("pkg/a.rs");
-        let mut ed = Editor::open(d.path()).unwrap();
+    fn ctrl_w_e_closes_the_tree_it_opened() {
+        let d = ScratchDir::new("toggle").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let file = ed.focus();
         sized(&mut ed);
-        select_first_entry(&mut ed);
-        tree_key(&mut ed, TreeCmd::Down);
-        let root = ed.window().tree().unwrap().root().to_path_buf();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        assert_eq!(ed.window_ids().len(), 2, "opened");
 
         ed.apply(cmd(Action::Window(WindowCmd::Tree)));
 
-        assert_eq!(ed.window().tree().expect("a second tree").root(), root, "not the cwd");
+        assert_eq!(ed.window_ids().len(), 1, "and put away again");
+        assert_eq!(ed.focus(), file);
+        assert!(ed.tree_window().is_none());
+    }
+
+    /// Including from the tree itself, which is where pressing it twice in a
+    /// row lands you.
+    #[test]
+    fn ctrl_w_e_closes_the_tree_from_inside_it() {
+        let d = ScratchDir::new("toggle-inside").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        assert!(ed.window().tree().is_some(), "focus is on the tree");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        assert_eq!(ed.window_ids().len(), 1);
+        assert!(ed.tree_window().is_none());
+    }
+
+    /// The `bee .` session: the tree is the only window, so there is nothing
+    /// to close. It shows a buffer instead, which is the same thing Enter on a
+    /// file does and leaves the session in a state that still has a window.
+    #[test]
+    fn toggling_off_the_only_window_shows_a_buffer_rather_than_closing_it() {
+        let d = ScratchDir::new("toggle-alone").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        sized(&mut ed);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        assert_eq!(ed.window_ids().len(), 1, "the last window is never closed");
+        assert!(ed.window().buffer().is_some(), "showing a buffer now");
+    }
+
+    /// `-` with a tree already open goes to it rather than making a second.
+    #[test]
+    fn minus_goes_to_the_tree_that_is_already_open() {
+        let d = ScratchDir::new("minus-existing").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        let tree = ed.focus();
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        assert_ne!(ed.focus(), tree);
+
+        ed.apply(cmd(Action::Tree(TreeCmd::Up)));
+
+        assert_eq!(ed.focus(), tree, "focused the one that exists");
+        assert_eq!(ed.window_ids().len(), 2, "rather than making another");
     }
 
     /// The file it opens still goes back where you came from — the sidebar is
