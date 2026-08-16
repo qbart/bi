@@ -219,7 +219,10 @@ and it does not fit `Selection` without either a third mode flag on every
 selection or one selection per line. The second is expressible in this model
 and is how Kakoune does it, so blockwise becomes a way of *creating* several
 selections rather than a new kind of one. Worth doing after multi-cursor
-exists, not before.
+exists, not before — which it now does. Specified in
+[blockwise.md](blockwise.md), where the rectangle is derived from the primary
+selection's corners and materialises into selections only when something acts
+on it.
 
 **Split windows.** Two views of one file need two selection sets, one per view.
 This design allows it — `Selections` is not a singleton on `Editor` by
