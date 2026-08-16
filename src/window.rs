@@ -31,7 +31,24 @@ pub enum Content {
     Tree(Tree),
 }
 
+/// Which keymap a window wants, and which renderer.
+///
+/// An enum rather than an `is_tree` flag: the next pane kind should be a
+/// variant and a compiler error, not a second boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentKind {
+    Text,
+    Tree,
+}
+
 impl Content {
+    pub fn kind(&self) -> ContentKind {
+        match self {
+            Content::Text(_) => ContentKind::Text,
+            Content::Tree(_) => ContentKind::Tree,
+        }
+    }
+
     /// The buffer behind this content, if it is text at all.
     pub fn buffer(&self) -> Option<BufferId> {
         match self {

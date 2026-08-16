@@ -10,10 +10,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bee::buffer::Cursor;
-use bee::editor::{Editor, LineNumbers, Mode, VisualKind};
+use bee::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
 use bee::picker::{Picker, PickerKind};
 use bee::selection::Selections;
 use bee::syntax::{Span as HlSpan, Syntax};
+use bee::tree::{Kind, Tree};
 use bee::window::{Chrome, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
@@ -300,6 +301,68 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     }
 }
 
+/// Colour for a directory row. Blue is what `ls` has used for decades, and the
+/// fingers know it before the eyes do.
+const TREE_DIR: Color = Color::Blue;
+
+/// A symlink. Cyan, again following `ls`.
+const TREE_LINK: Color = Color::Cyan;
+
+/// One window's tree. Returns where the terminal cursor belongs.
+///
+/// The glyphs are chosen here rather than in the core, which hands over depth
+/// and kind and nothing that looks like anything — README decision #6 for a
+/// second subsystem. No gutter and no highlighting: a row is not a line, so it
+/// has no line number, and a path has no syntax.
+fn render_tree(frame: &mut Frame, tree: &Tree, area: Rect, focused: bool) -> Option<(u16, u16)> {
+    let rows = tree.rows();
+    let last = (tree.scroll() + area.height as usize).min(rows.len());
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(area.height as usize);
+
+    for (index, row) in rows.iter().enumerate().take(last).skip(tree.scroll()) {
+        let marker = match (row.kind, row.open) {
+            (Kind::Dir, true) => "▾ ",
+            (Kind::Dir, false) => "▸ ",
+            _ => "  ",
+        };
+        let indent = "  ".repeat(row.depth);
+        let name = match row.kind {
+            Kind::Dir => format!("{}/", row.name),
+            Kind::Link => format!("{}@", row.name),
+            Kind::File => row.name.clone(),
+        };
+
+        let style = match row.kind {
+            Kind::Dir => Style::default().fg(TREE_DIR).add_modifier(Modifier::BOLD),
+            Kind::Link => Style::default().fg(TREE_LINK),
+            Kind::File => Style::default(),
+        };
+
+        let spans = vec![Span::raw(format!("{indent}{marker}")), Span::styled(name, style)];
+        if index != tree.selected() {
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Shown in every tree pane, not only the focused one: unlike a text
+        // cursor this is where the *next* Enter goes, so hiding it would make
+        // switching to a tree a guess.
+        let bg = if focused { SELECTION_BG } else { CURSOR_LINE_BG };
+        lines.push(fill_line(spans, bg, area.width as usize));
+        if focused {
+            let col = (indent.chars().count() + marker.chars().count()) as u16;
+            cursor_at = Some((
+                area.x + col.min(area.width.saturating_sub(1)),
+                area.y + lines.len() as u16 - 1,
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
 /// One window's text. Returns where the terminal cursor belongs, when this is
 /// the window that has it.
 fn render_window(
@@ -309,9 +372,11 @@ fn render_window(
     text_area: Rect,
     focused: bool,
 ) -> Option<(u16, u16)> {
-    let pane = ed.pane(id)?;
-    let (buffer, scroll) = (pane.buffer, pane.text.scroll);
-    let selections = &pane.text.selections;
+    let (text, buffer, syntax) = match ed.pane(id)? {
+        Pane::Text { text, buffer, syntax, .. } => (text, buffer, syntax),
+        Pane::Tree { tree, .. } => return render_tree(frame, tree, text_area, focused),
+    };
+    let (scroll, selections) = (text.scroll, &text.selections);
 
     let total = buffer.line_count();
     let gutter = gutter_width(ed, buffer);
@@ -324,7 +389,7 @@ fn render_window(
     // One query for the whole visible range, then partition per line. Bounded
     // by pane height, never by file size.
     let last_row = (scroll + text_area.height as usize).min(total);
-    let highlights = pane.syntax.map(|syntax| {
+    let highlights = syntax.map(|syntax| {
         let rope = buffer.rope();
         let from = rope.line_to_byte(scroll.min(rope.len_lines()));
         let to = rope.line_to_byte(last_row.min(rope.len_lines()));
@@ -480,17 +545,27 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Paragr
 /// Split out for the same reason [`status_spans`] is: a `Paragraph` cannot be
 /// read back, and what the row says is the thing worth guarding.
 fn window_status_text(ed: &Editor, id: WindowId, width: u16) -> String {
-    let Some(pane) = ed.pane(id) else { return String::new() };
-    let name = pane
-        .buffer
-        .path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "[No Name]".into());
-
-    let cursor = pane.text.selections.cursor();
-    let left = format!(" {name}{}", if pane.buffer.is_modified() { " [+]" } else { "" });
-    let right = format!("{}:{} ", pane.buffer.row_at(cursor) + 1, pane.buffer.col_at(cursor) + 1);
+    let (left, right) = match ed.pane(id) {
+        None => return String::new(),
+        // A tree names its root and counts rows, where a file names itself and
+        // counts row:col. Nothing to modify, so no modified marker.
+        Some(Pane::Tree { tree, .. }) => (
+            format!(" {} [tree]", tree.root().display()),
+            format!("{}/{} ", tree.selected() + 1, tree.rows().len()),
+        ),
+        Some(Pane::Text { text, buffer, .. }) => {
+            let name = buffer
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "[No Name]".into());
+            let cursor = text.selections.cursor();
+            (
+                format!(" {name}{}", if buffer.is_modified() { " [+]" } else { "" }),
+                format!("{}:{} ", buffer.row_at(cursor) + 1, buffer.col_at(cursor) + 1),
+            )
+        }
+    };
 
     let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
     format!("{left}{}{right}", " ".repeat(pad))
@@ -723,6 +798,26 @@ mod tests {
 
         ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
         assert!(window_status_text(&ed, ed.focus(), 30).contains("[+]"), "modified is marked");
+    }
+
+    /// A tree pane names its root and counts rows, where a file names itself
+    /// and counts row:col. There is nothing to modify, so no marker for it.
+    #[test]
+    fn a_tree_pane_says_its_root_and_which_row_it_is_on() {
+        let dir = std::env::temp_dir().join(format!("bee-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+
+        let ed = Editor::open(&dir).unwrap();
+        let row = window_status_text(&ed, ed.focus(), 60);
+
+        assert!(row.contains("[tree]"), "{row:?}");
+        assert!(row.contains(&dir.display().to_string()), "{row:?}");
+        assert!(row.ends_with("1/3 "), "the root row, of root plus two entries: {row:?}");
+        assert!(!row.contains("[+]"), "nothing to modify: {row:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The footer describes the session; the window row describes the window.

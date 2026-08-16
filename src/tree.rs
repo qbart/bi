@@ -65,8 +65,12 @@ impl Tree {
         if !root.is_dir() {
             anyhow::bail!("{} is not a directory", root.display());
         }
+        // Resolved on the way in, because `bee .` would otherwise root at "."
+        // — whose parent is "" rather than the directory above it, leaving `-`
+        // nowhere to go in the one case the key exists for.
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut tree = Self {
-            root: root.to_path_buf(),
+            root,
             expanded: BTreeSet::new(),
             rows: Vec::new(),
             selected: 0,
@@ -527,6 +531,20 @@ mod tests {
         tree.step(false, 2);
         tree.scroll_to_selected(2);
         assert_eq!(tree.scroll(), 0);
+    }
+
+    /// `bee .` roots at ".", whose parent is "" rather than the directory
+    /// above it — so `-` would have had nowhere to go in the one case the
+    /// feature exists for.
+    #[test]
+    fn a_relative_root_is_resolved_so_going_up_has_somewhere_to_go() {
+        let mut tree = Tree::new(".").unwrap();
+        assert!(tree.root().is_absolute(), "resolved on the way in: {:?}", tree.root());
+
+        let was = tree.root().to_path_buf();
+        tree.up();
+
+        assert_eq!(tree.root(), was.parent().unwrap(), "and `-` has a parent to find");
     }
 
     #[test]

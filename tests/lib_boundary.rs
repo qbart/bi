@@ -8,7 +8,7 @@
 use bee::editor::{Action, Command, Editor, Mode, WindowCmd};
 use bee::input::Input;
 use bee::key::{Key, KeyCode};
-use bee::window::{Chrome, Dir, Rect, Side};
+use bee::window::{Chrome, ContentKind, Dir, Rect, Side};
 
 /// A headless editor session: feed keys, read text back.
 struct Session {
@@ -27,7 +27,7 @@ impl Session {
     }
 
     fn press(&mut self, key: Key) {
-        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode) {
+        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode, ContentKind::Text) {
             self.editor.apply(cmd);
         }
         self.editor.settle();
@@ -136,7 +136,7 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
     assert_eq!(s.text(), "Xalpha");
 
     let other = *s.editor.window_ids().iter().find(|&&id| id != s.editor.focus()).unwrap();
-    assert_eq!(s.editor.pane(other).unwrap().buffer.rope().to_string(), "Xalpha");
+    assert_eq!(s.editor.buffer_of(other).unwrap().rope().to_string(), "Xalpha");
 
     s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Focus(Side::Right)) });
     assert_eq!(s.editor.focus(), other, "switched by geometry");

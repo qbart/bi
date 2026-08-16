@@ -15,7 +15,10 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
-use crate::window::{Chrome, Content, Dir, Layout, Rect, Side, Text, Window, WindowId};
+use crate::tree::{Kind, Tree};
+use crate::window::{
+    Chrome, Content, ContentKind, Dir, Layout, Rect, Side, Text, Window, WindowId,
+};
 
 /// Charwise, linewise or blockwise.
 ///
@@ -273,6 +276,9 @@ pub enum Action {
     /// Splits, closes, resizes or switches windows. Handled beside
     /// [`Action::Buffer`] and for the same reason.
     Window(WindowCmd),
+    /// A key in a window holding a tree. Handled beside the two above, and for
+    /// the same reason: it changes what a window shows.
+    Tree(TreeCmd),
 }
 
 impl Action {
@@ -523,19 +529,6 @@ struct BufferEntry {
     last: Cursors,
 }
 
-/// A command that reaches past the view it was typed in.
-///
-/// Ex lines used to arrive this way too, discovered mid-flight inside a view.
-/// They are parsed before dispatch now — see [`Editor::run_ex`] — so what is
-/// left is the picker, which genuinely cannot know what it is choosing for
-/// until a row is accepted: a register pick pastes into the buffer the view
-/// already holds, and a buffer pick reaches the list that view was borrowed
-/// from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Escalation {
-    Buffer(BufferCmd),
-}
-
 /// A parsed `:` line.
 ///
 /// The split that matters is which arms need a rope: those are the last four,
@@ -650,6 +643,34 @@ pub enum WindowCmd {
     Equalize,
 }
 
+/// What a key does in a window holding a tree.
+///
+/// Every arm here the tree can answer by itself; `Expand` and `Enter` are the
+/// two that may instead reach past it and open a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeCmd {
+    /// `j` / `k`, with their count.
+    Select {
+        down: bool,
+        count: usize,
+    },
+    First,
+    Last,
+    HalfPage {
+        down: bool,
+    },
+    /// `l` — open a directory, or open the file under the cursor.
+    Expand,
+    /// `h` — close a directory, or step to the parent row.
+    Collapse,
+    /// `Enter` — a directory toggles, a file opens.
+    Enter,
+    /// `-` — re-root at the parent directory.
+    Up,
+    Refresh,
+    ToggleHidden,
+}
+
 /// Which buffer a window should show, and what to do to the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferCmd {
@@ -675,6 +696,12 @@ pub struct Editor {
     windows: Vec<Window>,
     layout: Layout,
     focus: WindowId,
+    /// The window that was focused before this one.
+    ///
+    /// Where a file opened from a tree goes, which is what makes `:vs .` a
+    /// sidebar without anything here being one. `Ctrl-W p` would read the same
+    /// field.
+    previous: Option<WindowId>,
     next_buffer: u32,
     next_window: u32,
     /// The area and chrome the frontend last laid out in.
@@ -689,11 +716,9 @@ pub struct Editor {
 }
 
 /// One window and what it shows, borrowed to be drawn.
-pub struct Pane<'a> {
-    pub window: &'a Window,
-    pub text: &'a Text,
-    pub buffer: &'a Buffer,
-    pub syntax: Option<&'a Syntax>,
+pub enum Pane<'a> {
+    Text { window: &'a Window, text: &'a Text, buffer: &'a Buffer, syntax: Option<&'a Syntax> },
+    Tree { window: &'a Window, tree: &'a Tree },
 }
 
 /// One buffer, one window, and the session, borrowed together for the length
@@ -781,7 +806,18 @@ impl Editor {
         Self::with_buffer(Buffer::empty())
     }
 
+    /// A directory opens a tree, and leaves a `[No Name]` in the list behind
+    /// it — the list is never empty, so nothing downstream has to learn that
+    /// the session started on a directory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path.is_dir() {
+            let mut editor = Self::empty();
+            // Assigned rather than shown: there was nothing here before, so
+            // there is no alternate to remember.
+            editor.window_mut().content = Content::Tree(Tree::new(path)?);
+            return Ok(editor);
+        }
         Ok(Self::with_buffer(Buffer::open(path)?))
     }
 
@@ -797,6 +833,7 @@ impl Editor {
             windows: vec![Window::new(window_id, buffer_id)],
             layout: Layout::new(window_id),
             focus: window_id,
+            previous: None,
             next_buffer: 1,
             next_window: 1,
             area: Rect::default(),
@@ -806,6 +843,12 @@ impl Editor {
     }
 
     // ---- what the focused view is -------------------------------------------
+
+    /// Which keymap the focused window wants. The frontend passes this back
+    /// into `Input::on_key`.
+    pub fn content_kind(&self) -> ContentKind {
+        self.window().content.kind()
+    }
 
     pub fn focus(&self) -> WindowId {
         self.focus
@@ -856,15 +899,28 @@ impl Editor {
     /// `View` — that would mean borrowing the session mutably to read a rope.
     pub fn pane(&self, id: WindowId) -> Option<Pane<'_>> {
         let window = self.window_of(id)?;
-        let text = window.text()?;
-        let entry = self.entry(text.buffer);
-        Some(Pane { window, text, buffer: &entry.buffer, syntax: entry.syntax.as_ref() })
+        Some(match &window.content {
+            Content::Tree(tree) => Pane::Tree { window, tree },
+            Content::Text(text) => {
+                let entry = self.entry(text.buffer);
+                Pane::Text { window, text, buffer: &entry.buffer, syntax: entry.syntax.as_ref() }
+            }
+        })
+    }
+
+    /// The buffer a given window shows, if it shows one.
+    pub fn buffer_of(&self, id: WindowId) -> Option<&Buffer> {
+        Some(&self.entry(self.window_of(id)?.buffer()?).buffer)
     }
 
     /// The block's span on one row of a given window.
     pub fn block_span_in(&self, id: WindowId, row: usize) -> (usize, usize) {
-        let Some(pane) = self.pane(id) else { return (0, 0) };
-        span_of_block_at(pane.buffer, &pane.text.selections, self.session.block_to_eol, row)
+        let (Some(buffer), Some(text)) =
+            (self.buffer_of(id), self.window_of(id).and_then(Window::text))
+        else {
+            return (0, 0);
+        };
+        span_of_block_at(buffer, &text.selections, self.session.block_to_eol, row)
     }
 
     /// First visible row of the focused window.
@@ -1131,6 +1187,82 @@ impl Editor {
         self.layout.leaves()
     }
 
+    /// Moves focus, remembering where it came from.
+    ///
+    /// Every focus change goes through here, so `previous` cannot drift out of
+    /// step with the one field it exists to shadow.
+    fn set_focus(&mut self, id: WindowId) {
+        if id == self.focus {
+            return;
+        }
+        self.previous = Some(self.focus);
+        self.focus = id;
+    }
+
+    /// Where a file opened from a tree should go.
+    ///
+    /// The last window focused before this one, when it still exists and still
+    /// holds text; failing that the first text window in layout order; failing
+    /// that this one, which is the single-window case and means the tree is
+    /// displaced. See `docs/specs/tree.md`.
+    fn handoff_window(&self) -> WindowId {
+        let usable = |id: &WindowId| {
+            *id != self.focus && self.window_of(*id).is_some_and(|w| w.text().is_some())
+        };
+        self.previous
+            .filter(usable)
+            .or_else(|| self.window_ids().into_iter().find(|id| usable(id)))
+            .unwrap_or(self.focus)
+    }
+
+    fn run_tree_cmd(&mut self, cmd: TreeCmd) {
+        let height = self.window().height;
+        if self.window().tree().is_none() {
+            // `-` is the same key in the other direction: out of the file and
+            // into the tree on the directory holding it.
+            if cmd == TreeCmd::Up {
+                self.show_tree_here();
+            }
+            return;
+        }
+        let Some(tree) = self.window_mut().tree_mut() else { return };
+
+        // Everything the tree can answer without leaving itself.
+        match cmd {
+            TreeCmd::Select { down, count } => return tree.step(down, count),
+            TreeCmd::First => return tree.select(0),
+            TreeCmd::Last => return tree.select(usize::MAX),
+            TreeCmd::HalfPage { down } => return tree.step(down, (height / 2).max(1)),
+            TreeCmd::Collapse => return tree.collapse(),
+            TreeCmd::Up => return tree.up(),
+            TreeCmd::Refresh => return tree.refresh(),
+            TreeCmd::ToggleHidden => return tree.toggle_hidden(),
+            TreeCmd::Expand | TreeCmd::Enter => {}
+        }
+
+        let Some(row) = tree.selected_row() else { return };
+        if row.kind == Kind::Dir {
+            // The difference between the two keys is only here: `l` opens a
+            // closed directory and leaves an open one alone, `Enter` flips it.
+            match cmd {
+                TreeCmd::Enter => tree.toggle(),
+                _ => tree.expand(),
+            }
+            return;
+        }
+
+        let path = row.path.clone();
+        let target = self.handoff_window();
+        match self.open_path(&path.to_string_lossy()) {
+            Ok(id) => {
+                self.show(target, id);
+                self.set_focus(target);
+                self.session.status = self.name_of(id);
+            }
+            Err(e) => self.session.status = format!("{e:#}"),
+        }
+    }
+
     fn fresh_window_id(&mut self) -> WindowId {
         let id = WindowId(self.next_window);
         self.next_window += 1;
@@ -1143,19 +1275,26 @@ impl Editor {
 
         match cmd {
             WindowCmd::Split { dir, path } => {
-                // The buffer first: a failure to open must not leave a split
-                // showing the wrong file.
-                // `None` means a bare split, which duplicates whatever this
-                // window holds rather than naming a buffer to go and find.
-                let buffer = match path {
-                    Some(path) => match self.open_path(&path) {
-                        Ok(id) => Some(id),
+                // The content first: a failure to open must not leave a split
+                // showing the wrong thing. `None` means a bare split, which
+                // duplicates whatever this window holds rather than naming
+                // something to go and find.
+                let content = match path.as_deref() {
+                    None => None,
+                    Some(path) if std::path::Path::new(path).is_dir() => match Tree::new(path) {
+                        Ok(tree) => Some(Content::Tree(tree)),
                         Err(e) => {
                             self.session.status = format!("{e:#}");
                             return;
                         }
                     },
-                    None => None,
+                    Some(path) => match self.open_path(path) {
+                        Ok(id) => Some(Content::Text(Text::new(id))),
+                        Err(e) => {
+                            self.session.status = format!("{e:#}");
+                            return;
+                        }
+                    },
                 };
 
                 let new = self.fresh_window_id();
@@ -1173,21 +1312,25 @@ impl Editor {
                 let mut window = self.window().clone();
                 window.id = new;
                 self.windows.push(window);
-                self.focus = new;
-                if let Some(buffer) = buffer {
-                    self.show(new, buffer);
+                self.set_focus(new);
+                match content {
+                    // Through `show`, so the new window records where the
+                    // duplicated one was before it moves off that buffer.
+                    Some(Content::Text(text)) => self.show(new, text.buffer),
+                    Some(tree) => self.window_mut().show(tree),
+                    None => {}
                 }
             }
 
             WindowCmd::Focus(side) => {
                 let anchor = self.anchor_of(focus, side);
                 if let Some(next) = self.layout.neighbour(focus, side, area, &chrome, anchor) {
-                    self.focus = next;
+                    self.set_focus(next);
                 }
             }
             WindowCmd::Cycle { back } => {
                 if let Some(next) = self.layout.cycle(focus, back) {
-                    self.focus = next;
+                    self.set_focus(next);
                 }
             }
 
@@ -1225,7 +1368,7 @@ impl Editor {
         }
         self.windows.retain(|w| w.id != id);
         if self.focus == id {
-            self.focus = heir;
+            self.set_focus(heir);
         }
         true
     }
@@ -1251,10 +1394,96 @@ impl Editor {
         }
     }
 
-    /// Runs what a view handed back because it could not run it itself.
-    fn escalate(&mut self, escalation: Escalation) {
-        match escalation {
-            Escalation::Buffer(cmd) => self.run_buffer_cmd(cmd),
+    /// The actions that touch only the session, and so need no view.
+    ///
+    /// The command line and the picker are session state, not the buffer's:
+    /// they have to work in a window holding a tree, where there is no view to
+    /// run anything in. Without this `:q` cannot leave `bee .`.
+    ///
+    /// Returns whether it handled the action.
+    fn run_session_action(&mut self, action: &Action) -> bool {
+        match action {
+            Action::EnterCommandMode => {
+                self.session.status.clear();
+                self.session.mode = Mode::Command(String::new());
+            }
+            Action::CommandChar(c) => {
+                if let Mode::Command(line) = &mut self.session.mode {
+                    line.push(*c);
+                }
+            }
+            Action::CommandBackspace => {
+                if let Mode::Command(line) = &mut self.session.mode
+                    && line.pop().is_none()
+                {
+                    self.session.mode = Mode::Normal;
+                }
+            }
+            Action::CommandCancel => self.session.mode = Mode::Normal,
+            Action::CommandExecute => {
+                let Mode::Command(line) = std::mem::take(&mut self.session.mode) else {
+                    return true;
+                };
+                self.run_ex(&line);
+            }
+
+            Action::PickChar(c) => {
+                if let Some(picker) = &mut self.session.picker {
+                    picker.push_char(*c);
+                }
+            }
+            Action::PickBackspace => {
+                // Backspacing off the front cancels, as it does on a `:` line.
+                let empty = self.session.picker.as_mut().is_some_and(|p| !p.backspace());
+                if empty {
+                    self.close_picker();
+                }
+            }
+            Action::PickNext => {
+                if let Some(picker) = &mut self.session.picker {
+                    picker.next();
+                }
+            }
+            Action::PickPrev => {
+                if let Some(picker) = &mut self.session.picker {
+                    picker.prev();
+                }
+            }
+            Action::PickToggleShort => {
+                if let Some(picker) = &mut self.session.picker {
+                    picker.toggle_short();
+                }
+            }
+            Action::PickCancel => self.close_picker(),
+            Action::PickAccept => self.accept_pick(),
+
+            _ => return false,
+        }
+        true
+    }
+
+    fn close_picker(&mut self) {
+        self.session.picker = None;
+        self.session.mode = Mode::Normal;
+    }
+
+    /// Runs whatever the highlighted row meant.
+    ///
+    /// The two kinds part company here: a buffer pick reaches the list, which
+    /// is the editor's, and a register pick pastes, which needs a view — and a
+    /// tree pane has nothing to paste into.
+    fn accept_pick(&mut self) {
+        let picker = self.session.picker.take();
+        self.session.mode = Mode::Normal;
+        let Some(chosen) = picker.as_ref().and_then(Picker::selected) else { return };
+        match picker.expect("checked above").kind {
+            // A position rather than an id, because the rows were built from
+            // the list in order and it cannot change while the picker holds
+            // every key.
+            PickerKind::Buffer => self.run_buffer_cmd(BufferCmd::Chosen(chosen)),
+            PickerKind::Register { before } => {
+                self.in_view(|view| view.paste_pick(chosen, before));
+            }
         }
     }
 
@@ -1331,6 +1560,11 @@ impl Editor {
     /// its history and its modified flag intact, so nothing is discarded. Bare
     /// `:e` — reload from disk — still refuses, and needs a view.
     fn edit_path(&mut self, path: &str) {
+        // A path is a path: `:e` asks the disk what it is rather than making
+        // you remember which command a directory wants.
+        if std::path::Path::new(path).is_dir() {
+            return self.show_tree(path);
+        }
         match self.open_path(path) {
             Ok(id) => {
                 let focus = self.focus;
@@ -1338,6 +1572,42 @@ impl Editor {
                 self.session.status = format!("\"{}\" loaded", self.name_of(id));
             }
             Err(e) => self.session.status = format!("{e:#}"),
+        }
+    }
+
+    /// Points the focused window at a tree on `root`, parking what it held.
+    fn show_tree(&mut self, root: &str) {
+        let tree = match Tree::new(root) {
+            Ok(tree) => tree,
+            Err(e) => {
+                self.session.status = format!("{e:#}");
+                return;
+            }
+        };
+        // Leaving a buffer still records where this window was in it, whether
+        // what replaces it is another buffer or a tree.
+        if let Some(text) = self.window().text() {
+            let (buffer, pairs) = (text.buffer, text.selections.as_pairs());
+            self.entry_mut(buffer).last = pairs;
+        }
+        self.session.status = tree.root().display().to_string();
+        self.window_mut().show(Content::Tree(tree));
+    }
+
+    /// `-` from a text window: the tree on this file's directory, with the
+    /// file selected. A `[No Name]` buffer has no directory, so it roots at
+    /// the working directory instead.
+    fn show_tree_here(&mut self) {
+        let path = self.buffer().and_then(|b| b.path.clone());
+        let root = match path.as_ref().and_then(|p| p.parent()) {
+            Some(parent) => parent.to_path_buf(),
+            None => std::env::current_dir().unwrap_or_default(),
+        };
+
+        self.show_tree(&root.to_string_lossy());
+        let (Some(path), Some(tree)) = (path, self.window_mut().tree_mut()) else { return };
+        if let Some(row) = tree.rows().iter().position(|r| r.path == path) {
+            tree.select(row);
         }
     }
 
@@ -1432,6 +1702,13 @@ impl Editor {
     pub fn size_window(&mut self, id: WindowId, width: usize, height: usize) {
         if let Some(window) = self.window_mut_of(id) {
             window.width = width;
+            window.height = height;
+            // A tree scrolls to its selected row, the same job by another name
+            // — and the height is what `Ctrl-D` halves in either.
+            if let Some(tree) = window.tree_mut() {
+                tree.scroll_to_selected(height);
+                return;
+            }
         }
         if let Some(mut view) = self.view(id) {
             view.scroll_to_cursor(height);
@@ -1449,18 +1726,15 @@ impl Editor {
         match cmd.action {
             Action::Buffer(buffer_cmd) => return self.run_buffer_cmd(buffer_cmd),
             Action::Window(window_cmd) => return self.run_window_cmd(window_cmd),
-            // The `:` line is read here rather than inside the view, because
-            // half of what it can say reaches the lists a view is borrowed
-            // from — and because a tree window has no view at all.
-            Action::CommandExecute => {
-                let Mode::Command(line) = std::mem::take(&mut self.session.mode) else { return };
-                return self.run_ex(&line);
-            }
+            Action::Tree(tree_cmd) => return self.run_tree_cmd(tree_cmd),
             _ => {}
         }
-        // A tree window has no view, so nothing text-shaped can run in it.
-        if let Some(escalation) = self.focused().and_then(|mut view| view.apply(cmd)) {
-            self.escalate(escalation);
+        if self.run_session_action(&cmd.action) {
+            return;
+        }
+        // What is left needs the rope, and a tree window has none.
+        if let Some(mut view) = self.focused() {
+            view.apply(cmd);
         }
     }
 
@@ -1577,22 +1851,22 @@ impl View<'_> {
         *self.syntax = syntax_for(self.buffer);
     }
 
-    /// Returns anything the command turned out to need the session for — an ex
-    /// line is only read once it is already running in here.
-    pub fn apply(&mut self, cmd: Command) -> Option<Escalation> {
+    /// Everything that needs the rope. What does not — the window tree, the
+    /// buffer list, the command line, the picker — was handled by `Editor`
+    /// before this view existed.
+    pub fn apply(&mut self, cmd: Command) {
         if let Action::RepeatChange { count } = cmd.action {
             self.session.search_focus = false;
             self.repeat_change(count);
-            return None;
+            return;
         }
         if self.session.undo_from.is_empty() {
             self.session.undo_from = self.selections.as_pairs();
         }
         self.record(&cmd);
         let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
-        let mut escalation = None;
         for _ in 0..n {
-            escalation = self.apply_once(&cmd.action).or(escalation);
+            self.apply_once(&cmd.action);
         }
         // Decided per command rather than inside the search actions, because
         // what ends it is *anything else* — one place to say so, and no way
@@ -1615,7 +1889,6 @@ impl View<'_> {
             let after = self.selections.as_pairs();
             self.buffer.commit_undo(std::mem::take(&mut self.session.undo_from), after);
         }
-        escalation
     }
 
     /// Notes what `.` would replay.
@@ -1824,7 +2097,7 @@ impl View<'_> {
             // A visual operator repeats over the same extent from here, since
             // there is no selection any more.
             Some(extent) => self.repeat_over(&change, extent),
-            None => drop(self.apply(change.command.clone())),
+            None => self.apply(change.command.clone()),
         }
         for action in &change.typed {
             self.apply(Command { count: 1, action: action.clone() });
@@ -1979,15 +2252,12 @@ impl View<'_> {
         }
     }
 
-    fn apply_once(&mut self, action: &Action) -> Option<Escalation> {
+    fn apply_once(&mut self, action: &Action) {
         let eol = self.session.mode.allows_eol();
-        // Only the two arms that reach past this view set it; every other arm
-        // is a statement, which is what keeps the dispatch table readable.
-        let mut escalation = None;
 
         match action {
             Action::Move(m) => {
-                let m = self.resolve_find(*m)?;
+                let Some(m) = self.resolve_find(*m) else { return };
                 // `$` in a block is a ragged right edge rather than a column,
                 // and any other motion gives the edge back to the head.
                 if self.session.mode.visual() == Some(VisualKind::Block) {
@@ -2006,7 +2276,7 @@ impl View<'_> {
                 });
             }
             Action::Operate { op, target, count, sink } => {
-                let target = self.resolve_find_target(*target)?;
+                let Some(target) = self.resolve_find_target(*target) else { return };
                 let (op, count, sink) = (*op, *count, *sink);
                 self.for_each_selection(|ed, sel| {
                     match ed.buffer.operate(sel.head, op, target, count) {
@@ -2028,7 +2298,7 @@ impl View<'_> {
                 // entry is still owned by the ring.
                 let Some(entry) = self.session.registers.front().cloned() else {
                     self.session.status = "nothing to paste".into();
-                    return None;
+                    return;
                 };
                 let (before, count) = (*before, *count);
                 self.for_each_selection(|ed, sel| {
@@ -2037,35 +2307,6 @@ impl View<'_> {
             }
 
             Action::OpenPicker(kind) => self.open_picker(*kind),
-            Action::PickChar(c) => {
-                if let Some(p) = &mut self.session.picker {
-                    p.push_char(*c);
-                }
-            }
-            Action::PickBackspace => {
-                // Backspacing off the front cancels, as it does on a `:` line.
-                let empty = self.session.picker.as_mut().is_some_and(|p| !p.backspace());
-                if empty {
-                    self.close_picker();
-                }
-            }
-            Action::PickNext => {
-                if let Some(p) = &mut self.session.picker {
-                    p.next();
-                }
-            }
-            Action::PickPrev => {
-                if let Some(p) = &mut self.session.picker {
-                    p.prev();
-                }
-            }
-            Action::PickToggleShort => {
-                if let Some(p) = &mut self.session.picker {
-                    p.toggle_short();
-                }
-            }
-            Action::PickCancel => self.close_picker(),
-            Action::PickAccept => escalation = self.accept_pick(),
 
             Action::EnterInsert => self.session.mode = Mode::Insert,
             Action::EnterInsertAfter => {
@@ -2216,7 +2457,7 @@ impl View<'_> {
                     // Every row was too short for `I`. Nothing to insert into.
                     self.session.mode = Mode::Normal;
                     self.session.status = "no line reaches the block".into();
-                    return None;
+                    return;
                 }
                 self.selections.set(cursors.into_iter().map(Selection::collapsed).collect());
             }
@@ -2293,7 +2534,7 @@ impl View<'_> {
                         Some(range) => range,
                         None => {
                             self.session.status = "no word under the cursor".into();
-                            return None;
+                            return;
                         }
                     }
                 } else {
@@ -2303,11 +2544,11 @@ impl View<'_> {
                 let needle = self.buffer.slice(start, end);
                 let Some(found) = self.buffer.find_next(primary.head.at, &needle) else {
                     self.session.status = format!("no more matches for \"{needle}\"");
-                    return None;
+                    return;
                 };
                 if found == start {
                     self.session.status = "only one match".into();
-                    return None;
+                    return;
                 }
                 let width = needle.chars().count();
                 // A selection with room in it is only meaningful in visual
@@ -2328,7 +2569,7 @@ impl View<'_> {
                 let target = if *below { row + 1 } else { row.wrapping_sub(1) };
                 if *below && target >= self.buffer.line_count() || !*below && row == 0 {
                     self.session.status = "no line there".into();
-                    return None;
+                    return;
                 }
                 // Keeps the column, which is what makes a column of cursors.
                 let col = self.buffer.col_at(primary.head);
@@ -2372,7 +2613,7 @@ impl View<'_> {
                 self.session.replaced.push(overwritten);
             }
             Action::ReplaceBackspace => {
-                let overwritten = self.session.replaced.pop()?;
+                let Some(overwritten) = self.session.replaced.pop() else { return };
                 let mut i = 0;
                 self.for_each_selection(|ed, sel| {
                     let original = overwritten.get(i).copied().flatten();
@@ -2411,14 +2652,14 @@ impl View<'_> {
             }
             Action::SearchCancel => self.cancel_search(),
             Action::SearchExecute => {
-                let Mode::Search { query, forward } = &self.session.mode else { return None };
+                let Mode::Search { query, forward } = &self.session.mode else { return };
                 let (query, forward) = (query.clone(), *forward);
                 self.session.mode = Mode::Normal;
                 if query.is_empty() {
                     // A bare `/` repeats the last pattern, as in vim.
                     if self.session.last_search.is_none() {
                         self.session.pending_search_op = None;
-                        return None;
+                        return;
                     }
                 } else {
                     self.session.last_search =
@@ -2430,7 +2671,7 @@ impl View<'_> {
                 let at = self.selections.cursor();
                 let Some((start, end)) = self.buffer.word_at(at) else {
                     self.session.status = "no word under the cursor".into();
-                    return None;
+                    return;
                 };
                 self.session.last_search = Some(Search {
                     pattern: self.buffer.slice(start, end),
@@ -2446,27 +2687,24 @@ impl View<'_> {
                 self.scroll_by(if *down { half } else { -half }, true);
             }
 
-            Action::EnterCommandMode => {
-                self.session.status.clear();
-                self.session.mode = Mode::Command(String::new());
-            }
-            Action::CommandChar(c) => {
-                if let Mode::Command(line) = &mut self.session.mode {
-                    line.push(*c);
-                }
-            }
-            Action::CommandBackspace => {
-                if let Mode::Command(line) = &mut self.session.mode {
-                    if line.pop().is_none() {
-                        self.session.mode = Mode::Normal;
-                    }
-                }
-            }
-            Action::CommandCancel => self.session.mode = Mode::Normal,
-            // Handled by `Editor` before this view was built.
-            Action::CommandExecute | Action::Buffer(_) | Action::Window(_) => {}
+            // Handled by `Editor` before this view was built: the window
+            // tree, the buffer list, the command line and the picker.
+            Action::EnterCommandMode
+            | Action::CommandChar(_)
+            | Action::CommandBackspace
+            | Action::CommandCancel
+            | Action::CommandExecute
+            | Action::PickChar(_)
+            | Action::PickBackspace
+            | Action::PickNext
+            | Action::PickPrev
+            | Action::PickToggleShort
+            | Action::PickCancel
+            | Action::PickAccept
+            | Action::Buffer(_)
+            | Action::Window(_)
+            | Action::Tree(_) => {}
         }
-        escalation
     }
 
     /// Puts back the selections a revision recorded.
@@ -2624,35 +2862,15 @@ impl View<'_> {
         self.session.mode = Mode::Pick;
     }
 
-    fn close_picker(&mut self) {
-        self.session.picker = None;
-        self.session.mode = Mode::Normal;
-    }
-
-    fn accept_pick(&mut self) -> Option<Escalation> {
-        let picker = self.session.picker.take();
-        self.session.mode = Mode::Normal;
-        let picker = picker?;
-        let chosen = picker.selected()?;
-        match picker.kind {
-            PickerKind::Register { before } => {
-                let entry = self.session.registers.get(chosen).cloned()?;
-                // Push before pasting: move-to-front makes this the ring's head,
-                // so `.` and a later bare `p` repeat the entry you chose rather
-                // than whatever happened to be most recent.
-                self.session.registers.push(entry.clone());
-                let landed = self.buffer.paste(self.selections.cursor(), &entry, before, 1);
-                *self.selections = Selections::single(landed);
-                None
-            }
-            // The ring is right here; the buffer list is not. Escalates for the
-            // same reason `:b` does.
-            //
-            // A position rather than an id because the rows were built from the
-            // list in order, and the list cannot change while the picker holds
-            // every key.
-            PickerKind::Buffer => Some(Escalation::Buffer(BufferCmd::Chosen(chosen))),
-        }
+    /// Pastes the register the picker landed on.
+    fn paste_pick(&mut self, chosen: usize, before: bool) {
+        let Some(entry) = self.session.registers.get(chosen).cloned() else { return };
+        // Push before pasting: move-to-front makes this the ring's head, so
+        // `.` and a later bare `p` repeat the entry you chose rather than
+        // whatever happened to be most recent.
+        self.session.registers.push(entry.clone());
+        let landed = self.buffer.paste(self.selections.cursor(), &entry, before, 1);
+        *self.selections = Selections::single(landed);
     }
 
     /// The `:` commands. Deliberately tiny — this is not where the editor gets
@@ -3146,6 +3364,192 @@ mod tests {
         ed.run_ex(line);
     }
 
+    /// A directory under the temp dir, gone when the test ends.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("bee-dir-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(self, rel: &str) -> Self {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+            self
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn editing_a_directory_shows_a_tree_rather_than_reading_it_as_text() {
+        let d = ScratchDir::new("edit").file("a.rs");
+        let mut ed = editor("hello");
+
+        ex(&mut ed, &format!("e {}", d.path()));
+
+        assert!(ed.window().tree().is_some(), "the window holds a tree");
+        assert!(ed.buffer().is_none(), "so it shows no buffer at all");
+    }
+
+    /// `bee .` — and the buffer list stays non-empty, so nothing downstream
+    /// has to learn that the session began on a directory.
+    #[test]
+    fn opening_a_directory_starts_on_a_tree() {
+        let d = ScratchDir::new("open").file("a.rs");
+
+        let ed = Editor::open(d.path()).unwrap();
+
+        assert!(ed.window().tree().is_some());
+        assert_eq!(ed.buffer_ids().len(), 1, "with a [No Name] behind it");
+    }
+
+    #[test]
+    fn splitting_on_a_directory_gives_the_new_window_a_tree() {
+        let d = ScratchDir::new("split").file("a.rs");
+        let mut ed = editor("hello");
+        sized(&mut ed);
+
+        ex(&mut ed, &format!("vs {}", d.path()));
+
+        assert_eq!(ed.window_ids().len(), 2);
+        assert!(ed.window().tree().is_some(), "focus follows the new window");
+    }
+
+    /// `-` is one key in two directions: down into a file from the tree, and
+    /// back out to the tree from the file.
+    #[test]
+    fn minus_in_a_text_window_opens_the_tree_on_this_files_directory() {
+        let d = ScratchDir::new("minus").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(format!("{}/b.rs", d.path())).unwrap();
+
+        ed.apply(cmd(Action::Tree(TreeCmd::Up)));
+
+        let tree = ed.window().tree().expect("a tree now");
+        assert_eq!(tree.root(), std::path::Path::new(d.path()));
+        assert_eq!(tree.selected_row().unwrap().name, "b.rs", "on the file you left");
+    }
+
+    /// A given window's view onto its buffer — what the tests that watch a
+    /// second pane are actually asking about.
+    fn text_of(ed: &Editor, id: WindowId) -> &Text {
+        ed.window_of(id).expect("no such window").text().expect("that window holds a tree")
+    }
+
+    /// The command line is session state, not the buffer's, so it has to work
+    /// where there is no buffer. Without this `:q` cannot leave `bee .`.
+    #[test]
+    fn the_command_line_works_in_a_tree_window() {
+        let d = ScratchDir::new("tree-ex").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ed.apply(cmd(Action::EnterCommandMode));
+        for c in "q".chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+        ed.apply(cmd(Action::CommandExecute));
+
+        assert!(ed.session.quit, "`:q` left the editor");
+    }
+
+    /// The picker is session state too, and `:ls` is reachable from a tree.
+    #[test]
+    fn the_buffer_picker_works_from_a_tree_window() {
+        let d = ScratchDir::new("tree-pick").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ex(&mut ed, "ls");
+        assert!(ed.session.picker.is_some(), "`:ls` opened the picker");
+        ed.apply(cmd(Action::PickAccept));
+
+        assert!(ed.window().buffer().is_some(), "accepting showed the buffer here");
+    }
+
+    /// A tree pane shows no buffer, so the lines that need one say so rather
+    /// than failing quietly.
+    #[test]
+    fn the_lines_that_need_a_buffer_say_when_there_is_none() {
+        let d = ScratchDir::new("tree-refuse").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ex(&mut ed, "w");
+        assert_eq!(ed.session.status, "no buffer in this window");
+
+        ex(&mut ed, "bd");
+        assert_eq!(ed.session.status, "no buffer in this window");
+    }
+
+    /// `:bn` is not refused, though — asking to see a buffer here is exactly
+    /// what it means, and the tree becomes the alternate.
+    #[test]
+    fn switching_buffers_in_a_tree_window_shows_one_and_parks_the_tree() {
+        let d = ScratchDir::new("tree-bn").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        ex(&mut ed, "bn");
+
+        assert!(ed.window().buffer().is_some(), "a buffer is showing");
+        assert!(matches!(ed.window().alt, Some(Content::Tree(_))), "the tree is the alternate");
+    }
+
+    fn tree_key(ed: &mut Editor, tree_cmd: TreeCmd) {
+        ed.apply(cmd(Action::Tree(tree_cmd)));
+    }
+
+    /// Down one row from the root, onto the first entry.
+    fn select_first_entry(ed: &mut Editor) {
+        tree_key(ed, TreeCmd::Select { down: true, count: 1 });
+    }
+
+    #[test]
+    fn enter_on_a_file_replaces_the_tree_when_there_is_nowhere_else_to_put_it() {
+        let d = ScratchDir::new("enter-alone").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Enter);
+
+        let shown = ed.name_of(ed.window().buffer().expect("a buffer now"));
+        assert!(shown.ends_with("a.rs"), "opened here: {shown}");
+        assert!(
+            matches!(ed.window().alt, Some(Content::Tree(_))),
+            "and the tree is the alternate, expansion and all",
+        );
+    }
+
+    #[test]
+    fn enter_on_a_file_hands_it_to_the_other_window_and_leaves_the_tree_alone() {
+        let d = ScratchDir::new("enter-split").file("a.rs");
+        let mut ed = editor("hello");
+        sized(&mut ed);
+        let text_window = ed.focus();
+        ex(&mut ed, &format!("vs {}", d.path()));
+        let tree_window = ed.focus();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Enter);
+
+        assert!(
+            ed.window_of(tree_window).unwrap().tree().is_some(),
+            "the tree pane survives, which is what makes `:vs .` a sidebar",
+        );
+        assert_eq!(ed.focus(), text_window, "and focus follows the file");
+        let shown = ed.name_of(ed.window().buffer().unwrap());
+        assert!(shown.ends_with("a.rs"), "which landed in the other pane: {shown}");
+    }
+
     /// A line that parses but cannot run says what it wanted, not that it was
     /// never a command. Easy to lose when the parse moved out of the view.
     #[test]
@@ -3401,7 +3805,7 @@ mod tests {
 
         assert_eq!(ed.window_ids().len(), 2);
         assert_eq!(ed.buffer_ids().len(), 1, "one file, two views of it");
-        assert_eq!(Some(ed.pane(other(&ed)).unwrap().text.buffer), ed.window().buffer());
+        assert_eq!(Some(text_of(&ed, other(&ed)).buffer), ed.window().buffer());
     }
 
     /// Vim copies the cursor into the new window, so the split lands on the
@@ -3414,7 +3818,7 @@ mod tests {
 
         split(&mut ed, Dir::Horizontal);
         assert_eq!(ed.cursor_row().unwrap(), 2, "the new window");
-        assert_eq!(ed.pane(other(&ed)).unwrap().text.selections.cursor(), at, "and the old one");
+        assert_eq!(text_of(&ed, other(&ed)).selections.cursor(), at, "and the old one");
     }
 
     /// The reason `Edit` carries a char range at all: a window that did not
@@ -3427,13 +3831,10 @@ mod tests {
         split(&mut ed, Dir::Horizontal);
 
         let watcher = other(&ed);
-        assert_eq!(
-            ed.pane(watcher)
-                .unwrap()
-                .buffer
-                .row_at(ed.pane(watcher).unwrap().text.selections.cursor()),
-            2
-        );
+        let row_of = |ed: &Editor| {
+            ed.buffer_of(watcher).unwrap().row_at(text_of(ed, watcher).selections.cursor())
+        };
+        assert_eq!(row_of(&ed), 2);
 
         // Insert a line above everything, from the focused window.
         ed.set_cursor(Cursor::at(0));
@@ -3442,9 +3843,9 @@ mod tests {
         ed.apply(cmd(Action::EnterNormal));
         ed.settle();
 
-        let pane = ed.pane(watcher).unwrap();
+        let (buffer, text) = (ed.buffer_of(watcher).unwrap(), text_of(&ed, watcher));
         assert_eq!(
-            pane.buffer.row_at(pane.text.selections.cursor()),
+            buffer.row_at(text.selections.cursor()),
             3,
             "the other window followed the text down, rather than staying on row 2",
         );
@@ -3465,14 +3866,14 @@ mod tests {
         ed.apply(cmd(Action::InsertNewline));
         ed.apply(cmd(Action::EnterNormal));
         ed.settle();
-        let moved = ed.pane(watcher).unwrap().text.selections.cursor();
+        let moved = text_of(&ed, watcher).selections.cursor();
 
         ed.apply(cmd(Action::Undo));
         ed.settle();
 
-        let pane = ed.pane(watcher).unwrap();
-        assert_ne!(pane.text.selections.cursor(), moved, "it moved back");
-        assert_eq!(pane.buffer.row_at(pane.text.selections.cursor()), 2);
+        let (buffer, text) = (ed.buffer_of(watcher).unwrap(), text_of(&ed, watcher));
+        assert_ne!(text.selections.cursor(), moved, "it moved back");
+        assert_eq!(buffer.row_at(text.selections.cursor()), 2);
     }
 
     #[test]
@@ -3489,7 +3890,7 @@ mod tests {
         }
 
         assert!(ed.window().text().unwrap().scroll > 100, "the focused window followed its cursor");
-        assert_eq!(ed.pane(watcher).unwrap().text.scroll, 0, "and the other one stayed put");
+        assert_eq!(text_of(&ed, watcher).scroll, 0, "and the other one stayed put");
     }
 
     #[test]
@@ -3624,7 +4025,7 @@ mod tests {
         assert_eq!(ed.window_ids().len(), 2);
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n", "the new window shows it");
         assert_eq!(
-            ed.pane(other(&ed)).unwrap().buffer.rope().to_string(),
+            ed.buffer_of(other(&ed)).unwrap().rope().to_string(),
             "a\n",
             "and the old one is untouched",
         );

@@ -9,12 +9,12 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::editor::{Action, BufferCmd, Command, Mode, VisualKind, WindowCmd};
+use crate::editor::{Action, BufferCmd, Command, Mode, TreeCmd, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
 use crate::registers::Sink;
-use crate::window::{Dir, Side};
+use crate::window::{ContentKind, Dir, Side};
 
 #[derive(Default)]
 pub struct Input {
@@ -84,8 +84,13 @@ fn object_key(c: char) -> Option<TextObject> {
 }
 
 impl Input {
-    pub fn on_key(&mut self, key: Key, mode: &Mode) -> Option<Command> {
+    pub fn on_key(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
         match mode {
+            // A tree gets its own keymap rather than an overlay on normal
+            // mode's. Which one runs is a property of the window, not of the
+            // session — see `docs/specs/tree.md` on why `Mode::Tree` would be
+            // a second copy of a fact the window already holds.
+            Mode::Normal if content == ContentKind::Tree => self.tree(key),
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -246,6 +251,66 @@ impl Input {
         Some(Command { count: 1, action: Action::Window(cmd) })
     }
 
+    /// The keymap for a window holding a tree.
+    ///
+    /// Complete, not an overlay: nothing falls through to normal mode except
+    /// what is named here. An allowlist stays correct as keys are added to the
+    /// editor, where a denylist — "normal mode, minus the ones that edit" —
+    /// would have to be revisited every time and would be silently wrong until
+    /// someone noticed. For a pane sitting on a filesystem that is worth the
+    /// keys it leaves out.
+    ///
+    /// Nothing here enters insert or visual mode, and `Ctrl-W` is normal-mode
+    /// only, so a tree can never be focused in either.
+    fn tree(&mut self, key: Key) -> Option<Command> {
+        if self.window_pending {
+            return self.window_key(key);
+        }
+        let ctrl = key.mods.ctrl;
+        let count = self.count.unwrap_or(1).max(1);
+        let g = std::mem::take(&mut self.g_pending);
+
+        let tree_cmd = match key.code {
+            // The `g` prefix resolves first, or `gh` would read as `h`.
+            KeyCode::Char('g') if g => TreeCmd::First,
+            KeyCode::Char('h') if g => TreeCmd::ToggleHidden,
+            KeyCode::Char('g') => {
+                self.g_pending = true;
+                return None;
+            }
+
+            KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                self.count = Some(self.count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as usize);
+                return None;
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                return None;
+            }
+            KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
+            KeyCode::Char('^') if ctrl => return self.plain(Action::Buffer(BufferCmd::Alternate)),
+
+            KeyCode::Char('j') | KeyCode::Down => TreeCmd::Select { down: true, count },
+            KeyCode::Char('k') | KeyCode::Up => TreeCmd::Select { down: false, count },
+            KeyCode::Char('d') if ctrl => TreeCmd::HalfPage { down: true },
+            KeyCode::Char('u') if ctrl => TreeCmd::HalfPage { down: false },
+            KeyCode::Char('G') => TreeCmd::Last,
+            KeyCode::Char('l') | KeyCode::Right => TreeCmd::Expand,
+            KeyCode::Char('h') | KeyCode::Left => TreeCmd::Collapse,
+            KeyCode::Enter => TreeCmd::Enter,
+            KeyCode::Char('-') => TreeCmd::Up,
+            KeyCode::Char('R') => TreeCmd::Refresh,
+
+            // Everything else, Esc included, drops what was pending and does
+            // nothing — which is what an allowlist means.
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        self.plain(Action::Tree(tree_cmd))
+    }
+
     fn normal(&mut self, key: Key) -> Option<Command> {
         let ctrl = key.mods.ctrl;
 
@@ -278,6 +343,9 @@ impl Input {
             // Not every terminal sends this one, which is why `:b#` exists
             // beside it rather than only underneath it.
             KeyCode::Char('^') if ctrl => self.plain(Action::Buffer(BufferCmd::Alternate)),
+            // The tree on this file's directory. In a tree the same key goes
+            // up a level, which is the same move one step further out.
+            KeyCode::Char('-') => self.plain(Action::Tree(TreeCmd::Up)),
             // The start of a key, not a key. Any count already typed stays,
             // because it belongs to the resize forms.
             KeyCode::Char('w') if ctrl => {
@@ -751,10 +819,78 @@ mod tests {
         Key::ctrl(c)
     }
 
+    /// Feeds `keys` to a window holding a tree, returning what the last one
+    /// resolved to.
+    fn in_tree(keys: &str) -> Option<Command> {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in keys.chars() {
+            last = input.on_key(key(c), &Mode::Normal, ContentKind::Tree);
+        }
+        last
+    }
+
+    fn tree_action(keys: &str) -> Action {
+        in_tree(keys).unwrap_or_else(|| panic!("{keys:?} produced no command")).action
+    }
+
+    #[test]
+    fn minus_asks_for_the_tree_from_either_side() {
+        assert_eq!(typed("-").action, Action::Tree(TreeCmd::Up), "from a file");
+        assert_eq!(tree_action("-"), Action::Tree(TreeCmd::Up), "and from a tree");
+    }
+
+    #[test]
+    fn the_tree_keymap_moves_by_a_count() {
+        assert_eq!(tree_action("j"), Action::Tree(TreeCmd::Select { down: true, count: 1 }));
+        assert_eq!(tree_action("3j"), Action::Tree(TreeCmd::Select { down: true, count: 3 }));
+        assert_eq!(tree_action("k"), Action::Tree(TreeCmd::Select { down: false, count: 1 }));
+    }
+
+    #[test]
+    fn the_tree_keymap_expands_collapses_and_re_roots() {
+        assert_eq!(tree_action("l"), Action::Tree(TreeCmd::Expand));
+        assert_eq!(tree_action("h"), Action::Tree(TreeCmd::Collapse));
+        assert_eq!(tree_action("-"), Action::Tree(TreeCmd::Up));
+        assert_eq!(tree_action("R"), Action::Tree(TreeCmd::Refresh));
+    }
+
+    /// `gh` sits beside `gg` under the prefix normal mode already runs, and
+    /// the prefix has to resolve before `h` reads as collapse.
+    #[test]
+    fn the_g_prefix_tells_first_row_from_hidden_files() {
+        assert_eq!(tree_action("gg"), Action::Tree(TreeCmd::First));
+        assert_eq!(tree_action("gh"), Action::Tree(TreeCmd::ToggleHidden));
+        assert_eq!(tree_action("G"), Action::Tree(TreeCmd::Last));
+    }
+
+    /// The keymap is an allowlist, and this is what that buys: no key that
+    /// edits or enters insert mode can reach a pane sitting on a filesystem.
+    #[test]
+    fn nothing_in_a_tree_enters_insert_or_edits() {
+        for c in ['i', 'a', 'A', 'I', 'o', 'O', 'c', 'x', 'p', 'v', 'V', 'd', 'u', 's'] {
+            assert!(in_tree(&c.to_string()).is_none(), "{c:?} did something in a tree");
+        }
+    }
+
+    /// What it does let through: the window prefix and the command line, so a
+    /// tree pane is still a window and `:` still works from one.
+    #[test]
+    fn a_tree_still_takes_window_keys_and_the_command_line() {
+        let mut input = Input::default();
+        assert!(input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Tree).is_none(), "armed");
+        let cmd = input.on_key(key('v'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }));
+
+        assert_eq!(tree_action(":"), Action::EnterCommandMode);
+    }
+
     #[test]
     fn ctrl_caret_asks_for_the_alternate_buffer() {
         let mut input = Input::default();
-        let cmd = input.on_key(ctrl('^'), &Mode::Normal).expect("Ctrl-^ produced no command");
+        let cmd = input
+            .on_key(ctrl('^'), &Mode::Normal, ContentKind::Text)
+            .expect("Ctrl-^ produced no command");
         assert_eq!(cmd.action, Action::Buffer(BufferCmd::Alternate));
     }
 
@@ -764,7 +900,7 @@ mod tests {
         let mut input = Input::default();
         let mut last = None;
         for (i, c) in keys.chars().enumerate() {
-            let out = input.on_key(key(c), &Mode::Normal);
+            let out = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
             if i + 1 < keys.chars().count() {
                 assert!(out.is_none(), "{c:?} resolved early in {keys:?}");
             }
@@ -777,7 +913,7 @@ mod tests {
     fn typed_with(input: &mut Input, keys: &str) -> Command {
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal);
+            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
         }
         last.unwrap_or_else(|| panic!("{keys:?} produced no command"))
     }
@@ -786,7 +922,7 @@ mod tests {
         let mut input = Input::default();
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal);
+            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
         }
         last
     }
@@ -1014,7 +1150,7 @@ mod tests {
     fn the_black_hole_does_not_leak_into_the_next_command() {
         let mut input = Input::default();
         for c in "\"_dd".chars() {
-            input.on_key(key(c), &Mode::Normal);
+            input.on_key(key(c), &Mode::Normal, ContentKind::Text);
         }
         assert_eq!(
             typed_with(&mut input, "dd").action,
@@ -1043,7 +1179,7 @@ mod tests {
     #[test]
     fn picker_keys_map_to_pick_actions() {
         let mut input = Input::default();
-        let mut act = |k: Key| input.on_key(k, &Mode::Pick).unwrap().action;
+        let mut act = |k: Key| input.on_key(k, &Mode::Pick, ContentKind::Text).unwrap().action;
 
         assert_eq!(act(key('a')), Action::PickChar('a'));
         assert_eq!(act(ctrl('n')), Action::PickNext);
@@ -1060,7 +1196,10 @@ mod tests {
     #[test]
     fn a_plain_p_in_the_picker_is_a_query_char() {
         let mut input = Input::default();
-        assert_eq!(input.on_key(key('p'), &Mode::Pick).unwrap().action, Action::PickChar('p'));
+        assert_eq!(
+            input.on_key(key('p'), &Mode::Pick, ContentKind::Text).unwrap().action,
+            Action::PickChar('p')
+        );
     }
 
     #[test]
@@ -1086,11 +1225,11 @@ mod tests {
     #[test]
     fn escape_clears_a_half_typed_command() {
         let mut input = Input::default();
-        input.on_key(key('2'), &Mode::Normal);
-        input.on_key(key('d'), &Mode::Normal);
+        input.on_key(key('2'), &Mode::Normal, ContentKind::Text);
+        input.on_key(key('d'), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "2d");
 
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "");
     }
 
@@ -1098,18 +1237,24 @@ mod tests {
     fn the_pending_display_shows_the_whole_half_typed_command() {
         let mut input = Input::default();
         for c in "2d3".chars() {
-            input.on_key(key(c), &Mode::Normal);
+            input.on_key(key(c), &Mode::Normal, ContentKind::Text);
         }
         assert_eq!(input.pending_display(), "2d3");
-        input.on_key(key('g'), &Mode::Normal);
+        input.on_key(key('g'), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "2d3g");
     }
 
     #[test]
     fn u_undoes_and_ctrl_r_redoes() {
         let mut input = Input::default();
-        assert_eq!(input.on_key(key('u'), &Mode::Normal).unwrap().action, Action::Undo);
-        assert_eq!(input.on_key(ctrl('r'), &Mode::Normal).unwrap().action, Action::Redo);
+        assert_eq!(
+            input.on_key(key('u'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            Action::Undo
+        );
+        assert_eq!(
+            input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            Action::Redo
+        );
     }
 
     #[test]
@@ -1117,8 +1262,8 @@ mod tests {
         let mut input = Input::default();
         assert_eq!(typed("3u").count, 3);
 
-        assert!(input.on_key(key('2'), &Mode::Normal).is_none());
-        let cmd = input.on_key(ctrl('r'), &Mode::Normal).unwrap();
+        assert!(input.on_key(key('2'), &Mode::Normal, ContentKind::Text).is_none());
+        let cmd = input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text).unwrap();
         assert_eq!(cmd.count, 2);
         assert_eq!(cmd.action, Action::Redo);
     }
@@ -1128,7 +1273,7 @@ mod tests {
     fn operator_keys_are_just_letters_in_insert_mode() {
         let mut input = Input::default();
         for c in ['u', 'd', 'c'] {
-            let cmd = input.on_key(key(c), &Mode::Insert).unwrap();
+            let cmd = input.on_key(key(c), &Mode::Insert, ContentKind::Text).unwrap();
             assert_eq!(cmd.action, Action::InsertChar(c));
         }
     }
@@ -1164,10 +1309,13 @@ mod tests {
     #[test]
     fn r_waits_for_its_character() {
         let mut input = Input::default();
-        assert!(input.on_key(key('r'), &Mode::Normal).is_none(), "r alone resolves to nothing");
+        assert!(
+            input.on_key(key('r'), &Mode::Normal, ContentKind::Text).is_none(),
+            "r alone resolves to nothing"
+        );
         assert_eq!(input.pending_display(), "r", "and says so in the status line");
         assert_eq!(
-            input.on_key(key('x'), &Mode::Normal).unwrap().action,
+            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
             Action::ReplaceChar { ch: 'x', count: 1 }
         );
     }
@@ -1192,11 +1340,14 @@ mod tests {
     #[test]
     fn esc_abandons_a_pending_r() {
         let mut input = Input::default();
-        input.on_key(key('r'), &Mode::Normal);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        input.on_key(key('r'), &Mode::Normal, ContentKind::Text);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "");
         // The next key is an ordinary command again, not r's argument.
-        assert_eq!(input.on_key(key('x'), &Mode::Normal).unwrap().action, typed("x").action);
+        assert_eq!(
+            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            typed("x").action
+        );
     }
 
     #[test]
@@ -1229,7 +1380,7 @@ mod tests {
     #[test]
     fn a_find_alone_resolves_to_nothing_and_shows_in_the_status_line() {
         let mut input = Input::default();
-        assert!(input.on_key(key('f'), &Mode::Normal).is_none());
+        assert!(input.on_key(key('f'), &Mode::Normal, ContentKind::Text).is_none());
         assert_eq!(input.pending_display(), "f");
     }
 
@@ -1284,10 +1435,13 @@ mod tests {
     #[test]
     fn esc_abandons_a_pending_find() {
         let mut input = Input::default();
-        input.on_key(key('f'), &Mode::Normal);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        input.on_key(key('f'), &Mode::Normal, ContentKind::Text);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "");
-        assert_eq!(input.on_key(key('x'), &Mode::Normal).unwrap().action, typed("x").action);
+        assert_eq!(
+            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            typed("x").action
+        );
     }
 
     // ---- text objects ------------------------------------------------------
@@ -1358,19 +1512,22 @@ mod tests {
     fn an_unknown_object_key_abandons_the_operator() {
         let mut input = Input::default();
         for c in ['d', 'i'] {
-            assert!(input.on_key(key(c), &Mode::Normal).is_none());
+            assert!(input.on_key(key(c), &Mode::Normal, ContentKind::Text).is_none());
         }
         assert_eq!(input.pending_display(), "di");
-        assert!(input.on_key(key('z'), &Mode::Normal).is_none(), "no object named z");
+        assert!(
+            input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_none(),
+            "no object named z"
+        );
         assert_eq!(input.pending_display(), "", "and the operator is dropped");
     }
 
     #[test]
     fn esc_abandons_a_pending_object() {
         let mut input = Input::default();
-        input.on_key(key('d'), &Mode::Normal);
-        input.on_key(key('i'), &Mode::Normal);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal);
+        input.on_key(key('d'), &Mode::Normal, ContentKind::Text);
+        input.on_key(key('i'), &Mode::Normal, ContentKind::Text);
+        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "");
     }
 }

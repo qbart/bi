@@ -70,7 +70,7 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
             // fires twice.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(key) = tui::keys::translate(key)
-                    && let Some(cmd) = input.on_key(key, &ed.session.mode)
+                    && let Some(cmd) = input.on_key(key, &ed.session.mode, ed.content_kind())
                 {
                     ed.session.status.clear();
                     ed.apply(cmd);
