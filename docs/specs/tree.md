@@ -261,6 +261,10 @@ gh              show or hide dotfiles
 a               create — prefills the command line
 r               rename — prefills the command line
 dd              delete, with no `:` line in between
+y               yank the selected path into the register ring
+c   x           mark for copying / for cutting, and unmark
+p               paste what is marked into the selected directory
+Esc             clear the marks
 Ctrl-W …        every window key, unchanged
 Ctrl-W e        a tree beside this one, in a pane of its own
 :               the command line
@@ -612,6 +616,112 @@ windows.md needs two corrections in place, in the style it already uses for its
 own: `Window` no longer holds `selections` and `scroll` directly, and
 `Escalation` is no longer how ex commands reach `Editor`.
 
+## The clipboard
+
+Marking a few files and putting them somewhere else. `y` is separate and
+smaller, so it goes first.
+
+**`y` yanks the selected path into the register ring**, absolute, and says what
+it took. It is the existing ring, not a new one — the whole point is that `p` in
+a *text* buffer then pastes the path, which is what you wanted it for. The tree
+has no use for the ring itself; it is a producer, not a consumer.
+
+### Marking
+
+```rust
+pub struct Clipboard {
+    paths: Vec<PathBuf>,
+    mode: ClipMode,
+}
+
+pub enum ClipMode { Copy, Cut }
+```
+
+On `Session`, beside the registers, and for the same reason: you mark in one
+place and paste in another, and re-rooting the tree must not lose what you
+marked. It also means the marks show in the tree wherever those paths appear.
+
+`c` marks for copying, `x` for cutting, and both toggle. **One mode for the
+whole set**: pressing the other key converts everything rather than leaving a
+clipboard that both duplicates and destroys on one keystroke. Two files marked
+to copy and then an `x` is three files to move, and the footer says so.
+
+Converting does not unmark. `x` on a path already marked for copying means "make
+this a move", not "forget this one" — the same key doing two opposite things
+depending on state it does not show you is the kind of thing that costs a file.
+Toggling off is `c` on a copy-marked path, `x` on a cut-marked one: the key that
+put it there takes it away.
+
+`Esc` clears the marks, which is the only way out that does not involve pressing
+the right key on every one of them.
+
+### Pasting
+
+`p` puts them in the selected directory — the one holding the file, when the
+cursor is on a file, which is how `a` already picks its directory. Copying a
+directory copies it whole. Cutting is a rename, falling back to copy-then-delete
+across filesystems, because a rename between devices is not a rename.
+
+Refused: pasting a directory into itself or into anything below it. That one is
+a loop rather than a mistake, and no name for the destination fixes it.
+
+A cut clears the clipboard afterwards, because the sources are not there any
+more. A copy keeps it, so the same set can go to a second place.
+
+### Conflicts
+
+The destination exists. The paste **stops there** and puts the proposed path on
+the command line:
+
+```
+:paste-as src/lib.rs
+```
+
+Edit it and press Enter to place that one and carry on; press Esc to abort the
+rest. This is the prefilled-line trick `a` and `r` already use, and it is why
+this reverses "the editor has no prompt machinery and gains none" without
+actually growing any: the prompt is a `:` line, Enter is the assent, and Esc is
+the way out — all three already exist.
+
+What it costs is state, because a paste can now be half-done:
+
+```rust
+/// A paste stopped on a name it cannot use.
+pub struct Pasting {
+    queue: Vec<PathBuf>,
+    into: PathBuf,
+    mode: ClipMode,
+    done: usize,
+}
+```
+
+`Session::pasting: Option<Pasting>`. `:paste-as` places the head of the queue at
+the path given and resumes; `Esc` on that line drops it and reports how many
+landed. A second conflict stops again, so a paste of ten files into a directory
+holding all ten is ten prompts — which is the honest cost of never overwriting
+anything, and the reason `Esc` aborts the whole run rather than one file.
+
+**No skip.** A three-way rename/skip/abort needs single-key answers and a prompt
+that is not a `:` line, which is the machinery this design is avoiding. Aborting
+and re-marking the ones you meant is two keystrokes more and no new concepts.
+
+### The commands
+
+```
+:paste [<dir>]          the marked paths, into <dir> or the selected directory
+:paste-as <path>        place the one that stopped, and carry on
+```
+
+Ex commands for the reason the other three are: typeable without a tree,
+testable without one, and the keys become prefills over them.
+
+### Drawing
+
+The core does not know about the clipboard — `Row` gains nothing. `render_tree`
+takes the clipboard beside the tree and marks the rows whose paths are in it,
+`+` for a copy and `~` for a cut, in the column the depth indent already leaves.
+Structure from the core, glyphs from the frontend, exactly as with `▸`.
+
 ## Deliberately out
 
 - **Filtering the tree.** `/` over a listing is what a file picker does better,
@@ -625,3 +735,9 @@ own: `Window` no longer holds `selections` and `scroll` directly, and
   applies — is a real design, and it is the buffer design this spec rejected.
 - **Copying, and multi-selection.** One path per operation until there is a
   reason for more.
+
+  **Corrected.** There was a reason: moving a handful of files between two
+  directories is what a tree is for, and doing it one `:rename` at a time is
+  worse than doing it in a shell. See *The clipboard* below, which also
+  reverses the "no prompt machinery" line — narrowly, and using the command
+  line rather than growing a prompt system.
