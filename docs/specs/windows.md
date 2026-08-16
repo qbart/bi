@@ -252,6 +252,8 @@ pub struct Chrome {
     /// The smallest pane worth handing back.
     pub min_width: u16,
     pub min_height: u16,
+    /// How wide a tree pane opens. See tree.md.
+    pub tree_width: u16,
 }
 
 impl Editor {
@@ -348,6 +350,7 @@ now has.
 :sp[lit] [path]     split horizontally — the new window is above
 :vs[plit] [path]    split vertically — the new window is left
 Ctrl-W s, Ctrl-W v  the same two
+Ctrl-W e            a file tree beside this window — see tree.md
 Ctrl-W h j k l      focus the window in that direction
 Ctrl-W w, Ctrl-W W  cycle focus forwards, backwards
 Ctrl-W c, :close    close this window

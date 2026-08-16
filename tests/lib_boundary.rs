@@ -120,7 +120,7 @@ fn modes_are_observable_from_outside() {
 #[test]
 fn an_embedder_can_split_switch_and_edit_in_both_windows() {
     let mut s = Session::new("alpha");
-    let chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+    let chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 30 };
 
     let panes = s.editor.layout(Rect::new(0, 0, 80, 24), chrome);
     assert_eq!(panes.len(), 1);
@@ -273,7 +273,7 @@ fn an_embedder_can_browse_expand_and_open_without_a_terminal() {
         Session { editor: Editor::open(dir.path()).unwrap(), input: Input::default() };
     session.editor.layout(
         Rect::new(0, 0, 80, 24),
-        Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 },
+        Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 30 },
     );
 
     let rows = session.editor.window().tree().unwrap().rows();

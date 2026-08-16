@@ -262,6 +262,7 @@ a               create — prefills the command line
 r               rename — prefills the command line
 dd              delete, with no `:` line in between
 Ctrl-W …        every window key, unchanged
+Ctrl-W e        a tree beside this one, in a pane of its own
 :               the command line
 Ctrl-^          the alternate content, tree or file
 ```
@@ -319,6 +320,31 @@ first leaf in layout order holding text; if there is none, the file opens in
 place. `Ctrl-W p` falls out of the same field and is not specified here.
 
 Focus follows the file. You asked to open it.
+
+**Last-focused rather than an origin recorded on the tree.** A sidebar could
+remember the window it was opened from and always hand back to that one. It
+would be the same answer nearly every time — you reach a tree by moving focus to
+it, which makes the pane you left the previous one — and worse the rest of the
+time, because with two files open the pane you were *last* reading is the one
+you mean, not the one you happened to press the key in ten minutes ago. One
+field, no per-tree state, and it follows you.
+
+### The sidebar shortcut
+
+`Ctrl-W e` is that layout in one key: split vertically, root the new pane at the
+current file's directory, select the file, and narrow it to
+`Chrome::tree_width`. Under the window prefix because it makes a window, which
+is where every other key that makes one lives.
+
+The width is `Chrome`'s rather than the core's, for the reason `min_width` is:
+how wide a tree wants to be is a judgement about reading, and a core that
+hard-coded thirty columns would be asserting one on every frontend. It is a
+*starting* width — the pane becomes a weight like any other and keeps its share
+of the terminal, because a genuinely fixed-width pane is a concept `Layout` does
+not have and this did not need.
+
+On a window already holding a tree it duplicates that tree's root, the way
+`Ctrl-W v` duplicates a window rather than refusing.
 
 ## File operations
 

@@ -229,7 +229,7 @@ fn gutter_width(ed: &Editor, buffer: &bee::buffer::Buffer) -> usize {
 ///
 /// `min_height` is 2 because a pane has to fit a status row and a line of text
 /// — a terminal convention, which is why it lives here and not in the core.
-const CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+const CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 30 };
 
 fn to_core(r: Rect) -> CoreRect {
     CoreRect { x: r.x, y: r.y, width: r.width, height: r.height }

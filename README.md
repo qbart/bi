@@ -296,6 +296,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | Key | Does |
 |---|---|
 | `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
+| `Ctrl-W e` | a tree beside this file, rooted at its directory with it selected |
 | `Ctrl-W h j k l` | focus the window in that direction |
 | `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
 | `Ctrl-W c` `Ctrl-W q` | close this window |
@@ -316,7 +317,8 @@ showing it falls through to the next one.
 
 `bee .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
 and which one you meant is a question for the disk. `-` goes the other way, out
-of a file and into the tree above it. See [docs/specs/tree.md](docs/specs/tree.md).
+of a file and into the tree above it, and `Ctrl-W e` does the same into a pane
+beside it. See [docs/specs/tree.md](docs/specs/tree.md).
 
 | Key | Does |
 |---|---|
@@ -330,9 +332,15 @@ of a file and into the tree above it. See [docs/specs/tree.md](docs/specs/tree.m
 | `a` `r` | create / rename — each fills in a `:` line for you to agree to |
 | `dd` | delete outright. No undo for the filesystem; a directory with anything in it still wants `:delete!` |
 
-Enter on a file opens it in the last window focused before this one, so `:vs .`
-is a sidebar that stays put; with one window it opens in place and `Ctrl-^`
-brings the tree back with its expansion intact.
+Enter on a file opens it in the last window focused before this one, so a tree
+pane is a sidebar that stays put and files land in whichever pane you reached it
+from. With one window it opens in place, and `Ctrl-^` brings the tree back with
+its expansion intact.
+
+`Ctrl-W e` is the shortcut for that layout: it opens the tree beside the file
+you are reading, rooted at its directory with the file already selected, and
+`Chrome::tree_width` columns wide. That width is a starting point — the pane
+keeps its share of the terminal from then on, like every other pane.
 
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a

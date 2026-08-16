@@ -243,11 +243,16 @@ pub struct Chrome {
     pub rows: u16,
     pub min_width: u16,
     pub min_height: u16,
+    /// How wide a tree pane opens. A judgement about reading, not a fact about
+    /// geometry, so it sits here with the frontend's other judgements rather
+    /// than being a number in the core. It is a starting width: the pane keeps
+    /// its share of the terminal from then on, like every other pane.
+    pub tree_width: u16,
 }
 
 impl Default for Chrome {
     fn default() -> Self {
-        Self { columns: 0, rows: 0, min_width: 1, min_height: 1 }
+        Self { columns: 0, rows: 0, min_width: 1, min_height: 1, tree_width: 1 }
     }
 }
 
@@ -673,7 +678,8 @@ fn equalize(node: &mut Node) {
 mod tests {
     use super::*;
 
-    const CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+    const CHROME: Chrome =
+        Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 30 };
 
     fn area() -> Rect {
         Rect::new(0, 0, 80, 24)

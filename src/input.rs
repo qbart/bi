@@ -240,6 +240,10 @@ impl Input {
             // `q` quits the window, which is closing it.
             KeyCode::Char('c') | KeyCode::Char('q') => WindowCmd::Close,
             KeyCode::Char('o') => WindowCmd::Only,
+            // `e` for the pane most editors call an explorer. Under the window
+            // prefix because it makes a window, which is where every other key
+            // that makes one lives.
+            KeyCode::Char('e') => WindowCmd::Tree,
             KeyCode::Char('+') => WindowCmd::Resize { axis: Dir::Horizontal, cells },
             KeyCode::Char('-') => WindowCmd::Resize { axis: Dir::Horizontal, cells: -cells },
             KeyCode::Char('>') => WindowCmd::Resize { axis: Dir::Vertical, cells },

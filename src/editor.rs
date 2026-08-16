@@ -654,6 +654,9 @@ pub enum WindowCmd {
         dir: Dir,
         path: Option<String>,
     },
+    /// `Ctrl-W e` — a tree beside this window, rooted at the file it is
+    /// showing, with that file selected.
+    Tree,
     Focus(Side),
     Cycle {
         back: bool,
@@ -1377,6 +1380,48 @@ impl Editor {
                 }
             }
 
+            WindowCmd::Tree => {
+                // Rooted before the split, because it is a fact about the
+                // window you are leaving rather than the one being made.
+                let path = self.buffer().and_then(|b| b.path.clone());
+                let root = match (self.window().tree(), path.as_ref().and_then(|p| p.parent())) {
+                    // Already a tree: duplicate where it is looking, the way
+                    // `Ctrl-W v` duplicates a window rather than refusing.
+                    (Some(tree), _) => tree.root().to_path_buf(),
+                    (None, Some(parent)) => parent.to_path_buf(),
+                    (None, None) => std::env::current_dir().unwrap_or_default(),
+                };
+                let tree = match Tree::new(&root) {
+                    Ok(tree) => tree,
+                    Err(e) => {
+                        self.session.status = format!("{e:#}");
+                        return;
+                    }
+                };
+
+                let new = self.fresh_window_id();
+                if !self.layout.split(focus, new, Dir::Vertical, area, &chrome) {
+                    self.next_window -= 1;
+                    self.session.status = "not enough room to split".into();
+                    return;
+                }
+                self.windows.push(Window::showing(new, Content::Tree(tree)));
+                self.set_focus(new);
+                self.select_in_tree(path.as_deref());
+
+                // A half-screen tree is not a sidebar. Narrowed to the width
+                // the frontend asked for, which becomes a share of the
+                // terminal from here on, like every other pane.
+                let width = self
+                    .layout
+                    .rect_of(new, area, &chrome)
+                    .map_or(0, |rect| rect.width)
+                    .saturating_sub(chrome.tree_width);
+                if width > 0 {
+                    self.layout.resize(new, Dir::Vertical, -(width as i32), area, &chrome);
+                }
+            }
+
             WindowCmd::Focus(side) => {
                 let anchor = self.anchor_of(focus, side);
                 if let Some(next) = self.layout.neighbour(focus, side, area, &chrome, anchor) {
@@ -1660,6 +1705,14 @@ impl Editor {
         };
 
         self.show_tree(&root.to_string_lossy());
+        self.select_in_tree(path.as_deref());
+    }
+
+    /// Puts the focused tree's selection on `path`, if it is showing it.
+    ///
+    /// What makes `-` and `Ctrl-W e` land where you were rather than at the
+    /// top of the directory.
+    fn select_in_tree(&mut self, path: Option<&std::path::Path>) {
         let (Some(path), Some(tree)) = (path, self.window_mut().tree_mut()) else { return };
         if let Some(row) = tree.rows().iter().position(|r| r.path == path) {
             tree.select(row);
@@ -3907,6 +3960,106 @@ mod tests {
         assert_eq!(line, &format!("create {}/pkg/", d.path()), "inside it, not beside it");
     }
 
+    /// `Ctrl-W e` — a tree beside the file you are reading, rooted at its
+    /// directory with the file selected, and narrow enough to be a sidebar.
+    #[test]
+    fn ctrl_w_e_opens_a_narrow_tree_beside_the_current_file() {
+        let d = ScratchDir::new("sidebar").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(format!("{}/b.rs", d.path())).unwrap();
+        let file = ed.focus();
+        sized(&mut ed);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        let tree_window = ed.focus();
+
+        assert_eq!(ed.window_ids().len(), 2);
+        let tree = ed.window().tree().expect("focus is on the new tree");
+        assert_eq!(tree.root(), std::path::Path::new(d.path()).canonicalize().unwrap());
+        assert_eq!(tree.selected_row().unwrap().name, "b.rs", "on the file you were in");
+
+        let at = |ed: &mut Editor, cols| {
+            let rects = ed.layout(Rect::new(0, 0, cols, 24), TEST_CHROME);
+            let of = |id| rects.iter().find(|(w, _)| *w == id).unwrap().1.width;
+            (of(tree_window), of(file))
+        };
+
+        // `sized` laid out at 80, which is the width the sidebar was cut to.
+        let (sidebar, text) = at(&mut ed, 80);
+        assert!(sidebar < text, "the tree is the narrower pane");
+        assert!(sidebar <= TEST_CHROME.tree_width + 1, "and a sidebar, not a half: {sidebar}");
+
+        // A share of the terminal from here on, like every other pane.
+        let (wide, _) = at(&mut ed, 160);
+        assert!(wide > sidebar, "it grew with the terminal rather than staying put");
+    }
+
+    /// Duplicating rather than refusing, which is what `Ctrl-W v` does with a
+    /// window and costs nothing to be consistent with.
+    #[test]
+    fn ctrl_w_e_from_a_tree_roots_the_new_one_where_this_one_is() {
+        let d = ScratchDir::new("sidebar-tree").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        sized(&mut ed);
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Down);
+        let root = ed.window().tree().unwrap().root().to_path_buf();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        assert_eq!(ed.window().tree().expect("a second tree").root(), root, "not the cwd");
+    }
+
+    /// The file it opens still goes back where you came from — the sidebar is
+    /// a window like any other, and needs no rule of its own.
+    #[test]
+    fn a_sidebar_tree_hands_files_back_to_the_pane_it_grew_from() {
+        let d = ScratchDir::new("sidebar-open").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(format!("{}/b.rs", d.path())).unwrap();
+        let file = ed.focus();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        let tree = ed.focus();
+
+        tree_key(&mut ed, TreeCmd::First);
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Enter);
+
+        assert!(ed.window_of(tree).unwrap().tree().is_some(), "the sidebar stayed");
+        assert_eq!(ed.focus(), file, "and the file landed where you came from");
+        assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
+    }
+
+    /// Three panes: two files and a tree. Enter has to pick one of the two,
+    /// and the one you came from is the one you meant.
+    #[test]
+    fn enter_returns_to_whichever_window_you_reached_the_tree_from() {
+        let d = ScratchDir::new("handoff").file("a.rs");
+        let mut ed = editor("one");
+        sized(&mut ed);
+        let first = ed.focus();
+        ed.apply(cmd(Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None })));
+        let second = ed.focus();
+        assert_ne!(first, second);
+
+        ex(&mut ed, &format!("vs {}", d.path()));
+        let tree = ed.focus();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Enter);
+        assert_eq!(ed.focus(), second, "came from the second, went back to it");
+
+        // Now reach the tree from the *first* window instead.
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        while ed.focus() != first {
+            ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        }
+        while ed.focus() != tree {
+            ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        }
+        tree_key(&mut ed, TreeCmd::Enter);
+
+        assert_eq!(ed.focus(), first, "and this time back to the first");
+    }
+
     fn tree_key(ed: &mut Editor, tree_cmd: TreeCmd) {
         ed.apply(cmd(Action::Tree(tree_cmd)));
     }
@@ -4190,7 +4343,8 @@ mod tests {
 
     // ---- windows -----------------------------------------------------------
 
-    const TEST_CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+    const TEST_CHROME: Chrome =
+        Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 30 };
 
     /// Gives the editor a screen to lay out in. Splitting, resizing and
     /// directional switching are geometry, and geometry needs a size.
