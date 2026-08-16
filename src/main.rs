@@ -76,7 +76,7 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
                     ed.apply(cmd);
                 }
                 // Feed the parse tree. LSP will hang off the same drain.
-                ed.sync_syntax();
+                ed.settle();
             }
             Event::Resize(_, _) => {}
             _ => {}

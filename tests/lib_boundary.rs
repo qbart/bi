@@ -5,9 +5,10 @@
 //! the core is genuinely frontend-free. If someone adds a `ratatui` type to a
 //! signature in `editor`, `input` or `buffer`, this breaks.
 
-use bee::editor::{Editor, Mode};
+use bee::editor::{Action, Command, Editor, Mode, WindowCmd};
 use bee::input::Input;
 use bee::key::{Key, KeyCode};
+use bee::window::{Chrome, Dir, Rect, Side};
 
 /// A headless editor session: feed keys, read text back.
 struct Session {
@@ -29,7 +30,7 @@ impl Session {
         if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode) {
             self.editor.apply(cmd);
         }
-        self.editor.sync_syntax();
+        self.editor.settle();
     }
 
     /// Presses each char as its own key, in whatever mode the editor is in.
@@ -105,6 +106,44 @@ fn modes_are_observable_from_outside() {
 
     s.press(Key::char(':'));
     assert!(matches!(s.editor.session.mode, Mode::Command(_)));
+}
+
+/// Windows without a terminal.
+///
+/// Geometry is in the library, so an embedder lays out, splits, switches and
+/// edits through the public API alone — and `Rect` is four integers rather than
+/// anything a frontend owns.
+#[test]
+fn an_embedder_can_split_switch_and_edit_in_both_windows() {
+    let mut s = Session::new("alpha");
+    let chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+
+    let panes = s.editor.layout(Rect::new(0, 0, 80, 24), chrome);
+    assert_eq!(panes.len(), 1);
+
+    s.editor.apply(Command {
+        count: 1,
+        action: Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }),
+    });
+    let panes = s.editor.layout(Rect::new(0, 0, 80, 24), chrome);
+    assert_eq!(panes.len(), 2, "two panes, tiling the area");
+    assert_eq!(panes[0].1.width + panes[1].1.width + 1, 80);
+
+    // Type in the new window; the other one is looking at the same text.
+    s.keys("0");
+    s.type_text("X");
+    s.press(Key::code(KeyCode::Esc));
+    assert_eq!(s.text(), "Xalpha");
+
+    let other = *s.editor.window_ids().iter().find(|&&id| id != s.editor.focus()).unwrap();
+    assert_eq!(s.editor.pane(other).buffer.rope().to_string(), "Xalpha");
+
+    s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Focus(Side::Right)) });
+    assert_eq!(s.editor.focus(), other, "switched by geometry");
+
+    s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Close) });
+    assert_eq!(s.editor.window_ids().len(), 1);
+    assert_eq!(s.text(), "Xalpha", "and the buffer outlived the window");
 }
 
 /// The modules `lib.rs` declares. Kept as a literal list rather than a

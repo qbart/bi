@@ -13,7 +13,7 @@
 //! is not worth its churn for a single frontend.
 //!
 //! The seams the remaining work needs already exist: [`buffer::Edit`] and the
-//! [`editor::Action`] table, plus [`editor::Editor::sync_syntax`], which drains
+//! [`editor::Action`] table, plus [`editor::Editor::settle`], which drains
 //! the edit log for tree-sitter today and for LSP `didChange` later.
 
 pub mod buffer;

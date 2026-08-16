@@ -9,11 +9,12 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::editor::{Action, BufferCmd, Command, Mode, VisualKind};
+use crate::editor::{Action, BufferCmd, Command, Mode, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
 use crate::registers::Sink;
+use crate::window::{Dir, Side};
 
 #[derive(Default)]
 pub struct Input {
@@ -31,6 +32,9 @@ pub struct Input {
     /// `i` or `a` has been typed under an operator and is waiting for the
     /// object it selects. The bool is the `a` of `aw`.
     object_pending: Option<bool>,
+    /// `Ctrl-W` has been typed and is waiting for the key that says what to do
+    /// with a window. Not a key on its own — the start of one.
+    window_pending: bool,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
 }
@@ -132,6 +136,9 @@ impl Input {
         if let Some(around) = self.object_pending {
             s.push(if around { 'a' } else { 'i' });
         }
+        if self.window_pending {
+            s.push_str("^W");
+        }
         s
     }
 
@@ -195,8 +202,59 @@ impl Input {
         Some(Command { count, action })
     }
 
+    /// Resolves the key after `Ctrl-W`.
+    ///
+    /// A count in front belongs to the resize keys, where `3 Ctrl-W +` is three
+    /// rows; every other window key ignores it, which is what vim does and the
+    /// only place a count means anything here.
+    fn window_key(&mut self, key: Key) -> Option<Command> {
+        let cells = self.fold_count() as i32;
+        let cmd = match key.code {
+            // Ctrl or not: `Ctrl-W Ctrl-W` cycles just as `Ctrl-W w` does, so
+            // the finger already holding ctrl does not have to let go.
+            KeyCode::Char('w') => WindowCmd::Cycle { back: false },
+            KeyCode::Char('W') => WindowCmd::Cycle { back: true },
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                WindowCmd::Split { dir: Dir::Horizontal, path: None }
+            }
+            KeyCode::Char('v') => WindowCmd::Split { dir: Dir::Vertical, path: None },
+            KeyCode::Char('h') => WindowCmd::Focus(Side::Left),
+            KeyCode::Char('j') => WindowCmd::Focus(Side::Down),
+            KeyCode::Char('k') => WindowCmd::Focus(Side::Up),
+            KeyCode::Char('l') => WindowCmd::Focus(Side::Right),
+            KeyCode::Left => WindowCmd::Focus(Side::Left),
+            KeyCode::Down => WindowCmd::Focus(Side::Down),
+            KeyCode::Up => WindowCmd::Focus(Side::Up),
+            KeyCode::Right => WindowCmd::Focus(Side::Right),
+            // `q` quits the window, which is closing it.
+            KeyCode::Char('c') | KeyCode::Char('q') => WindowCmd::Close,
+            KeyCode::Char('o') => WindowCmd::Only,
+            KeyCode::Char('+') => WindowCmd::Resize { axis: Dir::Horizontal, cells },
+            KeyCode::Char('-') => WindowCmd::Resize { axis: Dir::Horizontal, cells: -cells },
+            KeyCode::Char('>') => WindowCmd::Resize { axis: Dir::Vertical, cells },
+            KeyCode::Char('<') => WindowCmd::Resize { axis: Dir::Vertical, cells: -cells },
+            KeyCode::Char('=') => WindowCmd::Equalize,
+            // Esc cancels, and anything unrecognised drops the prefix rather
+            // than swallowing the key — the same rule the rest of this file
+            // follows.
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        self.reset();
+        Some(Command { count: 1, action: Action::Window(cmd) })
+    }
+
     fn normal(&mut self, key: Key) -> Option<Command> {
         let ctrl = key.mods.ctrl;
+
+        // Checked before everything else: while the prefix is armed, `s` means
+        // split rather than substitute and `l` means "the window to the right"
+        // rather than a motion.
+        if self.window_pending {
+            return self.window_key(key);
+        }
 
         match key.code {
             // Esc clears the pending keymap state *and* drops any extra
@@ -220,6 +278,12 @@ impl Input {
             // Not every terminal sends this one, which is why `:b#` exists
             // beside it rather than only underneath it.
             KeyCode::Char('^') if ctrl => self.plain(Action::Buffer(BufferCmd::Alternate)),
+            // The start of a key, not a key. Any count already typed stays,
+            // because it belongs to the resize forms.
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                None
+            }
             KeyCode::Down if ctrl && key.mods.alt => {
                 self.plain(Action::AddCursorLine { below: true })
             }

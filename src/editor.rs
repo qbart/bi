@@ -15,7 +15,7 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
-use crate::window::{Chrome, Layout, Rect, Window, WindowId};
+use crate::window::{Chrome, Dir, Layout, Rect, Side, Window, WindowId};
 
 /// Charwise, linewise or blockwise.
 ///
@@ -270,6 +270,9 @@ pub enum Action {
     /// Handled by `Editor` before a `View` is built, because a view borrows
     /// from the very list these change.
     Buffer(BufferCmd),
+    /// Splits, closes, resizes or switches windows. Handled beside
+    /// [`Action::Buffer`] and for the same reason.
+    Window(WindowCmd),
 }
 
 impl Action {
@@ -532,12 +535,40 @@ pub enum Escalation {
         force: bool,
     },
     Buffer(BufferCmd),
+    Window(WindowCmd),
     /// `:qa` — every buffer has to agree, not just this one.
     QuitAll {
         force: bool,
     },
     /// `:wa` — writes every modified buffer.
     WriteAll,
+    /// `:q` — closes this window, and quits only from the last one.
+    Quit {
+        force: bool,
+    },
+}
+
+/// What `Ctrl-W` and the split commands do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowCmd {
+    /// A bare split duplicates the window — same buffer, same cursor, same
+    /// scroll — so the new pane lands on the line you were reading.
+    Split {
+        dir: Dir,
+        path: Option<String>,
+    },
+    Focus(Side),
+    Cycle {
+        back: bool,
+    },
+    Close,
+    Only,
+    /// `Ctrl-W + - < >`, in cells along `axis`.
+    Resize {
+        axis: Dir,
+        cells: i32,
+    },
+    Equalize,
 }
 
 /// Which buffer a window should show, and what to do to the list.
@@ -566,7 +597,23 @@ pub struct Editor {
     layout: Layout,
     focus: WindowId,
     next_buffer: u32,
+    next_window: u32,
+    /// The area and chrome the frontend last laid out in.
+    ///
+    /// Splitting, resizing and directional switching are all geometry
+    /// questions, and geometry needs a size. Before the first frame there is
+    /// none, so those commands act on a zero area and say they had no room —
+    /// which is true.
+    area: Rect,
+    chrome: Chrome,
     pub session: Session,
+}
+
+/// One window and what it shows, borrowed to be drawn.
+pub struct Pane<'a> {
+    pub window: &'a Window,
+    pub buffer: &'a Buffer,
+    pub syntax: Option<&'a Syntax>,
 }
 
 /// One buffer, one window, and the session, borrowed together for the length
@@ -660,6 +707,9 @@ impl Editor {
             layout: Layout::new(window_id),
             focus: window_id,
             next_buffer: 1,
+            next_window: 1,
+            area: Rect::default(),
+            chrome: Chrome::default(),
             session: Session::default(),
         }
     }
@@ -704,6 +754,22 @@ impl Editor {
 
     pub fn selections(&self) -> &Selections {
         &self.window().selections
+    }
+
+    /// Everything needed to *draw* one window, borrowed immutably.
+    ///
+    /// A renderer draws windows it is not editing, so it cannot go through
+    /// `View` — that would mean borrowing the session mutably to read a rope.
+    pub fn pane(&self, id: WindowId) -> Pane<'_> {
+        let window = self.window_of(id).expect("pane of a window that is not open");
+        let entry = self.entry(window.buffer);
+        Pane { window, buffer: &entry.buffer, syntax: entry.syntax.as_ref() }
+    }
+
+    /// The block's span on one row of a given window.
+    pub fn block_span_in(&self, id: WindowId, row: usize) -> (usize, usize) {
+        let pane = self.pane(id);
+        span_of_block_at(pane.buffer, &pane.window.selections, self.session.block_to_eol, row)
     }
 
     /// First visible row of the focused window.
@@ -944,10 +1010,147 @@ impl Editor {
         self.session.mode = Mode::Pick;
     }
 
+    // ---- the window tree ----------------------------------------------------
+
+    /// Every window, in layout order.
+    pub fn window_ids(&self) -> Vec<WindowId> {
+        self.layout.leaves()
+    }
+
+    fn fresh_window_id(&mut self) -> WindowId {
+        let id = WindowId(self.next_window);
+        self.next_window += 1;
+        id
+    }
+
+    fn run_window_cmd(&mut self, cmd: WindowCmd) {
+        let focus = self.focus;
+        let (area, chrome) = (self.area, self.chrome);
+
+        match cmd {
+            WindowCmd::Split { dir, path } => {
+                // The buffer first: a failure to open must not leave a split
+                // showing the wrong file.
+                let buffer = match path {
+                    Some(path) => match self.open_path(&path) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.session.status = format!("{e:#}");
+                            return;
+                        }
+                    },
+                    None => self.window().buffer,
+                };
+
+                let new = self.fresh_window_id();
+                if !self.layout.split(focus, new, dir, area, &chrome) {
+                    // Hand the id back rather than leaving a hole in the
+                    // sequence; nothing depends on it, but a gap invites the
+                    // question of what used to be there.
+                    self.next_window -= 1;
+                    self.session.status = "not enough room to split".into();
+                    return;
+                }
+
+                // Duplicates the window, so the split lands where you were
+                // reading rather than at the top of the file.
+                let mut window = self.window().clone();
+                window.id = new;
+                self.windows.push(window);
+                self.focus = new;
+                if buffer != self.window().buffer {
+                    self.show(new, buffer);
+                }
+            }
+
+            WindowCmd::Focus(side) => {
+                let anchor = self.anchor_of(focus, side);
+                if let Some(next) = self.layout.neighbour(focus, side, area, &chrome, anchor) {
+                    self.focus = next;
+                }
+            }
+            WindowCmd::Cycle { back } => {
+                if let Some(next) = self.layout.cycle(focus, back) {
+                    self.focus = next;
+                }
+            }
+
+            WindowCmd::Close => {
+                self.close_window(focus);
+            }
+            WindowCmd::Only => {
+                self.layout.only(focus);
+                self.windows.retain(|w| w.id == focus);
+            }
+
+            WindowCmd::Resize { axis, cells } => {
+                if !self.layout.resize(focus, axis, cells, area, &chrome) {
+                    self.session.status = "no divider that way".into();
+                }
+            }
+            WindowCmd::Equalize => self.layout.equalize(),
+        }
+    }
+
+    /// Closes a window. Returns whether it could — the last one cannot.
+    ///
+    /// Never checks for unsaved changes: it discards nothing, because the
+    /// buffer stays in the list. That is what "hidden buffer" means.
+    fn close_window(&mut self, id: WindowId) -> bool {
+        let Some(heir) = self.layout.close(id) else {
+            self.session.status = "cannot close the last window".into();
+            return false;
+        };
+        // Its cursor is worth keeping: reopening a split on the same file
+        // should land where the closed one was looking.
+        if let Some(window) = self.window_of(id) {
+            let (buffer, pairs) = (window.buffer, window.selections.as_pairs());
+            self.entry_mut(buffer).last = pairs;
+        }
+        self.windows.retain(|w| w.id != id);
+        if self.focus == id {
+            self.focus = heir;
+        }
+        true
+    }
+
+    /// Where the cursor sits on the axis a directional switch travels across,
+    /// in screen coordinates — what breaks the tie between two panes that are
+    /// both to the right.
+    fn anchor_of(&self, id: WindowId, side: Side) -> u16 {
+        let Some(window) = self.window_of(id) else { return 0 };
+        let Some(rect) = self.layout.rect_of(id, self.area, &self.chrome) else { return 0 };
+        let buffer = &self.entry(window.buffer).buffer;
+        let cursor = window.selections.cursor();
+        match side {
+            Side::Left | Side::Right => {
+                let row = buffer.row_at(cursor).saturating_sub(window.scroll);
+                rect.y + (row as u16).min(rect.height.saturating_sub(1))
+            }
+            Side::Up | Side::Down => {
+                let col = buffer.col_at(cursor);
+                rect.x + (col as u16).min(rect.width.saturating_sub(1))
+            }
+        }
+    }
+
     /// Runs what a view handed back because it could not run it itself.
     fn escalate(&mut self, escalation: Escalation) {
         match escalation {
             Escalation::Buffer(cmd) => self.run_buffer_cmd(cmd),
+            Escalation::Window(cmd) => self.run_window_cmd(cmd),
+            // Closes the window when more than one is open, and quits only from
+            // the last — which is what vim does, and what makes `:qa` mean
+            // something different from `:q`.
+            Escalation::Quit { force } => {
+                if self.windows.len() > 1 {
+                    self.close_window(self.focus);
+                } else if self.buffer().is_modified() && !force {
+                    self.session.status = "unsaved changes (use `:q!` to discard)".into();
+                } else {
+                    self.session.quit = true;
+                }
+            }
             Escalation::Edit { path, force } => {
                 let modified = self.buffer().is_modified();
                 // No longer refuses on unsaved changes: the old buffer goes
@@ -1013,8 +1216,12 @@ impl Editor {
     /// how much of a pane is text is then its own decision, which it reports
     /// back through [`Editor::size_window`]. Keeping that split is what stops a
     /// status row — a terminal convention — from being baked into geometry.
-    pub fn layout(&self, area: Rect, chrome: &Chrome) -> Vec<(WindowId, Rect)> {
-        self.layout.rects(area, chrome)
+    pub fn layout(&mut self, area: Rect, chrome: Chrome) -> Vec<(WindowId, Rect)> {
+        // Remembered, because `Ctrl-W +` means one row and a row is only a
+        // fraction of a weight once you know how many rows the parent had.
+        self.area = area;
+        self.chrome = chrome;
+        self.layout.rects(area, &chrome)
     }
 
     /// Tells a window how much room it actually got, and scrolls it to its
@@ -1034,18 +1241,29 @@ impl Editor {
     /// which hands back anything it discovered mid-flight — an ex line is only
     /// read once it is already running inside one.
     pub fn apply(&mut self, cmd: Command) {
-        if let Action::Buffer(buffer_cmd) = cmd.action {
-            self.run_buffer_cmd(buffer_cmd);
-            return;
+        match cmd.action {
+            Action::Buffer(buffer_cmd) => return self.run_buffer_cmd(buffer_cmd),
+            Action::Window(window_cmd) => return self.run_window_cmd(window_cmd),
+            _ => {}
         }
         if let Some(escalation) = self.focused().apply(cmd) {
             self.escalate(escalation);
         }
     }
 
-    /// Drains each buffer's edit log into its parse tree. Called once per key,
-    /// after the command has been applied and before the frame is drawn.
-    pub fn sync_syntax(&mut self) {
+    /// Settles everything an edit leaves behind. Called once per key, after the
+    /// command has been applied and before the frame is drawn.
+    ///
+    /// One drain of `pending_edits`, two consumers: the parse tree, and every
+    /// *other* window showing that buffer, whose cursors and scroll rows have
+    /// to move with text they did not edit. LSP `didChange` is the third, and
+    /// hangs off this same drain — see README decision #2.
+    ///
+    /// Shifting rather than clamping is the point. Clamping would keep the
+    /// other window inside the rope, but its cursor would slide relative to the
+    /// text every time a line was inserted above it, which is precisely what a
+    /// second window on one file exists to avoid.
+    pub fn settle(&mut self) {
         for entry in &mut self.buffers {
             let edits = std::mem::take(&mut entry.buffer.pending_edits);
             if edits.is_empty() {
@@ -1053,6 +1271,34 @@ impl Editor {
             }
             if let Some(syntax) = &mut entry.syntax {
                 syntax.update(entry.buffer.rope(), &edits);
+            }
+
+            for window in self.windows.iter_mut().filter(|w| w.buffer == entry.id) {
+                // The window that made the edit already has the right cursor:
+                // the command that moved the text moved it too. Mapping it
+                // again would double-count.
+                if window.id == self.focus {
+                    continue;
+                }
+                let mapped: Vec<Selection> = window
+                    .selections
+                    .all()
+                    .iter()
+                    .map(|s| Selection {
+                        anchor: Cursor::at(edits.iter().fold(s.anchor.at, |at, e| e.map(at))),
+                        head: Cursor::at(edits.iter().fold(s.head.at, |at, e| e.map(at))),
+                    })
+                    .collect();
+                window.selections.set(mapped);
+
+                // The scroll row follows the text above it, so a line inserted
+                // over the top of an unfocused pane does not slide its view.
+                let start = entry
+                    .buffer
+                    .rope()
+                    .line_to_char(window.scroll.min(entry.buffer.line_count().saturating_sub(1)));
+                let moved = edits.iter().fold(start, |at, e| e.map(at));
+                window.scroll = entry.buffer.row_at(Cursor::at(moved));
             }
         }
     }
@@ -2001,7 +2247,7 @@ impl View<'_> {
             }
 
             // Handled by `Editor` before this view was built.
-            Action::Buffer(_) => {}
+            Action::Buffer(_) | Action::Window(_) => {}
         }
         escalation
     }
@@ -2214,7 +2460,17 @@ impl View<'_> {
             // The `a` forms mean "every buffer", which they now genuinely do.
             "wa" | "wall" => return Some(Escalation::WriteAll),
             "qa" | "qall" => return Some(Escalation::QuitAll { force }),
-            "q" | "quit" => self.quit(force),
+            "q" | "quit" => return Some(Escalation::Quit { force }),
+            "sp" | "split" | "new" => {
+                let path = (!arg.is_empty()).then(|| arg.to_string());
+                return Some(Escalation::Window(WindowCmd::Split { dir: Dir::Horizontal, path }));
+            }
+            "vs" | "vsp" | "vsplit" | "vnew" => {
+                let path = (!arg.is_empty()).then(|| arg.to_string());
+                return Some(Escalation::Window(WindowCmd::Split { dir: Dir::Vertical, path }));
+            }
+            "clo" | "close" => return Some(Escalation::Window(WindowCmd::Close)),
+            "on" | "only" => return Some(Escalation::Window(WindowCmd::Only)),
             // Bare `:e` reloads this buffer, which is a view's own business.
             // With a path it changes which buffer the window shows, which is
             // the session's.
@@ -2242,7 +2498,7 @@ impl View<'_> {
             "set" => self.set_option(arg),
             "wq" | "x" => {
                 if self.write(arg) {
-                    self.quit(true);
+                    return Some(Escalation::Quit { force: true });
                 }
             }
             _ => {
@@ -2338,14 +2594,6 @@ impl View<'_> {
                 self.session.status = format!("\"{name}\" loaded");
             }
             Err(e) => self.session.status = format!("{e:#}"),
-        }
-    }
-
-    fn quit(&mut self, force: bool) {
-        if self.buffer.is_modified() && !force {
-            self.session.status = "unsaved changes (use `:q!` to discard)".into();
-        } else {
-            self.session.quit = true;
         }
     }
 
@@ -2990,6 +3238,282 @@ mod tests {
 
         ex(&mut ed, "qa");
         assert!(ed.session.quit);
+    }
+
+    // ---- windows -----------------------------------------------------------
+
+    const TEST_CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+
+    /// Gives the editor a screen to lay out in. Splitting, resizing and
+    /// directional switching are geometry, and geometry needs a size.
+    fn sized(ed: &mut Editor) {
+        ed.layout(Rect::new(0, 0, 80, 24), TEST_CHROME);
+    }
+
+    fn split(ed: &mut Editor, dir: Dir) {
+        sized(ed);
+        // The frontend settles after every key. Without doing the same, edits
+        // from the test's own setup are still pending, and the next settle
+        // would replay them onto the window that did not make them.
+        ed.settle();
+        ed.apply(cmd(Action::Window(WindowCmd::Split { dir, path: None })));
+    }
+
+    /// The window that is not focused.
+    fn other(ed: &Editor) -> WindowId {
+        *ed.window_ids().iter().find(|&&id| id != ed.focus()).expect("expected a second window")
+    }
+
+    #[test]
+    fn a_split_gives_two_windows_onto_one_buffer() {
+        let mut ed = editor("one\ntwo\n");
+        split(&mut ed, Dir::Vertical);
+
+        assert_eq!(ed.window_ids().len(), 2);
+        assert_eq!(ed.buffer_ids().len(), 1, "one file, two views of it");
+        assert_eq!(ed.pane(other(&ed)).window.buffer, ed.window().buffer);
+    }
+
+    /// Vim copies the cursor into the new window, so the split lands on the
+    /// line you were reading rather than at the top of the file.
+    #[test]
+    fn a_split_lands_where_you_were_reading() {
+        let mut ed = editor("one\ntwo\nthree\nfour\n");
+        let at = ed.buffer().at_row(2, false);
+        ed.set_cursor(at);
+
+        split(&mut ed, Dir::Horizontal);
+        assert_eq!(ed.cursor_row(), 2, "the new window");
+        assert_eq!(ed.pane(other(&ed)).window.selections.cursor(), at, "and the old one");
+    }
+
+    /// The reason `Edit` carries a char range at all: a window that did not
+    /// make the edit still has to follow the text.
+    #[test]
+    fn editing_in_one_window_moves_the_cursor_in_the_other() {
+        let mut ed = editor("one\ntwo\nthree\nfour\n");
+        let at = ed.buffer().at_row(2, false);
+        ed.set_cursor(at);
+        split(&mut ed, Dir::Horizontal);
+
+        let watcher = other(&ed);
+        assert_eq!(ed.pane(watcher).buffer.row_at(ed.pane(watcher).window.selections.cursor()), 2);
+
+        // Insert a line above everything, from the focused window.
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::InsertNewline));
+        ed.apply(cmd(Action::EnterNormal));
+        ed.settle();
+
+        let pane = ed.pane(watcher);
+        assert_eq!(
+            pane.buffer.row_at(pane.window.selections.cursor()),
+            3,
+            "the other window followed the text down, rather than staying on row 2",
+        );
+    }
+
+    /// Undo replays through `edit_raw`, so it produces edits like any other
+    /// change — and the other window follows without undo knowing it exists.
+    #[test]
+    fn an_undo_in_one_window_moves_the_other_too() {
+        let mut ed = editor("one\ntwo\nthree\nfour\n");
+        let at = ed.buffer().at_row(2, false);
+        ed.set_cursor(at);
+        split(&mut ed, Dir::Horizontal);
+        let watcher = other(&ed);
+
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::InsertNewline));
+        ed.apply(cmd(Action::EnterNormal));
+        ed.settle();
+        let moved = ed.pane(watcher).window.selections.cursor();
+
+        ed.apply(cmd(Action::Undo));
+        ed.settle();
+
+        let pane = ed.pane(watcher);
+        assert_ne!(pane.window.selections.cursor(), moved, "it moved back");
+        assert_eq!(pane.buffer.row_at(pane.window.selections.cursor()), 2);
+    }
+
+    #[test]
+    fn a_second_window_scrolls_on_its_own() {
+        let mut ed = editor(&"line\n".repeat(200));
+        split(&mut ed, Dir::Vertical);
+        let watcher = other(&ed);
+
+        let at = ed.buffer().at_row(150, false);
+        ed.set_cursor(at);
+        sized(&mut ed);
+        for id in ed.window_ids() {
+            ed.size_window(id, 40, 20);
+        }
+
+        assert!(ed.window().scroll > 100, "the focused window followed its cursor");
+        assert_eq!(ed.pane(watcher).window.scroll, 0, "and the other one stayed put");
+    }
+
+    #[test]
+    fn closing_a_window_leaves_its_buffer_open() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Close)));
+        assert_eq!(ed.window_ids().len(), 1);
+        assert_eq!(ed.buffer_ids().len(), 1);
+        assert_eq!(ed.buffer().rope().to_string(), "text\n");
+    }
+
+    /// Closing discards nothing — the buffer stays in the list — so it has no
+    /// business asking about unsaved changes.
+    #[test]
+    fn closing_a_window_does_not_ask_about_unsaved_changes() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        ed.apply(cmd(Action::InsertChar('X')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ed.apply(cmd(Action::Window(WindowCmd::Close)));
+        assert_eq!(ed.window_ids().len(), 1, "closed without complaint");
+        assert!(ed.buffer().is_modified(), "and the changes are still there");
+    }
+
+    #[test]
+    fn the_last_window_cannot_be_closed() {
+        let mut ed = editor("text\n");
+        sized(&mut ed);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Close)));
+        assert_eq!(ed.window_ids().len(), 1);
+        assert!(ed.session.status.contains("last window"));
+    }
+
+    #[test]
+    fn only_closes_every_other_window() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        split(&mut ed, Dir::Horizontal);
+        assert_eq!(ed.window_ids().len(), 3);
+
+        let kept = ed.focus();
+        ed.apply(cmd(Action::Window(WindowCmd::Only)));
+        assert_eq!(ed.window_ids(), vec![kept]);
+    }
+
+    /// This is what makes `:qa` mean something different from `:q`.
+    #[test]
+    fn q_closes_a_window_and_quits_only_from_the_last() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+
+        ex(&mut ed, "q");
+        assert!(!ed.session.quit, "it closed a window rather than quitting");
+        assert_eq!(ed.window_ids().len(), 1);
+
+        // From the last window it is a quit again, unsaved-changes check and
+        // all — which the closes above deliberately skipped.
+        ex(&mut ed, "q");
+        assert!(!ed.session.quit);
+        assert!(ed.session.status.contains("unsaved"));
+
+        ex(&mut ed, "q!");
+        assert!(ed.session.quit);
+    }
+
+    #[test]
+    fn switching_moves_focus_without_touching_the_buffer() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        let first = ed.focus();
+
+        // The new window is on the left, so its neighbour is to the right.
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Right))));
+        assert_ne!(ed.focus(), first);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        assert_eq!(ed.focus(), first, "and back");
+    }
+
+    #[test]
+    fn there_is_nothing_past_the_edge_so_focus_stays_put() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        let first = ed.focus();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        assert_eq!(ed.focus(), first);
+    }
+
+    #[test]
+    fn cycling_reaches_every_window_and_wraps() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        split(&mut ed, Dir::Vertical);
+
+        let mut seen = vec![ed.focus()];
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+            seen.push(ed.focus());
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "cycling visited all three");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        assert_eq!(ed.window_ids().len(), 3, "and wrapped rather than stopping");
+    }
+
+    #[test]
+    fn a_split_with_no_room_says_so_rather_than_making_a_pane_of_nothing() {
+        let mut ed = editor("text\n");
+        // Three rows: one pane fits a status row and a line of text; two do not.
+        ed.layout(Rect::new(0, 0, 80, 3), TEST_CHROME);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Split { dir: Dir::Horizontal, path: None })));
+        assert_eq!(ed.window_ids().len(), 1);
+        assert!(ed.session.status.contains("not enough room"));
+    }
+
+    #[test]
+    fn splitting_with_a_path_opens_that_file_in_the_new_window() {
+        let a = Scratch::new("split_a.txt", "a\n");
+        let b = Scratch::new("split_b.txt", "b\n");
+        let mut ed = opened(&a);
+        sized(&mut ed);
+
+        ex(&mut ed, &format!("vs {}", b.path()));
+        assert_eq!(ed.window_ids().len(), 2);
+        assert_eq!(ed.buffer().rope().to_string(), "b\n", "the new window shows it");
+        assert_eq!(
+            ed.pane(other(&ed)).buffer.rope().to_string(),
+            "a\n",
+            "and the old one is untouched",
+        );
+    }
+
+    #[test]
+    fn resizing_moves_the_divider_and_equalize_puts_it_back() {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+
+        let width = |ed: &mut Editor| {
+            let focus = ed.focus();
+            ed.layout(Rect::new(0, 0, 80, 24), TEST_CHROME)
+                .into_iter()
+                .find(|&(id, _)| id == focus)
+                .map(|(_, r)| r.width)
+                .unwrap()
+        };
+        let before = width(&mut ed);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Resize { axis: Dir::Vertical, cells: 6 })));
+        assert_eq!(width(&mut ed), before + 6);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Equalize)));
+        assert_eq!(width(&mut ed), before);
     }
 
     // ---- the buffer list ---------------------------------------------------

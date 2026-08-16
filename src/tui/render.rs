@@ -13,6 +13,7 @@ use bee::buffer::Cursor;
 use bee::editor::{Editor, LineNumbers, Mode, VisualKind};
 use bee::picker::Picker;
 use bee::syntax::{Span as HlSpan, Syntax};
+use bee::window::{Chrome, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
 
@@ -35,11 +36,6 @@ const EXTRA_CURSOR_BG: Color = Color::Magenta;
 /// Background for search matches. Distinct from the selection, since a match
 /// can sit inside one.
 const SEARCH_BG: Color = Color::Indexed(58);
-
-/// Background for the row:col readout in the footer. Grey rather than a hue:
-/// it marks the field as its own without competing with the mode block at the
-/// other end of the line, which is the one thing there that should shout.
-const POSITION_BG: Color = Color::Indexed(238);
 
 /// Repaints the background of the columns in `cols` within an already-built
 /// line, leaving the foreground alone.
@@ -219,43 +215,127 @@ fn styled_line(
 /// Fixed across modes on purpose — sizing it to the largest *relative* label
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
-fn gutter_width(ed: &Editor) -> usize {
+fn gutter_width(ed: &Editor, buffer: &bee::buffer::Buffer) -> usize {
     match ed.session.line_numbers {
         LineNumbers::Off => 0,
-        _ => format!("{}", ed.buffer().line_count()).len() + 1,
+        _ => format!("{}", buffer.line_count()).len() + 1,
     }
 }
 
+/// One column between panes that sit side by side; no rows between stacked
+/// ones, since each window's status line already separates those.
+///
+/// `min_height` is 2 because a pane has to fit a status row and a line of text
+/// — a terminal convention, which is why it lives here and not in the core.
+const CHROME: Chrome = Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2 };
+
+fn to_core(r: Rect) -> CoreRect {
+    CoreRect { x: r.x, y: r.y, width: r.width, height: r.height }
+}
+
+fn to_tui(r: CoreRect) -> Rect {
+    Rect { x: r.x, y: r.y, width: r.width, height: r.height }
+}
+
 pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
-    let [text_area, status_area] =
+    let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
-    ed.scroll_to_cursor(text_area.height as usize);
+    let panes: Vec<(WindowId, Rect)> =
+        ed.layout(to_core(body), CHROME).into_iter().map(|(id, rect)| (id, to_tui(rect))).collect();
 
-    let total = ed.buffer().line_count();
-    let gutter = gutter_width(ed);
-    let cursor = ed.selections().cursor();
-    let cursor_row = ed.buffer().row_at(cursor);
+    // Every window is told its size before anything is drawn, so scrolling has
+    // settled by the time the first pane is formatted.
+    for &(id, rect) in &panes {
+        ed.size_window(id, rect.width as usize, rect.height.saturating_sub(1) as usize);
+    }
+
+    let focus = ed.focus();
+    let mut cursor_at = None;
+
+    for &(id, rect) in &panes {
+        let [text, status] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rect);
+
+        let at = render_window(frame, ed, id, text, id == focus);
+        if id == focus {
+            cursor_at = at;
+        }
+        frame.render_widget(window_status(ed, id, id == focus, status.width), status);
+
+        // The rule in the column the layout reserved to the left of this pane.
+        if rect.x > body.x {
+            let rule = Rect { x: rect.x - 1, y: rect.y, width: 1, height: rect.height };
+            let bar: Vec<Line> = (0..rect.height)
+                .map(|_| Line::from(Span::styled("│", Style::default().fg(Color::DarkGray))))
+                .collect();
+            frame.render_widget(Paragraph::new(bar), rule);
+        }
+    }
+
+    // Worked out here rather than inside the footer: it caches on `Editor` and
+    // so needs the mutable borrow the widget builders do not have.
+    let matches = ed.search_count();
+    frame.render_widget(status_line(ed, pending, matches, footer.width), footer);
+
+    if matches!(ed.session.mode, Mode::Pick)
+        && let Some(picker) = ed.session.picker.as_mut()
+    {
+        render_picker(frame, picker, body);
+        return;
+    }
+
+    match &ed.session.mode {
+        Mode::Command(line) => {
+            frame.set_cursor_position((footer.x + 1 + line.chars().count() as u16, footer.y));
+        }
+        // Only the focused window gets it: there is one cursor, and it goes
+        // where typing goes.
+        _ => {
+            if let Some(at) = cursor_at {
+                frame.set_cursor_position(at);
+            }
+        }
+    }
+}
+
+/// One window's text. Returns where the terminal cursor belongs, when this is
+/// the window that has it.
+fn render_window(
+    frame: &mut Frame,
+    ed: &Editor,
+    id: WindowId,
+    text_area: Rect,
+    focused: bool,
+) -> Option<(u16, u16)> {
+    let pane = ed.pane(id);
+    let (buffer, scroll) = (pane.buffer, pane.window.scroll);
+    let selections = &pane.window.selections;
+
+    let total = buffer.line_count();
+    let gutter = gutter_width(ed, buffer);
+    let cursor = selections.cursor();
+    let cursor_row = buffer.row_at(cursor);
 
     let mut lines = Vec::with_capacity(text_area.height as usize);
     let mut cursor_screen_col = 0;
 
     // One query for the whole visible range, then partition per line. Bounded
-    // by terminal height, never by file size.
-    let last_row = (ed.scroll() + text_area.height as usize).min(total);
-    let highlights = ed.syntax().map(|syntax| {
-        let rope = ed.buffer().rope();
-        let from = rope.line_to_byte(ed.scroll().min(rope.len_lines()));
+    // by pane height, never by file size.
+    let last_row = (scroll + text_area.height as usize).min(total);
+    let highlights = pane.syntax.map(|syntax| {
+        let rope = buffer.rope();
+        let from = rope.line_to_byte(scroll.min(rope.len_lines()));
         let to = rope.line_to_byte(last_row.min(rope.len_lines()));
         (syntax, syntax.highlights(rope, from..to))
     });
 
-    for row in ed.scroll()..last_row {
-        let raw = ed.buffer().rope().line(row).to_string();
+    for row in scroll..last_row {
+        let raw = buffer.rope().line(row).to_string();
         let raw = raw.trim_end_matches(['\n', '\r']);
 
         if row == cursor_row {
-            cursor_screen_col = display_col(raw, ed.buffer().col_at(cursor));
+            cursor_screen_col = display_col(raw, buffer.col_at(cursor));
         }
 
         // A blank cell where a number is not due, so the text stays put.
@@ -273,7 +353,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         };
         match &highlights {
             Some((syntax, all)) => {
-                let line_start = ed.buffer().rope().line_to_byte(row);
+                let line_start = buffer.rope().line_to_byte(row);
                 let line_end = line_start + raw.len();
                 let mine: Vec<HlSpan> = all
                     .iter()
@@ -289,10 +369,10 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         if ed.session.highlight_search
             && let Some(search) = &ed.session.last_search
         {
-            let line_start = ed.buffer().rope().line_to_char(row);
+            let line_start = buffer.rope().line_to_char(row);
             let line_end = line_start + raw.chars().count();
             for (start, end) in
-                ed.buffer().matches_in(line_start, line_end, &search.pattern, search.whole_word)
+                buffer.matches_in(line_start, line_end, &search.pattern, search.whole_word)
             {
                 let from = display_col(raw, start.saturating_sub(line_start));
                 let to = display_col(raw, (end - line_start).min(raw.chars().count()));
@@ -303,7 +383,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         // Selected columns on this row, in screen columns and offset past the
         // gutter. Charwise includes the character under the head; linewise
         // covers the row whatever the columns are.
-        for selection in ed.selections().all() {
+        for selection in selections.all() {
             // A collapsed selection still covers something in visual mode — one
             // character for `v`, the whole line for `V` — so only skip it
             // outside visual, where it is a plain cursor.
@@ -311,8 +391,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
                 continue;
             }
             let (lo, hi) = selection.range();
-            let (first, last) =
-                (ed.buffer().row_at(Cursor::at(lo)), ed.buffer().row_at(Cursor::at(hi)));
+            let (first, last) = (buffer.row_at(Cursor::at(lo)), buffer.row_at(Cursor::at(hi)));
             if row < first || row > last {
                 continue;
             }
@@ -321,13 +400,13 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
                 // A rectangle says nothing about char ranges, so the block
                 // reads its own spans rather than the selection's range.
                 Some(VisualKind::Block) => {
-                    let line_start = ed.buffer().rope().line_to_char(row);
-                    let (start, end) = ed.block_span_at(row);
+                    let line_start = buffer.rope().line_to_char(row);
+                    let (start, end) = ed.block_span_in(id, row);
                     let (from, to) = (start - line_start, end - line_start);
                     display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
                 }
                 _ => {
-                    let line_start = ed.buffer().rope().line_to_char(row);
+                    let line_start = buffer.rope().line_to_char(row);
                     let from = lo.saturating_sub(line_start).min(raw.chars().count());
                     let to = if row < last {
                         raw.chars().count()
@@ -343,21 +422,24 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
         // The terminal's own cursor sits on the primary head; the others have
         // to be painted or they are invisible.
-        if ed.selections().len() > 1 {
-            for (i, selection) in ed.selections().all().iter().enumerate() {
-                if i == ed.selections().primary_index() {
+        if selections.len() > 1 {
+            for (i, selection) in selections.all().iter().enumerate() {
+                if i == selections.primary_index() {
                     continue;
                 }
                 let head = selection.head;
-                if ed.buffer().row_at(head) != row {
+                if buffer.row_at(head) != row {
                     continue;
                 }
-                let col = display_col(raw, ed.buffer().col_at(head)) + gutter;
+                let col = display_col(raw, buffer.col_at(head)) + gutter;
                 spans = paint_range(spans, col..col + 1, EXTRA_CURSOR_BG);
             }
         }
 
-        lines.push(if row == cursor_row {
+        // The cursor line is lit only in the focused window, as vim's
+        // `'cursorline'` is. A dark bar in every pane reads as noise rather
+        // than as a place.
+        lines.push(if row == cursor_row && focused {
             fill_line(spans, CURSOR_LINE_BG, text_area.width as usize)
         } else {
             Line::from(spans)
@@ -370,32 +452,47 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     }
 
     frame.render_widget(Paragraph::new(lines), text_area);
-    // Worked out here rather than inside the footer: it caches on `Editor` and
-    // so needs the mutable borrow the widget builders do not have.
-    let matches = ed.search_count();
-    frame.render_widget(status_line(ed, pending, matches, status_area.width), status_area);
 
-    if matches!(ed.session.mode, Mode::Pick)
-        && let Some(picker) = ed.session.picker.as_mut()
-    {
-        render_picker(frame, picker, text_area);
-        return;
-    }
+    focused.then(|| {
+        (
+            text_area.x + (gutter + cursor_screen_col) as u16,
+            text_area.y + (cursor_row.saturating_sub(scroll)) as u16,
+        )
+    })
+}
 
-    match &ed.session.mode {
-        Mode::Command(line) => {
-            frame.set_cursor_position((
-                status_area.x + 1 + line.chars().count() as u16,
-                status_area.y,
-            ));
-        }
-        _ => {
-            frame.set_cursor_position((
-                text_area.x + (gutter + cursor_screen_col) as u16,
-                text_area.y + (cursor_row - ed.scroll()) as u16,
-            ));
-        }
-    }
+/// One window's own status row: what it is showing, and where in it.
+///
+/// Reverse-video when focused, dim when not. This is the focus indicator,
+/// which is why the panes need no borders around them.
+fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Paragraph<'static> {
+    let style = if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Paragraph::new(Line::from(Span::styled(window_status_text(ed, id, width), style)))
+}
+
+/// Name and modified marker at the left, `row:col` pushed to the right edge.
+///
+/// Split out for the same reason [`status_spans`] is: a `Paragraph` cannot be
+/// read back, and what the row says is the thing worth guarding.
+fn window_status_text(ed: &Editor, id: WindowId, width: u16) -> String {
+    let pane = ed.pane(id);
+    let name = pane
+        .buffer
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[No Name]".into());
+
+    let cursor = pane.window.selections.cursor();
+    let left = format!(" {name}{}", if pane.buffer.is_modified() { " [+]" } else { "" });
+    let right = format!("{}:{} ", pane.buffer.row_at(cursor) + 1, pane.buffer.col_at(cursor) + 1);
+
+    let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
+    format!("{left}{}{right}", " ".repeat(pad))
 }
 
 /// The entry's first line, tab-expanded and elided to fit one row.
@@ -515,12 +612,18 @@ fn status_line(
     Paragraph::new(Line::from(status_spans(ed, pending, matches, width)))
 }
 
-/// The footer, left to right: position, name, modified, status — then the
-/// pending keys and the mode, pushed to the right edge.
+/// The footer, left to right: the message — then the pending keys and the mode,
+/// pushed to the right edge.
 ///
-/// Unless the search has it, in which case it is the pattern and the match
-/// count and nothing else. `matches` is therefore only read there: a remembered
-/// pattern is not a reason to keep counting at someone who has moved on.
+/// The name, the modified marker and `row:col` used to live here. They belong
+/// to a window rather than to the session, and now that there can be several
+/// they are drawn on each window's own status row; repeating the focused one
+/// down here would just be the same fact twice.
+///
+/// Unless the search has the line, in which case it is the pattern and the
+/// match count and nothing else. `matches` is therefore only read there: a
+/// remembered pattern is not a reason to keep counting at someone who has moved
+/// on.
 ///
 /// Split out from [`status_line`] because a `Paragraph` cannot be read back,
 /// and the order is the thing worth guarding.
@@ -555,27 +658,8 @@ fn status_spans(
         ];
     }
 
-    let name = ed
-        .buffer()
-        .path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "[No Name]".into());
-
-    let position = format!(
-        " {}:{} ",
-        ed.buffer().row_at(ed.selections().cursor()) + 1,
-        ed.buffer().col_at(ed.selections().cursor()) + 1
-    );
-
     let mut spans = vec![
-        Span::styled(position, Style::default().fg(Color::Gray).bg(POSITION_BG)),
-        Span::raw(format!(" {name}")),
-        Span::styled(
-            if ed.buffer().is_modified() { " [+]" } else { "" },
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled(ed.session.status.clone(), Style::default().fg(Color::Cyan)),
     ];
 
@@ -611,34 +695,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_footer_reads_position_then_name_then_mode_last() {
-        let ed = Editor::empty();
+    fn the_footer_reads_message_first_and_mode_last() {
+        let mut ed = Editor::empty();
+        ed.session.status = "written".into();
         let spans = status_spans(&ed, "", None, 80);
 
-        assert_eq!(spans[0].content.as_ref(), " 1:1 ", "position comes first");
-        assert_eq!(spans[0].style.bg, Some(POSITION_BG), "and is set off by its own background");
-        assert_eq!(spans[1].content.as_ref(), " [No Name]");
-        assert_eq!(spans[2].content.as_ref(), "", "nothing typed yet, so no modified sign");
+        assert_eq!(spans[1].content.as_ref(), "written", "the message comes first");
 
         let mode = spans.last().unwrap();
         assert_eq!(mode.content.as_ref(), " NORMAL ", "the mode sits at the right edge");
         assert_eq!(mode.style.bg, Some(Color::Blue));
     }
 
+    /// Name and position moved out of the footer and onto each window's own
+    /// row, so an unfocused pane says what it is showing.
+    #[test]
+    fn each_window_says_what_it_is_showing_and_where() {
+        let mut ed = Editor::empty();
+        let row = window_status_text(&ed, ed.focus(), 30);
+        assert!(row.starts_with(" [No Name]"), "{row:?}");
+        assert!(row.ends_with("1:1 "), "position is pushed to the right edge: {row:?}");
+        assert_eq!(row.chars().count(), 30, "and it fills the pane");
+
+        ed.buffer_mut().insert_str(Cursor::at(0), "x");
+        assert!(window_status_text(&ed, ed.focus(), 30).contains("[+]"), "modified is marked");
+    }
+
+    /// The footer describes the session; the window row describes the window.
+    /// Repeating the focused window's name down there would be the same fact
+    /// twice.
+    #[test]
+    fn the_footer_does_not_repeat_what_the_window_row_says() {
+        let ed = Editor::empty();
+        let footer: String =
+            status_spans(&ed, "", None, 80).iter().map(|s| s.content.to_string()).collect();
+
+        assert!(!footer.contains("[No Name]"), "{footer:?}");
+        assert!(!footer.contains("1:1"), "{footer:?}");
+    }
+
     #[test]
     fn the_gutter_keeps_its_width_in_every_mode_but_off() {
         let mut ed = Editor::empty();
         ed.buffer_mut().insert_str(Cursor::at(0), &"x\n".repeat(120));
-        let numbered = gutter_width(&ed);
+        let numbered = gutter_width(&ed, ed.buffer());
         assert_eq!(numbered, 4, "121 lines, so three digits and a space");
 
         ed.session.line_numbers = LineNumbers::Relative;
-        assert_eq!(gutter_width(&ed), numbered, "or the file slides sideways as you move");
+        assert_eq!(
+            gutter_width(&ed, ed.buffer()),
+            numbered,
+            "or the file slides sideways as you move"
+        );
         ed.session.line_numbers = LineNumbers::Every(10);
-        assert_eq!(gutter_width(&ed), numbered);
+        assert_eq!(gutter_width(&ed, ed.buffer()), numbered);
 
         ed.session.line_numbers = LineNumbers::Off;
-        assert_eq!(gutter_width(&ed), 0, "the column is gone, not blank");
+        assert_eq!(gutter_width(&ed, ed.buffer()), 0, "the column is gone, not blank");
     }
 
     #[test]

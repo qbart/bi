@@ -30,18 +30,41 @@ pub struct Point {
 
 /// A single mutation, in the form incremental reparse needs.
 ///
-/// Nothing consumes these yet. They are recorded now because tree-sitter's
-/// `InputEdit` and LSP's `textDocument/didChange` both want exactly this at
-/// every edit site, and retrofitting it later means touching every mutation.
+/// Bytes and points are what tree-sitter's `InputEdit` and LSP's
+/// `textDocument/didChange` want. The char range beside them is for positions:
+/// cursors are char indices, so a window that is not the one editing follows
+/// the text through these rather than being clamped to its new length.
+///
+/// One record with both, because there is one drain — see `Editor::settle`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code, reason = "consumed once tree-sitter and LSP land")]
+#[allow(dead_code, reason = "the byte fields are for LSP, which has not landed")]
 pub struct Edit {
     pub start_byte: usize,
     pub old_end_byte: usize,
     pub new_end_byte: usize,
+    pub start_char: usize,
+    pub old_end_char: usize,
+    pub new_end_char: usize,
     pub start_point: Point,
     pub old_end_point: Point,
     pub new_end_point: Point,
+}
+
+impl Edit {
+    /// Where `at` ends up after this edit.
+    ///
+    /// Positions before the edit do not move; positions after it shift by the
+    /// length delta; a position *inside* what was replaced collapses to the
+    /// start, since the text it named is gone.
+    pub fn map(&self, at: usize) -> usize {
+        if at <= self.start_char {
+            at
+        } else if at >= self.old_end_char {
+            at - self.old_end_char + self.new_end_char
+        } else {
+            self.start_char
+        }
+    }
 }
 
 /// Where the cursor is, and where it *wants* to be.
@@ -242,6 +265,9 @@ impl Buffer {
             start_byte,
             old_end_byte,
             new_end_byte: start_byte + text.len(),
+            start_char: start,
+            old_end_char: end,
+            new_end_char: new_end,
             start_point,
             old_end_point,
             new_end_point: self.point_at(new_end),

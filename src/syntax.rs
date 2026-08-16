@@ -179,7 +179,7 @@ mod tests {
     use crate::buffer::Buffer;
 
     /// Drains the buffer's edits into the tree — the same two lines
-    /// `Editor::sync_syntax` does, and the reason edits must be taken before
+    /// `Editor::settle` does, and the reason edits must be taken before
     /// the rope is borrowed.
     fn sync(syntax: &mut Syntax, buffer: &mut Buffer) {
         let edits = std::mem::take(&mut buffer.pending_edits);
