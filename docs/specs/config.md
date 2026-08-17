@@ -27,8 +27,10 @@ Not a plugin system, not per-project config, not a `:map` command. See
 
 ## Where it lives
 
-`$BEE_CONFIG`, else `$XDG_CONFIG_HOME/bee/config.toml`, else
-`~/.config/bee/config.toml`.
+`$BEE_CONFIG`, else `$XDG_CONFIG_HOME/bee`, else `~/.config/bee` — a
+**directory**, holding `config.toml` beside `themes/`. An override that named
+only the file would leave `bee config edit` and theme resolution with nowhere
+to look.
 
 ```
 ~/.config/bee/
