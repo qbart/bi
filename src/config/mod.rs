@@ -4,6 +4,14 @@
 //! semantics — the same argument `key.rs` makes for `Key`. A frontend owns
 //! only where the file lives. See `docs/specs/config.md`.
 
+use std::sync::OnceLock;
+
+use crate::editor::LineNumbers;
+
+mod parse;
+
+pub use parse::parse;
+
 /// A problem with a config file. Reported, never fatal: an editor you cannot
 /// launch because of a typo in its config is an editor you cannot use to fix
 /// the typo.
@@ -12,6 +20,84 @@ pub struct Diagnostic {
     /// 1-based, into whichever file it came from.
     pub line: usize,
     pub message: String,
+}
+
+/// bee's defaults, as the file that documents them.
+pub const DEFAULT_TOML: &str = include_str!("default.toml");
+
+/// A value an option can hold, in the one shape both `:set` and TOML can
+/// produce. `:set` parses a string into one; the parser converts a TOML value
+/// into one. Neither needs to know what any particular option is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionValue {
+    Int(i64),
+    Bool(bool),
+    /// A value no option can hold — a string, an array, a table. Carried
+    /// rather than rejected on the spot so the option itself gets to say what
+    /// it wanted, in the one place those messages live.
+    Other,
+}
+
+/// The `:set` namespace. One field per option, spelled as `:set` spells it,
+/// because `:set number 5` and `number = 5` are two ways to reach one setting
+/// and there is nothing to be gained by giving it two names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Options {
+    pub number: LineNumbers,
+    /// Off unless asked for: vim does not light the buffer up on a plain `/`.
+    pub hlsearch: bool,
+}
+
+impl Options {
+    /// The single place a name becomes a field. `:set` and the TOML parser
+    /// both come through here, so an option cannot exist for one and not the
+    /// other.
+    pub fn set(&mut self, name: &str, value: OptionValue) -> Result<(), String> {
+        match (name, value) {
+            ("number", OptionValue::Int(n)) => match LineNumbers::from_setting(n) {
+                Some(lines) => self.number = lines,
+                None => return Err("number takes 0 (off), -1 (relative) or a count".into()),
+            },
+            ("number", _) => return Err("number takes 0 (off), -1 (relative) or a count".into()),
+            ("hlsearch", OptionValue::Bool(on)) => self.hlsearch = on,
+            ("hlsearch", _) => return Err("hlsearch takes true or false".into()),
+            _ => return Err(format!("unknown option: {name}")),
+        }
+        Ok(())
+    }
+
+    /// What `:set <option>` reports when given no value.
+    pub fn get(&self, name: &str) -> Option<OptionValue> {
+        Some(match name {
+            "number" => OptionValue::Int(self.number.setting()),
+            "hlsearch" => OptionValue::Bool(self.hlsearch),
+            _ => return None,
+        })
+    }
+}
+
+/// Everything a config file can say. Options today; a theme and a keymap join
+/// them in steps 2 and 3 of `docs/specs/config.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub options: Options,
+}
+
+impl Default for Config {
+    /// The compiled-in defaults, parsed once.
+    ///
+    /// Parsed rather than constructed so that `default.toml` is exercised on
+    /// every run — if the shipped file stops parsing, no test has to catch it
+    /// because nothing starts.
+    fn default() -> Self {
+        static DEFAULT: OnceLock<Config> = OnceLock::new();
+        DEFAULT
+            .get_or_init(|| {
+                let bare = Config { options: Options::default() };
+                parse(DEFAULT_TOML, bare).expect("bee's own default.toml must parse").0
+            })
+            .clone()
+    }
 }
 
 /// The 1-based line a byte offset falls on.
@@ -39,6 +125,47 @@ pub(crate) fn line_of(src: &str, offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::LineNumbers;
+
+    #[test]
+    fn shipped_defaults_agree_with_the_rust_fallback() {
+        // `default.toml` is the documented source of the defaults and
+        // `Options::default()` is what an embedder with no config gets. They
+        // must say the same thing, and nothing but this test keeps them honest.
+        assert_eq!(Config::default().options, Options::default());
+    }
+
+    #[test]
+    fn set_and_get_round_trip_every_option() {
+        let mut options = Options::default();
+
+        assert_eq!(options.set("number", OptionValue::Int(5)), Ok(()));
+        assert_eq!(options.number, LineNumbers::Every(5));
+        assert_eq!(options.get("number"), Some(OptionValue::Int(5)));
+
+        assert_eq!(options.set("hlsearch", OptionValue::Bool(true)), Ok(()));
+        assert!(options.hlsearch);
+        assert_eq!(options.get("hlsearch"), Some(OptionValue::Bool(true)));
+    }
+
+    #[test]
+    fn set_rejects_unknown_names_and_bad_values() {
+        let mut options = Options::default();
+
+        assert_eq!(options.set("nmber", OptionValue::Int(5)), Err("unknown option: nmber".into()));
+        assert_eq!(options.get("nmber"), None);
+
+        assert_eq!(
+            options.set("number", OptionValue::Int(-7)),
+            Err("number takes 0 (off), -1 (relative) or a count".into())
+        );
+        assert_eq!(options.number, LineNumbers::Every(1), "a rejected set changes nothing");
+
+        assert_eq!(
+            options.set("hlsearch", OptionValue::Int(1)),
+            Err("hlsearch takes true or false".into())
+        );
+    }
 
     #[test]
     fn line_of_counts_newlines_before_the_offset() {
