@@ -156,6 +156,7 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
 const LIB_MODULES: &[&str] = &[
     "lib.rs",
     "buffer.rs",
+    "config/mod.rs",
     "editor.rs",
     "history.rs",
     "input.rs",
@@ -209,10 +210,19 @@ fn the_module_list_matches_what_lib_rs_declares() {
     )
     .unwrap();
 
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let declared: Vec<String> = lib
         .lines()
         .filter_map(|l| l.trim().strip_prefix("pub mod ")?.strip_suffix(';'))
-        .map(|m| format!("{m}.rs"))
+        .map(|m| {
+            // A module can live at `m.rs` or, once it grows submodules, at
+            // `m/mod.rs` — check the filesystem rather than guessing.
+            if root.join(format!("{m}.rs")).is_file() {
+                format!("{m}.rs")
+            } else {
+                format!("{m}/mod.rs")
+            }
+        })
         .collect();
 
     let mut expected: Vec<&str> = LIB_MODULES.iter().copied().filter(|m| *m != "lib.rs").collect();
