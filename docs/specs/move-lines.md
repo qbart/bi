@@ -70,9 +70,13 @@ true of a command that is vim in one form and not in another.
 
 What survives is the distance model, moved to where it belongs: the arrows.
 
-All of it is measured against vim 9.0 rather than remembered — every cursor
-line against every address in a five-line buffer, and every two-line block
-against a spread of them.
+All of it is measured against vim 9.0 rather than remembered, by running both
+editors over the same file and diffing the results: every cursor line against
+every absolute address in a five-line buffer, every two-line block against a
+spread of them, and every cursor line against the signed forms and the bare
+`+` and `-`. 115 combinations, no disagreements. `scripts/` is where that
+harness belongs if it is ever wanted again — `vim_differential.py` already does
+the same job for motions.
 
 **A move that would run off either end clamps** rather than refusing. `:m +99`
 on the third-from-last line means "to the bottom", which is what someone typing
