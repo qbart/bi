@@ -19,13 +19,21 @@ pub struct Diagnostic {
 /// `toml_edit` reports spans as byte ranges; a diagnostic wants a line. Out of
 /// range clamps to the last line rather than panicking, because a span that
 /// disagrees with its source is a dependency bug and should not take the
-/// editor with it. The clamp lands one byte short of the end so that a
-/// trailing newline still ends the last real line instead of opening a
-/// phantom empty one after it — consistent with how an offset sitting on any
-/// other newline is treated: it still belongs to the line before it.
+/// editor with it. The clamp is `src.len()`, never less — end-of-string is
+/// always a valid slice boundary, but `len - 1` is not when the source's last
+/// character is multi-byte UTF-8 (TOML source routinely is), so the slice
+/// index itself is never computed by subtracting from `len`. A trailing
+/// newline in the source is instead handled after slicing, by not counting
+/// it: it still ends the last real line rather than opening a phantom empty
+/// one after it, consistent with how an offset sitting on any other newline
+/// is treated — it still belongs to the line before it.
 pub(crate) fn line_of(src: &str, offset: usize) -> usize {
-    let offset = offset.min(src.len().saturating_sub(1));
-    1 + src[..offset].bytes().filter(|&b| b == b'\n').count()
+    let end = offset.min(src.len());
+    let mut newlines = src[..end].bytes().filter(|&b| b == b'\n').count();
+    if end == src.len() && src.ends_with('\n') {
+        newlines -= 1;
+    }
+    1 + newlines
 }
 
 #[cfg(test)]
@@ -40,6 +48,25 @@ mod tests {
         assert_eq!(line_of(src, 4), 2);
         assert_eq!(line_of(src, 8), 3);
         assert_eq!(line_of(src, 999), 3, "past the end clamps rather than panics");
+    }
+
+    /// The clamp must never land on a computed index that isn't a char
+    /// boundary. `"a€"` is 4 bytes ('a' then a 3-byte '€'); an offset of
+    /// exactly `src.len()` — an entirely ordinary "end of file" span — used
+    /// to be clamped to `len - 1`, which falls inside the '€' and panics.
+    #[test]
+    fn line_of_does_not_panic_on_multibyte_utf8_at_the_end() {
+        let src = "a€";
+        assert_eq!(line_of(src, src.len()), 1);
+        assert_eq!(line_of(src, src.len() + 10), 1, "past the end still clamps");
+    }
+
+    #[test]
+    fn line_of_counts_newlines_around_multibyte_utf8() {
+        let src = "héllo\nwörld\n";
+        assert_eq!(line_of(src, 0), 1);
+        assert_eq!(line_of(src, src.find('\n').unwrap() + 1), 2, "just past the first newline");
+        assert_eq!(line_of(src, src.len()), 2, "trailing newline still ends the last line");
     }
 
     /// Pins the dependency's span behaviour, because every diagnostic line
