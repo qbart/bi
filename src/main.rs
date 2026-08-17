@@ -114,6 +114,11 @@ fn commented(defaults: &str) -> String {
     let mut out = String::from(INIT_HEADER);
     for line in defaults.lines() {
         let trimmed = line.trim_start();
+        // Assumes every setting is scalar-valued, one per line. A multi-line
+        // array value's continuation line can itself start with `[` — an
+        // array of arrays, say — and would be mistaken for a table header
+        // here and left live instead of commented. True of every option
+        // today; worth another look the day one isn't.
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
             out.push_str(line);
             out.push('\n');
@@ -351,6 +356,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert_ne!(uncommented, out, "the line was actually uncommented");
+
         let (config, problems) =
             bee::config::parse(&uncommented, bee::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
@@ -384,6 +391,40 @@ mod tests {
 
         let err = config_edit_path(&missing).expect_err("nothing to edit yet");
         assert!(err.to_string().contains("bee config init"), "{err}");
+    }
+
+    #[test]
+    fn xdg_config_reports_no_dir_as_no_config() {
+        // `dir: None` is what `config_dir()` returns when neither
+        // `$BEE_CONFIG`, `$XDG_CONFIG_HOME` nor `$HOME` is set — nowhere to
+        // look is not an error, it is the normal case for `ConfigSource`.
+        let source = XdgConfig { dir: None };
+        assert_eq!(source.config().unwrap(), None);
+    }
+
+    #[test]
+    fn xdg_config_reports_a_dir_with_no_file_as_no_config() {
+        let dir = std::env::temp_dir().join(format!("bee-xdg-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let source = XdgConfig { dir: Some(dir.clone()) };
+        assert_eq!(source.config().unwrap(), None, "the NotFound -> Ok(None) rule");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xdg_config_reads_a_written_file() {
+        let dir = std::env::temp_dir().join(format!("bee-xdg-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[options]\nnumber = 5\n").unwrap();
+
+        let source = XdgConfig { dir: Some(dir.clone()) };
+        assert_eq!(source.config().unwrap(), Some("[options]\nnumber = 5\n".to_string()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

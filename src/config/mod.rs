@@ -127,17 +127,15 @@ impl Default for Config {
 /// `toml_edit` reports spans as byte ranges; a diagnostic wants a line. Out of
 /// range clamps to the last line rather than panicking, because a span that
 /// disagrees with its source is a dependency bug and should not take the
-/// editor with it. The clamp is `src.len()`, never less — end-of-string is
-/// always a valid slice boundary, but `len - 1` is not when the source's last
-/// character is multi-byte UTF-8 (TOML source routinely is), so the slice
-/// index itself is never computed by subtracting from `len`. A trailing
-/// newline in the source is instead handled after slicing, by not counting
-/// it: it still ends the last real line rather than opening a phantom empty
-/// one after it, consistent with how an offset sitting on any other newline
-/// is treated — it still belongs to the line before it.
+/// editor with it. Counting runs over `src.as_bytes()`, not `src`, so the
+/// clamp needs no char-boundary care — slicing a byte slice can never land
+/// mid-character. A trailing newline in the source is handled after counting,
+/// by not counting it: it still ends the last real line rather than opening a
+/// phantom empty one after it, consistent with how an offset sitting on any
+/// other newline is treated — it still belongs to the line before it.
 pub(crate) fn line_of(src: &str, offset: usize) -> usize {
     let end = offset.min(src.len());
-    let mut newlines = src[..end].bytes().filter(|&b| b == b'\n').count();
+    let mut newlines = src.as_bytes()[..end].iter().filter(|&&b| b == b'\n').count();
     if end == src.len() && src.ends_with('\n') {
         newlines -= 1;
     }

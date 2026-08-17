@@ -489,15 +489,18 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | File | Holds |
 |---|---|
 | `buffer.rs` | rope, cursor, motions, the single mutation primitive |
+| `config/` | `Config`, the TOML parser and diagnostics, `ConfigSource` |
 | `history.rs` | the undo tree: revisions, branching, invertible `Change`s |
 | `registers.rs` | the yank ring: entries, capture, eviction |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `picker.rs` | the overlay's state: query, matches, selection |
+| `selection.rs` | selections: the editing primitive normal/visual/multi-cursor share |
 | `tree.rs` | the file tree: expansion, the flattened rows, the filesystem |
 | `syntax.rs` | tree-sitter: incremental reparse, highlight spans |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
 | `key.rs` | `Key` / `KeyCode` / `Mods` — bee's own key vocabulary |
+| `window.rs` | windows and the tree that arranges them; `Rect` layout geometry |
 
 **The terminal frontend** — `src/main.rs`:
 

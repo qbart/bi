@@ -54,8 +54,11 @@ The top level of `config.toml` holds tables and nothing else. A bare top-level
 key is a diagnostic, not a silent acceptance:
 
 ```
-config.toml:3: `theme` is not in a section — did you mean [ui] theme?
+config.toml:3: `theme` is not in a section
 ```
+
+The "did you mean [ui] theme?" hint arrives with step 2 — it cannot suggest a
+section that does not exist yet.
 
 ```toml
 [ui]
@@ -483,6 +486,14 @@ file now demonstrates supplying a keymap.
 `&Keymap` as a fourth argument to `on_key`. A GUI frontend then reads
 `ed.config().theme` and parses nothing.
 
+Step 1 already has two copies of the options: `apply_config` writes them into
+both `Session::options`, which `:set` mutates from then on, and `self.config`,
+which `:set` does not touch. `Editor::config()` and `Session::options` can
+disagree the moment `:set` runs. This is a known split, not an oversight —
+fixing it means picking one owner for runtime state, and step 2 is the
+natural point to do that, once the theme is a second consumer with the same
+question to answer.
+
 ### `ConfigSource`
 
 ```rust
@@ -555,7 +566,8 @@ Two subcommands, and no more.
 absent. If it exists: prints the path, exits 0, touches nothing. Never
 automatic — a config file appears because you asked for one.
 
-It writes the full default config **commented out**, under a header:
+It writes the full default config with every **key** commented out, under a
+header:
 
 ```toml
 # bee config
@@ -564,18 +576,24 @@ It writes the full default config **commented out**, under a header:
 # commented out keeps doing what bee does by default, including bindings added
 # in future versions. Uncomment a line only to change it.
 
-# [ui]
+[ui]
 # theme = "default"
 
-# [keys]
+[keys]
 # leader = " "
 
-# [keys.normal]
+[keys.normal]
 # "h" = "left"
 # …
 ```
 
-Writing them live would silently turn every user's file into a full
+Section headers are written **live**, uncommented, even though every key
+beneath one is commented out. An empty table parses to the same `Config` as no
+table at all, so the file stays inert either way — but commenting the header
+too would turn "uncomment a line" into a lie: the key would then sit outside
+any table and the parser would correctly reject it as not being in a section.
+
+Writing the keys live would silently turn every user's file into a full
 replacement, which is the failure the patch model exists to prevent. Commented
 out, it is a self-documenting menu that is semantically empty.
 

@@ -157,6 +157,7 @@ const LIB_MODULES: &[&str] = &[
     "lib.rs",
     "buffer.rs",
     "config/mod.rs",
+    "config/parse.rs",
     "editor.rs",
     "history.rs",
     "input.rs",
@@ -225,7 +226,15 @@ fn the_module_list_matches_what_lib_rs_declares() {
         })
         .collect();
 
-    let mut expected: Vec<&str> = LIB_MODULES.iter().copied().filter(|m| *m != "lib.rs").collect();
+    // `pub mod` in `lib.rs` names one entry per module, not one per file — a
+    // directory module like `config/` contributes a single `config/mod.rs`
+    // here. Submodule files (`config/parse.rs`) are reconciled separately
+    // below, against the filesystem rather than against `lib.rs`.
+    let mut expected: Vec<&str> = LIB_MODULES
+        .iter()
+        .copied()
+        .filter(|m| *m != "lib.rs" && (!m.contains('/') || m.ends_with("/mod.rs")))
+        .collect();
     let mut declared: Vec<&str> = declared.iter().map(|s| s.as_str()).collect();
     expected.sort_unstable();
     declared.sort_unstable();
@@ -234,6 +243,36 @@ fn the_module_list_matches_what_lib_rs_declares() {
         declared, expected,
         "LIB_MODULES is out of step with lib.rs's `pub mod` declarations",
     );
+
+    // A directory module can hold more than one file, and `pub mod` in
+    // `lib.rs` only names the directory, not what's inside it. Without this,
+    // a file added to `config/` (or any future directory module) is invisible
+    // to `LIB_MODULES` and so invisible to the terminal-crate scan above —
+    // which is exactly how `config/parse.rs` went unchecked.
+    for module in LIB_MODULES {
+        let Some(dir) = module.strip_suffix("/mod.rs") else { continue };
+        let dir_path = root.join(dir);
+
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir_path.display()))
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.ends_with(".rs").then(|| format!("{dir}/{name}"))
+            })
+            .collect();
+        on_disk.sort();
+
+        let mut declared_in_dir: Vec<&str> =
+            LIB_MODULES.iter().copied().filter(|m| m.starts_with(&format!("{dir}/"))).collect();
+        declared_in_dir.sort_unstable();
+
+        assert_eq!(
+            declared_in_dir,
+            on_disk.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{dir}/ on disk and LIB_MODULES disagree about what files it holds",
+        );
+    }
 }
 
 #[test]

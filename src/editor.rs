@@ -981,7 +981,19 @@ impl Editor {
         problems
     }
 
-    /// The config bee is running on.
+    /// The config as loaded — from `ConfigSource`, at startup or the most
+    /// recent `:reload`.
+    ///
+    /// This is not the same thing as the options bee is running on: `:set`
+    /// mutates `Session::options` alone, so after `:set number 5` this
+    /// still reports whatever the file said. `apply_config` copies loaded
+    /// options into `Session::options` on load, but the two copies diverge
+    /// the moment `:set` touches one of them. A GUI frontend reading
+    /// `ed.config().theme` in step 2 is unaffected — `:set` has no theme
+    /// spelling to move — but an option read through here can be stale.
+    /// Giving runtime state one owner is a decision for step 2, when the
+    /// theme becomes a second consumer; see "Ownership" in
+    /// `docs/specs/config.md`.
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -999,7 +1011,16 @@ impl Editor {
     fn read_config(&mut self, source: &dyn ConfigSource) -> Result<Vec<Diagnostic>, Diagnostic> {
         let text = match source.config() {
             Ok(Some(text)) => text,
-            Ok(None) => return Ok(Vec::new()),
+            // No file is not an error, but it is still a fact about the
+            // world that can change between calls — a file present at
+            // startup can be gone by `:reload`. Applying the defaults here,
+            // rather than leaving whatever was last applied, is what keeps
+            // this path agreeing with startup on an editor that has never
+            // seen a file at all.
+            Ok(None) => {
+                self.apply_config(Config::default());
+                return Ok(Vec::new());
+            }
             Err(e) => return Err(Diagnostic { line: 1, message: e.to_string() }),
         };
 
@@ -3736,10 +3757,20 @@ mod tests {
 
     #[test]
     fn no_config_file_is_not_a_problem() {
+        // Starting from an editor that already holds the defaults would pass
+        // whether or not a missing file actually applies them — load a
+        // non-default config first, so this test can tell the difference.
         let mut ed = Editor::empty();
+        ed.load_config(ConfigText(Some("[options]\nnumber = 5\n")));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "non-default before");
+
         let problems = ed.load_config(ConfigText(None));
         assert!(problems.is_empty());
-        assert_eq!(ed.session.options, crate::config::Options::default());
+        assert_eq!(
+            ed.session.options,
+            crate::config::Options::default(),
+            "no file reverts to defaults, the same as a fresh bee would show"
+        );
     }
 
     #[test]
@@ -3760,23 +3791,31 @@ mod tests {
     /// A source whose text can change between reads, which is what `:reload`
     /// is for. `RefCell` rather than a field because `ConfigSource::config`
     /// takes `&self` — the source is read-only to the editor, and mutable
-    /// only to its owner.
-    struct Mutable(std::cell::RefCell<String>);
+    /// only to its owner. `Option` so a test can also make the file go away
+    /// between reloads, the real-world shape of finding 1: a file present at
+    /// startup can be gone by the time `:reload` runs.
+    struct Mutable(std::cell::RefCell<Option<String>>);
+
+    impl Mutable {
+        fn new(text: &str) -> Self {
+            Self(std::cell::RefCell::new(Some(text.to_string())))
+        }
+    }
 
     impl crate::config::ConfigSource for Mutable {
         fn config(&self) -> anyhow::Result<Option<String>> {
-            Ok(Some(self.0.borrow().clone()))
+            Ok(self.0.borrow().clone())
         }
     }
 
     #[test]
     fn reload_picks_up_a_changed_file() {
         let mut ed = Editor::empty();
-        let source = std::rc::Rc::new(Mutable("[options]\nnumber = 5\n".to_string().into()));
+        let source = std::rc::Rc::new(Mutable::new("[options]\nnumber = 5\n"));
         ed.load_config(std::rc::Rc::clone(&source));
         assert_eq!(ed.session.options.number, LineNumbers::Every(5));
 
-        *source.0.borrow_mut() = "[options]\nnumber = -1\n".to_string();
+        *source.0.borrow_mut() = Some("[options]\nnumber = -1\n".to_string());
         ex(&mut ed, "reload");
 
         assert_eq!(ed.session.options.number, LineNumbers::Relative);
@@ -3786,10 +3825,10 @@ mod tests {
     #[test]
     fn a_failed_reload_changes_nothing() {
         let mut ed = Editor::empty();
-        let source = std::rc::Rc::new(Mutable("[options]\nnumber = 5\n".to_string().into()));
+        let source = std::rc::Rc::new(Mutable::new("[options]\nnumber = 5\n"));
         ed.load_config(std::rc::Rc::clone(&source));
 
-        *source.0.borrow_mut() = "[options\nnumber = -1\n".to_string();
+        *source.0.borrow_mut() = Some("[options\nnumber = -1\n".to_string());
         ex(&mut ed, "reload");
 
         assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the running config survives");
@@ -3799,11 +3838,34 @@ mod tests {
     #[test]
     fn reload_counts_the_problems_it_kept_going_past() {
         let mut ed = Editor::empty();
-        let source = std::rc::Rc::new(Mutable("[options]\nnmber = 9\nzz = 1\n".to_string().into()));
+        let source = std::rc::Rc::new(Mutable::new("[options]\nnmber = 9\nzz = 1\n"));
         ed.load_config(std::rc::Rc::clone(&source));
 
         ex(&mut ed, "reload");
         assert_eq!(ed.session.status, "config reloaded — 2 problems");
+    }
+
+    #[test]
+    fn reload_with_the_config_file_gone_reverts_to_defaults() {
+        // The whole-file-absent branch of `read_config` is the one place
+        // applied state depends on what was applied before: removing a line
+        // from the file reverts correctly because the base is always
+        // `Config::default()`, but the file disappearing entirely used to
+        // return early and leave the previous options running.
+        let mut ed = Editor::empty();
+        let source = std::rc::Rc::new(Mutable::new("[options]\nnumber = 5\n"));
+        ed.load_config(std::rc::Rc::clone(&source));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5));
+
+        *source.0.borrow_mut() = None;
+        ex(&mut ed, "reload");
+
+        assert_eq!(
+            ed.session.options,
+            crate::config::Options::default(),
+            "a fresh bee with no config file would show the defaults"
+        );
+        assert_eq!(ed.session.status, "config reloaded");
     }
 
     #[test]
