@@ -91,10 +91,6 @@ const INIT_HEADER: &str = "\
 # commented out keeps doing what bee does by default, including settings added
 # in later versions. Uncomment a line only to change it.
 #
-# A key needs its section uncommented too. \"number = 5\" on its own, with
-# \"[options]\" still commented out, is a key with no section, and bee reports
-# that as an error rather than accepting it silently.
-#
 # `:reload` re-reads this file without restarting.
 
 ";
@@ -105,13 +101,20 @@ const INIT_HEADER: &str = "\
 /// replacement, and that user would stop receiving defaults bee adds later —
 /// invisibly and permanently. Commented out it is a self-documenting menu that
 /// is semantically empty.
+///
+/// Section headers (`[options]` and, later, `[keys.normal]` and friends) are
+/// written *live*, uncommented, even though every key beneath one is
+/// commented out. An empty table parses to nothing — `read_options` walks a
+/// table with no items and produces no diagnostics — so the file stays
+/// semantically empty either way. The alternative, commenting the header too,
+/// turns "uncomment the one line you want" into a lie: the key would then sit
+/// outside any table and the parser would correctly reject it as not being in
+/// a section.
 fn commented(defaults: &str) -> String {
     let mut out = String::from(INIT_HEADER);
     for line in defaults.lines() {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            out.push('\n');
-        } else if trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
             out.push_str(line);
             out.push('\n');
         } else {
@@ -301,7 +304,11 @@ mod tests {
     fn the_written_config_is_the_defaults_commented_out() {
         let out = commented("[options]\nnumber = 1\n\n# already a comment\n");
 
-        assert!(out.contains("# [options]"), "settings are commented: {out}");
+        // Section headers are written live: an empty table is as inert as no
+        // table at all, and this is what lets uncommenting a single setting
+        // line actually work.
+        assert!(out.contains("\n[options]\n"), "the header is live: {out}");
+        assert!(!out.contains("# [options]"), "not commented: {out}");
         assert!(out.contains("# number = 1"));
         assert!(out.contains("# already a comment"), "and not double-commented");
         assert!(!out.contains("## already"), "{out}");
@@ -311,6 +318,43 @@ mod tests {
         let (config, problems) = bee::config::parse(&out, bee::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(config, bee::config::Config::default(), "semantically empty");
+    }
+
+    #[test]
+    fn the_real_shipped_defaults_commented_out_are_still_semantically_empty() {
+        // The synthetic test above pins the line-shape mechanics; this one
+        // exercises the actual file `bee config init` writes, which is what
+        // the review that found the section-header trap said was missing.
+        let out = commented(bee::config::DEFAULT_TOML);
+
+        let (config, problems) = bee::config::parse(&out, bee::config::Config::default()).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config, bee::config::Config::default(), "semantically empty");
+    }
+
+    #[test]
+    fn uncommenting_exactly_one_setting_line_just_works() {
+        // The header promises "uncomment a line only to change it" — this
+        // pins that promise against the real shipped file, the way a user
+        // actually edits it: find the line, strip its leading `# `, touch
+        // nothing else. With the section header still commented out, this
+        // used to leave the key belonging to no section and produce exactly
+        // one diagnostic instead of zero.
+        let out = commented(bee::config::DEFAULT_TOML);
+        let uncommented: String = out
+            .lines()
+            .map(
+                |line| {
+                    if line == "# number = 1" { line.strip_prefix("# ").unwrap() } else { line }
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (config, problems) =
+            bee::config::parse(&uncommented, bee::config::Config::default()).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.options.number, bee::editor::LineNumbers::Every(1));
     }
 
     #[test]

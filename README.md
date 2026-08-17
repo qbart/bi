@@ -466,13 +466,6 @@ number   = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
 hlsearch = false
 ```
 
-Every key in the file has to live under a section, this one included — a
-bare top-level key is rejected rather than silently accepted. That includes
-the lines `bee config init` writes for you: uncommenting a setting without
-also uncommenting its `[options]` header above leaves the key belonging to
-no section, and the parser is right to reject it, even though uncommenting
-just the one line you want is the obvious first thing to try.
-
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown
 option: nmber` on the status line, not stderr, which the alternate screen
