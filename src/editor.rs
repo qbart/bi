@@ -571,7 +571,8 @@ struct BufferEntry {
 enum ExLine {
     Window(WindowCmd),
     Buffer(BufferCmd),
-    /// `:e <path>`. Bare `:e` is [`ExLine::Reload`], which is a different job.
+    /// `:e <path>`. Bare `:e` is [`ExLine::Revert`], which is a different job
+    /// — and is not `:reload`, which is the config.
     Edit {
         path: String,
     },
@@ -608,7 +609,7 @@ enum ExLine {
     Write(String),
     WriteQuit(String),
     /// Bare `:e` — re-read this file from disk.
-    Reload {
+    Revert {
         force: bool,
     },
     /// `:42`.
@@ -681,7 +682,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "on" | "only" => ExLine::Window(WindowCmd::Only),
         // Bare `:e` reloads this buffer; with a path it changes what the
         // window shows, which is two different jobs under one name.
-        "e" | "edit" if arg.is_empty() => ExLine::Reload { force },
+        "e" | "edit" if arg.is_empty() => ExLine::Revert { force },
         "e" | "edit" => ExLine::Edit { path: arg.into() },
         "bn" | "bnext" => ExLine::Buffer(BufferCmd::Next),
         "bp" | "bprev" | "bprevious" => ExLine::Buffer(BufferCmd::Prev),
@@ -2238,7 +2239,7 @@ impl Editor {
             ExLine::Write(path) => {
                 self.in_view(|view| view.write(&path));
             }
-            ExLine::Reload { force } => {
+            ExLine::Revert { force } => {
                 self.in_view(|view| view.edit(force));
             }
             ExLine::Goto(row) => {
