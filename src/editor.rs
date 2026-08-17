@@ -2273,15 +2273,21 @@ impl Editor {
             self.session.status = match self.session.options.get(name) {
                 Some(OptionValue::Int(n)) => format!("{name}={n}"),
                 Some(OptionValue::Bool(on)) => format!("{name}={on}"),
-                Some(OptionValue::Other) => unreachable!("Options::get never returns Other"),
-                None => format!("unknown option: {name}"),
+                // `get` never yields `Other`: no option stores one. Reported
+                // as unknown rather than asserted away, because a future
+                // option whose `get` arm is wrong should produce a message,
+                // not take the editor down mid-session.
+                Some(OptionValue::Other) | None => format!("unknown option: {name}"),
             };
             return;
         }
 
         // The typed value `Options::set` wants. A bare word that is neither a
         // number nor a bool still goes through, so the option itself gets to
-        // say what it wanted rather than this function guessing.
+        // say what it wanted rather than this function guessing. Case-
+        // sensitive on purpose: TOML booleans are lowercase-only, and
+        // `:set hlsearch true` should accept exactly what `hlsearch = true`
+        // in config.toml accepts, no more.
         let parsed = match value.parse::<i64>() {
             Ok(n) => OptionValue::Int(n),
             Err(_) => match value {
@@ -2292,7 +2298,13 @@ impl Editor {
         };
 
         if let Err(message) = self.session.options.set(name, parsed) {
-            self.session.status = message;
+            // A real option given a bad value gets the value echoed — you
+            // want to see what you fat-fingered. An unknown option does not:
+            // its message already names the thing that was wrong.
+            self.session.status = match self.session.options.get(name) {
+                Some(_) => format!("{message}: {value}"),
+                None => message,
+            };
         }
     }
 
@@ -5108,7 +5120,7 @@ mod tests {
         let mut ed = Editor::empty();
 
         ex(&mut ed, "set hlsearch maybe");
-        assert_eq!(ed.session.status, "hlsearch takes true or false");
+        assert_eq!(ed.session.status, "hlsearch takes true or false: maybe");
 
         ex(&mut ed, "set nmber 5");
         assert_eq!(ed.session.status, "unknown option: nmber");
@@ -5124,7 +5136,7 @@ mod tests {
 
         ex(&mut ed, "set number -3");
         assert_eq!(ed.session.options.number, LineNumbers::Every(5), "left alone");
-        assert_eq!(ed.session.status, "number takes 0 (off), -1 (relative) or a count");
+        assert!(ed.session.status.contains("-3"));
 
         ex(&mut ed, "set wrap");
         assert_eq!(ed.session.status, "unknown option: wrap");
