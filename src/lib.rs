@@ -1,4 +1,4 @@
-//! bee — a batteries-included modal editor, as a library.
+//! bi — a batteries-included modal editor, as a library.
 //!
 //! This crate is the editor: text, history, motions, the keymap, registers and
 //! the parse tree. It knows nothing about terminals. Rendering and event input

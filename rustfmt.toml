@@ -1,4 +1,4 @@
-# bee is hand-formatted in a compact style: struct literals, match arms and
+# bi is hand-formatted in a compact style: struct literals, match arms and
 # short if/else stay on one line where they fit. rustfmt's default heuristics
 # expand those at roughly 60% of max_width, which would rewrite a large part of
 # the codebase. "Max" lets anything fitting inside max_width stay as written,

@@ -1,4 +1,4 @@
-# bee's defaults.
+# bi's defaults.
 #
 # Compiled into the binary. A user's config.toml is a PATCH over this file:
 # anything they leave out keeps doing what this says, including settings added

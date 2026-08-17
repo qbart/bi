@@ -984,7 +984,7 @@ impl Editor {
     /// The config as loaded — from `ConfigSource`, at startup or the most
     /// recent `:reload`.
     ///
-    /// This is not the same thing as the options bee is running on: `:set`
+    /// This is not the same thing as the options bi is running on: `:set`
     /// mutates `Session::options` alone, so after `:set number 5` this
     /// still reports whatever the file said. `apply_config` copies loaded
     /// options into `Session::options` on load, but the two copies diverge
@@ -1467,7 +1467,7 @@ impl Editor {
     ///
     /// Closing the window, unless it is the last one — that one can never
     /// close, so it shows a buffer instead. Which is what Enter on a file does
-    /// from a `bee .` session, and leaves a session that still has a window.
+    /// from a `bi .` session, and leaves a session that still has a window.
     fn close_tree(&mut self, id: WindowId) {
         if self.windows.len() > 1 {
             self.close_window(id);
@@ -1758,7 +1758,7 @@ impl Editor {
     ///
     /// The command line and the picker are session state, not the buffer's:
     /// they have to work in a window holding a tree, where there is no view to
-    /// run anything in. Without this `:q` cannot leave `bee .`.
+    /// run anything in. Without this `:q` cannot leave `bi .`.
     ///
     /// Returns whether it handled the action.
     fn run_session_action(&mut self, action: &Action) -> bool {
@@ -2743,7 +2743,7 @@ impl View<'_> {
     /// Where the block's cursors go for `I` and `A`.
     ///
     /// `I` skips a row that does not reach the left edge; `A` pads one out to
-    /// the column so what is appended lines up. Vim pads on `Esc`, bee pads on
+    /// the column so what is appended lines up. Vim pads on `Esc`, bi pads on
     /// entry — the same edit, visible while it is being typed into.
     fn block_insert_columns(&mut self, append: bool) -> Vec<Cursor> {
         let (lo, hi) = self.selections.primary().range();
@@ -3769,7 +3769,7 @@ mod tests {
         assert_eq!(
             ed.session.options,
             crate::config::Options::default(),
-            "no file reverts to defaults, the same as a fresh bee would show"
+            "no file reverts to defaults, the same as a fresh bi would show"
         );
     }
 
@@ -3863,7 +3863,7 @@ mod tests {
         assert_eq!(
             ed.session.options,
             crate::config::Options::default(),
-            "a fresh bee with no config file would show the defaults"
+            "a fresh bi with no config file would show the defaults"
         );
         assert_eq!(ed.session.status, "config reloaded");
     }
@@ -4249,7 +4249,7 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str, text: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("bee-test-{}-{name}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("bi-test-{}-{name}", std::process::id()));
             std::fs::write(&path, text).unwrap();
             Self(path)
         }
@@ -4283,7 +4283,7 @@ mod tests {
 
     impl ScratchDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("bee-dir-{}-{name}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("bi-dir-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -4323,7 +4323,7 @@ mod tests {
         assert!(ed.buffer().is_none(), "so it shows no buffer at all");
     }
 
-    /// `bee .` — and the buffer list stays non-empty, so nothing downstream
+    /// `bi .` — and the buffer list stays non-empty, so nothing downstream
     /// has to learn that the session began on a directory.
     #[test]
     fn opening_a_directory_starts_on_a_tree() {
@@ -4368,7 +4368,7 @@ mod tests {
     }
 
     /// The command line is session state, not the buffer's, so it has to work
-    /// where there is no buffer. Without this `:q` cannot leave `bee .`.
+    /// where there is no buffer. Without this `:q` cannot leave `bi .`.
     #[test]
     fn the_command_line_works_in_a_tree_window() {
         let d = ScratchDir::new("tree-ex").file("a.rs");
@@ -4990,7 +4990,7 @@ mod tests {
         assert!(ed.tree_window().is_none());
     }
 
-    /// The `bee .` session: the tree is the only window, so there is nothing
+    /// The `bi .` session: the tree is the only window, so there is nothing
     /// to close. It shows a buffer instead, which is the same thing Enter on a
     /// file does and leaves the session in a state that still has a window.
     #[test]

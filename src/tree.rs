@@ -138,7 +138,7 @@ impl Tree {
         if !root.is_dir() {
             anyhow::bail!("{} is not a directory", root.display());
         }
-        // Resolved on the way in, because `bee .` would otherwise root at "."
+        // Resolved on the way in, because `bi .` would otherwise root at "."
         // — whose parent is "" rather than the directory above it, leaving `-`
         // nowhere to go in the one case the key exists for.
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -445,7 +445,7 @@ mod tests {
 
     impl ScratchDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("bee-tree-{}-{name}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("bi-tree-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(tree.scroll(), 0);
     }
 
-    /// `bee .` roots at ".", whose parent is "" rather than the directory
+    /// `bi .` roots at ".", whose parent is "" rather than the directory
     /// above it — so `-` would have had nowhere to go in the one case the
     /// feature exists for.
     #[test]

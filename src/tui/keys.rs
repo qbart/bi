@@ -1,4 +1,4 @@
-//! crossterm key events → [`bee::key::Key`].
+//! crossterm key events → [`bi::key::Key`].
 //!
 //! This is the entire terminal-specific half of input handling. The keymap
 //! itself is library code, because "`d` waits for a motion" is editor
@@ -6,11 +6,11 @@
 
 use ratatui::crossterm::event::{KeyCode as CtCode, KeyEvent, KeyModifiers};
 
-use bee::key::{Key, KeyCode, Mods};
+use bi::key::{Key, KeyCode, Mods};
 
 /// Translates a terminal key event, or drops it.
 ///
-/// `None` means the key names nothing bee handles — function keys, `PageUp`,
+/// `None` means the key names nothing bi handles — function keys, `PageUp`,
 /// `Delete`, `Insert`, media keys. Dropping them here is where they already
 /// effectively went: they used to reach the keymap and fall through its
 /// catch-all arm.
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_bee_does_not_name_is_dropped() {
+    fn a_key_bi_does_not_name_is_dropped() {
         assert!(translate(ev(CtCode::F(1), KeyModifiers::NONE)).is_none());
         assert!(translate(ev(CtCode::PageUp, KeyModifiers::NONE)).is_none());
         assert!(translate(ev(CtCode::Delete, KeyModifiers::NONE)).is_none());

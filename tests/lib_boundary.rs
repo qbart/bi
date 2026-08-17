@@ -1,15 +1,15 @@
 //! Drives the editor through the library's public API alone.
 //!
 //! The assertions matter less than the fact that this file compiles. It is an
-//! embedder: it links `bee` and never names a terminal, so it can only build if
+//! embedder: it links `bi` and never names a terminal, so it can only build if
 //! the core is genuinely frontend-free. If someone adds a `ratatui` type to a
 //! signature in `editor`, `input` or `buffer`, this breaks.
 
-use bee::editor::{Action, Command, Editor, Mode, WindowCmd};
-use bee::input::Input;
-use bee::key::{Key, KeyCode};
-use bee::tree::Kind;
-use bee::window::{Chrome, Content, Dir, Rect, Side};
+use bi::editor::{Action, Command, Editor, Mode, WindowCmd};
+use bi::input::Input;
+use bi::key::{Key, KeyCode};
+use bi::tree::Kind;
+use bi::window::{Chrome, Content, Dir, Rect, Side};
 
 /// A headless editor session: feed keys, read text back.
 struct Session {
@@ -293,7 +293,7 @@ struct ScratchDir(std::path::PathBuf);
 
 impl ScratchDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("bee-embed-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("bi-embed-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(path.join("src")).unwrap();
         std::fs::write(path.join("src/lib.rs"), "fn main() {}\n").unwrap();

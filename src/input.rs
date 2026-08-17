@@ -399,7 +399,7 @@ impl Input {
             // moves the cursor — and `:m` works everywhere.
             KeyCode::Down if key.mods.shift => self.plain(Action::MoveLines { down: true }),
             KeyCode::Up if key.mods.shift => self.plain(Action::MoveLines { down: false }),
-            // Vim spells its jump list this way; bee has no jump list and
+            // Vim spells its jump list this way; bi has no jump list and
             // these are the keys the fingers reach for. Checked before the
             // plain `i` and `o`, which would otherwise swallow them — and
             // `Tab` is listed because it *is* Ctrl-I, byte for byte.
@@ -1000,9 +1000,9 @@ mod tests {
         assert_eq!(tree_action(":"), Action::EnterCommandMode);
     }
 
-    /// Vim spells the jump list this way, not the buffer list — but bee has no
+    /// Vim spells the jump list this way, not the buffer list — but bi has no
     /// jump list, and these are the keys the fingers reach for. Ctrl-I *is*
-    /// Tab: both are 0x09, and no terminal bee talks to tells them apart, so
+    /// Tab: both are 0x09, and no terminal bi talks to tells them apart, so
     /// binding one binds the other whether or not you meant to.
     #[test]
     fn ctrl_i_and_ctrl_o_cycle_the_buffer_list() {

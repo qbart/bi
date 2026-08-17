@@ -164,7 +164,7 @@ match vim.
 Two cases are recorded as known divergences and are **not** real differences:
 `vim -es -c "normal ..."` aborts the whole key sequence when a search fails or
 is cancelled, so a trailing `x` never runs there. Interactive vim, driven
-through a pty, agrees with bee in both.
+through a pty, agrees with bi in both.
 
 One thing the differential could not have caught, because it only compares
 files: entering the search line resets the keymap, so a pending operator would

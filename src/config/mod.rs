@@ -1,4 +1,4 @@
-//! bee's config: the types, the parser, and the source a frontend supplies.
+//! bi's config: the types, the parser, and the source a frontend supplies.
 //!
 //! The library owns the types and the parser because a keymap is editor
 //! semantics — the same argument `key.rs` makes for `Key`. A frontend owns
@@ -42,7 +42,7 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// bee's defaults, as the file that documents them.
+/// bi's defaults, as the file that documents them.
 pub const DEFAULT_TOML: &str = include_str!("default.toml");
 
 /// A value an option can hold, in the one shape both `:set` and TOML can
@@ -116,7 +116,7 @@ impl Default for Config {
         DEFAULT
             .get_or_init(|| {
                 let bare = Config { options: Options::default() };
-                parse(DEFAULT_TOML, bare).expect("bee's own default.toml must parse").0
+                parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })
             .clone()
     }

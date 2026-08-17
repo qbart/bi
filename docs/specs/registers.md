@@ -2,7 +2,7 @@
 
 Yank, delete and change put text somewhere; paste takes it back out. Vim gives
 you 36 addressable slots and expects you to choose one *at yank time*, which is
-the wrong moment — you rarely know yet whether a thing is worth keeping. bee
+the wrong moment — you rarely know yet whether a thing is worth keeping. bi
 keeps everything automatically in a deep ring and moves the choice to paste
 time, where a fuzzy picker can search it.
 
@@ -123,7 +123,7 @@ Vim's `"0` idiom rather than reproducing it.
 
 **Cursor lands** on the last char of pasted charwise text, or on the first char
 of the first pasted line for linewise. (Vim uses first *non-blank* for
-linewise; bee has no first-non-blank motion yet — `^` is currently an alias for
+linewise; bi has no first-non-blank motion yet — `^` is currently an alias for
 `0` — so first char is the honest approximation, and it moves when `^` becomes
 real.)
 

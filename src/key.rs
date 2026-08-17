@@ -1,4 +1,4 @@
-//! bee's own key vocabulary.
+//! bi's own key vocabulary.
 //!
 //! The keymap in [`crate::input`] is editor semantics, so it belongs in the
 //! library — but crossterm's `KeyEvent` does not. A frontend translates its

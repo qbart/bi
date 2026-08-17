@@ -1,5 +1,5 @@
 """Differential test: run the same normal-mode keys through real vim and
-through bee, and compare the resulting file.
+through bi, and compare the resulting file.
 
 Not part of `cargo test` — it needs vim on PATH and drives the real binary
 through a pty, so it is slow and has an external dependency. Run it by hand
@@ -7,7 +7,7 @@ after touching motions, operators or text objects:
 
     cargo build && python3 scripts/vim_differential.py [substring-filter]
 
-vim is the oracle. Any disagreement is either a bee bug or a deliberate,
+vim is the oracle. Any disagreement is either a bi bug or a deliberate,
 documented divergence — the KNOWN_DIVERGENCES table records the latter.
 """
 import os
@@ -18,21 +18,21 @@ import sys
 import tempfile
 import time
 
-BEE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "debug", "bee"
+BI = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "debug", "bi"
 )
 
-# Keys bee deliberately does not implement the way vim does, with the reason.
+# Keys bi deliberately does not implement the way vim does, with the reason.
 # Anything here still runs; it is reported separately rather than as a failure.
 # Replace mode's Backspace cannot be tested here: `vim -es -c "normal ..."`
 # inserts the DEL byte literally instead of processing it as a keypress. It is
 # covered by a unit test instead.
 KNOWN_DIVERGENCES = {
     "esc on search line": "same harness artifact as \"/ not found\": `-es` aborts"
-                          " the sequence. Interactive vim agrees with bee.",
+                          " the sequence. Interactive vim agrees with bi.",
     "/ not found": "harness artifact, not a real difference: `vim -es -c normal`"
                    " aborts the whole key sequence when a search fails, so the"
-                   " trailing x never runs. Interactive vim agrees with bee —"
+                   " trailing x never runs. Interactive vim agrees with bi —"
                    " checked through a pty.",
 }
 
@@ -50,7 +50,7 @@ def vim_run(text, keys):
     return out
 
 
-def bee_run(text, keys):
+def bi_run(text, keys):
     """Sends `keys` one character at a time, then :wq."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(text)
@@ -59,7 +59,7 @@ def bee_run(text, keys):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(TERM="xterm-256color")
-        os.execv(BEE, ["bee", path])
+        os.execv(BI, ["bi", path])
 
     import fcntl
     import struct
@@ -279,19 +279,19 @@ def main():
     for label, text, keys in CASES:
         if only and only not in label:
             continue
-        # vim -es starts on the LAST line; bee starts on the first. Normalise
+        # vim -es starts on the LAST line; bi starts on the first. Normalise
         # both to line 1, column 0 so the cases mean what they say.
         v = vim_run(text, "gg0" + keys)
-        b = bee_run(text, "gg0" + keys)
+        b = bi_run(text, "gg0" + keys)
         if v == b:
             same += 1
             print(f"  ok    {label:<16} -> {b!r}")
         elif label in KNOWN_DIVERGENCES:
             diverged += 1
-            print(f"  note  {label:<16} vim={v!r} bee={b!r}\n        {KNOWN_DIVERGENCES[label]}")
+            print(f"  note  {label:<16} vim={v!r} bi={b!r}\n        {KNOWN_DIVERGENCES[label]}")
         else:
             failures.append((label, keys, text, v, b))
-            print(f"  DIFF  {label:<16} vim={v!r}\n        {'':16} bee={b!r}")
+            print(f"  DIFF  {label:<16} vim={v!r}\n        {'':16} bi={b!r}")
 
     print(f"\n{same} match vim, {diverged} known divergences, {len(failures)} differ")
     return 1 if failures else 0

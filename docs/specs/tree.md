@@ -1,6 +1,6 @@
 # The file tree
 
-`bee src/main.rs` opens a file. `bee .` fails, because `Buffer::open` reads a
+`bi src/main.rs` opens a file. `bi .` fails, because `Buffer::open` reads a
 path into a rope and a directory is not text. There is no way to see what a
 project contains without leaving the editor, and no way to create, rename or
 delete a file from inside it.
@@ -207,7 +207,7 @@ display path. The full path is what the status row shows, and repeating it at
 the top of a pane eight columns wide was the same fact twice, in the place with
 the least room for it.
 
-**Corrected.** The root is resolved with `canonicalize` on the way in. `bee .`
+**Corrected.** The root is resolved with `canonicalize` on the way in. `bi .`
 would otherwise root at `"."`, whose parent is `""` rather than the directory
 above it — leaving `-` nowhere to go in the one case the key exists for. The
 tests missed this because `Path` comparison normalises a *trailing* `.` away, so
@@ -314,7 +314,7 @@ Enter on a file opens it in the **last-focused window that is not this one**, an
 the tree stays where it is. With no other window it opens in place, and the tree
 goes to `alt`.
 
-So `:vs .` is a persistent sidebar and `bee .` is netrw, out of one rule and no
+So `:vs .` is a persistent sidebar and `bi .` is netrw, out of one rule and no
 sidebar concept. The window tree needs no special case, `:only` needs no special
 case, and a tree pane resizes and closes like anything else.
 
@@ -349,7 +349,7 @@ moves focus to it, and only opens one when there is none.
 
 Closing means closing the window, except when it is the last one — that can
 never close, so it shows a buffer instead. Which is what Enter on a file already
-does from a `bee .` session, and leaves a session that still has a window in it.
+does from a `bi .` session, and leaves a session that still has a window in it.
 
 The escape hatch is still there: `:e <dir>`, `:sp <dir>` and `:vs <dir>` name a
 path outright, and someone who types two of them has asked for two trees.
@@ -555,8 +555,8 @@ is never empty, so nothing downstream learns that the session started on a
 directory.
 
 ```
-bee .            a tree on the current directory
-bee src/         a tree on src/
+bi .            a tree on the current directory
+bi src/         a tree on src/
 :e <dir>         this window shows a tree; its old content goes to alt
 :sp <dir>        a new window holding a tree
 :vs <dir>        the same, beside

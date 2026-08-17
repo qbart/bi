@@ -93,7 +93,7 @@ with the name spelled out.
 `x` is `d` and `s` is `c`, as everywhere else.
 
 **`c` diverges from vim, deliberately.** Vim takes the text typed on the first
-line and replicates it down the block when you press `Esc`. bee already has
+line and replicates it down the block when you press `Esc`. bi already has
 multi-cursor, so the cursors are real and the text appears on every row as it
 is typed. The buffer ends up identical; only the feedback is better.
 
@@ -113,7 +113,7 @@ Two rules for rows the rectangle overhangs:
 - **`I` skips them.** A row that does not reach the left edge gets no cursor,
   matching vim.
 - **`A` pads them** with spaces out to the column, so appended text lines up.
-  Vim pads on `Esc`; bee pads on entry, which is visible while typing and is
+  Vim pads on `Esc`; bi pads on entry, which is visible while typing and is
   the same edit either way.
 
 Padding is part of the insert session's undo group, so one `u` takes the

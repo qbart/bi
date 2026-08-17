@@ -1,6 +1,6 @@
 # Config
 
-bee has no config. The keymap is a set of `match` arms in `input.rs`, the
+bi has no config. The keymap is a set of `match` arms in `input.rs`, the
 highlight colours are a `match` in `tui/render.rs`, and `:set` knows one option
 because a real options table was waiting for this file. Nothing a user writes
 can change any of it.
@@ -20,7 +20,7 @@ The layer, `[options]`, `:reload` and both CLI subcommands ship. The theme
 ## What this is not
 
 Not a scripting language. TOML holds data; a key binds to a *name*, and the
-names are bee's own vocabulary. An embedded Lua or Steel would be a later
+names are bi's own vocabulary. An embedded Lua or Steel would be a later
 decision with its own spec, and this design is shaped so that it stays a
 possible one: a script's contribution to the keymap would be a registered name,
 which is a thing this design already has a slot for.
@@ -30,19 +30,19 @@ Not a plugin system, not per-project config, not a `:map` command. See
 
 ## Where it lives
 
-`$BEE_CONFIG`, else `$XDG_CONFIG_HOME/bee`, else `~/.config/bee` — a
+`$BI_CONFIG`, else `$XDG_CONFIG_HOME/bi`, else `~/.config/bi` — a
 **directory**, holding `config.toml` beside `themes/`. An override that named
-only the file would leave `bee config edit` and theme resolution with nowhere
+only the file would leave `bi config edit` and theme resolution with nowhere
 to look.
 
 ```
-~/.config/bee/
+~/.config/bi/
   config.toml
   themes/
     onedark.toml
 ```
 
-XDG rather than `~/.bee.toml` because `themes/` needs a sibling, and so will
+XDG rather than `~/.bi.toml` because `themes/` needs a sibling, and so will
 `queries/` when tree-sitter grows user grammars and `undo/` if `'undofile'` ever
 lands. A dotfile in `$HOME` has nowhere to put any of them.
 
@@ -83,7 +83,7 @@ onedark` and `theme = "onedark"`.
 An earlier draft split appearance into a `[ui]` table and left `[options]` for
 what `:set` understood. That put `theme` on one side and `number` on the other
 for no reason a user could predict — both are things you set because of how you
-want bee to look — and it meant every new option needed an argument about which
+want bi to look — and it meant every new option needed an argument about which
 half it belonged to. One table has no edge to be arbitrary at.
 
 It also removes a feature rather than adding one: with `theme` an ordinary
@@ -93,7 +93,7 @@ variant in step 2, which is a line of work, not a design question.
 
 ## The user file is a patch
 
-bee ships `src/config/default.toml` and compiles it in with `include_str!`. A
+bi ships `src/config/default.toml` and compiles it in with `include_str!`. A
 user's file is parsed as a patch over it: tables merge, keys override, and
 `false` unbinds.
 
@@ -106,10 +106,10 @@ user's file is parsed as a patch over it: tables merge, keys override, and
 
 The alternative — a user file that replaces the defaults wholesale — means every
 person who wants one different key pastes 120 lines and then silently never
-receives a binding bee adds later. That failure is invisible and permanent,
+receives a binding bi adds later. That failure is invisible and permanent,
 which is the worst combination.
 
-This is also why `bee config init` writes the defaults **commented out**. See
+This is also why `bi config init` writes the defaults **commented out**. See
 [The CLI](#the-cli).
 
 ## The keymap
@@ -140,7 +140,7 @@ motion` composes. Only the first is config.
 action.
 
 Helix's flat key-trie has no operator grammar to lean on, so it must enumerate
-combinations. bee has one already — decision #3, "motions are data, not
+combinations. bi has one already — decision #3, "motions are data, not
 actions", did most of this work three steps ago — and this design spends it.
 
 ### What a name resolves to
@@ -225,7 +225,7 @@ config.toml:14: "gd" is unreachable — "g" on line 12 already fires
 Vim resolves the same case with `timeoutlen`. Rejected: a clock in the input
 path makes keystroke handling untestable without fake time, and it is the source
 of vim's most-complained-about input behaviour — the pause before `j` moves
-because something might follow it. bee's defaults contain no such pair, and a
+because something might follow it. bi's defaults contain no such pair, and a
 user who creates one is told at load rather than discovering it as lag.
 
 ### Notation
@@ -373,12 +373,12 @@ keymap never learns what any of them are.
 
 ## Theme
 
-The `theme` option names a file in `~/.config/bee/themes/`, falling back to a
+The `theme` option names a file in `~/.config/bi/themes/`, falling back to a
 built-in of the same name, falling back to `default` with a diagnostic.
 
 A theme file has its own two sections, and the `[ui]` inside one is unrelated to
 the `[ui]` this design dropped from `config.toml`: here it distinguishes the
-colours of bee's own furniture from the colours of parsed code.
+colours of bi's own furniture from the colours of parsed code.
 
 ```toml
 # themes/onedark.toml
@@ -408,7 +408,7 @@ the aliases beside them at `tui/render.rs:152`. `[ui]` keys are the constants
 above it: `CURSOR_LINE_BG`, `SELECTION_BG`, `EXTRA_CURSOR_BG`, `SEARCH_BG`,
 `TREE_DIR`, `TREE_LINK`, `MARK_COPY`, `MARK_CUT`.
 
-### Colours are bee's own type
+### Colours are bi's own type
 
 ```rust
 pub enum Color { Ansi(Ansi), Indexed(u8), Rgb(u8, u8, u8) }
@@ -438,7 +438,7 @@ A bare string is shorthand for `{ fg = … }`; the table form adds `bg` and
 attributes.
 
 Hex-only was rejected: a user with a carefully-tuned solarized terminal would
-get bee's idea of green instead of theirs, and it needs truecolor to look right
+get bi's idea of green instead of theirs, and it needs truecolor to look right
 at all. The shipped `default` theme is ANSI, and reproduces today's colours
 exactly — installing this step changes nothing on screen until a theme is
 chosen. Shipped themes may be hex.
@@ -471,7 +471,7 @@ src/config/names.rs      &str <-> Binding
 src/config/default.toml  include_str!
 src/theme.rs             Theme, Color, Style
 
-src/main.rs              $BEE_CONFIG / XDG resolution, file IO, the CLI
+src/main.rs              $BI_CONFIG / XDG resolution, file IO, the CLI
 ```
 
 The keymap is editor semantics, so it belongs in the library — the argument
@@ -543,7 +543,7 @@ pub struct Diagnostic {
 
 An unknown command name, unknown option, bad key notation or unreachable
 binding drops **that binding**, records a `Diagnostic` with a line number, and
-loading continues. Only malformed TOML falls back wholesale — and even then bee
+loading continues. Only malformed TOML falls back wholesale — and even then bi
 starts on defaults.
 
 An editor you cannot launch because of a typo in its config is an editor you
@@ -572,7 +572,7 @@ that two things called reload do not mean two different jobs. The spelling
 
 Two subcommands, and no more.
 
-**`bee config init`** creates `~/.config/bee/` and writes `config.toml` if
+**`bi config init`** creates `~/.config/bi/` and writes `config.toml` if
 absent. If it exists: prints the path, exits 0, touches nothing. Never
 automatic — a config file appears because you asked for one.
 
@@ -580,10 +580,10 @@ It writes the full default config with every **key** commented out, under a
 header:
 
 ```toml
-# bee config
+# bi config
 #
-# This file is a PATCH over bee's defaults, not a replacement. Anything left
-# commented out keeps doing what bee does by default, including bindings added
+# This file is a PATCH over bi's defaults, not a replacement. Anything left
+# commented out keeps doing what bi does by default, including bindings added
 # in future versions. Uncomment a line only to change it.
 
 [options]
@@ -608,15 +608,15 @@ Writing the keys live would silently turn every user's file into a full
 replacement, which is the failure the patch model exists to prevent. Commented
 out, it is a self-documenting menu that is semantically empty.
 
-**`bee config edit`** opens `~/.config/bee/` as a tree. `Editor::open` already
+**`bi config edit`** opens `~/.config/bi/` as a tree. `Editor::open` already
 opens a directory as a tree (`editor.rs:947`), so this is argument routing and
 no new editor code — and `themes/` is in the same tree. If the directory does
-not exist: `no config yet — run \`bee config init\`` and exit 1. It does not
+not exist: `no config yet — run \`bi config init\`` and exit 1. It does not
 auto-create; init is the manual step.
 
 `main.rs` treats `args[1]` as a path today. `config` is a subcommand only in the
-two-argument form `bee config <sub>`, so `bee config` still opens a file named
-`config`. Anything else after `bee config` is an error naming the two
+two-argument form `bi config <sub>`, so `bi config` still opens a file named
+`config`. Anything else after `bi config` is an error naming the two
 subcommands.
 
 ## Rejected
@@ -638,9 +638,9 @@ TOML at startup is microseconds.
 second frontend re-implement the parser, the trie, the merge rules and the
 diagnostics. That is the opposite of an embeddable core.
 
-**`~/.bee.toml`.** No sibling for `themes/`, `queries/` or `undo/`.
+**`~/.bi.toml`.** No sibling for `themes/`, `queries/` or `undo/`.
 
-**Project-local `.bee.toml`.** Genuinely useful for per-project indent and
+**Project-local `.bi.toml`.** Genuinely useful for per-project indent and
 grammar settings, and a real hazard: a cloned repo that rebinds keys is vim's
 `exrc` problem, which needed a whole trust model, and it gets worse the day
 scripting lands. The loader merges an ordered list of layers, so adding a
@@ -660,7 +660,7 @@ This is the `:m` sweep's method — 115 combinations, no disagreements — appli
 to a refactor whose whole risk is silent behavioural drift.
 
 **`default.toml` is the parser's largest test.** If the language cannot express
-`f`'s pending argument, `<C-w>s`'s sequence or the object map, bee does not
+`f`'s pending argument, `<C-w>s`'s sequence or the object map, bi does not
 start, and `cargo test` says so before a user does.
 
 Beyond that:
@@ -669,7 +669,7 @@ Beyond that:
   binding — each yields a diagnostic with the right line number and no panic.
 - Patch semantics: a user table adds without wiping its section; `false`
   unbinds; an unmentioned mode is untouched.
-- `bee config init` is idempotent and never overwrites.
+- `bi config init` is idempotent and never overwrites.
 - `:reload` onto malformed TOML keeps the running config and reports.
 - `:reload` picks up a changed `leader`, a changed binding and a changed theme.
 - A theme naming a missing file falls back to `default` with a diagnostic.
@@ -678,7 +678,7 @@ Beyond that:
 
 Three steps, each useful on its own and each landing green.
 
-1. **The layer.** `bee::config` types, the parser, diagnostics, `ConfigSource`,
+1. **The layer.** `bi::config` types, the parser, diagnostics, `ConfigSource`,
    XDG discovery in `main.rs`, `[options]` wired to `Session`, `:reload`,
    `ExLine::Revert` rename, and both CLI subcommands. No keymap, no theme — but
    a real config file that does something, end to end.
@@ -703,6 +703,6 @@ keystroke does, and it is worth having the config layer proven before that.
 - **A picker over themes.** `:set theme <name>` is enough to try one, and it
   falls out of `theme` being an ordinary option rather than needing a command
   of its own.
-- **Options bee does not have.** No `tabstop`, no `ignorecase`, no
+- **Options bi does not have.** No `tabstop`, no `ignorecase`, no
   `expandtab` — `[options]` holds what `:set` already understands, and grows
   when the features do.

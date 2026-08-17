@@ -1,4 +1,4 @@
-# bee
+# bi
 
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
@@ -128,7 +128,7 @@ many. `[0/17]` means it is in front of the first.
 
 A search stays live while the keys are still the search — `n`, `N`, another
 `/`. The first key that is anything else hands the footer back, and the count
-goes with it: the pattern is still remembered for `n`, but bee has stopped
+goes with it: the pattern is still remembered for `n`, but bi has stopped
 counting at you.
 
 **Scrolling**
@@ -242,7 +242,7 @@ the same either way.
 
 ### Multiple cursors
 
-Vim has none of this, so the bindings are bee's own.
+Vim has none of this, so the bindings are bi's own.
 
 | Key | Does |
 |---|---|
@@ -347,7 +347,7 @@ showing it falls through to the next one.
 
 ### The file tree
 
-`bee .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
+`bi .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
 and which one you meant is a question for the disk. `-` goes the other way, out
 of a file and into the tree above it, and `Ctrl-W e` shows or hides one in a
 pane beside it. There is only ever one tree: `-` goes to the one that is open
@@ -447,15 +447,15 @@ numbering on.
 
 ### Config
 
-`~/.config/bee/config.toml` — found via `$BEE_CONFIG`, which names the
+`~/.config/bi/config.toml` — found via `$BI_CONFIG`, which names the
 *directory*, not the file, since `themes/` will need to be its sibling; else
-`$XDG_CONFIG_HOME/bee`; else `~/.config/bee`. `bee config init` creates it,
-writing bee's defaults commented out, and never overwrites one that already
-exists; `bee config edit` opens the directory as a tree. Neither runs on its
+`$XDG_CONFIG_HOME/bi`; else `~/.config/bi`. `bi config init` creates it,
+writing bi's defaults commented out, and never overwrites one that already
+exists; `bi config edit` opens the directory as a tree. Neither runs on its
 own — a config file appears because you asked for one.
 
-The file is a *patch* over bee's compiled-in defaults, never a replacement:
-an option you never mention keeps doing what bee already does, including
+The file is a *patch* over bi's compiled-in defaults, never a replacement:
+an option you never mention keeps doing what bi already does, including
 whatever a later version adds. The only section today is `[options]`, which
 **is** the `:set` namespace — one key per option, spelled identically, so
 `:set number 5` and `number = 5` reach one setting:
@@ -469,7 +469,7 @@ hlsearch = false
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown
 option: nmber` on the status line, not stderr, which the alternate screen
-swallows. Only malformed TOML falls back wholesale, and even then bee starts,
+swallows. Only malformed TOML falls back wholesale, and even then bi starts,
 on its defaults. `:reload` re-reads the file through the same path startup
 used and swaps in whatever parsed; a failed reload changes nothing, because
 reloading yourself into a config with no way to type `:reload` again is the
@@ -480,7 +480,7 @@ The theme and the keymap are specified but not built — see
 
 ## Layout
 
-bee is a library plus a frontend. The library is the editor and knows nothing
+bi is a library plus a frontend. The library is the editor and knows nothing
 about terminals; `src/tui/` is the terminal frontend, and a GUI would be its
 sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-split.md).
 
@@ -499,7 +499,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | `tree.rs` | the file tree: expansion, the flattened rows, the filesystem |
 | `syntax.rs` | tree-sitter: incremental reparse, highlight spans |
 | `input.rs` | keys → `Command`; the `[count] op [count] motion` state machine |
-| `key.rs` | `Key` / `KeyCode` / `Mods` — bee's own key vocabulary |
+| `key.rs` | `Key` / `KeyCode` / `Mods` — bi's own key vocabulary |
 | `window.rs` | windows and the tree that arranges them; `Rect` layout geometry |
 
 **The terminal frontend** — `src/main.rs`:
@@ -508,7 +508,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 |---|---|
 | `main.rs` | terminal lifecycle, event loop |
 | `tui/render.rs` | viewport-bounded render pass |
-| `tui/keys.rs` | crossterm key events → `bee::key::Key` |
+| `tui/keys.rs` | crossterm key events → `bi::key::Key` |
 
 ## The seven decisions this step locks in
 
@@ -591,11 +591,11 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   already `Option<Syntax>` and an unknown extension already renders as plain
   text, so the no-syntax path exists and works.
 - ~~**The config language is undecided**~~ Decided and half built: TOML, in
-  `~/.config/bee/config.toml`, parsed by `bee::config`. `[options]` is live.
+  `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live.
   The keymap in `input.rs` and the highlight table in `tui/render.rs` are still
   hardcoded and are steps 3 and 2 of [docs/specs/config.md](docs/specs/config.md).
 - **The core/frontend boundary is enforced by a test, not the compiler.** Fixed
-  as far as it goes: there is a `lib.rs`, `input.rs` speaks `bee::key::Key`
+  as far as it goes: there is a `lib.rs`, `input.rs` speaks `bi::key::Key`
   rather than crossterm's types, and rendering and event translation live in
   `src/tui/`. But a lib and a bin in one package share one dependency list, so
   nothing stops `editor.rs` from importing ratatui — except

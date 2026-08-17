@@ -2,12 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give bee a real config file — `~/.config/bee/config.toml` — that sets
+**Goal:** Give bi a real config file — `~/.config/bi/config.toml` — that sets
 options, reloads at runtime with `:reload`, and is created and edited through
-`bee config init` / `bee config edit`.
+`bi config init` / `bi config edit`.
 
 **Architecture:** The library owns the config types and the TOML parser
-(`bee::config`); the frontend owns only where the file lives, supplied through a
+(`bi::config`); the frontend owns only where the file lives, supplied through a
 `ConfigSource` trait so the core never learns what a filesystem is. Options move
 off `Session`'s loose fields into one `Options` struct that is simultaneously
 the `[options]` table and the `:set` namespace, so both reach one place.
@@ -25,7 +25,7 @@ to start.
   end to end, with `[options]` as its only content. The theme (step 2) and the
   keymap (step 3) get their own plans. Do not implement either here.
 - Everything in `src/config/` is library code. It must never name a terminal
-  crate — `tests/lib_boundary.rs` proves this by linking `bee` and compiling.
+  crate — `tests/lib_boundary.rs` proves this by linking `bi` and compiling.
   `toml_edit` is not a terminal crate and is fine.
 - `rustfmt.toml` sets `use_small_heuristics = "Max"` and `max_width = 100`.
   Run `cargo fmt` before every commit. Comments are wrapped by hand near 80.
@@ -49,8 +49,8 @@ to start.
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `bee::config::Diagnostic { line: usize, message: String }`;
-  `bee::config::line_of(src: &str, offset: usize) -> usize` (crate-visible)
+- Produces: `bi::config::Diagnostic { line: usize, message: String }`;
+  `bi::config::line_of(src: &str, offset: usize) -> usize` (crate-visible)
 
 - [ ] **Step 1: Add the dependency**
 
@@ -75,7 +75,7 @@ version number.
 Create `src/config/mod.rs`:
 
 ```rust
-//! bee's config: the types, the parser, and the source a frontend supplies.
+//! bi's config: the types, the parser, and the source a frontend supplies.
 //!
 //! The library owns the types and the parser because a keymap is editor
 //! semantics — the same argument `key.rs` makes for `Key`. A frontend owns
@@ -260,7 +260,7 @@ Expected: FAIL — `cannot find type Config`, `cannot find type Options`.
 Create `src/config/default.toml`:
 
 ```toml
-# bee's defaults.
+# bi's defaults.
 #
 # Compiled into the binary. A user's config.toml is a PATCH over this file:
 # anything they leave out keeps doing what this says, including settings added
@@ -280,7 +280,7 @@ use std::sync::OnceLock;
 
 use crate::editor::LineNumbers;
 
-/// bee's defaults, as the file that documents them.
+/// bi's defaults, as the file that documents them.
 pub const DEFAULT_TOML: &str = include_str!("default.toml");
 
 /// A value an option can hold, in the one shape both `:set` and TOML can
@@ -348,7 +348,7 @@ impl Default for Config {
         DEFAULT
             .get_or_init(|| {
                 let bare = Config { options: Options::default() };
-                parse(DEFAULT_TOML, bare).expect("bee's own default.toml must parse").0
+                parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })
             .clone()
     }
@@ -632,7 +632,7 @@ cargo test
 git add src/config/
 git commit -m "config: TOML in, with a line number on everything wrong
 
-Only malformed TOML is fatal, and even then bee starts on its defaults.
+Only malformed TOML is fatal, and even then bi starts on its defaults.
 An unknown option or a value of the wrong type drops that line and says
 which one it was, because a config file is edited by hand and will be
 wrong sometimes — and an editor you cannot launch because of a typo in
@@ -992,7 +992,7 @@ Add to the `impl Editor` block, near `open` and `empty`:
         problems
     }
 
-    /// The config bee is running on.
+    /// The config bi is running on.
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -1316,22 +1316,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_dir_prefers_bee_config_then_xdg_then_home() {
-        let bee = dir_from(Some("/explicit"), Some("/xdg"), Some("/home"));
-        assert_eq!(bee, Some(PathBuf::from("/explicit")));
+    fn config_dir_prefers_bi_config_then_xdg_then_home() {
+        let bi = dir_from(Some("/explicit"), Some("/xdg"), Some("/home"));
+        assert_eq!(bi, Some(PathBuf::from("/explicit")));
 
         let xdg = dir_from(None, Some("/xdg"), Some("/home"));
-        assert_eq!(xdg, Some(PathBuf::from("/xdg/bee")));
+        assert_eq!(xdg, Some(PathBuf::from("/xdg/bi")));
 
         let home = dir_from(None, None, Some("/home"));
-        assert_eq!(home, Some(PathBuf::from("/home/.config/bee")));
+        assert_eq!(home, Some(PathBuf::from("/home/.config/bi")));
 
         assert_eq!(dir_from(None, None, None), None, "nowhere to look is not a crash");
     }
 
     #[test]
     fn an_empty_env_var_is_the_same_as_an_unset_one() {
-        assert_eq!(dir_from(Some(""), None, Some("/home")), Some(PathBuf::from("/home/.config/bee")));
+        assert_eq!(dir_from(Some(""), None, Some("/home")), Some(PathBuf::from("/home/.config/bi")));
     }
 }
 ```
@@ -1339,7 +1339,7 @@ mod tests {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-cargo test --bin bee
+cargo test --bin bi
 ```
 
 Expected: FAIL — `cannot find function dir_from`.
@@ -1351,17 +1351,17 @@ Add to `src/main.rs`:
 ```rust
 use std::path::PathBuf;
 
-use bee::config::ConfigSource;
+use bi::config::ConfigSource;
 
-/// bee's config directory: `$BEE_CONFIG`, else `$XDG_CONFIG_HOME/bee`, else
-/// `~/.config/bee`.
+/// bi's config directory: `$BI_CONFIG`, else `$XDG_CONFIG_HOME/bi`, else
+/// `~/.config/bi`.
 ///
 /// A directory rather than a file, because `themes/` is its sibling and
-/// `bee config edit` opens the lot. This is the whole of what the frontend
+/// `bi config edit` opens the lot. This is the whole of what the frontend
 /// knows that the library does not.
 fn config_dir() -> Option<PathBuf> {
     dir_from(
-        std::env::var("BEE_CONFIG").ok().as_deref(),
+        std::env::var("BI_CONFIG").ok().as_deref(),
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
@@ -1370,19 +1370,19 @@ fn config_dir() -> Option<PathBuf> {
 /// The rule, with the environment passed in so it can be tested without
 /// setting process-wide variables — which two tests running at once would
 /// fight over.
-fn dir_from(bee: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+fn dir_from(bi: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     let some = |s: Option<&str>| s.filter(|s| !s.is_empty());
 
-    if let Some(explicit) = some(bee) {
+    if let Some(explicit) = some(bi) {
         return Some(PathBuf::from(explicit));
     }
     if let Some(xdg) = some(xdg) {
-        return Some(PathBuf::from(xdg).join("bee"));
+        return Some(PathBuf::from(xdg).join("bi"));
     }
-    some(home).map(|home| PathBuf::from(home).join(".config").join("bee"))
+    some(home).map(|home| PathBuf::from(home).join(".config").join("bi"))
 }
 
-/// Reads bee's config off the filesystem.
+/// Reads bi's config off the filesystem.
 struct XdgConfig {
     dir: Option<PathBuf>,
 }
@@ -1425,9 +1425,9 @@ swallows stderr:
 
 ```bash
 cargo test
-mkdir -p /tmp/bee-config-check
-printf '[options]\nnumber = -1\n' > /tmp/bee-config-check/config.toml
-BEE_CONFIG=/tmp/bee-config-check cargo run -- src/main.rs
+mkdir -p /tmp/bi-config-check
+printf '[options]\nnumber = -1\n' > /tmp/bi-config-check/config.toml
+BI_CONFIG=/tmp/bi-config-check cargo run -- src/main.rs
 ```
 
 Expected: the gutter shows relative numbers. `:set number` reports `number=-1`.
@@ -1436,11 +1436,11 @@ Quit with `:q`.
 Then check the failure path:
 
 ```bash
-printf '[options]\nnmber = 1\n' > /tmp/bee-config-check/config.toml
-BEE_CONFIG=/tmp/bee-config-check cargo run -- src/main.rs
+printf '[options]\nnmber = 1\n' > /tmp/bi-config-check/config.toml
+BI_CONFIG=/tmp/bi-config-check cargo run -- src/main.rs
 ```
 
-Expected: bee starts, gutter is normal, status line reads
+Expected: bi starts, gutter is normal, status line reads
 `1 config problem: unknown option: nmber`.
 
 - [ ] **Step 6: Commit**
@@ -1448,10 +1448,10 @@ Expected: bee starts, gutter is normal, status line reads
 ```bash
 cargo fmt
 git add src/main.rs
-git commit -m "bee: find the config, and say when it is wrong
+git commit -m "bi: find the config, and say when it is wrong
 
-\$BEE_CONFIG, else \$XDG_CONFIG_HOME/bee, else ~/.config/bee — a
-directory, because themes/ is its sibling and \`bee config edit\` opens
+\$BI_CONFIG, else \$XDG_CONFIG_HOME/bi, else ~/.config/bi — a
+directory, because themes/ is its sibling and \`bi config edit\` opens
 the lot.
 
 Discovery is the frontend's whole part in config: a GUI or an embedding
@@ -1465,13 +1465,13 @@ which is where a config warning would otherwise die unread."
 
 ---
 
-### Task 10: `bee config init`
+### Task 10: `bi config init`
 
 **Files:**
 - Modify: `src/main.rs`
 
 **Interfaces:**
-- Consumes: `bee::config::DEFAULT_TOML`, `config_dir()`
+- Consumes: `bi::config::DEFAULT_TOML`, `config_dir()`
 - Produces: `enum Invocation`; `parse_args(&[String]) -> Result<Invocation>`;
   `commented(defaults: &str) -> String`; `config_init(dir) -> Result<()>`
 
@@ -1505,19 +1505,19 @@ fn the_written_config_is_the_defaults_commented_out() {
 
     // The whole file must be inert, or a user's config silently becomes a
     // full replacement and they stop receiving later defaults.
-    let (config, problems) = bee::config::parse(&out, bee::config::Config::default()).unwrap();
+    let (config, problems) = bi::config::parse(&out, bi::config::Config::default()).unwrap();
     assert!(problems.is_empty(), "{problems:?}");
-    assert_eq!(config, bee::config::Config::default(), "semantically empty");
+    assert_eq!(config, bi::config::Config::default(), "semantically empty");
 }
 
 #[test]
 fn init_writes_once_and_never_overwrites() {
-    let dir = std::env::temp_dir().join(format!("bee-init-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bi-init-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     config_init(&dir).unwrap();
     let first = std::fs::read_to_string(dir.join("config.toml")).unwrap();
-    assert!(first.contains("PATCH over bee's defaults"));
+    assert!(first.contains("PATCH over bi's defaults"));
 
     std::fs::write(dir.join("config.toml"), "mine\n").unwrap();
     config_init(&dir).unwrap();
@@ -1531,7 +1531,7 @@ fn init_writes_once_and_never_overwrites() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-cargo test --bin bee
+cargo test --bin bi
 ```
 
 Expected: FAIL — `cannot find function parse_args`.
@@ -1557,9 +1557,9 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
         [first, sub] if first == "config" => match sub.as_str() {
             "init" => Ok(Invocation::ConfigInit),
             "edit" => Ok(Invocation::ConfigEdit),
-            other => bail!("no such command: bee config {other} — try `init` or `edit`"),
+            other => bail!("no such command: bi config {other} — try `init` or `edit`"),
         },
-        _ => bail!("usage: bee [path] | bee config init | bee config edit"),
+        _ => bail!("usage: bi [path] | bi config init | bi config edit"),
     }
 }
 ```
@@ -1572,20 +1572,20 @@ Add `use anyhow::bail;` to the existing `anyhow` import.
 /// The header on a freshly written config, explaining the one thing a user
 /// has to know about the file.
 const INIT_HEADER: &str = "\
-# bee config
+# bi config
 #
-# This file is a PATCH over bee's defaults, not a replacement. Anything left
-# commented out keeps doing what bee does by default, including settings added
+# This file is a PATCH over bi's defaults, not a replacement. Anything left
+# commented out keeps doing what bi does by default, including settings added
 # in later versions. Uncomment a line only to change it.
 #
 # `:reload` re-reads this file without restarting.
 
 ";
 
-/// bee's defaults, commented out.
+/// bi's defaults, commented out.
 ///
 /// Written live they would silently turn every user's file into a full
-/// replacement, and that user would stop receiving defaults bee adds later —
+/// replacement, and that user would stop receiving defaults bi adds later —
 /// invisibly and permanently. Commented out it is a self-documenting menu that
 /// is semantically empty.
 fn commented(defaults: &str) -> String {
@@ -1618,7 +1618,7 @@ fn config_init(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&path, commented(bee::config::DEFAULT_TOML))
+    std::fs::write(&path, commented(bi::config::DEFAULT_TOML))
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
@@ -1667,9 +1667,9 @@ fn main() -> Result<()> {
 
 ```bash
 cargo test
-BEE_CONFIG=/tmp/bee-init-demo cargo run -- config init
-cat /tmp/bee-init-demo/config.toml
-BEE_CONFIG=/tmp/bee-init-demo cargo run -- config init
+BI_CONFIG=/tmp/bi-init-demo cargo run -- config init
+cat /tmp/bi-init-demo/config.toml
+BI_CONFIG=/tmp/bi-init-demo cargo run -- config init
 ```
 
 Expected: the first writes and prints `wrote …`; the second prints
@@ -1679,23 +1679,23 @@ Expected: the first writes and prints `wrote …`; the second prints
 
 ```bash
 cargo fmt
-rm -rf /tmp/bee-init-demo /tmp/bee-config-check
+rm -rf /tmp/bi-init-demo /tmp/bi-config-check
 git add src/main.rs
-git commit -m "bee: config init writes the defaults, commented out
+git commit -m "bi: config init writes the defaults, commented out
 
 Manual, never automatic — a config file appears because you asked for
 one.
 
 It writes every default commented out rather than live. Written live,
 the file would silently become a full replacement of the defaults, and
-that user would stop receiving anything bee adds later — invisibly, and
+that user would stop receiving anything bi adds later — invisibly, and
 permanently. Commented out it is a documented menu that is semantically
 empty, which a test asserts by parsing it and comparing to the defaults."
 ```
 
 ---
 
-### Task 11: `bee config edit`
+### Task 11: `bi config edit`
 
 **Files:**
 - Modify: `src/main.rs`
@@ -1711,16 +1711,16 @@ In `main.rs`'s test module:
 ```rust
 #[test]
 fn edit_refuses_a_directory_that_does_not_exist() {
-    let missing = std::env::temp_dir().join(format!("bee-absent-{}", std::process::id()));
+    let missing = std::env::temp_dir().join(format!("bi-absent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&missing);
 
     let err = config_edit_path(&missing).expect_err("nothing to edit yet");
-    assert!(err.to_string().contains("bee config init"), "{err}");
+    assert!(err.to_string().contains("bi config init"), "{err}");
 }
 
 #[test]
 fn edit_opens_the_directory_it_finds() {
-    let dir = std::env::temp_dir().join(format!("bee-edit-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bi-edit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     config_init(&dir).unwrap();
 
@@ -1733,7 +1733,7 @@ fn edit_opens_the_directory_it_finds() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-cargo test --bin bee
+cargo test --bin bi
 ```
 
 Expected: FAIL — `cannot find function config_edit_path`.
@@ -1741,14 +1741,14 @@ Expected: FAIL — `cannot find function config_edit_path`.
 - [ ] **Step 3: Implement it**
 
 ```rust
-/// What `bee config edit` opens: the config *directory*, so `themes/` is in
+/// What `bi config edit` opens: the config *directory*, so `themes/` is in
 /// the tree beside `config.toml`.
 ///
-/// It does not create anything. `bee config init` is the manual step, and
+/// It does not create anything. `bi config init` is the manual step, and
 /// `edit` surprising you with a new file would undo that.
 fn config_edit_path(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
-        bail!("no config yet — run `bee config init`");
+        bail!("no config yet — run `bi config init`");
     }
     Ok(dir.to_path_buf())
 }
@@ -1772,17 +1772,17 @@ else is needed.
 
 ```bash
 cargo test
-BEE_CONFIG=/tmp/bee-edit-demo cargo run -- config edit
+BI_CONFIG=/tmp/bi-edit-demo cargo run -- config edit
 ```
 
-Expected: `Error: no config yet — run \`bee config init\``, exit non-zero.
+Expected: `Error: no config yet — run \`bi config init\``, exit non-zero.
 
 ```bash
-BEE_CONFIG=/tmp/bee-edit-demo cargo run -- config init
-BEE_CONFIG=/tmp/bee-edit-demo cargo run -- config edit
+BI_CONFIG=/tmp/bi-edit-demo cargo run -- config init
+BI_CONFIG=/tmp/bi-edit-demo cargo run -- config edit
 ```
 
-Expected: bee opens with a file tree showing `config.toml`. Press `<CR>` on it,
+Expected: bi opens with a file tree showing `config.toml`. Press `<CR>` on it,
 edit `number = 1` to `number = -1` uncommented, `:w`, then `:reload` — the
 gutter switches to relative numbers without restarting. That is the whole
 feature working end to end.
@@ -1791,9 +1791,9 @@ feature working end to end.
 
 ```bash
 cargo fmt
-rm -rf /tmp/bee-edit-demo
+rm -rf /tmp/bi-edit-demo
 git add src/main.rs
-git commit -m "bee: config edit opens the config directory
+git commit -m "bi: config edit opens the config directory
 
 Editor::open already opens a directory as a tree, so this is argument
 routing and no new editor code — and themes/ comes along in the same
@@ -1828,7 +1828,7 @@ way the cursor-on-`Buffer` bullet was struck through when `Selections` landed:
 
 ```markdown
 - ~~**The config language is undecided**~~ Decided and half built: TOML, in
-  `~/.config/bee/config.toml`, parsed by `bee::config`. `[options]` is live.
+  `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live.
   The keymap in `input.rs` and the highlight table in `tui/render.rs` are still
   hardcoded and are steps 3 and 2 of [docs/specs/config.md](docs/specs/config.md).
 ```
@@ -1836,7 +1836,7 @@ way the cursor-on-`Buffer` bullet was struck through when `Selections` landed:
 - [ ] **Step 3: Add a config section to the README**
 
 After "Line numbers" (`:420`), a short section: where the file lives, that it
-is a patch over the defaults, `bee config init` / `edit`, `:reload`, and the
+is a patch over the defaults, `bi config init` / `edit`, `:reload`, and the
 `[options]` table with its two entries. Match the surrounding voice — the
 README explains *why* a thing is shaped the way it is, not only what it does.
 
@@ -1876,7 +1876,7 @@ three. It is decided now, and a third of it is built."
 **Spec coverage.** Every requirement of the spec's step 1 has a task: XDG
 discovery (9), the section rule and `[options]` (3), patch-over-defaults (3),
 `ConfigSource` and the boundary (6), non-fatal diagnostics (3, 6, 9), `:reload`
-with the `Revert` rename (7, 8), `bee config init` (10) and `edit` (11), and
+with the `Revert` rename (7, 8), `bi config init` (10) and `edit` (11), and
 `[options]` unified with `:set` (4, 5). Steps 2 (theme) and 3 (keymap) are out
 of scope by the Global Constraints and get their own plans.
 

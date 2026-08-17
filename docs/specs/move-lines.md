@@ -5,7 +5,7 @@ commands and a register spent, for what is one thought. `:m` is that thought,
 and `Shift-Up` / `Shift-Down` are the same thing without the colon.
 
 Two halves, and they answer different questions. `:m` is vim's `:move`, exactly
-— you know the line you want to be after. The arrows are bee's own — you know
+— you know the line you want to be after. The arrows are bi's own — you know
 how far, and counting rows to turn that into a line number is the work the
 command was supposed to save.
 

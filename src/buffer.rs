@@ -424,7 +424,7 @@ impl Buffer {
     ///
     /// Undo history goes with it: the old revisions describe text that no
     /// longer exists, and replaying them through `edit_raw` would desynchronise
-    /// the parse tree. Vim keeps history here behind `'undoreload'`; bee does
+    /// the parse tree. Vim keeps history here behind `'undoreload'`; bi does
     /// not. The caller must rebuild syntax — the tree belongs to the old text.
     pub fn reload(&mut self, at: Cursor) -> Result<Cursor> {
         let path = self.path.clone().context("no file name")?;
@@ -1106,7 +1106,7 @@ impl Buffer {
     /// uppercase in it makes the whole thing case-sensitive. That is
     /// `ignorecase` plus `smartcase`, which is what nearly everyone sets.
     ///
-    /// Naive scan over a materialised `Vec<char>`. Fine at the sizes bee opens;
+    /// Naive scan over a materialised `Vec<char>`. Fine at the sizes bi opens;
     /// a regex backend will replace the matching without changing the shape.
     pub fn search(
         &self,
@@ -1867,7 +1867,7 @@ mod tests {
     /// no revision and the buffer keeps claiming it has unsaved changes.
     #[test]
     fn saving_with_an_open_group_marks_the_written_state_as_saved() {
-        let path = std::env::temp_dir().join("bee_save_open_group.txt");
+        let path = std::env::temp_dir().join("bi_save_open_group.txt");
         let _ = std::fs::remove_file(&path);
 
         let mut b = buf("hello");

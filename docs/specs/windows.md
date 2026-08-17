@@ -1,6 +1,6 @@
 # Windows and buffers
 
-bee holds one buffer and shows one view of it. `Editor` owns a `Buffer`, a
+bi holds one buffer and shows one view of it. `Editor` owns a `Buffer`, a
 `Selections`, a `scroll` row and a `Syntax`, and `:e <path>` throws the old file
 away to make room for the new one. There is no buffer list, so `:bn` has nothing
 to cycle, and no window tree, so `:vsplit` has nowhere to put a second pane.
@@ -404,7 +404,7 @@ Accepting sets the focused window's buffer.
 
 **It picks where vim prints.** `:ls` in vim dumps a table you then read a number
 out of and retype into `:b`; here the list *is* the chooser, and the number vim
-makes you carry never has to exist. The divergence is deliberate — bee has no
+makes you carry never has to exist. The divergence is deliberate — bi has no
 buffer numbers to print — and the cost is that `:ls` in a script or a pipe has
 nothing to say.
 

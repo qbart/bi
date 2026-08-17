@@ -1,6 +1,6 @@
 # Library split
 
-bee is one binary crate. Nothing can link its core, so a second frontend — a
+bi is one binary crate. Nothing can link its core, so a second frontend — a
 GUI, an embedding, a headless test harness — has no way in, and the only way to
 drive the editor is to press keys at a terminal.
 
@@ -36,8 +36,8 @@ src/{buffer,editor,history,motion,picker,registers,syntax}.rs
 
 src/main.rs       mod tui; + terminal setup, restore, event loop
 src/tui.rs        module root — pub mod keys, render
-src/tui/render.rs was ui.rs — verbatim except crate:: → bee::
-src/tui/keys.rs   new — crossterm KeyEvent → bee::Key
+src/tui/render.rs was ui.rs — verbatim except crate:: → bi::
+src/tui/keys.rs   new — crossterm KeyEvent → bi::Key
 ```
 
 `main.rs` calls `tui::render::render(frame, ed, pending)` and
@@ -177,7 +177,7 @@ KeyModifiers::NONE)`. They become `Key::char('d')`, `Key::ctrl('r')` and
 that an unmapped code yields `None`.
 
 `tests/lib_boundary.rs` is new and is the point of the exercise. It plays the
-part of an embedder: it links `bee`, never names a terminal, and drives a
+part of an embedder: it links `bi`, never names a terminal, and drives a
 headless session through the public API — type, move, delete, undo, redo, yank,
 paste, switch modes. It can only compile if the core is genuinely frontend-free,
 so the split proves itself on every `cargo test`.

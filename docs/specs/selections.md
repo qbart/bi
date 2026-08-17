@@ -206,7 +206,7 @@ one real cursor. The primary selection gets it; every other head is drawn as a
 styled cell — reversed video — by the same span-patching path
 `fill_line` already uses for the cursor line.
 
-Vim has no multi-cursor and so offers no bindings to copy. bee's:
+Vim has no multi-cursor and so offers no bindings to copy. bi's:
 
 | Key | Does |
 |---|---|

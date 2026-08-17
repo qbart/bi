@@ -1,6 +1,6 @@
 # Motions, operators and text objects
 
-bee's keymap covers twelve motions and three operators. Vim has roughly forty
+bi's keymap covers twelve motions and three operators. Vim has roughly forty
 and twelve. This file records the gap, what closes it, and in what order.
 
 ## Status
@@ -49,7 +49,7 @@ typed — and these are the same trick:
 They cost one match arm each and no new `Action`.
 
 **Counts.** Vim's `2D` deletes to the end of the line *and* the whole line
-below. bee's `D` ignores any count beyond the first line, the same
+below. bi's `D` ignores any count beyond the first line, the same
 simplification already documented for `dw`. `2X` and `2s` do repeat, because
 `Motion::Left` and `Motion::Right` take a count natively.
 
@@ -98,7 +98,7 @@ or the editor is left describing a file that no longer matches:
 1. The rope is replaced from disk.
 2. Undo history is reset. The old revisions describe text that is gone, and
    replaying them through `edit_raw` would corrupt the tree. Vim keeps history
-   across a reload behind `'undoreload'`; bee does not, and says so.
+   across a reload behind `'undoreload'`; bi does not, and says so.
 3. The cursor is clamped — the file may have got shorter.
 4. `reload_syntax` runs and `pending_edits` is cleared. The parse tree belongs
    to the old text; keeping it would feed tree-sitter edits against the wrong
@@ -144,7 +144,7 @@ changes nothing.
 `;` and `,` repeat the last find and reverse it. The last find is editor state
 rather than keymap state, because it has to survive the keymap's `reset()`.
 A quirk worth preserving: in vim, `,` after `t{c}` can stick, since "till" from
-a position already adjacent to the target has nowhere to go. bee does what vim
+a position already adjacent to the target has nowhere to go. bi does what vim
 does with `cpo` unset — `,` after `t` moves to the next match, not zero
 distance.
 
@@ -208,14 +208,14 @@ spans is the point of having both.
 
 `cargo test` covers the pieces. Conformance is checked separately by
 `scripts/vim_differential.py`, which runs the same keys through real vim and
-through bee and compares the resulting file. It is not part of `cargo test`: it
+through bi and compares the resulting file. It is not part of `cargo test`: it
 needs vim on `PATH` and drives the binary through a pty.
 
 103 cases match vim exactly, with no divergences. Four differences it found were
 fixed rather than recorded — the `t`-repeat rule above, `a"`'s trailing
 whitespace, linewise inner blocks, and a **pre-existing** bug where `dG` on a
 file that already ended in a newline swallowed that newline. It also caught four
-of my own wrong assumptions, where bee was right and the expectation was not.
+of my own wrong assumptions, where bi was right and the expectation was not.
 
 ## Deferred
 
@@ -318,7 +318,7 @@ its result depends on what was chosen; replaying the keystrokes would reopen
 it. A plain `p` repeats the same entry anyway, since choosing one moves it to
 the front of the ring.
 
-**`.` inside a macro or a count-prefixed insert** (`3ifoo<Esc>`) — bee has no
+**`.` inside a macro or a count-prefixed insert** (`3ifoo<Esc>`) — bi has no
 macros, and repeat-counted insert is its own feature.
 
 ### What building it turned up
@@ -327,7 +327,7 @@ Two **pre-existing** bugs, neither caused by `.` but both made obvious by it,
 because a repeat starts from wherever the last one left the cursor:
 
 - **Leaving insert did not step the cursor left.** Vim moves back onto the last
-  character typed; bee only clamped onto a valid column, leaving it one to the
+  character typed; bi only clamped onto a valid column, leaving it one to the
   right. `iAB<Esc>.` inserted in the wrong place. Leaving *visual* mode
   correctly does not step, so the fix is conditional on the mode being left.
 - **`w` on the final word of a file did not move.** A file ending in a newline
@@ -377,7 +377,7 @@ renderer already hands over.
 
 Scrolling cannot be checked by comparing files — it changes what you see, not
 what you have. Both editors were driven through a pty instead and their windows
-and cursors compared directly, with vim given bee's `scrolloff=3` so the two are
+and cursors compared directly, with vim given bi's `scrolloff=3` so the two are
 answering the same question. `Ctrl-E`, `Ctrl-E`×3, `Ctrl-D`, `Ctrl-D`×2 and
 `Ctrl-D` then `Ctrl-U` all land identically.
 

@@ -9,13 +9,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use bee::buffer::Cursor;
-use bee::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
-use bee::picker::{Picker, PickerKind};
-use bee::selection::Selections;
-use bee::syntax::{Span as HlSpan, Syntax};
-use bee::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
-use bee::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
+use bi::buffer::Cursor;
+use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
+use bi::picker::{Picker, PickerKind};
+use bi::selection::Selections;
+use bi::syntax::{Span as HlSpan, Syntax};
+use bi::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
+use bi::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
 
@@ -217,7 +217,7 @@ fn styled_line(
 /// Fixed across modes on purpose — sizing it to the largest *relative* label
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
-fn gutter_width(ed: &Editor, buffer: &bee::buffer::Buffer) -> usize {
+fn gutter_width(ed: &Editor, buffer: &bi::buffer::Buffer) -> usize {
     match ed.session.options.number {
         LineNumbers::Off => 0,
         _ => format!("{}", buffer.line_count()).len() + 1,
@@ -920,7 +920,7 @@ mod tests {
     /// a thirty-column sidebar cannot spare a line to say it twice.
     #[test]
     fn a_tree_pane_has_no_status_row() {
-        let dir = std::env::temp_dir().join(format!("bee-status-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bi-status-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
 

@@ -1,7 +1,7 @@
-//! bee's terminal frontend.
+//! bi's terminal frontend.
 //!
 //! Terminal setup, the event loop, and nothing else. The editor itself is the
-//! `bee` library — see `src/lib.rs`. A second frontend would replace this file
+//! `bi` library — see `src/lib.rs`. A second frontend would replace this file
 //! and `src/tui/`, and touch nothing below them.
 
 mod tui;
@@ -19,9 +19,9 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, terminal};
 
-use bee::config::ConfigSource;
-use bee::editor::Editor;
-use bee::input::Input;
+use bi::config::ConfigSource;
+use bi::editor::Editor;
+use bi::input::Input;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -76,29 +76,29 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
         [first, sub] if first == "config" => match sub.as_str() {
             "init" => Ok(Invocation::ConfigInit),
             "edit" => Ok(Invocation::ConfigEdit),
-            other => bail!("no such command: bee config {other} — try `init` or `edit`"),
+            other => bail!("no such command: bi config {other} — try `init` or `edit`"),
         },
-        _ => bail!("usage: bee [path] | bee config init | bee config edit"),
+        _ => bail!("usage: bi [path] | bi config init | bi config edit"),
     }
 }
 
 /// The header on a freshly written config, explaining the one thing a user
 /// has to know about the file.
 const INIT_HEADER: &str = "\
-# bee config
+# bi config
 #
-# This file is a PATCH over bee's defaults, not a replacement. Anything left
-# commented out keeps doing what bee does by default, including settings added
+# This file is a PATCH over bi's defaults, not a replacement. Anything left
+# commented out keeps doing what bi does by default, including settings added
 # in later versions. Uncomment a line only to change it.
 #
 # `:reload` re-reads this file without restarting.
 
 ";
 
-/// bee's defaults, commented out.
+/// bi's defaults, commented out.
 ///
 /// Written live they would silently turn every user's file into a full
-/// replacement, and that user would stop receiving defaults bee adds later —
+/// replacement, and that user would stop receiving defaults bi adds later —
 /// invisibly and permanently. Commented out it is a self-documenting menu that
 /// is semantically empty.
 ///
@@ -143,33 +143,33 @@ fn config_init(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&path, commented(bee::config::DEFAULT_TOML))
+    std::fs::write(&path, commented(bi::config::DEFAULT_TOML))
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
 }
 
-/// What `bee config edit` opens: the config *directory*, so `themes/` is in
+/// What `bi config edit` opens: the config *directory*, so `themes/` is in
 /// the tree beside `config.toml`.
 ///
-/// It does not create anything. `bee config init` is the manual step, and
+/// It does not create anything. `bi config init` is the manual step, and
 /// `edit` surprising you with a new file would undo that.
 fn config_edit_path(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
-        bail!("no config yet — run `bee config init`");
+        bail!("no config yet — run `bi config init`");
     }
     Ok(dir.to_path_buf())
 }
 
-/// bee's config directory: `$BEE_CONFIG`, else `$XDG_CONFIG_HOME/bee`, else
-/// `~/.config/bee`.
+/// bi's config directory: `$BI_CONFIG`, else `$XDG_CONFIG_HOME/bi`, else
+/// `~/.config/bi`.
 ///
 /// A directory rather than a file, because `themes/` is its sibling and
-/// `bee config edit` opens the lot. This is the whole of what the frontend
+/// `bi config edit` opens the lot. This is the whole of what the frontend
 /// knows that the library does not.
 fn config_dir() -> Option<PathBuf> {
     dir_from(
-        std::env::var("BEE_CONFIG").ok().as_deref(),
+        std::env::var("BI_CONFIG").ok().as_deref(),
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
@@ -178,21 +178,21 @@ fn config_dir() -> Option<PathBuf> {
 /// The rule, with the environment passed in so it can be tested without
 /// setting process-wide variables — which two tests running at once would
 /// fight over.
-fn dir_from(bee: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+fn dir_from(bi: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     fn some(s: Option<&str>) -> Option<&str> {
         s.filter(|s| !s.is_empty())
     }
 
-    if let Some(explicit) = some(bee) {
+    if let Some(explicit) = some(bi) {
         return Some(PathBuf::from(explicit));
     }
     if let Some(xdg) = some(xdg) {
-        return Some(PathBuf::from(xdg).join("bee"));
+        return Some(PathBuf::from(xdg).join("bi"));
     }
-    some(home).map(|home| PathBuf::from(home).join(".config").join("bee"))
+    some(home).map(|home| PathBuf::from(home).join(".config").join("bi"))
 }
 
-/// Reads bee's config off the filesystem.
+/// Reads bi's config off the filesystem.
 struct XdgConfig {
     dir: Option<PathBuf>,
 }
@@ -268,15 +268,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_dir_prefers_bee_config_then_xdg_then_home() {
-        let bee = dir_from(Some("/explicit"), Some("/xdg"), Some("/home"));
-        assert_eq!(bee, Some(PathBuf::from("/explicit")));
+    fn config_dir_prefers_bi_config_then_xdg_then_home() {
+        let bi = dir_from(Some("/explicit"), Some("/xdg"), Some("/home"));
+        assert_eq!(bi, Some(PathBuf::from("/explicit")));
 
         let xdg = dir_from(None, Some("/xdg"), Some("/home"));
-        assert_eq!(xdg, Some(PathBuf::from("/xdg/bee")));
+        assert_eq!(xdg, Some(PathBuf::from("/xdg/bi")));
 
         let home = dir_from(None, None, Some("/home"));
-        assert_eq!(home, Some(PathBuf::from("/home/.config/bee")));
+        assert_eq!(home, Some(PathBuf::from("/home/.config/bi")));
 
         assert_eq!(dir_from(None, None, None), None, "nowhere to look is not a crash");
     }
@@ -285,7 +285,7 @@ mod tests {
     fn an_empty_env_var_is_the_same_as_an_unset_one() {
         assert_eq!(
             dir_from(Some(""), None, Some("/home")),
-            Some(PathBuf::from("/home/.config/bee"))
+            Some(PathBuf::from("/home/.config/bi"))
         );
     }
 
@@ -320,21 +320,21 @@ mod tests {
 
         // The whole file must be inert, or a user's config silently becomes a
         // full replacement and they stop receiving later defaults.
-        let (config, problems) = bee::config::parse(&out, bee::config::Config::default()).unwrap();
+        let (config, problems) = bi::config::parse(&out, bi::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(config, bee::config::Config::default(), "semantically empty");
+        assert_eq!(config, bi::config::Config::default(), "semantically empty");
     }
 
     #[test]
     fn the_real_shipped_defaults_commented_out_are_still_semantically_empty() {
         // The synthetic test above pins the line-shape mechanics; this one
-        // exercises the actual file `bee config init` writes, which is what
+        // exercises the actual file `bi config init` writes, which is what
         // the review that found the section-header trap said was missing.
-        let out = commented(bee::config::DEFAULT_TOML);
+        let out = commented(bi::config::DEFAULT_TOML);
 
-        let (config, problems) = bee::config::parse(&out, bee::config::Config::default()).unwrap();
+        let (config, problems) = bi::config::parse(&out, bi::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(config, bee::config::Config::default(), "semantically empty");
+        assert_eq!(config, bi::config::Config::default(), "semantically empty");
     }
 
     #[test]
@@ -345,7 +345,7 @@ mod tests {
         // nothing else. With the section header still commented out, this
         // used to leave the key belonging to no section and produce exactly
         // one diagnostic instead of zero.
-        let out = commented(bee::config::DEFAULT_TOML);
+        let out = commented(bi::config::DEFAULT_TOML);
         let uncommented: String = out
             .lines()
             .map(
@@ -359,19 +359,19 @@ mod tests {
         assert_ne!(uncommented, out, "the line was actually uncommented");
 
         let (config, problems) =
-            bee::config::parse(&uncommented, bee::config::Config::default()).unwrap();
+            bi::config::parse(&uncommented, bi::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(config.options.number, bee::editor::LineNumbers::Every(1));
+        assert_eq!(config.options.number, bi::editor::LineNumbers::Every(1));
     }
 
     #[test]
     fn init_writes_once_and_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("bee-init-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bi-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         config_init(&dir).unwrap();
         let first = std::fs::read_to_string(dir.join("config.toml")).unwrap();
-        assert!(first.contains("PATCH over bee's defaults"));
+        assert!(first.contains("PATCH over bi's defaults"));
 
         std::fs::write(dir.join("config.toml"), "mine\n").unwrap();
         config_init(&dir).unwrap();
@@ -386,17 +386,17 @@ mod tests {
 
     #[test]
     fn edit_refuses_a_directory_that_does_not_exist() {
-        let missing = std::env::temp_dir().join(format!("bee-absent-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("bi-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
 
         let err = config_edit_path(&missing).expect_err("nothing to edit yet");
-        assert!(err.to_string().contains("bee config init"), "{err}");
+        assert!(err.to_string().contains("bi config init"), "{err}");
     }
 
     #[test]
     fn xdg_config_reports_no_dir_as_no_config() {
         // `dir: None` is what `config_dir()` returns when neither
-        // `$BEE_CONFIG`, `$XDG_CONFIG_HOME` nor `$HOME` is set — nowhere to
+        // `$BI_CONFIG`, `$XDG_CONFIG_HOME` nor `$HOME` is set — nowhere to
         // look is not an error, it is the normal case for `ConfigSource`.
         let source = XdgConfig { dir: None };
         assert_eq!(source.config().unwrap(), None);
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn xdg_config_reports_a_dir_with_no_file_as_no_config() {
-        let dir = std::env::temp_dir().join(format!("bee-xdg-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bi-xdg-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn xdg_config_reads_a_written_file() {
-        let dir = std::env::temp_dir().join(format!("bee-xdg-file-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bi-xdg-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "[options]\nnumber = 5\n").unwrap();
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn edit_opens_the_directory_it_finds() {
-        let dir = std::env::temp_dir().join(format!("bee-edit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bi-edit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         config_init(&dir).unwrap();
 
