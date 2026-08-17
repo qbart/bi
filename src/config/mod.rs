@@ -12,6 +12,20 @@ mod parse;
 
 pub use parse::parse;
 
+/// Where a frontend gets config text from.
+///
+/// A trait rather than a path, because "where does a config file live on this
+/// platform, or inside this embedding host" is the one part of config that
+/// genuinely varies per frontend — and the library must not learn what a
+/// filesystem is to serve it. An embedder can read from a database or a
+/// bundled resource.
+///
+/// `Ok(None)` means there is no config, which is normal and not a problem.
+/// `Err` means there was one and it could not be read, which is.
+pub trait ConfigSource {
+    fn config(&self) -> anyhow::Result<Option<String>>;
+}
+
 /// A problem with a config file. Reported, never fatal: an editor you cannot
 /// launch because of a typo in its config is an editor you cannot use to fix
 /// the typo.

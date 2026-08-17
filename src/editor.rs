@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, BufferId, Cursor};
-use crate::config::{OptionValue, Options};
+use crate::config::{Config, ConfigSource, Diagnostic, OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
@@ -848,6 +848,11 @@ pub struct Editor {
     area: Rect,
     chrome: Chrome,
     pub session: Session,
+    config: Config,
+    /// Kept so `:reload` can ask again. `None` until a frontend supplies one —
+    /// an embedder that wants no config never calls `load_config`, and
+    /// `:reload` then has nothing to re-read and says so.
+    config_source: Option<Box<dyn ConfigSource>>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -956,6 +961,51 @@ impl Editor {
         Ok(Self::with_buffer(Buffer::open(path)?))
     }
 
+    /// Applies a config source, and remembers it for `:reload`.
+    ///
+    /// Called after construction rather than passed to [`Editor::open`] so
+    /// that the three dozen existing call sites — nearly all tests — stay as
+    /// they are, and so an embedder that wants no config simply never calls
+    /// it.
+    ///
+    /// The returned diagnostics are the frontend's to show. Startup and
+    /// `:reload` run this same path, which is the only way the two stay in
+    /// agreement.
+    pub fn load_config(&mut self, source: impl ConfigSource + 'static) -> Vec<Diagnostic> {
+        let problems = self.read_config(&source);
+        self.config_source = Some(Box::new(source));
+        problems
+    }
+
+    /// The config bee is running on.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Reads and applies, without touching the stored source. Shared by
+    /// [`Editor::load_config`] and `:reload`.
+    fn read_config(&mut self, source: &dyn ConfigSource) -> Vec<Diagnostic> {
+        let text = match source.config() {
+            Ok(Some(text)) => text,
+            Ok(None) => return Vec::new(),
+            Err(e) => return vec![Diagnostic { line: 1, message: e.to_string() }],
+        };
+
+        match crate::config::parse(&text, Config::default()) {
+            Ok((config, problems)) => {
+                self.apply_config(config);
+                problems
+            }
+            // Unsalvageable: the running config stays exactly as it was.
+            Err(problem) => vec![problem],
+        }
+    }
+
+    fn apply_config(&mut self, config: Config) {
+        self.session.options = config.options;
+        self.config = config;
+    }
+
     fn with_buffer(buffer: Buffer) -> Self {
         let (buffer_id, window_id) = (BufferId(0), WindowId(0));
         Self {
@@ -974,6 +1024,8 @@ impl Editor {
             area: Rect::default(),
             chrome: Chrome::default(),
             session: Session::default(),
+            config: Config::default(),
+            config_source: None,
         }
     }
 
@@ -3607,6 +3659,43 @@ mod tests {
     use crate::motion::TextObject;
     use crate::picker::PickerKind;
 
+    /// A config source that serves a string, so a test needs no filesystem.
+    struct Text(Option<&'static str>);
+
+    impl crate::config::ConfigSource for Text {
+        fn config(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.0.map(str::to_string))
+        }
+    }
+
+    #[test]
+    fn load_config_applies_options_and_reports_problems() {
+        let mut ed = Editor::empty();
+        assert_eq!(ed.session.options.number, LineNumbers::Every(1), "defaults before");
+
+        let problems = ed.load_config(Text(Some("[options]\nnumber = 5\nnmber = 9\n")));
+
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the good line applied");
+        assert_eq!(problems.len(), 1, "and the bad one was reported, not fatal");
+        assert_eq!(problems[0].line, 3);
+    }
+
+    #[test]
+    fn no_config_file_is_not_a_problem() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(Text(None));
+        assert!(problems.is_empty());
+        assert_eq!(ed.session.options, crate::config::Options::default());
+    }
+
+    #[test]
+    fn malformed_config_keeps_the_defaults_and_reports_once() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(Text(Some("[options\nnumber = 5\n")));
+        assert_eq!(problems.len(), 1);
+        assert_eq!(ed.session.options.number, LineNumbers::Every(1), "unchanged");
+    }
+
     /// Text arrives as one committed revision, so a single undo lands back on
     /// it rather than on an empty buffer.
     fn editor(text: &str) -> Editor {
@@ -4095,7 +4184,7 @@ mod tests {
 
     /// A given window's view onto its buffer — what the tests that watch a
     /// second pane are actually asking about.
-    fn text_of(ed: &Editor, id: WindowId) -> &Text {
+    fn text_of(ed: &Editor, id: WindowId) -> &super::Text {
         ed.window_of(id).expect("no such window").text().expect("that window holds a tree")
     }
 
