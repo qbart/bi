@@ -1,6 +1,6 @@
 //! TOML into a [`Config`], with a line number on everything that goes wrong.
 
-use toml_edit::{Document, Item, Value};
+use toml_edit::{Document, Item, Table, Value};
 
 use super::{Config, Diagnostic, OptionValue, line_of};
 
@@ -22,9 +22,9 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
 
     for (key, item) in doc.iter() {
         // `doc.iter()` yields `&str` keys, which carry no span. The key with
-        // its span lives on the table.
-        let line =
-            doc.get_key_value(key).and_then(|(k, _)| k.span()).map_or(1, |s| line_of(src, s.start));
+        // its span lives on the table — `doc` derefs to one, so `line_for`
+        // reaches it the same way a section's own reader does.
+        let line = line_for(&doc, key, src);
 
         let Some(table) = item.as_table() else {
             problems.push(Diagnostic { line, message: format!("`{key}` is not in a section") });
@@ -40,22 +40,25 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
     Ok((config, problems))
 }
 
-fn read_options(
-    src: &str,
-    table: &toml_edit::Table,
-    config: &mut Config,
-    problems: &mut Vec<Diagnostic>,
-) {
+fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
     for (key, item) in table.iter() {
-        let line = table
-            .get_key_value(key)
-            .and_then(|(k, _)| k.span())
-            .map_or(1, |s| line_of(src, s.start));
+        let line = line_for(table, key, src);
 
         if let Err(message) = config.options.set(key, option_value(item)) {
             problems.push(Diagnostic { line, message });
         }
     }
+}
+
+/// The line `key` sits on, for a diagnostic.
+///
+/// A key's span is how a diagnostic learns its line, and every section's
+/// reader needs the same lookup — `key.span()` on the table's own copy of
+/// the key, not the borrowed `&str` iteration yields, which carries none.
+/// One helper here rather than one per reader, because `[ui]` and the
+/// `[keys.*]` sections that follow will each need this too.
+fn line_for(table: &Table, key: &str, src: &str) -> usize {
+    table.get_key_value(key).and_then(|(k, _)| k.span()).map_or(1, |s| line_of(src, s.start))
 }
 
 /// A TOML scalar as an [`OptionValue`]. Anything else — a string, an array, a
