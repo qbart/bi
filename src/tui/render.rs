@@ -218,7 +218,7 @@ fn styled_line(
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
 fn gutter_width(ed: &Editor, buffer: &bee::buffer::Buffer) -> usize {
-    match ed.session.line_numbers {
+    match ed.session.options.number {
         LineNumbers::Off => 0,
         _ => format!("{}", buffer.line_count()).len() + 1,
     }
@@ -452,7 +452,7 @@ fn render_window(
         }
 
         // A blank cell where a number is not due, so the text stays put.
-        let mut spans = match ed.session.line_numbers.label_for(row, cursor_row) {
+        let mut spans = match ed.session.options.number.label_for(row, cursor_row) {
             _ if gutter == 0 => Vec::new(),
             Some(n) => vec![Span::styled(
                 format!("{n:>width$} ", width = gutter - 1),
@@ -479,7 +479,7 @@ fn render_window(
         }
         // Search matches, under the selection so a selected match still reads
         // as selected. Bounded by the row, like every other pass here.
-        if ed.session.highlight_search
+        if ed.session.options.hlsearch
             && let Some(search) = &ed.session.last_search
         {
             let line_start = buffer.rope().line_to_char(row);
@@ -951,16 +951,16 @@ mod tests {
         let numbered = gutter_width(&ed, ed.buffer().unwrap());
         assert_eq!(numbered, 4, "121 lines, so three digits and a space");
 
-        ed.session.line_numbers = LineNumbers::Relative;
+        ed.session.options.number = LineNumbers::Relative;
         assert_eq!(
             gutter_width(&ed, ed.buffer().unwrap()),
             numbered,
             "or the file slides sideways as you move"
         );
-        ed.session.line_numbers = LineNumbers::Every(10);
+        ed.session.options.number = LineNumbers::Every(10);
         assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), numbered);
 
-        ed.session.line_numbers = LineNumbers::Off;
+        ed.session.options.number = LineNumbers::Off;
         assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), 0, "the column is gone, not blank");
     }
 

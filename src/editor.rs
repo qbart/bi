@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, BufferId, Cursor};
+use crate::config::Options;
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
@@ -509,20 +510,19 @@ pub struct Session {
     /// The last search, for `n`/`N` and the highlight pass. Beside
     /// `last_find`, and there for the same reason: it outlives `Input::reset`.
     pub last_search: Option<Search>,
-    /// Whether every match is highlighted. Off unless `:hls` asks for it —
-    /// vim does not light the buffer up on a plain `/`, and the status line's
-    /// `[3/17]` says how many there are without painting them.
-    pub highlight_search: bool,
-    /// What the gutter shows. `:set number`.
+    /// Everything `:set` can change, and everything `[options]` can say.
     ///
-    /// Session-wide by choice, where vim scopes `'number'` per window.
+    /// One struct rather than a field each so that a new option is one line in
+    /// `Options` instead of one field here, one match arm in `set_option` and
+    /// one parse rule. `:reload` also needs to replace all of them at once,
+    /// which a struct does and a spray of fields does not.
     ///
-    /// A gutter that is numbered in one pane and not in its neighbour makes the
-    /// same file read differently depending on where you opened it, and the
-    /// setting is a reading preference rather than anything about the view. One
-    /// value, and every window obeys it. Not a placeholder for a per-window
-    /// option later — see `docs/specs/windows.md`.
-    pub line_numbers: LineNumbers,
+    /// Session-wide by choice, where vim scopes `'number'` per window. A
+    /// gutter numbered in one pane and not in its neighbour makes the same
+    /// file read differently depending on where you opened it, and the setting
+    /// is a reading preference rather than anything about the view. See
+    /// `docs/specs/windows.md`.
+    pub options: Options,
     /// Whether the status line belongs to the search.
     ///
     /// True while the search line is being typed and for as long as the keys
@@ -2166,7 +2166,7 @@ impl Editor {
             ExLine::Quit { force } => self.quit(force),
             ExLine::QuitAll { force } => self.quit_all(force),
             ExLine::WriteAll => self.write_all(),
-            ExLine::Highlight(on) => self.session.highlight_search = on,
+            ExLine::Highlight(on) => self.session.options.hlsearch = on,
             ExLine::Set(arg) => self.set_option(&arg),
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Rename { from, to } => self.rename_path(&from, &to),
@@ -2215,11 +2215,12 @@ impl Editor {
         match name {
             "number" => {
                 if value.is_empty() {
-                    self.session.status = format!("number={}", self.session.line_numbers.setting());
+                    self.session.status =
+                        format!("number={}", self.session.options.number.setting());
                     return;
                 }
                 match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
-                    Some(lines) => self.session.line_numbers = lines,
+                    Some(lines) => self.session.options.number = lines,
                     None => {
                         self.session.status =
                             format!("number takes 0 (off), -1 (relative) or a count: {value}");
@@ -4974,17 +4975,17 @@ mod tests {
     #[test]
     fn set_number_takes_off_relative_and_a_count() {
         let mut ed = editor("one\ntwo\nthree");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Every(1), "every line, by default");
+        assert_eq!(ed.session.options.number, LineNumbers::Every(1), "every line, by default");
 
         ex(&mut ed, "set number 0");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Off);
+        assert_eq!(ed.session.options.number, LineNumbers::Off);
         ex(&mut ed, "set number -1");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Relative);
+        assert_eq!(ed.session.options.number, LineNumbers::Relative);
         ex(&mut ed, "set number 5");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Every(5));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5));
         // Vim's spelling, which the fingers type without asking.
         ex(&mut ed, "set number=10");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Every(10));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(10));
     }
 
     #[test]
@@ -4996,7 +4997,7 @@ mod tests {
         assert_eq!(ed.session.status, "number=5", "no value asks rather than sets");
 
         ex(&mut ed, "set number -3");
-        assert_eq!(ed.session.line_numbers, LineNumbers::Every(5), "left alone");
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "left alone");
         assert!(ed.session.status.contains("-3"));
 
         ex(&mut ed, "set wrap");
@@ -6553,14 +6554,14 @@ mod tests {
         let mut ed = editor("foo foo");
         search_for(&mut ed, "foo", true);
         assert!(
-            !ed.session.highlight_search,
+            !ed.session.options.hlsearch,
             "a plain `/` does not light the buffer up, as in vim"
         );
 
         ed.run_ex("hls");
-        assert!(ed.session.highlight_search);
+        assert!(ed.session.options.hlsearch);
         ed.run_ex("noh");
-        assert!(!ed.session.highlight_search);
+        assert!(!ed.session.options.hlsearch);
     }
 
     #[test]
