@@ -26,6 +26,12 @@ pub trait ConfigSource {
     fn config(&self) -> anyhow::Result<Option<String>>;
 }
 
+impl<T: ConfigSource> ConfigSource for std::rc::Rc<T> {
+    fn config(&self) -> anyhow::Result<Option<String>> {
+        (**self).config()
+    }
+}
+
 /// A problem with a config file. Reported, never fatal: an editor you cannot
 /// launch because of a typo in its config is an editor you cannot use to fix
 /// the typo.

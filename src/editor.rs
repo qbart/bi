@@ -614,6 +614,8 @@ enum ExLine {
     },
     /// `:42`.
     Goto(usize),
+    /// `:reload` — the config, not the buffer. See [`ExLine::Revert`].
+    ReloadConfig,
 }
 
 /// Where `:m` puts the lines — an address, exactly as in vim.
@@ -722,6 +724,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
         },
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
+        "reload" => ExLine::ReloadConfig,
         _ => match name.parse::<usize>() {
             Ok(row) => ExLine::Goto(row),
             Err(_) => ExLine::Unknown(name.into()),
@@ -973,7 +976,7 @@ impl Editor {
     /// `:reload` run this same path, which is the only way the two stay in
     /// agreement.
     pub fn load_config(&mut self, source: impl ConfigSource + 'static) -> Vec<Diagnostic> {
-        let problems = self.read_config(&source);
+        let problems = self.read_config(&source).unwrap_or_else(|d| vec![d]);
         self.config_source = Some(Box::new(source));
         problems
     }
@@ -984,27 +987,64 @@ impl Editor {
     }
 
     /// Reads and applies, without touching the stored source. Shared by
-    /// [`Editor::load_config`] and `:reload`.
-    fn read_config(&mut self, source: &dyn ConfigSource) -> Vec<Diagnostic> {
+    /// [`Editor::load_config`] and [`Editor::reload_config`].
+    ///
+    /// `Err` is the unsalvageable case — the source could not be read, or
+    /// the document is not TOML at all — and leaves the running config
+    /// untouched. `Ok` carries the per-item problems, if any, from a
+    /// document that did parse and was applied.
+    ///
+    /// Sets no status: startup and `:reload` have different things to say
+    /// about the result, so that is left to the caller.
+    fn read_config(&mut self, source: &dyn ConfigSource) -> Result<Vec<Diagnostic>, Diagnostic> {
         let text = match source.config() {
             Ok(Some(text)) => text,
-            Ok(None) => return Vec::new(),
-            Err(e) => return vec![Diagnostic { line: 1, message: e.to_string() }],
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(Diagnostic { line: 1, message: e.to_string() }),
         };
 
         match crate::config::parse(&text, Config::default()) {
             Ok((config, problems)) => {
                 self.apply_config(config);
-                problems
+                Ok(problems)
             }
             // Unsalvageable: the running config stays exactly as it was.
-            Err(problem) => vec![problem],
+            Err(problem) => Err(problem),
         }
     }
 
     fn apply_config(&mut self, config: Config) {
         self.session.options = config.options;
         self.config = config;
+    }
+
+    /// Re-reads the config through the source a frontend supplied, and swaps
+    /// every option at once.
+    ///
+    /// A failed reload changes nothing. Reloading yourself into an unusable
+    /// config, with no way to type `:reload` again, is the one outcome worth
+    /// engineering against — so a document that does not parse is reported
+    /// and discarded, and the running config stays.
+    fn reload_config(&mut self) {
+        // Taken and put back: `read_config` needs `&mut self`, and the
+        // source lives on `self`.
+        let Some(source) = self.config_source.take() else {
+            self.session.status = "no config to reload".into();
+            return;
+        };
+
+        let result = self.read_config(source.as_ref());
+        self.config_source = Some(source);
+
+        self.session.status = match result {
+            Ok(problems) => match problems.len() {
+                0 => "config reloaded".into(),
+                n => format!("config reloaded — {n} problem{}", if n == 1 { "" } else { "s" }),
+            },
+            Err(problem) => {
+                format!("config not reloaded — line {}: {}", problem.line, problem.message)
+            }
+        };
     }
 
     fn with_buffer(buffer: Buffer) -> Self {
@@ -2234,6 +2274,7 @@ impl Editor {
             }
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
+            ExLine::ReloadConfig => self.reload_config(),
 
             // The rest need the rope, and so need a view.
             ExLine::Write(path) => {
@@ -3707,6 +3748,62 @@ mod tests {
         let problems = ed.load_config(Text(Some("[options\nnumber = 5\n")));
         assert_eq!(problems.len(), 1);
         assert_eq!(ed.session.options.number, LineNumbers::Every(1), "unchanged");
+    }
+
+    /// A source whose text can change between reads, which is what `:reload`
+    /// is for. `Cell` rather than a field because `ConfigSource::config`
+    /// takes `&self` — the source is read-only to the editor, and mutable
+    /// only to its owner.
+    struct Mutable(std::cell::RefCell<String>);
+
+    impl crate::config::ConfigSource for Mutable {
+        fn config(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some(self.0.borrow().clone()))
+        }
+    }
+
+    #[test]
+    fn reload_picks_up_a_changed_file() {
+        let mut ed = Editor::empty();
+        let source = std::rc::Rc::new(Mutable("[options]\nnumber = 5\n".to_string().into()));
+        ed.load_config(std::rc::Rc::clone(&source));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5));
+
+        *source.0.borrow_mut() = "[options]\nnumber = -1\n".to_string();
+        ex(&mut ed, "reload");
+
+        assert_eq!(ed.session.options.number, LineNumbers::Relative);
+        assert_eq!(ed.session.status, "config reloaded");
+    }
+
+    #[test]
+    fn a_failed_reload_changes_nothing() {
+        let mut ed = Editor::empty();
+        let source = std::rc::Rc::new(Mutable("[options]\nnumber = 5\n".to_string().into()));
+        ed.load_config(std::rc::Rc::clone(&source));
+
+        *source.0.borrow_mut() = "[options\nnumber = -1\n".to_string();
+        ex(&mut ed, "reload");
+
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the running config survives");
+        assert!(ed.session.status.contains("config not reloaded"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn reload_counts_the_problems_it_kept_going_past() {
+        let mut ed = Editor::empty();
+        let source = std::rc::Rc::new(Mutable("[options]\nnmber = 9\nzz = 1\n".to_string().into()));
+        ed.load_config(std::rc::Rc::clone(&source));
+
+        ex(&mut ed, "reload");
+        assert_eq!(ed.session.status, "config reloaded — 2 problems");
+    }
+
+    #[test]
+    fn reload_without_a_source_says_so() {
+        let mut ed = Editor::empty();
+        ex(&mut ed, "reload");
+        assert_eq!(ed.session.status, "no config to reload");
     }
 
     /// Text arrives as one committed revision, so a single undo lands back on
