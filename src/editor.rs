@@ -193,6 +193,9 @@ pub enum Action {
     },
     /// `Ctrl-N` — a cursor at the next occurrence of the word under the cursor.
     AddCursorNextMatch,
+    /// `<C-x>` — the same match, passed over: the newest cursor moves on to
+    /// the one after it instead of a cursor being left behind.
+    SkipCursorToNextMatch,
     /// `Ctrl-Alt-Down` / `Ctrl-Alt-Up`.
     AddCursorLine {
         below: bool,
@@ -3221,42 +3224,18 @@ impl View<'_> {
             }
 
             Action::AddCursorNextMatch => {
-                let primary = self.selections.primary();
-                // The selection itself when there is one, otherwise the word
-                // under the cursor — so it works in both normal and visual.
-                let (start, end) = if primary.is_collapsed() {
-                    match self.buffer.word_at(primary.head) {
-                        Some(range) => range,
-                        None => {
-                            self.session.status = "no word under the cursor".into();
-                            return;
-                        }
-                    }
-                } else {
-                    primary.inclusive_range(self.buffer.rope().len_chars())
-                };
-
-                let needle = self.buffer.slice(start, end);
-                let Some(found) = self.buffer.find_next(primary.head.at, &needle) else {
-                    self.session.status = format!("no more matches for \"{needle}\"");
-                    return;
-                };
-                if found == start {
-                    self.session.status = "only one match".into();
-                    return;
+                if let Some(selection) = self.next_match_selection() {
+                    self.selections.push(selection);
                 }
-                let width = needle.chars().count();
-                // A selection with room in it is only meaningful in visual
-                // mode. In normal mode the new cursor goes to the *start* of
-                // the match: collapsing the range onto its head would leave it
-                // on the last character, so typing would land inside the word
-                // rather than in front of it.
-                self.selections.push(match self.session.mode.visual() {
-                    Some(_) => {
-                        Selection { anchor: Cursor::at(found), head: Cursor::at(found + width - 1) }
-                    }
-                    None => Selection::at(found),
-                });
+            }
+            // The same search, over the primary rather than beside it. `push`
+            // makes what it adds primary, so the one this replaces is always
+            // the most recently placed cursor — which is the one the user is
+            // looking at and the only one they can mean by "not this".
+            Action::SkipCursorToNextMatch => {
+                if let Some(selection) = self.next_match_selection() {
+                    *self.selections.primary_mut() = selection;
+                }
             }
             Action::AddCursorLine { below } => {
                 let primary = self.selections.primary();
@@ -3413,6 +3392,53 @@ impl View<'_> {
             | Action::Window(_)
             | Action::Tree(_) => {}
         }
+    }
+
+    /// Where a match-following cursor goes next: the primary selection, or
+    /// the word under it, found again after where it sits.
+    ///
+    /// `None` means it did not move and the status line already says why. The
+    /// two callers differ only in what they do with the answer — `<C-n>` adds
+    /// a cursor there, `<C-x>` moves the one it has — and that difference is
+    /// the whole of "skip": the match is passed over rather than taken.
+    fn next_match_selection(&mut self) -> Option<Selection> {
+        let primary = self.selections.primary();
+        // The selection itself when there is one, otherwise the word under
+        // the cursor — so it works in both normal and visual.
+        let (start, end) = if primary.is_collapsed() {
+            match self.buffer.word_at(primary.head) {
+                Some(range) => range,
+                None => {
+                    self.session.status = "no word under the cursor".into();
+                    return None;
+                }
+            }
+        } else {
+            primary.inclusive_range(self.buffer.rope().len_chars())
+        };
+
+        let needle = self.buffer.slice(start, end);
+        let found = match self.buffer.find_next(primary.head.at, &needle) {
+            Some(found) => found,
+            None => {
+                self.session.status = format!("no more matches for \"{needle}\"");
+                return None;
+            }
+        };
+        if found == start {
+            self.session.status = "only one match".into();
+            return None;
+        }
+
+        let width = needle.chars().count();
+        // A selection with room in it is only meaningful in visual mode. In
+        // normal mode the cursor goes to the *start* of the match: collapsing
+        // the range onto its head would leave it on the last character, so
+        // typing would land inside the word rather than in front of it.
+        Some(match self.session.mode.visual() {
+            Some(_) => Selection { anchor: Cursor::at(found), head: Cursor::at(found + width - 1) },
+            None => Selection::at(found),
+        })
     }
 
     /// Puts back the selections a revision recorded.
@@ -6470,6 +6496,46 @@ mod tests {
         let mut ed = editor("unique word");
         ed.apply(cmd(Action::AddCursorNextMatch));
         assert_eq!(ed.selections().unwrap().len(), 1);
+        assert!(!ed.session.status.is_empty());
+    }
+
+    /// The point of skipping: an occurrence you do not want to edit is passed
+    /// over, and the cursor count does not grow.
+    #[test]
+    fn skip_moves_the_cursor_on_instead_of_leaving_one_behind() {
+        let mut ed = editor("foo foo foo");
+        ed.apply(cmd(Action::SkipCursorToNextMatch));
+
+        assert_eq!(ed.selections().unwrap().len(), 1, "skipping never adds a cursor");
+        assert_eq!(heads(&ed), vec![4], "moved to the second occurrence");
+
+        ed.apply(cmd(Action::SkipCursorToNextMatch));
+        assert_eq!(heads(&ed), vec![8], "and on to the third");
+    }
+
+    /// Skipping in the middle of a multi-cursor edit has to leave the cursors
+    /// already placed alone — it is the newest one, the one just landed on a
+    /// match, that the user is rejecting.
+    #[test]
+    fn skip_replaces_only_the_newest_cursor() {
+        let mut ed = editor("foo foo foo foo");
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(heads(&ed), vec![0, 4]);
+
+        ed.apply(cmd(Action::SkipCursorToNextMatch));
+        assert_eq!(heads(&ed), vec![0, 8], "the second cursor moved, the first stayed");
+
+        // And adding again resumes from where the skip left off.
+        ed.apply(cmd(Action::AddCursorNextMatch));
+        assert_eq!(heads(&ed), vec![0, 8, 12]);
+    }
+
+    #[test]
+    fn skip_with_nowhere_to_go_reports_and_does_not_move() {
+        let mut ed = editor("unique word");
+        ed.apply(cmd(Action::SkipCursorToNextMatch));
+        assert_eq!(ed.selections().unwrap().len(), 1);
+        assert_eq!(heads(&ed), vec![0], "stayed put");
         assert!(!ed.session.status.is_empty());
     }
 

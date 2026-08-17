@@ -211,8 +211,21 @@ Vim has no multi-cursor and so offers no bindings to copy. bi's:
 | Key | Does |
 |---|---|
 | `Ctrl-N` | add a cursor at the next occurrence of the word under the cursor |
+| `Ctrl-X` | skip that occurrence — move the newest cursor to it instead of adding one |
 | `Ctrl-Alt-Down` / `Ctrl-Alt-Up` | add a cursor on the line below / above |
 | `Esc` | collapse to the primary cursor |
+
+`Ctrl-X` is `Ctrl-N`'s search with the opposite answer, and the two share
+`next_match_selection` so they can never disagree about what "the next match"
+means. It replaces the *primary* selection, which is always the most recently
+placed cursor because `Selections::push` makes what it adds primary — and that
+is the only cursor the user can mean by "not this one".
+
+Both refuse the key in blockwise visual rather than declining to handle it. The
+distinction matters: `visual` falls through to `normal` for anything it does not
+claim, and `normal` binds both keys, so a guard that merely skips the arm sends
+the key to the very action it was excluding. `Ctrl-N` had exactly that bug from
+the day it was written.
 
 Chosen over VSCode's `Ctrl-D` because that is vim's half-page scroll, which
 `motions.md` step 6 still wants, and over a `g` prefix because `gj`/`gk` are

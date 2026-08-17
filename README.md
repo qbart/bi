@@ -247,6 +247,7 @@ Vim has none of this, so the bindings are bi's own.
 | Key | Does |
 |---|---|
 | `Ctrl-N` | add a cursor at the next occurrence of the word under the cursor, wrapping |
+| `Ctrl-X` | skip this occurrence — move the newest cursor on to the next one instead |
 | `Ctrl-Alt-Down` `Ctrl-Alt-Up` | add a cursor on the line below / above, keeping the column |
 | `Esc` | collapse back to one cursor |
 
@@ -254,6 +255,12 @@ Every command applies at every cursor, and the whole thing is one undo step —
 including the cursors themselves, which come back when you undo. In visual mode
 `Ctrl-N` selects the next occurrence of the *selection* instead, so
 `viw` then `Ctrl-N` `Ctrl-N` then `c` is a rename.
+
+`Ctrl-X` is the same search as `Ctrl-N` with the opposite answer: it moves the
+cursor you just placed rather than leaving one behind, so a match you do not
+want to edit is stepped over. `Ctrl-N` `Ctrl-X` `Ctrl-N` takes the first and
+third occurrences and leaves the second alone. Neither key does anything in
+blockwise visual, where the rectangle comes from one selection's corners.
 
 The terminal has one real cursor; it sits on the primary selection and the
 others are drawn as coloured cells. The status line shows the count, since the

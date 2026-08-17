@@ -382,6 +382,7 @@ impl Input {
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
+            KeyCode::Char('x') if ctrl => self.plain(Action::SkipCursorToNextMatch),
             KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(VisualKind::Block)),
             KeyCode::Char('e') if ctrl => self.plain(Action::ScrollLine { down: true }),
             KeyCode::Char('y') if ctrl => self.plain(Action::ScrollLine { down: false }),
@@ -701,8 +702,21 @@ impl Input {
         // which is the multi-cursor idiom people expect from other editors.
         // Not in a block: the rectangle is derived from one selection's
         // corners, so a second one has nothing to say.
-        if ctrl && key.code == KeyCode::Char('n') && !block {
-            return self.plain(Action::AddCursorNextMatch);
+        // `Ctrl-X` sits beside it: the same search, but the match is passed
+        // over rather than taken.
+        //
+        // Both are intercepted here even in a block, where neither applies,
+        // because `normal` binds them too and anything falling through to it
+        // would arrive there anyway — the exclusion has to refuse the key, not
+        // merely decline to handle it.
+        if ctrl && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('x')) {
+            if block {
+                return None;
+            }
+            return self.plain(match key.code {
+                KeyCode::Char('n') => Action::AddCursorNextMatch,
+                _ => Action::SkipCursorToNextMatch,
+            });
         }
 
         let KeyCode::Char(c) = key.code else {
@@ -998,6 +1012,33 @@ mod tests {
         assert_eq!(cmd.action, Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }));
 
         assert_eq!(tree_action(":"), Action::EnterCommandMode);
+    }
+
+    /// `<C-n>` takes a match, `<C-x>` passes it over. They are the same
+    /// gesture and have to be reachable from the same two modes, or skipping
+    /// is only available where you did not need it.
+    #[test]
+    fn ctrl_x_skips_a_match_wherever_ctrl_n_takes_one() {
+        let mut input = Input::default();
+        for mode in [Mode::Normal, Mode::Visual(VisualKind::Char)] {
+            let take = input.on_key(ctrl('n'), &mode, ContentKind::Text).unwrap();
+            assert_eq!(take.action, Action::AddCursorNextMatch, "{mode:?}");
+
+            let skip = input.on_key(ctrl('x'), &mode, ContentKind::Text).unwrap();
+            assert_eq!(skip.action, Action::SkipCursorToNextMatch, "{mode:?}");
+        }
+
+        // Neither belongs in a block: the rectangle comes from one selection's
+        // corners, so a second cursor has nothing to say about it.
+        let block = Mode::Visual(VisualKind::Block);
+        assert!(
+            input.on_key(ctrl('x'), &block, ContentKind::Text).is_none(),
+            "blockwise visual has no second selection to skip"
+        );
+        assert!(
+            input.on_key(ctrl('n'), &block, ContentKind::Text).is_none(),
+            "and none to add — the guard has to refuse the key, not fall through to `normal`"
+        );
     }
 
     /// Vim spells the jump list this way, not the buffer list — but bi has no
