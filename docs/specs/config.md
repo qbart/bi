@@ -57,14 +57,14 @@ key is a diagnostic, not a silent acceptance:
 config.toml:3: `theme` is not in a section
 ```
 
-The "did you mean [ui] theme?" hint arrives with step 2 — it cannot suggest a
-section that does not exist yet.
+Bare, with no suggestion, which is what ships. Now that `[options]` is the only
+settings section, a `did you mean [options] theme?` hint is trivially correct
+for any bare key and would be worth adding — it was not, while a second
+settings section existed and the parser could not know which one you meant.
 
 ```toml
-[ui]
-theme = "onedark"
-
 [options]
+theme = "onedark"
 number = 5
 hlsearch = false
 
@@ -75,15 +75,21 @@ leader = " "
 "H" = "line_start"
 ```
 
-`[options]` **is** the `:set` namespace — one key per `:set` option, spelled
-identically, so `:set number 5` and `number = 5` are two ways to reach one
-setting. `[ui]` holds what `:set` has no spelling for, which today is `theme`
-alone.
+`[options]` **is** the `:set` namespace, and there is no second settings
+section. One key per option, spelled as `:set` spells it, so `:set number 5`
+and `number = 5` are two ways to reach one setting — and so are `:set theme
+onedark` and `theme = "onedark"`.
 
-The rule is arbitrary at the edges — `number` is arguably appearance and could
-have gone in `[ui]` — but it is the only rule with no ambiguity: if `:set` can
-say it, it is in `[options]`. Splitting by meaning instead would leave every new
-option needing an argument about which half it belongs to.
+An earlier draft split appearance into a `[ui]` table and left `[options]` for
+what `:set` understood. That put `theme` on one side and `number` on the other
+for no reason a user could predict — both are things you set because of how you
+want bee to look — and it meant every new option needed an argument about which
+half it belonged to. One table has no edge to be arbitrary at.
+
+It also removes a feature rather than adding one: with `theme` an ordinary
+option, `:set theme onedark` is how you try a theme, and no `:theme` command
+needs to exist. That does oblige [`OptionValue`](#options) to grow a string
+variant in step 2, which is a line of work, not a design question.
 
 ## The user file is a patch
 
@@ -367,8 +373,12 @@ keymap never learns what any of them are.
 
 ## Theme
 
-`ui.theme` names a file in `~/.config/bee/themes/`, falling back to a built-in
-of the same name, falling back to `default` with a diagnostic.
+The `theme` option names a file in `~/.config/bee/themes/`, falling back to a
+built-in of the same name, falling back to `default` with a diagnostic.
+
+A theme file has its own two sections, and the `[ui]` inside one is unrelated to
+the `[ui]` this design dropped from `config.toml`: here it distinguishes the
+colours of bee's own furniture from the colours of parsed code.
 
 ```toml
 # themes/onedark.toml
@@ -576,8 +586,9 @@ header:
 # commented out keeps doing what bee does by default, including bindings added
 # in future versions. Uncomment a line only to change it.
 
-[ui]
+[options]
 # theme = "default"
+# number = 1
 
 [keys]
 # leader = " "
@@ -671,8 +682,9 @@ Three steps, each useful on its own and each landing green.
    XDG discovery in `main.rs`, `[options]` wired to `Session`, `:reload`,
    `ExLine::Revert` rename, and both CLI subcommands. No keymap, no theme — but
    a real config file that does something, end to end.
-2. **The theme.** `[ui] theme`, theme files, `Color` / `Style`, `render.rs`
-   reading the table it currently hardcodes. Ships a `default` theme
+2. **The theme.** The `theme` option, theme files, `Color` / `Style`,
+   `render.rs` reading the table it currently hardcodes, and the string variant
+   `OptionValue` needs to carry a theme name. Ships a `default` theme
    reproducing today's colours exactly.
 3. **The keymap.** The names table, `Binding` / `Pending`, the per-mode maps,
    the keymap half of `default.toml`, the `input.rs` refactor, and the
@@ -688,8 +700,9 @@ keystroke does, and it is worth having the config layer proven before that.
 - **`:map` / `:set` writing back to the file.** `:set` still changes the running
   value; persisting is a separate question about comment-preserving edits.
 - **Per-project config**, and the trust model it needs.
-- **A picker over themes**, or `:theme`. `ui.theme` plus `:reload` is enough to
-  try one.
+- **A picker over themes.** `:set theme <name>` is enough to try one, and it
+  falls out of `theme` being an ordinary option rather than needing a command
+  of its own.
 - **Options bee does not have.** No `tabstop`, no `ignorecase`, no
   `expandtab` — `[options]` holds what `:set` already understands, and grows
   when the features do.

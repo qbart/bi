@@ -55,8 +55,8 @@ fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
 /// A key's span is how a diagnostic learns its line, and every section's
 /// reader needs the same lookup — `key.span()` on the table's own copy of
 /// the key, not the borrowed `&str` iteration yields, which carries none.
-/// One helper here rather than one per reader, because `[ui]` and the
-/// `[keys.*]` sections that follow will each need this too.
+/// One helper here rather than one per reader, because the `[keys.*]` sections
+/// that follow will each need this too.
 fn line_for(table: &Table, key: &str, src: &str) -> usize {
     table.get_key_value(key).and_then(|(k, _)| k.span()).map_or(1, |s| line_of(src, s.start))
 }
