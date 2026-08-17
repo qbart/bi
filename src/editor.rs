@@ -3714,9 +3714,9 @@ mod tests {
     use crate::picker::PickerKind;
 
     /// A config source that serves a string, so a test needs no filesystem.
-    struct Text(Option<&'static str>);
+    struct ConfigText(Option<&'static str>);
 
-    impl crate::config::ConfigSource for Text {
+    impl crate::config::ConfigSource for ConfigText {
         fn config(&self) -> anyhow::Result<Option<String>> {
             Ok(self.0.map(str::to_string))
         }
@@ -3727,7 +3727,7 @@ mod tests {
         let mut ed = Editor::empty();
         assert_eq!(ed.session.options.number, LineNumbers::Every(1), "defaults before");
 
-        let problems = ed.load_config(Text(Some("[options]\nnumber = 5\nnmber = 9\n")));
+        let problems = ed.load_config(ConfigText(Some("[options]\nnumber = 5\nnmber = 9\n")));
 
         assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the good line applied");
         assert_eq!(problems.len(), 1, "and the bad one was reported, not fatal");
@@ -3737,17 +3737,24 @@ mod tests {
     #[test]
     fn no_config_file_is_not_a_problem() {
         let mut ed = Editor::empty();
-        let problems = ed.load_config(Text(None));
+        let problems = ed.load_config(ConfigText(None));
         assert!(problems.is_empty());
         assert_eq!(ed.session.options, crate::config::Options::default());
     }
 
     #[test]
-    fn malformed_config_keeps_the_defaults_and_reports_once() {
+    fn malformed_config_keeps_what_was_loaded_and_reports_once() {
         let mut ed = Editor::empty();
-        let problems = ed.load_config(Text(Some("[options\nnumber = 5\n")));
+        ed.load_config(ConfigText(Some("[options]\nnumber = 5\n")));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5));
+
+        // The point of the test: not "ends up default", but "left alone". If
+        // `read_config` applied anything on a parse error, this would be
+        // `Every(1)` and the test would say so.
+        let problems = ed.load_config(ConfigText(Some("[options\nnumber = 5\n")));
+
         assert_eq!(problems.len(), 1);
-        assert_eq!(ed.session.options.number, LineNumbers::Every(1), "unchanged");
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the running config survives");
     }
 
     /// A source whose text can change between reads, which is what `:reload`
@@ -4294,7 +4301,7 @@ mod tests {
 
     /// A given window's view onto its buffer — what the tests that watch a
     /// second pane are actually asking about.
-    fn text_of(ed: &Editor, id: WindowId) -> &super::Text {
+    fn text_of(ed: &Editor, id: WindowId) -> &Text {
         ed.window_of(id).expect("no such window").text().expect("that window holds a tree")
     }
 
