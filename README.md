@@ -3,9 +3,8 @@
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
-Status: modal editing, undo, registers, tree-sitter highlighting for Rust,
-TOML, YAML, JSON, INI, Markdown and CMake, a buffer list, split windows, and a
-file tree.
+Status: modal editing, undo, registers, tree-sitter highlighting for twenty
+languages, a buffer list, split windows, and a file tree.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -572,9 +571,11 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   pages. The split tree is the shape that would carry both.
 - No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
   `docs/specs/registers.md`.
-- Seven grammars: Rust, TOML, YAML, JSON, INI, Markdown and CMake. Adding one
-  is a line in `syntax.rs`, but each is a C library that costs build time and
-  binary size.
+- Twenty grammars: Rust, C, C++, C3, Go, Python, Lua, Bash, CSS, GLSL, HLSL,
+  Slang, HCL/Terraform, Dockerfile, CMake, TOML, YAML, JSON, INI and Markdown.
+  Adding one is a line in `syntax.rs`, but each is a C library that costs build
+  time and binary size, and three of them ship no highlight query — see
+  `docs/specs/tree-sitter.md`.
 - No tree-sitter injections, so a code fence in markdown highlights as a fence
   and its contents stay plain — and markdown's own inline syntax (`**bold**`,
   links, code spans) is a second grammar reached the same way, so it is
@@ -589,11 +590,13 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 
 ### Architectural, and cheaper to fix now than later
 
-- **Tree-sitter is not optional, so building needs a C toolchain.** Grammars
-  are C compiled by `cc`, which breaks minimal containers and makes
-  cross-compilation harder. A Cargo feature would fix it: `Editor::syntax` is
-  already `Option<Syntax>` and an unknown file name already renders as plain
-  text, so the no-syntax path exists and works.
+- **Tree-sitter is not optional, so building needs a C toolchain — and twenty
+  grammars is a 23.6 MB binary, up from 4.75 MB with Rust alone.** Grammars are
+  C compiled by `cc`, which breaks minimal containers and makes
+  cross-compilation harder, and each one is a large generated parser table. A
+  Cargo feature per grammar fixes both: `Editor::syntax` is already
+  `Option<Syntax>` and an unknown file name already renders as plain text, so
+  the no-syntax path exists and works.
 - ~~**The config language is undecided**~~ Decided and half built: TOML, in
   `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live.
   The keymap in `input.rs` and the highlight table in `tui/render.rs` are still

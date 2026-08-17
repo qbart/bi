@@ -5,9 +5,9 @@ user actually *sees*, and the reason `Buffer::Edit` has existed since step 1.
 
 ## Status
 
-**Built**, for Rust, TOML, YAML, JSON, INI, Markdown and CMake. Markdown is
-block-level only until injections land. Injections, indent queries and
-background parsing remain deferred — see the end of this file.
+**Built**, for twenty languages — see the table below. Markdown is block-level
+only until injections land. Injections, indent queries and background parsing
+remain deferred — see the end of this file.
 
 ## What is already in place
 
@@ -148,13 +148,95 @@ because build files are named rather than suffixed — CMake is written into
 
 An unknown name means no `Syntax` and plain text — never an error.
 
-**Rust, TOML, YAML, JSON, INI, Markdown and CMake.** The original argument
-here was "Rust only": every grammar is a C library that costs compile time and
-binary size, and the editor is written in Rust so Rust is what gets dogfooded.
-The cost is real and now measured — the six grammars grew the release binary
-from 4.75 MB to 5.42 MB (+670 KB) and added about a minute and a half to a
-release build on a Raspberry Pi — but the formats above are what an editor
-actually sits in front of while configuring itself. `bi`'s own config is TOML.
+### Not every grammar ships a query
+
+Three of them do not, and the failure is invisible: `Query::new(..).ok()?`
+turns a missing or incompatible query into plain text with no message.
+
+- **HCL / Terraform.** `tree-sitter-hcl` publishes the parser and excludes the
+  query files from the package. The upstream repository has them, but
+  `include_str!` cannot reach into a dependency, so bi ships its own —
+  `src/queries/hcl.scm`, written against that crate's `node-types.json`. It is
+  the only query here bi authors.
+- **Slang and HLSL.** Both crates ship their `HIGHLIGHTS_QUERY` commented out.
+  Both borrow C's. Not C++'s: Slang rejects it outright (no `auto` node), and
+  HLSL *accepts* it and then matches nothing at all — the worse of the two
+  failures, because a grammar that compiles its query and highlights nothing
+  looks installed.
+
+That last case is why `the_queries_bi_did_not_get_from_a_crate_produce_captures`
+asserts a snippet comes back with captures in it, rather than asserting the
+query merely compiles.
+
+**Dockerfile comes from `arborium-dockerfile`.** The obvious
+`tree-sitter-dockerfile` is pinned to tree-sitter 0.20, and two versions of
+tree-sitter cannot coexist in one binary — both declare `links = "tree-sitter"`,
+so cargo refuses to resolve rather than letting a duplicate native runtime
+link. Any future grammar has to be on 0.26 or it cannot be used at all.
+
+**C3 is a git dependency**, `c3lang/tree-sitter-c3` — there is no crates.io
+release. That is a real cost: it pins a commit rather than a version, and it
+would block publishing bi to crates.io.
+
+### Languages
+
+The table, by the key that reaches it:
+
+| grammar | keys |
+|---|---|
+| Rust | `rs` |
+| C | `c` `h` |
+| C++ | `cpp` `cc` `cxx` `hpp` `hxx` `hh` |
+| C3 | `c3` `c3i` |
+| Go | `go` |
+| Python | `py` `pyi` |
+| Lua | `lua` |
+| Bash | `sh` `bash` `zsh` · `.bashrc` `.zshrc` |
+| CSS | `css` |
+| GLSL | `glsl` `vert` `frag` `comp` |
+| HLSL | `hlsl` |
+| Slang | `slang` |
+| HCL / Terraform | `tf` `tfvars` `hcl` |
+| Dockerfile | `Dockerfile` |
+| CMake | `cmake` · `CMakeLists.txt` |
+| TOML | `toml` |
+| YAML | `yaml` `yml` |
+| JSON | `json` |
+| INI | `ini` |
+| Markdown | `md` `markdown` |
+
+**`.h` goes to C**, which is a coin-flip that has to land somewhere. A C++
+project whose headers are `.h` gets a grammar that reads most of the file; a C
+project handed the C++ grammar gets nothing better in exchange.
+
+**`.zshrc` goes to the bash grammar.** zsh is not bash, but there is no zsh
+grammar to prefer, and bash reads all but the exotic parts of a normal rc file.
+
+The original argument here was "Rust only": every grammar is a C library that
+costs compile time and binary size, and the editor is written in Rust so Rust
+is what gets dogfooded.
+
+**That cost turned out to be the headline, and it is worth stating in full:**
+
+| | release binary |
+|---|---|
+| Rust only | 4.75 MB |
+| + TOML, YAML, JSON, INI, Markdown, CMake | 5.42 MB |
+| + the other thirteen | **23.60 MB** |
+
+Twenty grammars is a 5× binary. The jump is not evenly spread — the C-family
+grammars dominate it, and C++, HLSL and Slang are each a large generated
+parser table. A release build on a Raspberry Pi gained about three minutes.
+
+Nothing here is wrong, but it changes which deferred item matters most.
+`Editor::syntax` is already `Option<Syntax>` and an unknown name already
+renders as plain text, so **the no-syntax path exists and works** — putting
+grammars behind Cargo features is a mechanical change, and it is now the
+cheapest way to get the binary back. The README already lists the C-toolchain
+version of this argument under "cheaper to fix now than later".
+
+What bought the 18 MB is that these are the formats an editor sits in front
+of: its own config is TOML, its build is CMake, its shell is bash.
 
 **Markdown runs its block grammar only.** `tree-sitter-md` is *two* parsers:
 a block grammar for headings, fences, lists and quotes, and a separate inline
@@ -168,6 +250,7 @@ while its contents do not.
 ```toml
 tree-sitter = "0.26"
 streaming-iterator = "0.1"   # QueryCursor::matches is a streaming iterator
+
 tree-sitter-rust = "0.24"
 tree-sitter-toml-ng = "0.7"  # the maintained TOML grammar; tree-sitter-toml is on an ABI from 0.20
 tree-sitter-yaml = "0.7"
@@ -175,11 +258,27 @@ tree-sitter-json = "0.24"
 tree-sitter-ini = "1.4"
 tree-sitter-md = "0.5"       # LANGUAGE is the block grammar; INLINE_LANGUAGE waits on injections
 tree-sitter-cmake = "0.7"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-lua = "0.5"
+tree-sitter-bash = "0.25"
+tree-sitter-css = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-hcl = "1.1"      # parser only — the query is src/queries/hcl.scm
+tree-sitter-glsl = "0.2"
+tree-sitter-hlsl = "0.2"     # query commented out upstream; borrows C's
+tree-sitter-slang = "0.3"    # ditto
+arborium-dockerfile = "2.18" # tree-sitter-dockerfile is stuck on tree-sitter 0.20
+tree-sitter-c3 = { git = "https://github.com/c3lang/tree-sitter-c3" }  # no crates.io release
 ```
 
-Each exposes `LANGUAGE` and `HIGHLIGHTS_QUERY`, so a new grammar is genuinely
-one arm — markdown is the exception, naming its query `HIGHLIGHT_QUERY_BLOCK`
-because it has two.
+Most expose `LANGUAGE` and `HIGHLIGHTS_QUERY`, so a new grammar is one arm.
+The exceptions are worth knowing before adding the next one: C, C++ and Bash
+spell it `HIGHLIGHT_QUERY`; GLSL, HLSL and Slang name the language
+`LANGUAGE_GLSL` and so on; markdown has two grammars and calls its query
+`HIGHLIGHT_QUERY_BLOCK`; and `arborium-dockerfile` exposes `language()` as a
+function.
 
 These are the **first non-pure-Rust dependencies**. Grammars are C compiled by
 `cc`, which means a C toolchain becomes a build requirement and

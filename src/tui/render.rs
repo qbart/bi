@@ -171,7 +171,7 @@ fn exact_style(name: &str) -> Option<Style> {
         "comment" => Style::default().fg(Color::DarkGray),
         "constant" | "number" | "float" | "boolean" => Style::default().fg(Color::Yellow),
         "attribute" | "label" => Style::default().fg(Color::LightMagenta),
-        "operator" | "punctuation" => Style::default().fg(Color::Gray),
+        "operator" | "punctuation" | "delimiter" => Style::default().fg(Color::Gray),
         // The key side of a config format — TOML, YAML and INI call it
         // `property`, JSON dresses it as a string. Without this the whole
         // left-hand column of a config file renders unstyled, which is most

@@ -33,9 +33,20 @@ pub struct Span {
 /// otherwise the text after the last dot decides. One arm per language either
 /// way, so adding one stays a line.
 fn language_for(file: &str) -> Option<(Language, &'static str)> {
-    if file == "CMakeLists.txt" {
-        return Some(cmake());
+    let named = match file {
+        "CMakeLists.txt" => Some(cmake()),
+        "Dockerfile" => {
+            Some((arborium_dockerfile::language().into(), arborium_dockerfile::HIGHLIGHTS_QUERY))
+        }
+        // zsh is not bash, but the bash grammar reads all but the exotic parts
+        // of a normal rc file, and there is no zsh grammar to prefer to it.
+        ".bashrc" | ".zshrc" => Some(bash()),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
     }
+
     match file.rsplit('.').next().unwrap_or(file) {
         "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
         "toml" => {
@@ -54,9 +65,39 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
             Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
         }
         "cmake" => Some(cmake()),
+        "go" => Some((tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY)),
+        "c3" | "c3i" => Some((tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY)),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
+            Some((tree_sitter_cpp::LANGUAGE.into(), tree_sitter_cpp::HIGHLIGHT_QUERY))
+        }
+        // `.h` is ambiguous and always will be. C, because a C++ project that
+        // uses it gets a grammar that reads most of the file anyway, while a C
+        // project handed the C++ grammar gets nothing better.
+        "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
+        "lua" => Some((tree_sitter_lua::LANGUAGE.into(), tree_sitter_lua::HIGHLIGHTS_QUERY)),
+        "sh" | "bash" | "zsh" => Some(bash()),
+        // Terraform is HCL. The query is bi's own — see `src/queries/hcl.scm`.
+        "tf" | "tfvars" | "hcl" => Some((tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS)),
+        "css" => Some((tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY)),
+        // Slang and HLSL are C-family forks whose crates ship their highlight
+        // queries commented out, so both borrow C's. Not C++'s: Slang rejects
+        // it outright (no `auto` node) and HLSL accepts it but then matches
+        // nothing at all, which is the worse failure of the two because it
+        // looks like a working grammar. Both are pinned by tests below.
+        "slang" => Some((tree_sitter_slang::LANGUAGE_SLANG.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
+        "glsl" | "vert" | "frag" | "comp" => {
+            Some((tree_sitter_glsl::LANGUAGE_GLSL.into(), tree_sitter_glsl::HIGHLIGHTS_QUERY))
+        }
+        "hlsl" => Some((tree_sitter_hlsl::LANGUAGE_HLSL.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
+        "py" | "pyi" => {
+            Some((tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY))
+        }
         _ => None,
     }
 }
+
+/// HCL's highlights, which the grammar crate does not ship. See the file.
+const HCL_HIGHLIGHTS: &str = include_str!("queries/hcl.scm");
 
 fn is_spell(capture: &str) -> bool {
     matches!(capture, "spell" | "nospell")
@@ -64,6 +105,10 @@ fn is_spell(capture: &str) -> bool {
 
 fn cmake() -> (Language, &'static str) {
     (tree_sitter_cmake::LANGUAGE.into(), tree_sitter_cmake::HIGHLIGHTS_QUERY)
+}
+
+fn bash() -> (Language, &'static str) {
+    (tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY)
 }
 
 /// Lets tree-sitter read predicate text straight out of the rope instead of
@@ -261,8 +306,48 @@ mod tests {
     /// against the tree-sitter version in `Cargo.toml` degrades *silently* to
     /// plain text — `Query::new(..).ok()?` — so nothing but a test that asks
     /// for each one will notice.
-    const KNOWN: &[&str] =
-        &["rs", "toml", "yaml", "yml", "json", "ini", "md", "markdown", "cmake", "CMakeLists.txt"];
+    const KNOWN: &[&str] = &[
+        "rs",
+        "toml",
+        "yaml",
+        "yml",
+        "json",
+        "ini",
+        "md",
+        "markdown",
+        "cmake",
+        "CMakeLists.txt",
+        "go",
+        "c3",
+        "c3i",
+        "cpp",
+        "cc",
+        "cxx",
+        "hpp",
+        "hxx",
+        "hh",
+        "c",
+        "h",
+        "lua",
+        "sh",
+        "bash",
+        "zsh",
+        ".bashrc",
+        ".zshrc",
+        "Dockerfile",
+        "tf",
+        "tfvars",
+        "hcl",
+        "css",
+        "slang",
+        "glsl",
+        "vert",
+        "frag",
+        "comp",
+        "hlsl",
+        "py",
+        "pyi",
+    ];
 
     /// The capture names for `text`, in order, with the text they cover.
     fn captures(file: &str, text: &str) -> Vec<(String, String)> {
@@ -355,6 +440,56 @@ mod tests {
             yaml.iter().any(|(n, t)| n == "string" && t == "value"),
             "the value should stay a plain string, got {yaml:?}"
         );
+    }
+
+    /// A grammar whose query compiles but matches *nothing* is the worst
+    /// failure available here: it looks installed and renders plain. HLSL did
+    /// exactly that with the C++ query, so every borrowed or hand-written
+    /// query gets a snippet that must come back with captures in it.
+    #[test]
+    fn the_queries_bi_did_not_get_from_a_crate_produce_captures() {
+        // Terraform, whose query is bi's own — `src/queries/hcl.scm`.
+        let tf =
+            captures("tf", "# note\nresource \"aws_instance\" \"web\" {\n  ami = var.image\n}\n");
+        covers(&tf, "comment", "# note");
+        covers(&tf, "keyword", "resource");
+        covers(&tf, "type", "aws_instance");
+        covers(&tf, "property", "ami");
+        covers(&tf, "variable", "var");
+
+        // Slang and HLSL, borrowing C's.
+        for shader in ["slang", "hlsl"] {
+            let found = captures(shader, "// note\nfloat4 main(float2 uv) { return 0; }\n");
+            covers(&found, "comment", "// note");
+            covers(&found, "type", "float4");
+            covers(&found, "function", "main");
+            assert!(found.len() > 3, "{shader} matched almost nothing: {found:?}");
+        }
+    }
+
+    #[test]
+    fn the_added_languages_highlight_their_own_shapes() {
+        let go = captures("go", "package main\n\nfunc f() int { return 1 }\n");
+        covers(&go, "keyword", "func");
+
+        let py = captures("py", "def f(x):\n    return \"s\"\n");
+        covers(&py, "keyword", "def");
+        covers(&py, "function", "f");
+
+        let c = captures("c", "int main(void) { return 0; }\n");
+        covers(&c, "type", "int");
+
+        let lua = captures("lua", "local x = 1\n");
+        covers(&lua, "keyword", "local");
+
+        let sh = captures(".bashrc", "# note\nexport PATH=/bin\n");
+        covers(&sh, "comment", "# note");
+
+        let docker = captures("Dockerfile", "FROM alpine:3.19\n");
+        covers(&docker, "keyword", "FROM");
+
+        let c3 = captures("c3", "fn int main() { return 0; }\n");
+        covers(&c3, "keyword", "fn");
     }
 
     /// `@spell` is a spellchecker hint, and INI hangs one on the same node as
