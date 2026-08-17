@@ -34,14 +34,22 @@ words. `{n}` below means an optional count.
 | `h` `l` | left, right (`Space` also moves right) |
 | `j` `k` | down, up, keeping a goal column through short lines |
 | `w` `b` | start of the next / previous word |
+| `e` `ge` | end of the next / previous word |
+| `W` `B` `E` `gE` | the same, over WORDs — whitespace-delimited, so `foo.bar` is one |
 | `f{c}` `F{c}` | onto the next / previous `{c}`, within the line |
 | `t{c}` `T{c}` | just before / after it |
 | `;` `,` | repeat the last find, or reverse it |
-| `0` `^` | start of the line (`^` is an alias for `0` until a first-non-blank motion exists) |
+| `0` | column zero |
+| `^` `g_` | first / last non-blank of the line |
 | `$` | end of the line |
+| `%` | the bracket matching the one at or after the cursor |
+| `{` `}` | previous / next blank line — the paragraph boundary |
 | `gg` | first line |
 | `G` | last line, or line `{n}` when counted |
 | arrows, `Home`, `End` | same as the above |
+
+`e` is *inclusive* and `w` is *exclusive*, which is why both exist: `de` takes
+the word, `dw` takes the word and the space after it.
 
 **Operators** — take a motion, or double the key for whole lines.
 

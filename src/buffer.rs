@@ -517,19 +517,19 @@ impl Buffer {
     }
 
     /// `w` — start of the next word.
-    pub fn word_forward(&self, cur: Cursor, allow_eol: bool) -> Cursor {
+    pub fn word_forward(&self, cur: Cursor, allow_eol: bool, big: bool) -> Cursor {
         let len = self.rope.len_chars();
         let mut i = cur.at;
         if i >= len {
             return cur;
         }
-        let start_class = class_of(self.rope.char(i));
+        let start_class = self.class_at(i, big);
         if start_class != CharClass::Whitespace {
-            while i < len && class_of(self.rope.char(i)) == start_class {
+            while i < len && self.class_at(i, big) == start_class {
                 i += 1;
             }
         }
-        while i < len && class_of(self.rope.char(i)) == CharClass::Whitespace {
+        while i < len && self.class_at(i, big) == CharClass::Whitespace {
             i += 1;
         }
         let landed = self.clamped(Cursor::at(i.min(len)), allow_eol);
@@ -544,22 +544,182 @@ impl Buffer {
         landed
     }
 
-    /// `b` — start of the previous word.
-    pub fn word_backward(&self, cur: Cursor, allow_eol: bool) -> Cursor {
+    /// `b` / `B` — start of the previous word.
+    pub fn word_backward(&self, cur: Cursor, allow_eol: bool, big: bool) -> Cursor {
         if cur.at == 0 {
             return cur;
         }
         let mut i = cur.at - 1;
-        while i > 0 && class_of(self.rope.char(i)) == CharClass::Whitespace {
+        while i > 0 && self.class_at(i, big) == CharClass::Whitespace {
             i -= 1;
         }
-        let class = class_of(self.rope.char(i));
+        let class = self.class_at(i, big);
         if class != CharClass::Whitespace {
-            while i > 0 && class_of(self.rope.char(i - 1)) == class {
+            while i > 0 && self.class_at(i - 1, big) == class {
                 i -= 1;
             }
         }
         self.clamped(Cursor::at(i), allow_eol)
+    }
+
+    /// `e` / `E` / `ge` / `gE` — the end of a word rather than its start.
+    ///
+    /// Always moves at least one character before looking, or `e` sitting on
+    /// the last character of a word would find that same character again and
+    /// the motion would never advance.
+    pub fn word_end(&self, cur: Cursor, allow_eol: bool, big: bool, forward: bool) -> Cursor {
+        let len = self.rope.len_chars();
+        if len == 0 {
+            return cur;
+        }
+        let mut i = cur.at;
+        if forward {
+            if i + 1 >= len {
+                return self.clamped(Cursor::at(len - 1), allow_eol);
+            }
+            i += 1;
+            while i < len && self.class_at(i, big) == CharClass::Whitespace {
+                i += 1;
+            }
+            if i >= len {
+                return self.clamped(Cursor::at(len - 1), allow_eol);
+            }
+            let class = self.class_at(i, big);
+            while i + 1 < len && self.class_at(i + 1, big) == class {
+                i += 1;
+            }
+        } else {
+            if i == 0 {
+                return cur;
+            }
+            i -= 1;
+            // Step off the current word first: `ge` from inside a word means
+            // the end of the *previous* one, not the character behind you.
+            let here = self.class_at(cur.at, big);
+            if here != CharClass::Whitespace {
+                while i > 0 && self.class_at(i, big) == here {
+                    i -= 1;
+                }
+            }
+            while i > 0 && self.class_at(i, big) == CharClass::Whitespace {
+                i -= 1;
+            }
+        }
+        self.clamped(Cursor::at(i.min(len.saturating_sub(1))), allow_eol)
+    }
+
+    /// `^` — the first character on the line that is not a blank, or the last
+    /// column when the whole line is blank.
+    pub fn first_non_blank(&self, cur: Cursor) -> Cursor {
+        let row = self.row_at(cur);
+        let start = self.rope.line_to_char(row);
+        let len = self.line_len(row);
+        let mut i = 0;
+        while i < len && self.rope.char(start + i).is_whitespace() {
+            i += 1;
+        }
+        Cursor::at(start + i.min(len.saturating_sub(1)))
+    }
+
+    /// `g_` — the last character on the line that is not a blank.
+    pub fn last_non_blank(&self, cur: Cursor, allow_eol: bool) -> Cursor {
+        let row = self.row_at(cur);
+        let start = self.rope.line_to_char(row);
+        let len = self.line_len(row);
+        let mut i = len;
+        while i > 0 && self.rope.char(start + i - 1).is_whitespace() {
+            i -= 1;
+        }
+        self.clamped(Cursor::at(start + i.saturating_sub(1)), allow_eol)
+    }
+
+    /// `%` — the bracket matching the first one at or after the cursor.
+    ///
+    /// Vim scans forward on the line for a bracket to start from, so `%`
+    /// anywhere before an opening paren still works. Staying put when there is
+    /// none leaves an operator with an empty range, which is the right answer.
+    pub fn matching_bracket(&self, cur: Cursor, allow_eol: bool) -> Cursor {
+        const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+        let len = self.rope.len_chars();
+        let row = self.row_at(cur);
+        let row_end = self.rope.line_to_char(row) + self.line_len(row);
+
+        let mut from = cur.at;
+        let (open, close, forward) = loop {
+            if from >= row_end || from >= len {
+                return cur;
+            }
+            let c = self.rope.char(from);
+            if let Some(&(o, c2)) = PAIRS.iter().find(|(o, _)| *o == c) {
+                break (o, c2, true);
+            }
+            if let Some(&(o, c2)) = PAIRS.iter().find(|(_, c2)| *c2 == c) {
+                break (o, c2, false);
+            }
+            from += 1;
+        };
+
+        let (mine, theirs) = if forward { (open, close) } else { (close, open) };
+        let mut depth = 0usize;
+        let mut i = from;
+        loop {
+            let c = self.rope.char(i);
+            if c == mine {
+                depth += 1;
+            } else if c == theirs {
+                depth -= 1;
+                if depth == 0 {
+                    return self.clamped(Cursor::at(i), allow_eol);
+                }
+            }
+            if forward {
+                i += 1;
+                if i >= len {
+                    return cur;
+                }
+            } else {
+                if i == 0 {
+                    return cur;
+                }
+                i -= 1;
+            }
+        }
+    }
+
+    /// `{` / `}` — the next blank line in that direction, or the end of the
+    /// buffer. Vim's paragraph boundary, which is a line with nothing on it.
+    pub fn paragraph_move(&self, cur: Cursor, forward: bool, allow_eol: bool) -> Cursor {
+        let last = self.line_count().saturating_sub(1);
+        let mut row = self.row_at(cur);
+        loop {
+            if forward {
+                if row >= last {
+                    return self.clamped(Cursor::at(self.rope.len_chars()), allow_eol);
+                }
+                row += 1;
+            } else {
+                if row == 0 {
+                    return Cursor::at(0);
+                }
+                row -= 1;
+            }
+            if self.line_len(row) == 0 {
+                return self.clamped(Cursor::at(self.rope.line_to_char(row)), allow_eol);
+            }
+        }
+    }
+
+    /// A character's class, with `big` folding punctuation into words so that
+    /// only whitespace separates a WORD.
+    fn class_at(&self, at: usize, big: bool) -> CharClass {
+        match class_of(self.rope.char(at)) {
+            CharClass::Whitespace => CharClass::Whitespace,
+            other if big => {
+                let _ = other;
+                CharClass::Word
+            }
+            other => other,
+        }
     }
 
     // ---- operators ---------------------------------------------------------
@@ -590,9 +750,16 @@ impl Buffer {
                 Motion::Right => self.right(cur, eol),
                 Motion::Up => self.vertical(cur, -1, eol),
                 Motion::Down => self.vertical(cur, 1, eol),
-                Motion::WordForward => self.word_forward(cur, eol),
-                Motion::WordBackward => self.word_backward(cur, eol),
+                Motion::Word { big, forward: true, end: false } => self.word_forward(cur, eol, big),
+                Motion::Word { big, forward: false, end: false } => {
+                    self.word_backward(cur, eol, big)
+                }
+                Motion::Word { big, forward, end: true } => self.word_end(cur, eol, big, forward),
                 Motion::LineStart => self.line_start(cur),
+                Motion::FirstNonBlank => self.first_non_blank(cur),
+                Motion::LastNonBlank => self.last_non_blank(cur, eol),
+                Motion::MatchingBracket => self.matching_bracket(cur, eol),
+                Motion::Paragraph { forward } => self.paragraph_move(cur, forward, eol),
                 Motion::LineEnd => self.line_end(cur, eol),
                 Motion::CurrentLine
                 | Motion::FirstLine
@@ -610,21 +777,21 @@ impl Buffer {
     /// End of the `count`-th word from `at`, or `None` if `at` is whitespace.
     ///
     /// This is `e`, and it exists only to serve the `cw` quirk below.
-    fn word_end_from(&self, at: usize, count: usize) -> Option<usize> {
+    fn word_end_from(&self, at: usize, count: usize, big: bool) -> Option<usize> {
         let len = self.rope.len_chars();
-        if at >= len || class_of(self.rope.char(at)) == CharClass::Whitespace {
+        if at >= len || self.class_at(at, big) == CharClass::Whitespace {
             return None;
         }
         let mut i = at;
         for _ in 0..count {
-            while i < len && class_of(self.rope.char(i)) == CharClass::Whitespace {
+            while i < len && self.class_at(i, big) == CharClass::Whitespace {
                 i += 1;
             }
             if i >= len {
                 break;
             }
-            let class = class_of(self.rope.char(i));
-            while i + 1 < len && class_of(self.rope.char(i + 1)) == class {
+            let class = self.class_at(i, big);
+            while i + 1 < len && self.class_at(i + 1, big) == class {
                 i += 1;
             }
             i += 1;
@@ -718,8 +885,8 @@ impl Buffer {
         // Vim quirk: `cw` on a non-blank is `ce` — it changes the word without
         // swallowing the whitespace after it. On whitespace it is plain `w`.
         if op == Operator::Change
-            && motion == Motion::WordForward
-            && let Some(end) = self.word_end_from(at.at, count)
+            && let Motion::Word { big, forward: true, end: false } = motion
+            && let Some(end) = self.word_end_from(at.at, count, big)
         {
             return Some((at.at, (end + 1).min(len)));
         }
@@ -731,7 +898,9 @@ impl Buffer {
         }
         // Vim quirk: an exclusive motion that leaves the line stops at the end
         // of it, so `dw` on the last word of a line does not join the next one.
-        if motion == Motion::WordForward && self.row_of(hi) > self.row_of(lo) {
+        if matches!(motion, Motion::Word { forward: true, end: false, .. })
+            && self.row_of(hi) > self.row_of(lo)
+        {
             let row = self.row_of(lo);
             hi = self.rope.line_to_char(row) + self.line_len(row);
         }
@@ -956,7 +1125,11 @@ impl Buffer {
 
                 self.apply_edit(start, start, &text);
                 let landed = if before { row } else { row + 1 };
-                self.at_row(landed, false)
+                // Vim puts the cursor on the first *non-blank* of the pasted
+                // line, which matters the moment you paste indented code.
+                // `registers.md` settled for the first character until a
+                // first-non-blank motion existed; `^` is now one.
+                self.first_non_blank(self.at_row(landed, false))
             }
             EntryKind::Blockwise => {
                 let row = self.row_at(at);
@@ -997,9 +1170,18 @@ impl Buffer {
             Motion::Right => self.right(at, allow_eol),
             Motion::Up => self.vertical(at, -1, allow_eol),
             Motion::Down => self.vertical(at, 1, allow_eol),
-            Motion::WordForward => self.word_forward(at, allow_eol),
-            Motion::WordBackward => self.word_backward(at, allow_eol),
+            Motion::Word { big, forward: true, end: false } => {
+                self.word_forward(at, allow_eol, big)
+            }
+            Motion::Word { big, forward: false, end: false } => {
+                self.word_backward(at, allow_eol, big)
+            }
+            Motion::Word { big, forward, end: true } => self.word_end(at, allow_eol, big, forward),
             Motion::LineStart => self.line_start(at),
+            Motion::FirstNonBlank => self.first_non_blank(at),
+            Motion::LastNonBlank => self.last_non_blank(at, allow_eol),
+            Motion::MatchingBracket => self.matching_bracket(at, allow_eol),
+            Motion::Paragraph { forward } => self.paragraph_move(at, forward, allow_eol),
             Motion::LineEnd => self.line_end(at, allow_eol),
             Motion::FirstLine => self.at_row(0, allow_eol),
             Motion::LastLine => self.at_row(usize::MAX, allow_eol),
@@ -1692,14 +1874,139 @@ mod tests {
     #[test]
     fn word_motions_cross_punctuation_and_whitespace() {
         let mut b = buf("foo.bar  baz");
-        b.apply_motion(Motion::WordForward, false);
+        b.apply_motion(Motion::Word { big: false, forward: true, end: false }, false);
         assert_eq!(b.cursor.at, 3, "stops at the dot");
-        b.apply_motion(Motion::WordForward, false);
+        b.apply_motion(Motion::Word { big: false, forward: true, end: false }, false);
         assert_eq!(b.cursor.at, 4, "then the word after it");
-        b.apply_motion(Motion::WordForward, false);
+        b.apply_motion(Motion::Word { big: false, forward: true, end: false }, false);
         assert_eq!(b.cursor.at, 9, "skips the double space");
-        b.apply_motion(Motion::WordBackward, false);
+        b.apply_motion(Motion::Word { big: false, forward: false, end: false }, false);
         assert_eq!(b.cursor.at, 4);
+    }
+
+    /// Shorthands, because the flags read badly inline.
+    const fn word(forward: bool, end: bool) -> Motion {
+        Motion::Word { big: false, forward, end }
+    }
+    const fn big_word(forward: bool, end: bool) -> Motion {
+        Motion::Word { big: true, forward, end }
+    }
+
+    /// A WORD is whitespace-delimited, so `W` steps over the punctuation `w`
+    /// stops at.
+    #[test]
+    fn big_word_motions_ignore_punctuation() {
+        let mut b = buf("foo.bar  baz");
+        b.apply_motion(big_word(true, false), false);
+        assert_eq!(b.cursor.at, 9, "straight past the dot to the next WORD");
+        b.apply_motion(big_word(false, false), false);
+        assert_eq!(b.cursor.at, 0, "and all the way back");
+    }
+
+    #[test]
+    fn e_lands_on_the_last_character_of_a_word_and_keeps_going() {
+        let mut b = buf("foo.bar  baz");
+        b.apply_motion(word(true, true), false);
+        assert_eq!(b.cursor.at, 2, "the second o, not the dot");
+        // From the end of a word it must advance, or `e` would never move.
+        b.apply_motion(word(true, true), false);
+        assert_eq!(b.cursor.at, 3, "the dot is its own word");
+        b.apply_motion(word(true, true), false);
+        assert_eq!(b.cursor.at, 6, "end of bar");
+
+        let mut b = buf("foo.bar  baz");
+        b.apply_motion(big_word(true, true), false);
+        assert_eq!(b.cursor.at, 6, "E takes foo.bar whole");
+    }
+
+    #[test]
+    fn ge_goes_back_to_the_end_of_the_previous_word() {
+        let mut b = buf("foo bar baz");
+        b.cursor = Cursor::at(9);
+        b.apply_motion(word(false, true), false);
+        assert_eq!(b.cursor.at, 6, "end of bar");
+        b.apply_motion(word(false, true), false);
+        assert_eq!(b.cursor.at, 2, "end of foo");
+        b.apply_motion(word(false, true), false);
+        assert_eq!(b.cursor.at, 0, "nowhere further back to go");
+    }
+
+    /// The difference between `de` and `dw` is the reason both keys exist:
+    /// `e` is inclusive and stops at the word, `w` is exclusive and takes the
+    /// whitespace after it.
+    #[test]
+    fn de_takes_the_word_and_dw_takes_the_space_too() {
+        let mut b = buf("foo bar");
+        b.operate(Operator::Delete, Target::Motion(word(true, true)), 1);
+        assert_eq!(b.rope().to_string(), " bar");
+
+        let mut b = buf("foo bar");
+        b.operate(Operator::Delete, Target::Motion(word(true, false)), 1);
+        assert_eq!(b.rope().to_string(), "bar");
+    }
+
+    #[test]
+    fn caret_is_the_first_non_blank_and_zero_is_still_column_zero() {
+        let mut b = buf("    indented");
+        b.cursor = Cursor::at(8);
+        b.apply_motion(Motion::FirstNonBlank, false);
+        assert_eq!(b.cursor_col(), 4, "past the indent");
+        b.apply_motion(Motion::LineStart, false);
+        assert_eq!(b.cursor_col(), 0, "`0` is unchanged by `^` existing");
+
+        // A line that is nothing but blanks has no non-blank to find.
+        let mut b = buf("    ");
+        b.apply_motion(Motion::FirstNonBlank, false);
+        assert_eq!(b.cursor_col(), 3, "clamped rather than off the end");
+    }
+
+    #[test]
+    fn g_underscore_is_the_last_non_blank() {
+        let mut b = buf("hello world   ");
+        b.apply_motion(Motion::LastNonBlank, false);
+        assert_eq!(b.cursor.at, 10, "the d, not the trailing spaces");
+
+        // Inclusive, like `$`, so the character it lands on comes with it.
+        let mut b = buf("hello world   ");
+        b.operate(Operator::Delete, Target::Motion(Motion::LastNonBlank), 1);
+        assert_eq!(b.rope().to_string(), "   ");
+    }
+
+    #[test]
+    fn percent_jumps_between_matching_brackets() {
+        let mut b = buf("if (a[0]) { x }");
+        b.apply_motion(Motion::MatchingBracket, false);
+        assert_eq!(b.cursor.at, 8, "scanned forward to `(` and matched its `)`");
+
+        // And back again from the closing side.
+        b.apply_motion(Motion::MatchingBracket, false);
+        assert_eq!(b.cursor.at, 3);
+
+        // Nesting is counted, not just the next bracket of the same kind.
+        let mut b = buf("((x))");
+        b.apply_motion(Motion::MatchingBracket, false);
+        assert_eq!(b.cursor.at, 4, "the outer pair");
+
+        // Nothing to match is not an error; it simply does not move.
+        let mut b = buf("plain text");
+        b.apply_motion(Motion::MatchingBracket, false);
+        assert_eq!(b.cursor.at, 0);
+    }
+
+    #[test]
+    fn braces_move_by_paragraph() {
+        let mut b = buf("one\ntwo\n\nthree\n\nfour");
+        b.apply_motion(Motion::Paragraph { forward: true }, false);
+        assert_eq!(b.row_of(b.cursor.at), 2, "the blank line after the first block");
+        b.apply_motion(Motion::Paragraph { forward: true }, false);
+        assert_eq!(b.row_of(b.cursor.at), 4);
+        b.apply_motion(Motion::Paragraph { forward: false }, false);
+        assert_eq!(b.row_of(b.cursor.at), 2, "and back");
+
+        // Past the last paragraph it stops at the end rather than wrapping.
+        b.apply_motion(Motion::Paragraph { forward: true }, false);
+        b.apply_motion(Motion::Paragraph { forward: true }, false);
+        assert_eq!(b.row_of(b.cursor.at), 5);
     }
 
     #[test]
@@ -1892,19 +2199,43 @@ mod tests {
     #[test]
     fn dw_deletes_to_the_start_of_the_next_word() {
         assert_eq!(
-            op("foo bar baz", 0, Operator::Delete, Target::Motion(Motion::WordForward), 1),
+            op(
+                "foo bar baz",
+                0,
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1
+            ),
             "bar baz"
         );
     }
 
     #[test]
     fn dw_on_the_last_word_takes_all_of_it() {
-        assert_eq!(op("foo", 0, Operator::Delete, Target::Motion(Motion::WordForward), 1), "");
+        assert_eq!(
+            op(
+                "foo",
+                0,
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1
+            ),
+            ""
+        );
     }
 
     #[test]
     fn counted_dw_deletes_that_many_words() {
-        assert_eq!(op("a b c d", 0, Operator::Delete, Target::Motion(Motion::WordForward), 3), "d");
+        assert_eq!(
+            op(
+                "a b c d",
+                0,
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                3
+            ),
+            "d"
+        );
     }
 
     /// Vim quirk: `cw` on a non-blank behaves like `ce`, so the whitespace after
@@ -1912,7 +2243,13 @@ mod tests {
     #[test]
     fn cw_changes_the_word_and_leaves_the_spaces() {
         assert_eq!(
-            op("foo   bar", 0, Operator::Change, Target::Motion(Motion::WordForward), 1),
+            op(
+                "foo   bar",
+                0,
+                Operator::Change,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1
+            ),
             "   bar"
         );
     }
@@ -1920,7 +2257,13 @@ mod tests {
     #[test]
     fn cw_on_whitespace_is_not_special_and_acts_like_w() {
         assert_eq!(
-            op("a   bar", 1, Operator::Change, Target::Motion(Motion::WordForward), 1),
+            op(
+                "a   bar",
+                1,
+                Operator::Change,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1
+            ),
             "abar"
         );
     }
@@ -1928,7 +2271,13 @@ mod tests {
     #[test]
     fn counted_cw_reaches_the_end_of_the_last_word() {
         assert_eq!(
-            op("foo   bar baz", 0, Operator::Change, Target::Motion(Motion::WordForward), 2),
+            op(
+                "foo   bar baz",
+                0,
+                Operator::Change,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                2
+            ),
             " baz"
         );
     }
@@ -1938,7 +2287,13 @@ mod tests {
     #[test]
     fn dw_at_the_end_of_a_line_does_not_join_lines() {
         assert_eq!(
-            op("hello\nworld", 3, Operator::Delete, Target::Motion(Motion::WordForward), 1),
+            op(
+                "hello\nworld",
+                3,
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1
+            ),
             "hel\nworld"
         );
     }
@@ -1962,7 +2317,13 @@ mod tests {
     #[test]
     fn db_deletes_the_previous_word() {
         assert_eq!(
-            op("foo bar", 4, Operator::Delete, Target::Motion(Motion::WordBackward), 1),
+            op(
+                "foo bar",
+                4,
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: false, end: false }),
+                1
+            ),
             "bar"
         );
     }
@@ -2034,7 +2395,12 @@ mod tests {
         let mut b = buf("abc");
         b.cursor = Cursor::at(0);
         assert!(
-            b.operate(Operator::Delete, Target::Motion(Motion::WordBackward), 1).is_none(),
+            b.operate(
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: false, end: false }),
+                1
+            )
+            .is_none(),
             "b at char 0 has no range"
         );
         assert_eq!(b.rope().to_string(), "abc");
@@ -2045,7 +2411,13 @@ mod tests {
     #[test]
     fn a_charwise_operator_captures_what_it_took() {
         let mut b = buf("foo bar");
-        let e = b.operate(Operator::Delete, Target::Motion(Motion::WordForward), 1).unwrap();
+        let e = b
+            .operate(
+                Operator::Delete,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1,
+            )
+            .unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(e.kind, EntryKind::Charwise);
     }
@@ -2071,7 +2443,13 @@ mod tests {
     #[test]
     fn yank_captures_without_touching_the_text() {
         let mut b = buf("foo bar");
-        let e = b.operate(Operator::Yank, Target::Motion(Motion::WordForward), 1).unwrap();
+        let e = b
+            .operate(
+                Operator::Yank,
+                Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                1,
+            )
+            .unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(b.rope().to_string(), "foo bar", "yank is not a mutation");
         assert!(b.pending_edits.is_empty(), "and logs no edit");
@@ -2081,7 +2459,13 @@ mod tests {
     fn a_backward_yank_leaves_the_cursor_at_the_start_of_the_range() {
         let mut b = buf("foo bar");
         b.cursor = Cursor::at(4);
-        let e = b.operate(Operator::Yank, Target::Motion(Motion::WordBackward), 1).unwrap();
+        let e = b
+            .operate(
+                Operator::Yank,
+                Target::Motion(Motion::Word { big: false, forward: false, end: false }),
+                1,
+            )
+            .unwrap();
         assert_eq!(e.text, "foo ");
         assert_eq!(b.cursor.at, 0);
     }

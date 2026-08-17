@@ -4001,7 +4001,11 @@ mod tests {
     #[test]
     fn dw_deletes_a_word_and_undoes_in_one_step() {
         let mut ed = editor("foo bar baz");
-        ed.apply(operate(Operator::Delete, Motion::WordForward, 2));
+        ed.apply(operate(
+            Operator::Delete,
+            Motion::Word { big: false, forward: true, end: false },
+            2,
+        ));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "baz");
 
         ed.apply(cmd(Action::Undo));
@@ -4011,7 +4015,11 @@ mod tests {
     #[test]
     fn c_enters_insert_mode_so_you_can_type_the_replacement() {
         let mut ed = editor("foo bar");
-        ed.apply(operate(Operator::Change, Motion::WordForward, 1));
+        ed.apply(operate(
+            Operator::Change,
+            Motion::Word { big: false, forward: true, end: false },
+            1,
+        ));
         assert_eq!(ed.session.mode, Mode::Insert);
         assert_eq!(ed.buffer().unwrap().rope().to_string(), " bar");
 
@@ -4025,7 +4033,11 @@ mod tests {
     #[test]
     fn a_change_and_its_typing_undo_together() {
         let mut ed = editor("foo bar");
-        ed.apply(operate(Operator::Change, Motion::WordForward, 1));
+        ed.apply(operate(
+            Operator::Change,
+            Motion::Word { big: false, forward: true, end: false },
+            1,
+        ));
         type_str(&mut ed, "xyz");
         ed.apply(cmd(Action::EnterNormal));
 
@@ -4037,7 +4049,11 @@ mod tests {
     fn a_delete_that_matches_nothing_leaves_no_undo_step() {
         let mut ed = editor("abc");
         ed.apply(operate(Operator::Delete, Motion::Right, 1));
-        ed.apply(operate(Operator::Delete, Motion::WordBackward, 1));
+        ed.apply(operate(
+            Operator::Delete,
+            Motion::Word { big: false, forward: false, end: false },
+            1,
+        ));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "bc", "b at char 0 did nothing");
 
         ed.apply(cmd(Action::Undo));
@@ -4051,7 +4067,11 @@ mod tests {
     #[test]
     fn yank_then_paste_round_trips() {
         let mut ed = editor("foo bar");
-        ed.apply(operate(Operator::Yank, Motion::WordForward, 1));
+        ed.apply(operate(
+            Operator::Yank,
+            Motion::Word { big: false, forward: true, end: false },
+            1,
+        ));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo bar", "yank changed nothing");
 
         ed.apply(paste(false, 1));
@@ -6662,7 +6682,7 @@ mod tests {
         let mut ed = editor("one two three");
         ed.apply(cmd(Action::Operate {
             op: Operator::Delete,
-            target: Target::Motion(Motion::WordForward),
+            target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
             count: 1,
             sink: Sink::Ring,
         }));
@@ -6672,7 +6692,7 @@ mod tests {
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Operate {
             op: Operator::Yank,
-            target: Target::Motion(Motion::WordForward),
+            target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
             count: 1,
             sink: Sink::Ring,
         }));

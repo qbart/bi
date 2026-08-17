@@ -121,11 +121,12 @@ Vim's `"0` idiom rather than reproducing it.
 | Charwise | insert after the cursor char | insert at the cursor |
 | Linewise | open a new line below | open a new line above |
 
-**Cursor lands** on the last char of pasted charwise text, or on the first char
-of the first pasted line for linewise. (Vim uses first *non-blank* for
-linewise; bi has no first-non-blank motion yet — `^` is currently an alias for
-`0` — so first char is the honest approximation, and it moves when `^` becomes
-real.)
+**Cursor lands** on the last char of pasted charwise text, or on the first
+*non-blank* of the first pasted line for linewise — vim's rule, and it matters
+the moment you paste indented code. This waited on step 3 of `motions.md`:
+until `^` was a real first-non-blank motion rather than an alias for `0`,
+first-char was the honest approximation. `scripts/vim_differential.py` now
+pins it.
 
 **Counts repeat the content**: `3p` pastes three copies as one edit and one
 undo step.

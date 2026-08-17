@@ -9,7 +9,7 @@ and twelve. This file records the gap, what closes it, and in what order.
 |---|---|---|
 | **1** ✅ | `:e` `:e!` `:e <path>`; `D C s S X r{char} ~ J` | nothing new |
 | **2** ✅ | `f F t T ; ,` and text objects `iw aw i( a" …` | a pending-argument state |
-| 3 | `e ge W B E`, real `^`, `g_ + - _`, `%` | nothing new |
+| **3** ✅ | `e ge E gE W B`, real `^`, `g_`, `%`, `{ }` | nothing new |
 | **4** ✅ | `.` — repeat last change | a record of the last change |
 | **5** ✅ | `/ ? n N * #` search | see `search.md` |
 | **6** ✅ | `Ctrl-E/Y`, `Ctrl-D/U` — scrolling only | the window height |
@@ -194,15 +194,42 @@ parse tree; sentences want a sentence definition nobody agrees on.
 
 ## Step 3 — the remaining plain motions
 
-`e` and `ge` (end of word), `W B E` (whitespace-delimited WORDs), `%` (matching
-bracket), and the first-non-blank family: real `^`, `g_`, `+`, `-`, `_`.
+**Built.** `e ge E gE` (end of word), `W B` (whitespace-delimited WORDs), `%`
+(matching bracket), `{` and `}` (paragraphs), and a real `^` and `g_`.
 
-`^` today is an alias for `0`. The README already flags this. Fixing it means
-`Motion::LineStart` keeps meaning column zero and a new `FirstNonBlank` joins
-it, rather than changing what `0` does.
+`^` was an alias for `0`. Fixing it left `Motion::LineStart` meaning column
+zero and added `FirstNonBlank` beside it, rather than changing what `0` does.
 
 `e` is **inclusive** where `w` is exclusive — `dw` and `de` deleting different
-spans is the point of having both.
+spans is the point of having both, and it is one line in `Motion::kind`.
+
+### Eight word motions, one variant
+
+`WordForward` and `WordBackward` became:
+
+```rust
+Motion::Word { big: bool, forward: bool, end: bool }
+```
+
+Eight keys — `w b e ge W B E gE` — are the eight combinations of three
+independent flags, so enumerating them as eight variants would have meant
+eight arms in every match that handles a motion. It also lands ahead of the
+keymap in `config.md`, which has to give each combination a name either way.
+
+The two vim quirks that special-cased `WordForward` now match on
+`Word { forward: true, end: false, .. }`, so they apply to `W` as well as `w`,
+which is what vim does:
+
+- `cw` on a non-blank behaves as `ce` — it changes the word without
+  swallowing the whitespace after it.
+- an exclusive word motion that leaves the line stops at the end of it, so
+  `dw` on the last word of a line does not join the next one.
+
+### `+`, `-` and `_` are not built
+
+The other first-non-blank motions. They are linewise, unlike `^` and `g_`,
+so they want `linewise_rows` rather than a target — a different shape of
+change to the same family, and nothing depends on them.
 
 ## Verification
 
@@ -211,11 +238,19 @@ spans is the point of having both.
 through bi and compares the resulting file. It is not part of `cargo test`: it
 needs vim on `PATH` and drives the binary through a pty.
 
-103 cases match vim exactly, with no divergences. Four differences it found were
+167 cases match vim exactly, with five known divergences and none unexplained.
+Four differences it found were
 fixed rather than recorded — the `t`-repeat rule above, `a"`'s trailing
 whitespace, linewise inner blocks, and a **pre-existing** bug where `dG` on a
 file that already ended in a newline swallowed that newline. It also caught four
 of my own wrong assumptions, where bi was right and the expectation was not.
+
+The five known divergences are all one harness artifact rather than five
+behaviours: `vim -es -c "normal ..."` **aborts the whole key sequence** when a
+command fails, so a case like `eex` at the end of a buffer never runs its `x`.
+bi treats a motion with nowhere to go as staying put and carries on, which is
+what interactive vim does — two of the five were confirmed that way through a
+pty, and the three step-3 cases are the same mechanism.
 
 ## Deferred
 

@@ -14,9 +14,33 @@ pub enum Motion {
     Right,
     Up,
     Down,
-    WordForward,
-    WordBackward,
+    /// `w` `b` `e` `ge`, and their WORD forms `W` `B` `E` `gE`.
+    ///
+    /// One variant rather than eight, because the three flags are genuinely
+    /// independent and the keymap in `docs/specs/config.md` has to name each
+    /// combination anyway. `big` is the whitespace-delimited WORD, where
+    /// punctuation does not break a word; `end` lands on the last character
+    /// of the word instead of the first, which is also what makes it
+    /// inclusive.
+    Word {
+        big: bool,
+        forward: bool,
+        end: bool,
+    },
     LineStart,
+    /// `^` — the first non-blank of the line. Separate from [`Motion::LineStart`]
+    /// rather than replacing it, because `0` still has to mean column zero.
+    FirstNonBlank,
+    /// `g_` — the last non-blank. Inclusive, like `$`, so `dg_` takes the
+    /// final character and leaves the trailing whitespace.
+    LastNonBlank,
+    /// `%` — the bracket matching the one at or after the cursor. Inclusive,
+    /// so `d%` takes both brackets and everything between them.
+    MatchingBracket,
+    /// `{` and `}` — to the blank line that bounds this paragraph.
+    Paragraph {
+        forward: bool,
+    },
     LineEnd,
     FirstLine,
     LastLine,
@@ -140,10 +164,21 @@ impl Motion {
             // resolves it. Exclusive is the conservative answer if it ever
             // leaked, since it deletes less rather than more.
             Motion::RepeatFind { .. } => Kind::Exclusive,
+            // `de` takes the word and `dw` takes the word plus the space after
+            // it. That difference is the whole reason both keys exist, and it
+            // is this line.
+            Motion::Word { end, .. } => {
+                if end {
+                    Kind::Inclusive
+                } else {
+                    Kind::Exclusive
+                }
+            }
+            Motion::LastNonBlank | Motion::MatchingBracket => Kind::Inclusive,
             Motion::Left
             | Motion::Right
-            | Motion::WordForward
-            | Motion::WordBackward
+            | Motion::FirstNonBlank
+            | Motion::Paragraph { .. }
             | Motion::LineStart => Kind::Exclusive,
         }
     }

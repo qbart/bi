@@ -51,10 +51,19 @@ fn motion_key(c: char) -> Option<Motion> {
         'l' | ' ' => Motion::Right,
         'j' => Motion::Down,
         'k' => Motion::Up,
-        'w' => Motion::WordForward,
-        'b' => Motion::WordBackward,
-        '0' | '^' => Motion::LineStart,
+        'w' => Motion::Word { big: false, forward: true, end: false },
+        'b' => Motion::Word { big: false, forward: false, end: false },
+        'e' => Motion::Word { big: false, forward: true, end: true },
+        'W' => Motion::Word { big: true, forward: true, end: false },
+        'B' => Motion::Word { big: true, forward: false, end: false },
+        'E' => Motion::Word { big: true, forward: true, end: true },
+        '0' => Motion::LineStart,
+        // `^` was an alias for `0` until the first-non-blank motion existed.
+        '^' => Motion::FirstNonBlank,
         '$' => Motion::LineEnd,
+        '%' => Motion::MatchingBracket,
+        '{' => Motion::Paragraph { forward: false },
+        '}' => Motion::Paragraph { forward: true },
         _ => return None,
     })
 }
@@ -485,6 +494,9 @@ impl Input {
             self.g_pending = false;
             return match c {
                 'g' => self.resolve(Motion::FirstLine),
+                'e' => self.resolve(Motion::Word { big: false, forward: false, end: true }),
+                'E' => self.resolve(Motion::Word { big: true, forward: false, end: true }),
+                '_' => self.resolve(Motion::LastNonBlank),
                 _ => {
                     self.reset();
                     None
@@ -912,6 +924,77 @@ mod tests {
         Key { code, mods: crate::key::Mods { shift: true, ..Default::default() } }
     }
 
+    /// Feeds `keys` in normal mode and returns what the last one resolved to.
+    fn normal_keys(keys: &str) -> Option<Command> {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in keys.chars() {
+            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+        }
+        last
+    }
+
+    fn motion_of(keys: &str) -> Motion {
+        match normal_keys(keys).unwrap_or_else(|| panic!("{keys:?} resolved to nothing")).action {
+            Action::Move(motion) => motion,
+            other => panic!("{keys:?} is not a motion: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_word_keys_name_all_eight_combinations() {
+        assert_eq!(motion_of("w"), Motion::Word { big: false, forward: true, end: false });
+        assert_eq!(motion_of("b"), Motion::Word { big: false, forward: false, end: false });
+        assert_eq!(motion_of("e"), Motion::Word { big: false, forward: true, end: true });
+        assert_eq!(motion_of("ge"), Motion::Word { big: false, forward: false, end: true });
+        assert_eq!(motion_of("W"), Motion::Word { big: true, forward: true, end: false });
+        assert_eq!(motion_of("B"), Motion::Word { big: true, forward: false, end: false });
+        assert_eq!(motion_of("E"), Motion::Word { big: true, forward: true, end: true });
+        assert_eq!(motion_of("gE"), Motion::Word { big: true, forward: false, end: true });
+    }
+
+    /// `^` was an alias for `0` until now, which the README called out as
+    /// wrong. Fixing it must not disturb `0`.
+    #[test]
+    fn caret_and_zero_are_finally_different_keys() {
+        assert_eq!(motion_of("^"), Motion::FirstNonBlank);
+        assert_eq!(motion_of("0"), Motion::LineStart);
+        assert_eq!(motion_of("g_"), Motion::LastNonBlank);
+    }
+
+    #[test]
+    fn percent_and_the_braces_are_motions_like_any_other() {
+        assert_eq!(motion_of("%"), Motion::MatchingBracket);
+        assert_eq!(motion_of("}"), Motion::Paragraph { forward: true });
+        assert_eq!(motion_of("{"), Motion::Paragraph { forward: false });
+
+        // And so they compose with operators and counts for free — which is
+        // the whole argument for motions being data.
+        // The count rides on the operator, which is where `d2w` puts it too.
+        let cmd = normal_keys("d2}").expect("resolved");
+        assert!(
+            matches!(
+                cmd.action,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Paragraph { forward: true }),
+                    count: 2,
+                    ..
+                }
+            ),
+            "{:?}",
+            cmd.action
+        );
+    }
+
+    /// `0` is a count digit once a count is being typed, and `d2$` must not
+    /// become `d20`. The new `^` sits next to that rule without touching it.
+    #[test]
+    fn zero_after_a_count_is_still_a_digit() {
+        let cmd = normal_keys("20j").expect("resolved");
+        assert_eq!(cmd.count, 20);
+    }
+
     /// The first thing in the keymap to read `shift`, which `Key` has carried
     /// unread since it was written.
     #[test]
@@ -1113,7 +1196,10 @@ mod tests {
     #[test]
     fn a_bare_motion_moves() {
         let cmd = typed("w");
-        assert_eq!(cmd.action, Action::Move(Motion::WordForward));
+        assert_eq!(
+            cmd.action,
+            Action::Move(Motion::Word { big: false, forward: true, end: false })
+        );
         assert_eq!(cmd.count, 1);
     }
 
@@ -1130,7 +1216,7 @@ mod tests {
             typed("dw").action,
             Action::Operate {
                 op: Operator::Delete,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -1143,7 +1229,7 @@ mod tests {
             typed("cw").action,
             Action::Operate {
                 op: Operator::Change,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -1178,7 +1264,7 @@ mod tests {
             typed("2d3w").action,
             Action::Operate {
                 op: Operator::Delete,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 6,
                 sink: Sink::Ring
             }
@@ -1191,7 +1277,7 @@ mod tests {
             typed("d3w").action,
             Action::Operate {
                 op: Operator::Delete,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 3,
                 sink: Sink::Ring
             }
@@ -1250,7 +1336,7 @@ mod tests {
             typed("yw").action,
             Action::Operate {
                 op: Operator::Yank,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 1,
                 sink: Sink::Ring
             }
@@ -1322,7 +1408,7 @@ mod tests {
             typed("\"_dw").action,
             Action::Operate {
                 op: Operator::Delete,
-                target: Target::Motion(Motion::WordForward),
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
                 count: 1,
                 sink: Sink::BlackHole
             }

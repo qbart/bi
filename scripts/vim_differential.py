@@ -30,6 +30,13 @@ BI = os.path.join(
 KNOWN_DIVERGENCES = {
     "esc on search line": "same harness artifact as \"/ not found\": `-es` aborts"
                           " the sequence. Interactive vim agrees with bi.",
+    "e past last": "same class: `e` at the last character of the buffer fails,"
+                   " and `-es` aborts the sequence rather than running the"
+                   " trailing x. Interactively vim beeps and stays put, which"
+                   " is what bi does.",
+    "ge at start": "as above, with `ge` at position 0 — nowhere further back.",
+    "% no bracket": "as above: `%` with no bracket on the line fails in vim."
+                    " bi stays put, which is what interactive vim does too.",
     "/ not found": "harness artifact, not a real difference: `vim -es -c normal`"
                    " aborts the whole key sequence when a search fails, so the"
                    " trailing x never runs. Interactive vim agrees with bi —"
@@ -109,6 +116,34 @@ CASES = [
     ("f miss",         "abc\n",                "dfz"),
     ("t then ;",       "a.b.c.d\n",            "t.;x"),
     ("cfx",            "a-b-x-c\n",            "cfxZ\x1b"),
+
+    # Step 3 motions: word ends, WORDs, first/last non-blank, %, paragraphs.
+    ("yyp indent cursor", "    foo\nbar\n",     "yypx"),
+    ("p linewise cursor",  "  a\nb\n",           "yyjpx"),
+    ("de",             "foo bar baz\n",        "de"),
+    ("de mid word",    "foobar baz\n",         "2lde"),
+    ("de punct",       "foo.bar baz\n",        "de"),
+    ("dE",             "foo.bar baz\n",        "dE"),
+    ("d2e",            "foo bar baz qux\n",    "d2e"),
+    ("dW",             "foo.bar baz\n",        "dW"),
+    ("dB",             "foo.bar baz\n",        "$dB"),
+    ("dge",            "foo bar baz\n",        "$dge"),
+    ("dgE",            "foo.bar baz\n",        "$dgE"),
+    ("e at word end",  "ab cd\n",              "lex"),
+    ("e past last",    "ab\n",                 "eex"),
+    ("ge at start",    "ab cd\n",              "gex"),
+    ("d^",             "    foo bar\n",        "$d^"),
+    ("^ then x",       "    foo\n",            "^x"),
+    ("^ blank line",   "    \n",               "^x"),
+    ("dg_",            "foo bar   \n",         "dg_"),
+    ("g_ then x",      "foo bar   \n",         "g_x"),
+    ("d% parens",      "a (b c) d\n",          "d%"),
+    ("d% nested",      "((x)) y\n",            "d%"),
+    ("d% from close",  "(ab) c\n",             "3ld%"),
+    ("% no bracket",   "plain text\n",         "%x"),
+    ("d}",             "one\ntwo\n\nthree\n",  "d}"),
+    ("d{",             "one\n\ntwo\nthree\n",  "Gd{"),
+    ("} then x",       "one\n\ntwo\n",         "}x"),
 
     ("diw start",      "foo bar baz\n",        "diw"),
     ("diw mid",        "foo bar baz\n",        "wdiw"),
