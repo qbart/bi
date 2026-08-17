@@ -149,18 +149,21 @@ rather than a row index — see [docs/specs/motions.md](docs/specs/motions.md).
 |---|---|
 | `Shift-Down` `Shift-Up` | move this line, or the selected block, one row — `{n}` says how far |
 
-`:m` is the same thing told where to go, and it reads its argument two ways:
+`:m` is vim's `:move`, and its argument is an **address** — a line to land
+*after*, not a distance. `:m 0` is the top, `:m $` the bottom, `:m 12` puts the
+lines after line 12, and the signed forms are addresses too: `+3` means `.+3`,
+which is why `:m -1` names the line above and moves nothing, and `:m -2` is how
+you go up one.
 
-- **A bare number is vim's address** — the lines land *after* line N, so `:m 0`
-  is the top, `:m $` the bottom, and `:m 12` puts them after line 12. Identical
-  to vim, which is why it is direction-dependent: coming from above line 12 they
-  become line 12, coming from below, line 13.
-- **A signed number is a distance** — `:m +3` is three rows down, `:m -2` two
-  rows up. Vim reads those as addresses too, which is why `:m-2` there travels
-  one row and `:m-1` travels none. Here the number you type is the number of
-  rows, and a distance past either end clamps rather than refusing.
+Being an address is also why it is direction-dependent: coming from above line
+12 the line becomes line 12, coming from below it becomes line 13. And an
+address off either end is refused rather than clamped, because a typed line
+number is a claim about a line that either exists or does not.
 
-See [docs/specs/move-lines.md](docs/specs/move-lines.md).
+The arrows are the other half of this, and are not vim: `Shift-Down` travels
+one row, `{n}` of them, and simply stops at the end. Reach for `:m` when you
+know the line, and for the arrows when you know the distance. See
+[docs/specs/move-lines.md](docs/specs/move-lines.md).
 
 In visual mode the block moves and stays selected, so nudging it is a matter of
 holding the key. `m` itself is untouched, and still free for the marks the gaps
@@ -307,8 +310,8 @@ afterwards repeats it.
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
-| `:m +3` `:m -2` | move this line, or the selection, that many rows |
-| `:m 0` `:m $` `:m 12` | after line 0, the last line, or line 12 — vim's addresses |
+| `:m 12` `:m 0` `:m $` | move this line, or the selection, after that line |
+| `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |

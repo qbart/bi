@@ -4,14 +4,19 @@ Reordering a file means yanking lines, moving, and pasting them back — three
 commands and a register spent, for what is one thought. `:m` is that thought,
 and `Shift-Up` / `Shift-Down` are the same thing without the colon.
 
+Two halves, and they answer different questions. `:m` is vim's `:move`, exactly
+— you know the line you want to be after. The arrows are bee's own — you know
+how far, and counting rows to turn that into a line number is the work the
+command was supposed to save.
+
 ## Status
 
 **Built.**
 
 Three corrections below, marked **Corrected**: how many edits a move takes,
 what a file with no final newline needs — two cases, of which one was written
-down — and what a bare number means, which is now vim's address rather than
-this spec's first answer.
+down — and what the argument to `:m` means, which is now vim's address in every
+form rather than the distance this spec first chose.
 
 ## What `m` costs
 
@@ -24,38 +29,50 @@ keys are the arrows.
 ## The command
 
 ```
-:m +3       down three rows
-:m -2       up two rows
+:m 12       after line 12
 :m 0        after line 0 — the top
 :m $        after the last line
-:m 12       after line 12
+:m +3       after `.+3`
+:m -2       after `.-2`, which is one row up
 ```
 
 Over a visual selection, the whole block moves and stays selected, so a second
 `:m` — or a second `Shift-Down` — carries on from where the first left off.
 
-The argument is read two ways, and the split is on the sign.
+**Every form is an address**, which is to say a line to land after, and none of
+them is a distance. `.` is the cursor's line, so `+3` is `.+3`; `:m -1` names
+the line above and therefore moves nothing at all, and `-2` is how you go up
+one. That reads like an off-by-one and is not one: it falls out of "after",
+and it is why every vimrc in the world binds `:m .+1` and `:m .-2`.
 
-**A bare number is vim's address**, exactly: the lines land *after* line N, and
-`0` and `$` are the same addresses they always were. This is why the absolute
-form is direction-dependent, and why that is not a bug — the address names a
-line in the buffer as it stands, so a block arriving from above leaves a hole
-that the address falls through, and one arriving from below finds everything
-above the address untouched. From line 2, `:m 4` becomes line 4; from line 5,
-`:m 2` becomes line 3. Both measured against vim 9.0, along with every other
-combination in a five-line buffer and every two-line block in one.
+Three consequences worth stating, because each is a thing someone will file as
+a bug:
 
-**Corrected.** A bare number first meant "become line N", which is neither vim
-nor obviously better: it reads the same for a block travelling down and differs
-only going up, so it was a divergence nobody would notice until it bit them.
-The address is the older, better-known answer and costs nothing to match.
+**It is direction-dependent.** The address names a line in the buffer as it
+stands, so a block arriving from above leaves a hole the address falls through,
+while one arriving from below finds everything above the address untouched.
+From line 2, `:m 4` becomes line 4; from line 5, `:m 2` becomes line 3.
 
-**A signed number is a distance.** `+3` is three rows down and `-2` is two rows
-up. Vim reads those as addresses too — `.+3` and `.-2` — which is why `:m-2`
-there travels one row and `:m-1` travels none. That is a fine primitive and a
-poor command: an off-by-one between the number typed and the rows travelled is
-a trap that never stops being one, and `Shift-Up` needs a distance behind it
-anyway. This half of the divergence is deliberate and stays.
+**An address off either end is refused**, not clamped, and says so. A typed line
+number is a claim about a line that either exists or does not. The arrow keys
+clamp, because they name no line — that difference is the whole distinction
+between the two halves.
+
+**An address inside the range moves nothing.** `:2,3m 2` and `:2,3m 3` are
+no-ops, which falls out of the arithmetic rather than needing a rule.
+
+**Corrected, twice, and this is the second.** `:m` first read `+N` as N rows
+down and a bare `N` as "become line N". The bare number went first, being a
+divergence nobody would notice until it bit them; the signed forms followed,
+because half a divergence is worse than either whole — the point of matching
+vim is that `:m .-2` does what a decade of muscle memory says, and that is not
+true of a command that is vim in one form and not in another.
+
+What survives is the distance model, moved to where it belongs: the arrows.
+
+All of it is measured against vim 9.0 rather than remembered — every cursor
+line against every address in a five-line buffer, and every two-line block
+against a spread of them.
 
 **A move that would run off either end clamps** rather than refusing. `:m +99`
 on the third-from-last line means "to the bottom", which is what someone typing
@@ -68,9 +85,15 @@ Shift-Down    move it down one
 Shift-Up      move it up one
 ```
 
-With a count, `3 Shift-Down` moves three. In visual mode they move the
-selection and keep it, which is what makes nudging a block a matter of holding
-a key rather than counting rows first.
+With a count, `3 Shift-Down` moves three, and running off the end simply stops.
+In visual mode they move the selection and keep it, which is what makes nudging
+a block a matter of holding a key rather than counting rows first.
+
+These are the distance half, and they are not vim — vim has no such key, and
+the mappings everyone writes for it are `:m .+1` and `:m .-2` wrapped in `gv=gv`
+to get the selection back. `Shift-Down` is that, without the wrapping. It is
+also why `:m` can be vim-exact without anyone having to count rows: the
+question "how far" now has a key of its own.
 
 `Key` has carried `shift` since it was written — "`alt` and `shift` are carried
 even though the keymap reads neither today", says `key.rs`, and this is the

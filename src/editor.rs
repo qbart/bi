@@ -615,18 +615,17 @@ enum ExLine {
     Goto(usize),
 }
 
-/// Where `:m` puts the lines.
+/// Where `:m` puts the lines — an address, exactly as in vim.
 ///
-/// `+N` is *down N rows* and `-N` is *up N*, which is not vim's `:m`: there the
-/// argument is an address to move the line after, so `:m-2` travels one row and
-/// `:m-1` travels none. A fine primitive and a poor command — the whole point
-/// here is distance, and an off-by-one between the number typed and the rows
-/// travelled never stops being a trap. See `docs/specs/move-lines.md`.
+/// Every form names a line to land *after*, including the signed ones: `+3` is
+/// `.+3` and `-2` is `.-2`, which is why `:m -1` moves nothing at all. The
+/// arithmetic is vim's, measured against it rather than remembered. See
+/// `docs/specs/move-lines.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveTo {
-    Down(usize),
-    Up(usize),
-    /// `:m 12` — so that it becomes row 12. `:m 0` is the top.
+    /// `+N` / `-N`, relative to the cursor's line.
+    Relative(isize),
+    /// `:m 12` — after line 12. `:m 0` is before the first.
     Row(usize),
     /// `:m $`.
     End,
@@ -637,17 +636,17 @@ fn parse_move(arg: &str) -> Option<MoveTo> {
     if arg == "$" {
         return Some(MoveTo::End);
     }
-    // A bare `+` or `-` is one row, which is what a finger reaching for the
-    // key rather than the number means.
-    let distance = |rest: &str| -> Option<usize> {
+    // A bare `+` or `-` is one, which is what a finger reaching for the key
+    // rather than the number means. Vim reads them the same way.
+    let offset = |rest: &str| -> Option<isize> {
         match rest.trim() {
             "" => Some(1),
             n => n.parse().ok(),
         }
     };
     match arg.split_at_checked(1) {
-        Some(("+", rest)) => distance(rest).map(MoveTo::Down),
-        Some(("-", rest)) => distance(rest).map(MoveTo::Up),
+        Some(("+", rest)) => offset(rest).map(MoveTo::Relative),
+        Some(("-", rest)) => offset(rest).map(|n| MoveTo::Relative(-n)),
         _ => arg.parse().ok().map(MoveTo::Row),
     }
 }
@@ -3469,15 +3468,28 @@ impl View<'_> {
         }]);
     }
 
-    /// `:m` — the same move the arrows make, told where to go.
+    /// `:m {address}` — vim's move, arithmetic and all.
     fn move_to(&mut self, to: MoveTo) {
         let (first, last) = self.selected_rows();
-        let row = match to {
-            MoveTo::Down(by) => first + by,
-            MoveTo::Up(by) => first.saturating_sub(by),
-            MoveTo::Row(address) => self.after_line(address, first, last),
-            MoveTo::End => self.after_line(self.buffer.line_count(), first, last),
+        let lines = self.buffer.line_count() as isize;
+        // `.` is the cursor's line. A range does not move it, which is why
+        // `:m +1` over a selection depends on which end the cursor is at —
+        // vim's behaviour, and the reason `Shift-Down` exists for the job.
+        let here = self.buffer.row_at(self.selections.cursor()) as isize + 1;
+        let address = match to {
+            MoveTo::Relative(by) => here + by,
+            MoveTo::Row(row) => row as isize,
+            MoveTo::End => lines,
         };
+
+        // Off either end is refused rather than clamped, because that is what
+        // vim does — and unlike the arrow keys, a typed address is a claim
+        // about a line that either exists or does not.
+        if address < 0 || address > lines {
+            self.session.status = format!("no line {address}");
+            return;
+        }
+        let row = self.after_line(address as usize, first, last);
         self.move_lines(first, last, row);
     }
 
@@ -4287,16 +4299,24 @@ mod tests {
         assert_eq!(ed.buffer().unwrap().edits(), edits, "and leaves no undo step");
     }
 
-    /// `+N` is N rows down, where vim's `:m+1` is an address to move after —
-    /// which is why `:m-1` does nothing there and one row up here.
+    /// The signed forms are addresses too — `+3` is `.+3` — so `:m -1` names
+    /// the line above and moves nothing. Every line here is what vim 9.0
+    /// prints for the same keystrokes.
     #[test]
-    fn the_ex_command_counts_rows_rather_than_naming_an_address() {
-        let mut ed = editor("a\nb\nc\nd\n");
-        ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
+    fn the_signed_forms_are_addresses_relative_to_the_cursor() {
+        let at = |arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(2, false));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
 
-        ex(&mut ed, "m -2");
-
-        assert_eq!(whole(&ed), "a\nd\nb\nc\n", "two rows up, not one");
+        assert_eq!(at("m +1"), "a\nb\nd\nc\ne\n");
+        assert_eq!(at("m +2"), "a\nb\nd\ne\nc\n");
+        assert_eq!(at("m -2"), "a\nc\nb\nd\ne\n");
+        assert_eq!(at("m -1"), "a\nb\nc\nd\ne\n", "names the line above, so nothing");
+        assert_eq!(at("m +"), "a\nb\nd\nc\ne\n", "a bare sign is one");
+        assert_eq!(at("m -"), "a\nb\nc\nd\ne\n");
     }
 
     #[test]
@@ -4311,9 +4331,9 @@ mod tests {
     }
 
     /// A bare number is vim's address — the lines land *after* line N — and
-    /// these four cases are what vim 9.0 actually prints, measured rather than
-    /// remembered. Note it is direction-dependent by nature: from above, "after
-    /// line 4" makes it line 4; from below, "after line 2" makes it line 3.
+    /// these are what vim 9.0 actually prints, measured rather than remembered.
+    /// Note it is direction-dependent by nature: from above, "after line 4"
+    /// makes it line 4; from below, "after line 2" makes it line 3.
     #[test]
     fn a_bare_number_is_an_address_and_the_lines_land_after_it() {
         let at = |row: usize, arg: &str| {
@@ -4349,26 +4369,23 @@ mod tests {
         assert_eq!(at("m 1"), "a\nb\nc\nd\ne\n", "already after line 1");
     }
 
-    /// The half that is deliberately not vim: `+N` and `-N` are rows travelled,
-    /// where vim reads them as an address and needs `-2` to go up one.
+    /// A typed address is a claim about a line that either exists or does not,
+    /// so vim refuses it rather than doing its best. The arrow keys, which
+    /// name no line, still clamp.
     #[test]
-    fn a_signed_number_is_a_distance_and_not_an_address() {
-        let mut ed = editor("a\nb\nc\nd\ne\n");
-        ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
-
-        ex(&mut ed, "m -1");
-
-        assert_eq!(whole(&ed), "a\nb\nd\nc\ne\n", "one row up; vim would do nothing");
-    }
-
-    #[test]
-    fn a_distance_past_the_end_clamps_rather_than_refusing() {
+    fn an_address_off_either_end_is_refused_rather_than_clamped() {
         let mut ed = editor("a\nb\nc\n");
         ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
 
         ex(&mut ed, "m +99");
+        assert_eq!(whole(&ed), "a\nb\nc\n", "{}", ed.session.status);
+        assert_eq!(ed.session.status, "no line 100");
 
-        assert_eq!(whole(&ed), "b\nc\na\n");
+        ex(&mut ed, "m 9");
+        assert_eq!(whole(&ed), "a\nb\nc\n");
+
+        move_key(&mut ed, true, 99);
+        assert_eq!(whole(&ed), "b\nc\na\n", "but Shift-Down still just stops");
     }
 
     /// Keeping the selection is what makes nudging a block a matter of holding
