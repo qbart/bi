@@ -8,9 +8,10 @@ and `Shift-Up` / `Shift-Down` are the same thing without the colon.
 
 **Built.**
 
-Two corrections below, marked **Corrected**: how many edits a move takes, and
-what a file with no final newline needs — which turned out to be two cases
-rather than one, and only one of them was written down.
+Three corrections below, marked **Corrected**: how many edits a move takes,
+what a file with no final newline needs — two cases, of which one was written
+down — and what a bare number means, which is now vim's address rather than
+this spec's first answer.
 
 ## What `m` costs
 
@@ -23,25 +24,38 @@ keys are the arrows.
 ## The command
 
 ```
-:m +3       down three lines
-:m -2       up two
-:m 0        to the top
-:m $        to the end
-:m 12       so that it becomes line 12
+:m +3       down three rows
+:m -2       up two rows
+:m 0        after line 0 — the top
+:m $        after the last line
+:m 12       after line 12
 ```
 
 Over a visual selection, the whole block moves and stays selected, so a second
 `:m` — or a second `Shift-Down` — carries on from where the first left off.
 
-**`+N` means down N, and `-N` means up N.** Vim's `:m` takes an *address* to
-move the line after, which is why `:m-2` in vim moves a line up by one and
-`:m-1` does nothing at all. That is a fine primitive and a poor command: the
-whole point here is distance, and an off-by-one between the number you type and
-the number of rows you travel is a trap that never stops being one. The
-divergence is deliberate and this paragraph is the whole of it.
+The argument is read two ways, and the split is on the sign.
 
-`0` and `$` keep their vim meaning, because there is no distance to get wrong:
-the top and the bottom.
+**A bare number is vim's address**, exactly: the lines land *after* line N, and
+`0` and `$` are the same addresses they always were. This is why the absolute
+form is direction-dependent, and why that is not a bug — the address names a
+line in the buffer as it stands, so a block arriving from above leaves a hole
+that the address falls through, and one arriving from below finds everything
+above the address untouched. From line 2, `:m 4` becomes line 4; from line 5,
+`:m 2` becomes line 3. Both measured against vim 9.0, along with every other
+combination in a five-line buffer and every two-line block in one.
+
+**Corrected.** A bare number first meant "become line N", which is neither vim
+nor obviously better: it reads the same for a block travelling down and differs
+only going up, so it was a divergence nobody would notice until it bit them.
+The address is the older, better-known answer and costs nothing to match.
+
+**A signed number is a distance.** `+3` is three rows down and `-2` is two rows
+up. Vim reads those as addresses too — `.+3` and `.-2` — which is why `:m-2`
+there travels one row and `:m-1` travels none. That is a fine primitive and a
+poor command: an off-by-one between the number typed and the rows travelled is
+a trap that never stops being one, and `Shift-Up` needs a distance behind it
+anyway. This half of the divergence is deliberate and stays.
 
 **A move that would run off either end clamps** rather than refusing. `:m +99`
 on the third-from-last line means "to the bottom", which is what someone typing

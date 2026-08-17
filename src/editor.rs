@@ -3475,12 +3475,25 @@ impl View<'_> {
         let row = match to {
             MoveTo::Down(by) => first + by,
             MoveTo::Up(by) => first.saturating_sub(by),
-            // `:m 12` means "become row 12", which is one-based on the line
-            // numbers you can see. `:m 0` is the top, as it is in vim.
-            MoveTo::Row(row) => row.saturating_sub(1),
-            MoveTo::End => usize::MAX,
+            MoveTo::Row(address) => self.after_line(address, first, last),
+            MoveTo::End => self.after_line(self.buffer.line_count(), first, last),
         };
         self.move_lines(first, last, row);
+    }
+
+    /// Where a block starts once it is put *after* one-based line `address` —
+    /// vim's `:m {number}`, arithmetic and all.
+    ///
+    /// Which is why it is direction-dependent, and why that is not a bug: the
+    /// address names a line in the buffer as it stands now, so a block coming
+    /// from above it leaves a hole that the address falls through. From below,
+    /// nothing above the address moved and the block lands right after it.
+    fn after_line(&self, address: usize, first: usize, last: usize) -> usize {
+        let height = last - first + 1;
+        // How many of the block's own rows sit at or above the address, and so
+        // are not there to be counted once it has been lifted out.
+        let lifted = address.saturating_sub(first).min(height);
+        address - lifted
     }
 
     /// `:42` — put the cursor on that row.
@@ -4295,6 +4308,57 @@ mod tests {
 
         ex(&mut ed, "m $");
         assert_eq!(whole(&ed), "a\nc\nb\n");
+    }
+
+    /// A bare number is vim's address — the lines land *after* line N — and
+    /// these four cases are what vim 9.0 actually prints, measured rather than
+    /// remembered. Note it is direction-dependent by nature: from above, "after
+    /// line 4" makes it line 4; from below, "after line 2" makes it line 3.
+    #[test]
+    fn a_bare_number_is_an_address_and_the_lines_land_after_it() {
+        let at = |row: usize, arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(row, false));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
+
+        assert_eq!(at(1, "m 4"), "a\nc\nd\nb\ne\n", "from above: b becomes line 4");
+        assert_eq!(at(4, "m 2"), "a\nb\ne\nc\nd\n", "from below: e becomes line 3");
+        assert_eq!(at(3, "m 4"), "a\nb\nc\nd\ne\n", "already after line 4, so nothing");
+        assert_eq!(at(1, "m 0"), "b\na\nc\nd\ne\n", "0 is before line 1");
+        assert_eq!(at(1, "m $"), "a\nc\nd\ne\nb\n");
+    }
+
+    /// The address arithmetic has to count the block's own rows: from above,
+    /// the address falls through the hole the block leaves. Both of these are
+    /// what `:2,3m {addr}` prints in vim 9.0.
+    #[test]
+    fn a_block_lands_after_the_address_from_either_side_of_it() {
+        let at = |arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
+            ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
+
+        assert_eq!(at("m 5"), "a\nd\ne\nb\nc\n", "from above line 5");
+        assert_eq!(at("m 0"), "b\nc\na\nd\ne\n", "to the top");
+        assert_eq!(at("m 1"), "a\nb\nc\nd\ne\n", "already after line 1");
+    }
+
+    /// The half that is deliberately not vim: `+N` and `-N` are rows travelled,
+    /// where vim reads them as an address and needs `-2` to go up one.
+    #[test]
+    fn a_signed_number_is_a_distance_and_not_an_address() {
+        let mut ed = editor("a\nb\nc\nd\ne\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
+
+        ex(&mut ed, "m -1");
+
+        assert_eq!(whole(&ed), "a\nb\nd\nc\ne\n", "one row up; vim would do nothing");
     }
 
     #[test]

@@ -149,14 +149,18 @@ rather than a row index — see [docs/specs/motions.md](docs/specs/motions.md).
 |---|---|
 | `Shift-Down` `Shift-Up` | move this line, or the selected block, one row — `{n}` says how far |
 
-`:m` is the same thing told where to go: `:m +3` down three, `:m -2` up two,
-`:m 0` to the top, `:m $` to the bottom, `:m 12` so that it becomes line 12. A
-distance past either end clamps rather than refusing.
+`:m` is the same thing told where to go, and it reads its argument two ways:
 
-Note that `+N` means *N rows down*, where vim's `:m` takes an address to move
-the line after — which is why `:m-2` in vim travels one row and `:m-1` travels
-none. The whole point here is distance, so the number you type is the number of
-rows. See [docs/specs/move-lines.md](docs/specs/move-lines.md).
+- **A bare number is vim's address** — the lines land *after* line N, so `:m 0`
+  is the top, `:m $` the bottom, and `:m 12` puts them after line 12. Identical
+  to vim, which is why it is direction-dependent: coming from above line 12 they
+  become line 12, coming from below, line 13.
+- **A signed number is a distance** — `:m +3` is three rows down, `:m -2` two
+  rows up. Vim reads those as addresses too, which is why `:m-2` there travels
+  one row and `:m-1` travels none. Here the number you type is the number of
+  rows, and a distance past either end clamps rather than refusing.
+
+See [docs/specs/move-lines.md](docs/specs/move-lines.md).
 
 In visual mode the block moves and stays selected, so nudging it is a matter of
 holding the key. `m` itself is untouched, and still free for the marks the gaps
@@ -304,7 +308,7 @@ afterwards repeats it.
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
 | `:m +3` `:m -2` | move this line, or the selection, that many rows |
-| `:m 0` `:m $` `:m 12` | to the top, the bottom, or so that it becomes line 12 |
+| `:m 0` `:m $` `:m 12` | after line 0, the last line, or line 12 — vim's addresses |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
