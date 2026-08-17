@@ -393,6 +393,12 @@ impl Input {
             // The tree on this file's directory. In a tree the same key goes
             // up a level, which is the same move one step further out.
             KeyCode::Char('-') => self.plain(Action::Tree(TreeCmd::Up)),
+            // The first thing in the keymap to read `shift`, which `Key` has
+            // carried since it was written. Terminals that do not send a
+            // modifier with an arrow simply get the plain arrow, which still
+            // moves the cursor — and `:m` works everywhere.
+            KeyCode::Down if key.mods.shift => self.plain(Action::MoveLines { down: true }),
+            KeyCode::Up if key.mods.shift => self.plain(Action::MoveLines { down: false }),
             // Vim spells its jump list this way; bee has no jump list and
             // these are the keys the fingers reach for. Checked before the
             // plain `i` and `o`, which would otherwise swallow them — and
@@ -886,6 +892,35 @@ mod tests {
 
     fn tree_action(keys: &str) -> Action {
         in_tree(keys).unwrap_or_else(|| panic!("{keys:?} produced no command")).action
+    }
+
+    fn shifted(code: KeyCode) -> Key {
+        Key { code, mods: crate::key::Mods { shift: true, ..Default::default() } }
+    }
+
+    /// The first thing in the keymap to read `shift`, which `Key` has carried
+    /// unread since it was written.
+    #[test]
+    fn shift_and_an_arrow_moves_the_line_where_the_arrow_alone_moves_the_cursor() {
+        let mut input = Input::default();
+        let down = input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text);
+        assert_eq!(down.unwrap().action, Action::MoveLines { down: true });
+
+        let up = input.on_key(shifted(KeyCode::Up), &Mode::Normal, ContentKind::Text);
+        assert_eq!(up.unwrap().action, Action::MoveLines { down: false });
+
+        let plain = input.on_key(Key::code(KeyCode::Down), &Mode::Normal, ContentKind::Text);
+        assert_eq!(plain.unwrap().action, Action::Move(Motion::Down), "unshifted is a motion");
+    }
+
+    #[test]
+    fn a_count_says_how_far_the_line_travels() {
+        let mut input = Input::default();
+        assert!(input.on_key(key('3'), &Mode::Normal, ContentKind::Text).is_none());
+        let cmd = input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text).unwrap();
+
+        assert_eq!(cmd.count, 3, "and the action is repeatable, so that is three rows");
+        assert_eq!(cmd.action, Action::MoveLines { down: true });
     }
 
     #[test]

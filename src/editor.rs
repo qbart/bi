@@ -229,6 +229,15 @@ pub enum Action {
     ScrollHalfPage {
         down: bool,
     },
+    /// `Shift-Up` / `Shift-Down`, and `:m` — move this line, or the selected
+    /// block, by `rows` in that direction.
+    MoveLines {
+        down: bool,
+    },
+    /// `:m 0`, `:m $`, `:m 12` — move it so it starts at that row.
+    MoveLinesTo {
+        row: usize,
+    },
     /// `R`
     EnterReplace,
     /// A character typed in replace mode.
@@ -290,7 +299,12 @@ impl Action {
         if let Action::Move(m) = self {
             return !m.is_absolute();
         }
-        matches!(self, Action::InsertChar(_) | Action::Undo | Action::Redo)
+        // A move repeats one row at a time, so `3 Shift-Down` clamps at the
+        // bottom the same way three presses would.
+        matches!(
+            self,
+            Action::InsertChar(_) | Action::Undo | Action::Redo | Action::MoveLines { .. }
+        )
     }
 }
 
@@ -585,6 +599,8 @@ enum ExLine {
     Paste(Option<String>),
     /// `:paste-as <path>` — place the one that stopped, and carry on.
     PasteAs(String),
+    /// `:m +3`, `:m -2`, `:m 0`, `:m $`, `:m 12`.
+    Move(MoveTo),
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -597,6 +613,43 @@ enum ExLine {
     },
     /// `:42`.
     Goto(usize),
+}
+
+/// Where `:m` puts the lines.
+///
+/// `+N` is *down N rows* and `-N` is *up N*, which is not vim's `:m`: there the
+/// argument is an address to move the line after, so `:m-2` travels one row and
+/// `:m-1` travels none. A fine primitive and a poor command — the whole point
+/// here is distance, and an off-by-one between the number typed and the rows
+/// travelled never stops being a trap. See `docs/specs/move-lines.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveTo {
+    Down(usize),
+    Up(usize),
+    /// `:m 12` — so that it becomes row 12. `:m 0` is the top.
+    Row(usize),
+    /// `:m $`.
+    End,
+}
+
+fn parse_move(arg: &str) -> Option<MoveTo> {
+    let arg = arg.trim();
+    if arg == "$" {
+        return Some(MoveTo::End);
+    }
+    // A bare `+` or `-` is one row, which is what a finger reaching for the
+    // key rather than the number means.
+    let distance = |rest: &str| -> Option<usize> {
+        match rest.trim() {
+            "" => Some(1),
+            n => n.parse().ok(),
+        }
+    };
+    match arg.split_at_checked(1) {
+        Some(("+", rest)) => distance(rest).map(MoveTo::Down),
+        Some(("-", rest)) => distance(rest).map(MoveTo::Up),
+        _ => arg.parse().ok().map(MoveTo::Row),
+    }
 }
 
 /// Splits a `:` line into a command and its argument. `None` for a blank line,
@@ -664,6 +717,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "paste" => ExLine::Paste((!arg.is_empty()).then(|| arg.to_string())),
         "paste-as" if !arg.is_empty() => ExLine::PasteAs(arg.into()),
         "paste-as" => ExLine::Error("paste it as what?".into()),
+        "m" | "move" => match parse_move(arg) {
+            Some(to) => ExLine::Move(to),
+            None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
+        },
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         _ => match name.parse::<usize>() {
             Ok(row) => ExLine::Goto(row),
@@ -2120,6 +2177,9 @@ impl Editor {
                 None => self.paste_into_selected(),
             },
             ExLine::PasteAs(path) => self.run_paste(Some(path.into())),
+            ExLine::Move(to) => {
+                self.in_view(|view| view.move_to(to));
+            }
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
 
@@ -3173,6 +3233,19 @@ impl View<'_> {
                 self.run_search();
             }
 
+            Action::MoveLines { down } => {
+                let (first, last) = self.selected_rows();
+                let to = match down {
+                    true => first + 1,
+                    false => first.saturating_sub(1),
+                };
+                self.move_lines(first, last, to);
+            }
+            Action::MoveLinesTo { row } => {
+                let (first, last) = self.selected_rows();
+                self.move_lines(first, last, *row);
+            }
+
             Action::ScrollLine { down } => self.scroll_by(if *down { 1 } else { -1 }, false),
             Action::ScrollHalfPage { down } => {
                 let half = (*self.height / 2).max(1) as isize;
@@ -3367,6 +3440,49 @@ impl View<'_> {
 
     /// The `:` commands. Deliberately tiny — this is not where the editor gets
     /// interesting, and a real command table wants the config layer first.
+    /// The rows the move acts on: the selected block, or the cursor's line.
+    fn selected_rows(&self) -> (usize, usize) {
+        let (lo, hi) = self.selections.primary().range();
+        (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi)))
+    }
+
+    /// Moves the block and takes the cursor — and the selection — with it.
+    ///
+    /// Keeping the selection is what makes nudging a block a matter of holding
+    /// a key rather than counting rows first.
+    fn move_lines(&mut self, first: usize, last: usize, to: usize) {
+        let col = self.buffer.col_at(self.selections.cursor());
+        let selected = !self.selections.primary().is_collapsed();
+        let Some(landed) = self.buffer.move_lines(first, last, to, col) else { return };
+
+        if !selected {
+            *self.selections = Selections::single(landed);
+            return;
+        }
+        // The block kept its height, so the tail follows the head.
+        let head = self.buffer.row_at(landed);
+        let end = self.buffer.at_row(head + (last - first), false);
+        let (from, upto) = self.buffer.line_range(landed.at, end.at, false);
+        self.selections.set(vec![Selection {
+            anchor: Cursor::at(from),
+            head: Cursor::at(upto.saturating_sub(1)),
+        }]);
+    }
+
+    /// `:m` — the same move the arrows make, told where to go.
+    fn move_to(&mut self, to: MoveTo) {
+        let (first, last) = self.selected_rows();
+        let row = match to {
+            MoveTo::Down(by) => first + by,
+            MoveTo::Up(by) => first.saturating_sub(by),
+            // `:m 12` means "become row 12", which is one-based on the line
+            // numbers you can see. `:m 0` is the top, as it is in vim.
+            MoveTo::Row(row) => row.saturating_sub(1),
+            MoveTo::End => usize::MAX,
+        };
+        self.move_lines(first, last, row);
+    }
+
     /// `:42` — put the cursor on that row.
     fn goto_row(&mut self, row: usize) {
         let cursor = self.buffer.at_row(row.saturating_sub(1), false);
@@ -4113,6 +4229,132 @@ mod tests {
         let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
         let path = format!("{}/a.rs", d.path());
         assert_eq!(line, &format!("rename {path} {path}"), "edit the second one");
+    }
+
+    // ---- moving lines -------------------------------------------------------
+
+    fn whole(ed: &Editor) -> String {
+        ed.buffer().unwrap().rope().to_string()
+    }
+
+    fn move_key(ed: &mut Editor, down: bool, count: usize) {
+        ed.apply(Command { count, action: Action::MoveLines { down } });
+    }
+
+    #[test]
+    fn shift_down_moves_the_line_and_the_cursor_rides_with_it() {
+        let mut ed = editor("alpha\nbeta\ngamma\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+
+        move_key(&mut ed, true, 1);
+
+        assert_eq!(whole(&ed), "beta\nalpha\ngamma\n");
+        assert_eq!(ed.cursor_row().unwrap(), 1, "still on the line it pushed");
+    }
+
+    #[test]
+    fn a_count_carries_the_line_that_many_rows() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+
+        move_key(&mut ed, true, 2);
+
+        assert_eq!(whole(&ed), "b\nc\na\nd\n");
+    }
+
+    #[test]
+    fn moving_off_either_end_does_nothing_at_all() {
+        let mut ed = editor("a\nb\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+        let edits = ed.buffer().unwrap().edits();
+
+        move_key(&mut ed, false, 1);
+
+        assert_eq!(whole(&ed), "a\nb\n");
+        assert_eq!(ed.buffer().unwrap().edits(), edits, "and leaves no undo step");
+    }
+
+    /// `+N` is N rows down, where vim's `:m+1` is an address to move after —
+    /// which is why `:m-1` does nothing there and one row up here.
+    #[test]
+    fn the_ex_command_counts_rows_rather_than_naming_an_address() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
+
+        ex(&mut ed, "m -2");
+
+        assert_eq!(whole(&ed), "a\nd\nb\nc\n", "two rows up, not one");
+    }
+
+    #[test]
+    fn the_ex_command_reaches_the_top_and_the_bottom() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
+        ex(&mut ed, "m 0");
+        assert_eq!(whole(&ed), "b\na\nc\n");
+
+        ex(&mut ed, "m $");
+        assert_eq!(whole(&ed), "a\nc\nb\n");
+    }
+
+    #[test]
+    fn a_distance_past_the_end_clamps_rather_than_refusing() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+
+        ex(&mut ed, "m +99");
+
+        assert_eq!(whole(&ed), "b\nc\na\n");
+    }
+
+    /// Keeping the selection is what makes nudging a block a matter of holding
+    /// a key rather than counting rows first.
+    #[test]
+    fn a_visual_block_moves_as_one_and_stays_selected() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        move_key(&mut ed, true, 1);
+        assert_eq!(whole(&ed), "c\na\nb\nd\n");
+
+        move_key(&mut ed, true, 1);
+        assert_eq!(whole(&ed), "c\nd\na\nb\n", "the second press carried on");
+    }
+
+    #[test]
+    fn undo_puts_a_move_back_in_one_step() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+
+        move_key(&mut ed, true, 1);
+        assert_eq!(whole(&ed), "b\na\nc\n");
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(whole(&ed), "a\nb\nc\n");
+    }
+
+    /// The property `settle` already gives every other edit, and the reason a
+    /// move goes through `edit_raw` like anything else.
+    #[test]
+    fn another_window_follows_the_lines_that_moved() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
+        split(&mut ed, Dir::Horizontal);
+        let watcher = other(&ed);
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+
+        move_key(&mut ed, true, 1);
+        ed.settle();
+
+        let cursor = row_in(&ed, watcher);
+        assert_eq!(cursor, 3, "still on `d`, which the move did not touch");
+    }
+
+    fn row_in(ed: &Editor, id: WindowId) -> usize {
+        let view = ed.window_of(id).unwrap().text().unwrap();
+        ed.buffer_of(id).unwrap().row_at(view.selections.cursor())
     }
 
     // ---- the clipboard ------------------------------------------------------

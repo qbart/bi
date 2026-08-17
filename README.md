@@ -143,6 +143,25 @@ otherwise fall outside. Deliberately absent: `H`/`M`/`L`, `zz`/`zt`/`zb` and
 `Ctrl-F`/`Ctrl-B`, which need the viewport to be something the editor owns
 rather than a row index — see [docs/specs/motions.md](docs/specs/motions.md).
 
+**Moving lines**
+
+| Key | Does |
+|---|---|
+| `Shift-Down` `Shift-Up` | move this line, or the selected block, one row — `{n}` says how far |
+
+`:m` is the same thing told where to go: `:m +3` down three, `:m -2` up two,
+`:m 0` to the top, `:m $` to the bottom, `:m 12` so that it becomes line 12. A
+distance past either end clamps rather than refusing.
+
+Note that `+N` means *N rows down*, where vim's `:m` takes an address to move
+the line after — which is why `:m-2` in vim travels one row and `:m-1` travels
+none. The whole point here is distance, so the number you type is the number of
+rows. See [docs/specs/move-lines.md](docs/specs/move-lines.md).
+
+In visual mode the block moves and stays selected, so nudging it is a matter of
+holding the key. `m` itself is untouched, and still free for the marks the gaps
+below promise.
+
 **Repeating**
 
 | Key | Does |
@@ -284,6 +303,8 @@ afterwards repeats it.
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
+| `:m +3` `:m -2` | move this line, or the selection, that many rows |
+| `:m 0` `:m $` `:m 12` | to the top, the bottom, or so that it becomes line 12 |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |

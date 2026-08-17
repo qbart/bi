@@ -834,6 +834,75 @@ impl Buffer {
         (Entry { text, kind }, landed)
     }
 
+    /// Moves rows `first..=last` so the block starts at `to`.
+    ///
+    /// `None` when there is nothing to do, so a `Shift-Up` on the first line
+    /// puts no no-op on the undo stack. Returns where the cursor lands: the
+    /// first row that moved, in the column it was already in, because anything
+    /// else makes a held key walk away from the line it is pushing.
+    ///
+    /// See `docs/specs/move-lines.md`.
+    pub fn move_lines(
+        &mut self,
+        first: usize,
+        last: usize,
+        to: usize,
+        col: usize,
+    ) -> Option<Cursor> {
+        let lines = self.line_count();
+        let last = last.min(lines.saturating_sub(1));
+        if first > last {
+            return None;
+        }
+        let height = last - first + 1;
+        // Clamped rather than refused: `:m +99` near the bottom means "to the
+        // bottom", which is what someone typing a big number wants.
+        let to = to.min(lines - height);
+        if to == first {
+            return None;
+        }
+
+        let (from, upto) =
+            self.line_range(self.rope.line_to_char(first), self.rope.line_to_char(last), true);
+        let mut block = self.rope.slice(from..upto).to_string();
+        let terminated = block.ends_with('\n');
+        // Lifting the final line out takes the newline that ended the line
+        // *above* it rather than inventing one at the end, so a file with no
+        // terminator still has none afterwards.
+        let cut_from = if terminated { from } else { from.saturating_sub(1) };
+        if !terminated {
+            block.push('\n');
+        }
+
+        self.apply_edit(cut_from, upto, "");
+
+        // `to` is where the block should start in the finished text, and the
+        // rope with the block gone is exactly the finished text without it —
+        // so `to` is the insertion row, whichever way the block travelled.
+        let at = match to < self.line_count() {
+            true => self.rope.line_to_char(to),
+            false => self.rope.len_chars(),
+        };
+
+        // Putting it back past a final line with no terminator would weld it
+        // to the line above, so the newline moves to the front instead.
+        let welds = at == self.rope.len_chars() && !self.ends_with_newline();
+        let text = match welds {
+            true => format!("\n{}", block.trim_end_matches('\n')),
+            false => block,
+        };
+        self.apply_edit(at, at, &text);
+
+        let landed = at + if welds { 1 } else { 0 };
+        let row = self.row_at(Cursor::at(landed));
+        Some(self.clamped(Cursor::at(self.rope.line_to_char(row) + col), false))
+    }
+
+    fn ends_with_newline(&self) -> bool {
+        let len = self.rope.len_chars();
+        len > 0 && self.rope.char(len - 1) == '\n'
+    }
+
     /// Char range covering the whole of every line `start..=end` touches,
     /// plus the terminator when there is one. Linewise visual.
     pub fn line_range(&self, start: usize, end: usize, take_terminator: bool) -> (usize, usize) {
@@ -1373,6 +1442,89 @@ impl Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- moving lines -------------------------------------------------------
+
+    fn rows(text: &str) -> Buffer {
+        let mut buffer = Buffer::empty();
+        buffer.insert_str(Cursor::at(0), text);
+        buffer
+    }
+
+    fn shown(buffer: &Buffer) -> String {
+        buffer.rope().to_string()
+    }
+
+    #[test]
+    fn a_line_moves_down_and_the_cursor_rides_with_it() {
+        let mut buffer = rows("alpha\nbeta\ngamma\ndelta\n");
+
+        let landed = buffer.move_lines(0, 0, 2, 3).expect("moved");
+
+        assert_eq!(shown(&buffer), "beta\ngamma\nalpha\ndelta\n");
+        assert_eq!(buffer.row_at(landed), 2, "on the line it pushed");
+        assert_eq!(buffer.col_at(landed), 3, "in the column it was in");
+    }
+
+    #[test]
+    fn a_line_moves_up() {
+        let mut buffer = rows("alpha\nbeta\ngamma\n");
+
+        let landed = buffer.move_lines(2, 2, 0, 0).expect("moved");
+
+        assert_eq!(shown(&buffer), "gamma\nalpha\nbeta\n");
+        assert_eq!(buffer.row_at(landed), 0);
+    }
+
+    #[test]
+    fn a_block_moves_as_one() {
+        let mut buffer = rows("a\nb\nc\nd\ne\n");
+
+        buffer.move_lines(0, 1, 2, 0).expect("moved");
+
+        assert_eq!(shown(&buffer), "c\nd\na\nb\ne\n");
+    }
+
+    /// `:m +99` near the bottom means "to the bottom". Refusing would be
+    /// correct and useless.
+    #[test]
+    fn a_move_past_the_end_clamps_rather_than_refusing() {
+        let mut buffer = rows("a\nb\nc\n");
+
+        buffer.move_lines(0, 0, 99, 0).expect("moved");
+
+        assert_eq!(shown(&buffer), "b\nc\na\n");
+    }
+
+    #[test]
+    fn moving_a_block_onto_itself_is_not_an_edit() {
+        let mut buffer = rows("a\nb\nc\n");
+        let before = buffer.edits();
+
+        assert!(buffer.move_lines(0, 0, 0, 0).is_none(), "nowhere to go");
+
+        assert_eq!(buffer.edits(), before, "and nothing on the undo stack");
+    }
+
+    /// Where the rope arithmetic is: lifting the last line out takes a
+    /// terminator it never had, and putting one back would weld it on.
+    #[test]
+    fn a_file_with_no_final_newline_survives_a_move_to_the_end() {
+        let mut buffer = rows("alpha\nbeta\ngamma");
+
+        buffer.move_lines(0, 0, 2, 0).expect("moved");
+
+        assert_eq!(shown(&buffer), "beta\ngamma\nalpha");
+    }
+
+    #[test]
+    fn a_file_with_no_final_newline_survives_its_last_line_moving_up() {
+        let mut buffer = rows("alpha\nbeta\ngamma");
+
+        buffer.move_lines(2, 2, 0, 0).expect("moved");
+
+        assert_eq!(shown(&buffer), "gamma\nalpha\nbeta");
+    }
 
     /// A buffer with a cursor attached.
     ///
