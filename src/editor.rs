@@ -932,17 +932,21 @@ fn span_of_block_at(
     (start + from, start + to.max(from))
 }
 
-/// Picks a grammar from the file's extension. An unknown one yields `None`,
-/// which renders as plain text.
+/// Picks a grammar from the file's name. An unknown one yields `None`, which
+/// renders as plain text.
+///
+/// The whole name rather than the extension, so a grammar can claim
+/// `CMakeLists.txt`. Which key wins is `syntax.rs`'s business, not this
+/// function's.
 fn syntax_for(buffer: &Buffer) -> Option<Syntax> {
-    let extension = buffer
+    let name = buffer
         .path
         .as_ref()
-        .and_then(|p| p.extension())
+        .and_then(|p| p.file_name())
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_string();
-    Syntax::new(&extension, buffer.rope())
+    Syntax::new(&name, buffer.rope())
 }
 
 impl Editor {
@@ -4483,6 +4487,20 @@ mod tests {
         assert!(!std::path::Path::new(&from).exists());
         assert_eq!(ed.name_of(ed.window().buffer().unwrap()), to, "and the buffer came with it");
         assert!(ed.syntax().is_some(), "a .rs now, so it highlights");
+    }
+
+    /// `syntax_for` reads the whole file name rather than the extension, so a
+    /// grammar can claim a file that has none worth having. `CMakeLists.txt`
+    /// looks like a `.txt` from the outside.
+    #[test]
+    fn a_grammar_can_claim_a_file_by_name() {
+        let d = ScratchDir::new("byname").file("CMakeLists.txt").file("notes.txt");
+
+        let cmake = Editor::open(&format!("{}/CMakeLists.txt", d.path())).unwrap();
+        assert!(cmake.syntax().is_some(), "CMakeLists.txt is cmake, not plain text");
+
+        let plain = Editor::open(&format!("{}/notes.txt", d.path())).unwrap();
+        assert!(plain.syntax().is_none(), "an ordinary .txt still has no grammar");
     }
 
     #[test]

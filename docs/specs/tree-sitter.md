@@ -5,8 +5,9 @@ user actually *sees*, and the reason `Buffer::Edit` has existed since step 1.
 
 ## Status
 
-**Built**, for Rust only. Injections, indent queries and background parsing
-remain deferred — see the end of this file.
+**Built**, for Rust, TOML, YAML, JSON, INI, Markdown and CMake. Markdown is
+block-level only until injections land. Injections, indent queries and
+background parsing remain deferred — see the end of this file.
 
 ## What is already in place
 
@@ -103,6 +104,21 @@ the invariant the README's rendering decision commits to — highlighting a
 **Overlapping captures resolve narrowest-wins**, implemented by painting a
 per-byte array over the visible range widest-first and run-length encoding the
 result. Highlight queries nest, and the innermost match is the specific one.
+
+**Two captures over the identical range is not nesting**, and the order
+tree-sitter yields them in carries no meaning, so the tie is broken explicitly:
+the name with more dotted segments wins, and failing that the later pattern.
+This is not hypothetical — a JSON key is captured as both `string.special.key`
+and `string`, and a YAML key as both `property` and `string`. Worse, the two
+queries disagree about which order to write them in, so any rule based on
+pattern order alone fixes one language and breaks the other. Left unresolved,
+keys take the colour of ordinary string values and a config file renders as one
+green wall.
+
+**`@spell` and `@nospell` are dropped.** They mark where a spellchecker should
+look and say nothing about colour, but INI and CMake both hang one on the same
+node as `@comment`. Letting them through leaves comments competing against a
+capture no theme has an entry for, and comments come out unstyled.
 The array is bounded by the viewport, so this stays cheap. Rolling this ourselves over
 `QueryCursor` rather than using the `tree-sitter-highlight` crate: that crate
 is stream-oriented and whole-document by design, which fights the viewport
@@ -110,26 +126,60 @@ restriction above. Revisit if injections make it worth it.
 
 ## Languages
 
-Extension → grammar, table-driven so adding one is a line:
+File name → grammar, table-driven so adding one is a line:
 
 ```rust
-match ext {
-    "rs" => Some(tree_sitter_rust::LANGUAGE),
+if file == "CMakeLists.txt" { return Some(cmake()) }
+match file.rsplit('.').next() {
+    "rs"   => tree_sitter_rust,
+    "toml" => tree_sitter_toml_ng,
+    // …
     _ => None,
 }
 ```
 
-**Start with Rust only.** The editor is written in Rust, so it is what gets
-dogfooded, and each grammar is a C library that costs compile time and binary
-size. An unknown extension means no `Syntax` and plain text — never an error.
+**The key is the file name, not the extension.** `Syntax::new` takes
+`Cargo.toml` or `CMakeLists.txt`, tries whole names first, and falls back to
+the text after the last dot. A bare `"rs"` is a name with no dot in it, so it
+still resolves as an extension and the old callers still work. This exists
+because build files are named rather than suffixed — CMake is written into
+`CMakeLists.txt` far more often than into `*.cmake`, and `Makefile`,
+`Dockerfile` and `.gitconfig` will want the same door.
+
+An unknown name means no `Syntax` and plain text — never an error.
+
+**Rust, TOML, YAML, JSON, INI, Markdown and CMake.** The original argument
+here was "Rust only": every grammar is a C library that costs compile time and
+binary size, and the editor is written in Rust so Rust is what gets dogfooded.
+The cost is real and now measured — the six grammars grew the release binary
+from 4.75 MB to 5.42 MB (+670 KB) and added about a minute and a half to a
+release build on a Raspberry Pi — but the formats above are what an editor
+actually sits in front of while configuring itself. `bi`'s own config is TOML.
+
+**Markdown runs its block grammar only.** `tree-sitter-md` is *two* parsers:
+a block grammar for headings, fences, lists and quotes, and a separate inline
+grammar for emphasis, links and code spans. Reaching the second one means
+injections, which are still deferred below. Block structure is most of what
+the eye uses, so half is worth having; the fence of a code block highlights
+while its contents do not.
 
 ## Dependencies, and the cost of them
 
 ```toml
 tree-sitter = "0.26"
-tree-sitter-rust = "0.24"
 streaming-iterator = "0.1"   # QueryCursor::matches is a streaming iterator
+tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7"  # the maintained TOML grammar; tree-sitter-toml is on an ABI from 0.20
+tree-sitter-yaml = "0.7"
+tree-sitter-json = "0.24"
+tree-sitter-ini = "1.4"
+tree-sitter-md = "0.5"       # LANGUAGE is the block grammar; INLINE_LANGUAGE waits on injections
+tree-sitter-cmake = "0.7"
 ```
+
+Each exposes `LANGUAGE` and `HIGHLIGHTS_QUERY`, so a new grammar is genuinely
+one arm — markdown is the exception, naming its query `HIGHLIGHT_QUERY_BLOCK`
+because it has two.
 
 These are the **first non-pure-Rust dependencies**. Grammars are C compiled by
 `cc`, which means a C toolchain becomes a build requirement and
@@ -157,7 +207,18 @@ Highlighting:
 - a snippet yields expected capture names at expected byte ranges
 - querying a byte range returns only spans within it
 - nested captures resolve to the narrowest
-- a file with no known extension highlights as plain text and does not error
+- a file with no known name highlights as plain text and does not error
+
+Per grammar, because a grammar fails *quietly*:
+
+- **every name in the table yields a parser.** `Query::new(..).ok()?` turns a
+  query that will not compile against the current tree-sitter into plain text
+  with no message anywhere. A grammar bumped past an ABI it shares with us
+  would otherwise be noticed by a user, not by the suite.
+- a key and a value in each of TOML, YAML, JSON and INI get *different*
+  captures — the tie-break above, from the side that shows
+- `CMakeLists.txt` resolves by name, not extension
+- no `@spell` or `@nospell` ever reaches the frontend
 
 ## Deferred
 
@@ -165,6 +226,13 @@ Highlighting:
 names this as where most of the complexity lives: per-region parsers and
 incremental reparse across injection boundaries. It needs the single-language
 path working first.
+
+Markdown now gives this a concrete first customer rather than a hypothetical
+one, and a cheap one: `tree-sitter-md` ships `INJECTION_QUERY_BLOCK`, and the
+first region to light up is markdown's *own* inline grammar, which needs no
+language lookup at all. Fenced code blocks — a `rust` fence resolving through
+the same table `language_for` already is — follow from the same machinery.
+`Syntax` holding one `Tree` is the thing that has to give.
 
 **Indent and textobject queries.** Tree-sitter's `indents.scm` gives real
 auto-indent, and `textobjects.scm` gives `dif` / `daf` — delete inside/around a

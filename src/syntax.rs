@@ -25,16 +25,45 @@ pub struct Span {
     pub capture: u32,
 }
 
-/// Grammar for a file extension, or `None` for plain text.
+/// Grammar for a file, or `None` for plain text.
 ///
-/// One arm per language — adding one is a line. Rust only for now: the editor
-/// is written in Rust so it is what gets dogfooded, and every grammar is a C
-/// library that costs build time and binary size.
-fn language_for(extension: &str) -> Option<(Language, &'static str)> {
-    match extension {
+/// `file` is a file *name* — `Cargo.toml`, `CMakeLists.txt` — or a bare
+/// extension, which is the same string with no dot in it. Whole names are
+/// tried first, because a build file is often named rather than suffixed;
+/// otherwise the text after the last dot decides. One arm per language either
+/// way, so adding one stays a line.
+fn language_for(file: &str) -> Option<(Language, &'static str)> {
+    if file == "CMakeLists.txt" {
+        return Some(cmake());
+    }
+    match file.rsplit('.').next().unwrap_or(file) {
         "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
+        "toml" => {
+            Some((tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY))
+        }
+        "yaml" | "yml" => {
+            Some((tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY))
+        }
+        "json" => Some((tree_sitter_json::LANGUAGE.into(), tree_sitter_json::HIGHLIGHTS_QUERY)),
+        "ini" => Some((tree_sitter_ini::LANGUAGE.into(), tree_sitter_ini::HIGHLIGHTS_QUERY)),
+        // The block grammar only. Markdown's inline syntax — emphasis, links,
+        // code spans — is a *second* parser reached through an injection, and
+        // injections are still deferred. Block structure is most of what you
+        // look at anyway: headings, fences, list markers, quotes.
+        "md" | "markdown" => {
+            Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
+        }
+        "cmake" => Some(cmake()),
         _ => None,
     }
+}
+
+fn is_spell(capture: &str) -> bool {
+    matches!(capture, "spell" | "nospell")
+}
+
+fn cmake() -> (Language, &'static str) {
+    (tree_sitter_cmake::LANGUAGE.into(), tree_sitter_cmake::HIGHLIGHTS_QUERY)
 }
 
 /// Lets tree-sitter read predicate text straight out of the rope instead of
@@ -56,18 +85,25 @@ pub struct Syntax {
     parser: Parser,
     tree: Tree,
     query: Query,
+    /// Dotted segments per capture, indexed by capture id. Precomputed
+    /// because it is consulted while sorting every visible span, and it
+    /// never changes for a given query.
+    specificity: Vec<u8>,
 }
 
 impl Syntax {
-    /// Parses `rope` for the grammar matching `extension`. `None` when no
-    /// grammar is known — an unrecognised file is plain text, never an error.
-    pub fn new(extension: &str, rope: &Rope) -> Option<Self> {
-        let (language, highlights) = language_for(extension)?;
+    /// Parses `rope` for the grammar matching `file` — a file name, or a bare
+    /// extension. `None` when no grammar is known: an unrecognised file is
+    /// plain text, never an error.
+    pub fn new(file: &str, rope: &Rope) -> Option<Self> {
+        let (language, highlights) = language_for(file)?;
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
         let query = Query::new(&language, highlights).ok()?;
         let tree = parse(&mut parser, rope, None)?;
-        Some(Self { parser, tree, query })
+        let specificity =
+            query.capture_names().iter().map(|n| n.matches('.').count() as u8 + 1).collect();
+        Some(Self { parser, tree, query, specificity })
     }
 
     pub fn capture_name(&self, capture: u32) -> &str {
@@ -99,21 +135,39 @@ impl Syntax {
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(range.clone());
 
-        let mut raw: Vec<(usize, usize, u32)> = Vec::new();
+        let mut raw: Vec<(usize, usize, u32, usize)> = Vec::new();
         let mut matches = cursor.matches(&self.query, self.tree.root_node(), RopeProvider(rope));
         while let Some(m) = matches.next() {
             for capture in m.captures {
+                // `@spell` / `@nospell` mark where a spellchecker should look;
+                // they say nothing about colour. Several grammars hang one on
+                // the same node as `@comment` — INI and CMake both do — so
+                // letting them through would leave comments competing with a
+                // capture that no theme has an entry for.
+                if is_spell(self.capture_name(capture.index)) {
+                    continue;
+                }
                 let node = capture.node.byte_range();
-                raw.push((node.start, node.end, capture.index));
+                raw.push((node.start, node.end, capture.index, m.pattern_index));
             }
         }
 
         // Widest first, so a nested capture overwrites the one containing it —
         // the innermost match is the specific one.
-        raw.sort_by_key(|(start, end, _)| std::cmp::Reverse(end - start));
+        //
+        // Two patterns capturing the *same* range is not nesting, and the
+        // order they arrive in is not meaningful, so it is broken explicitly:
+        // the more dotted name wins, then the later pattern. A JSON key is
+        // both `string.special.key` and `string`, a YAML key is both
+        // `property` and `string`, and the queries disagree about which
+        // order to write them in — without this, keys take the colour of
+        // ordinary string values and a config file reads as one green wall.
+        raw.sort_by_key(|(start, end, capture, pattern)| {
+            (std::cmp::Reverse(end - start), self.specificity[*capture as usize], *pattern)
+        });
 
         let mut cells: Vec<Option<u32>> = vec![None; range.len()];
-        for (start, end, capture) in raw {
+        for (start, end, capture, _) in raw {
             let start = start.clamp(range.start, range.end) - range.start;
             let end = end.clamp(range.start, range.end) - range.start;
             for cell in &mut cells[start..end] {
@@ -201,6 +255,118 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Every name the table claims. A grammar whose query fails to compile
+    /// against the tree-sitter version in `Cargo.toml` degrades *silently* to
+    /// plain text — `Query::new(..).ok()?` — so nothing but a test that asks
+    /// for each one will notice.
+    const KNOWN: &[&str] =
+        &["rs", "toml", "yaml", "yml", "json", "ini", "md", "markdown", "cmake", "CMakeLists.txt"];
+
+    /// The capture names for `text`, in order, with the text they cover.
+    fn captures(file: &str, text: &str) -> Vec<(String, String)> {
+        let rope = Rope::from_str(text);
+        let syntax = Syntax::new(file, &rope).unwrap_or_else(|| panic!("no grammar for {file}"));
+        names(&syntax, &rope, 0..text.len())
+    }
+
+    /// Asserts some capture whose name starts with `capture` covers `text`.
+    fn covers(found: &[(String, String)], capture: &str, text: &str) {
+        assert!(
+            found.iter().any(|(n, t)| n.starts_with(capture) && t.trim() == text),
+            "expected {text:?} to be a {capture}, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn every_grammar_in_the_table_parses_and_queries() {
+        for file in KNOWN {
+            assert!(Syntax::new(file, &Rope::from_str("")).is_some(), "no grammar for {file}");
+        }
+    }
+
+    #[test]
+    fn cmake_is_found_by_file_name_as_well_as_extension() {
+        // The point of keying on the name: nobody writes `*.cmake` nearly as
+        // often as they write this one file.
+        let found = captures("CMakeLists.txt", "project(bi)\n");
+        covers(&found, "function", "project");
+    }
+
+    #[test]
+    fn toml_yaml_json_and_ini_highlight_their_keys_and_values() {
+        let toml = captures("toml", "[server]\nport = 8080\nname = \"bi\"\n");
+        covers(&toml, "type", "port");
+        covers(&toml, "number", "8080");
+        covers(&toml, "string", "\"bi\"");
+
+        let yaml = captures("yaml", "key: value\ncount: 1\n");
+        covers(&yaml, "property", "key");
+        covers(&yaml, "string", "value");
+        covers(&yaml, "number", "1");
+
+        let json = captures("json", "{\"a\": 1, \"b\": \"two\"}");
+        covers(&json, "string.special.key", "\"a\"");
+        covers(&json, "number", "1");
+
+        let ini = captures("ini", "[sec]\nkey = val\n");
+        covers(&ini, "type", "sec");
+        covers(&ini, "property", "key");
+    }
+
+    #[test]
+    fn markdown_highlights_its_block_structure() {
+        // Block grammar only, so a heading and a fence are captured but the
+        // `**bold**` inside the paragraph is not — that needs the inline
+        // grammar, and an injection to reach it.
+        let found = captures("md", "# Title\n\nsome **bold** text\n");
+        covers(&found, "text.title", "Title");
+        assert!(
+            !found.iter().any(|(n, t)| t.contains("bold") && n.starts_with("text.emphasis")),
+            "inline emphasis is not expected before injections land: {found:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_highlights_commands_and_control_flow() {
+        let found = captures("CMakeLists.txt", "if(A)\n  project(bi)\nendif()\n");
+        covers(&found, "keyword", "if");
+        covers(&found, "function", "project");
+    }
+
+    /// Two patterns over the byte-identical range is not nesting, and the
+    /// order tree-sitter yields them in is not meaningful. A key that reads
+    /// as an ordinary string value is the visible symptom.
+    #[test]
+    fn a_key_captured_twice_keeps_the_more_specific_name() {
+        let json = captures("json", "{\"a\": \"b\"}");
+        covers(&json, "string.special.key", "\"a\"");
+        assert!(
+            json.iter().any(|(n, t)| n == "string" && t == "\"b\""),
+            "the value should stay a plain string, got {json:?}"
+        );
+
+        // YAML writes the two patterns in the opposite order to JSON, so a
+        // rule based on pattern order alone would fix one and break the other.
+        let yaml = captures("yaml", "key: value\n");
+        covers(&yaml, "property", "key");
+        assert!(
+            yaml.iter().any(|(n, t)| n == "string" && t == "value"),
+            "the value should stay a plain string, got {yaml:?}"
+        );
+    }
+
+    /// `@spell` is a spellchecker hint, and INI hangs one on the same node as
+    /// `@comment`. If it competes, comments come out unstyled.
+    #[test]
+    fn a_spellcheck_marker_never_wins_a_capture() {
+        let found = captures("ini", "; a note\nkey = val\n");
+        covers(&found, "comment", "; a note");
+        assert!(
+            !found.iter().any(|(n, _)| n == "spell" || n == "nospell"),
+            "a spell marker reached the frontend: {found:?}"
+        );
     }
 
     #[test]

@@ -142,23 +142,48 @@ fn display_col(line: &str, char_col: usize) -> usize {
 
 /// Capture name to colour.
 ///
-/// Matches on the part before the first dot, so `function.method` falls back to
-/// `function` without needing an arm of its own. This table is the whole reason
-/// `syntax.rs` emits names rather than styles: a GUI frontend writes its own,
-/// and a theme file eventually replaces it.
+/// Tries the whole name, then drops one dotted segment at a time:
+/// `string.special.key` asks for `string.special` and then `string`. So
+/// `function.method` needs no arm of its own, while a name that wants to
+/// differ from its own prefix — a JSON key is a `string.special.key`, and
+/// should not look like a string value — can say so. This table is the whole
+/// reason `syntax.rs` emits names rather than styles: a GUI frontend writes
+/// its own, and a theme file eventually replaces it.
 fn style_for(name: &str) -> Style {
-    let base = name.split('.').next().unwrap_or(name);
-    match base {
+    let mut key = name;
+    loop {
+        if let Some(style) = exact_style(key) {
+            return style;
+        }
+        match key.rfind('.') {
+            Some(dot) => key = &key[..dot],
+            None => return Style::default(),
+        }
+    }
+}
+
+fn exact_style(name: &str) -> Option<Style> {
+    Some(match name {
         "keyword" => Style::default().fg(Color::Magenta),
         "function" | "constructor" => Style::default().fg(Color::Blue),
-        "type" => Style::default().fg(Color::Cyan),
+        "type" | "module" => Style::default().fg(Color::Cyan),
         "string" | "escape" | "character" => Style::default().fg(Color::Green),
         "comment" => Style::default().fg(Color::DarkGray),
         "constant" | "number" | "float" | "boolean" => Style::default().fg(Color::Yellow),
         "attribute" | "label" => Style::default().fg(Color::LightMagenta),
         "operator" | "punctuation" => Style::default().fg(Color::Gray),
-        _ => Style::default(),
-    }
+        // The key side of a config format — TOML, YAML and INI call it
+        // `property`, JSON dresses it as a string. Without this the whole
+        // left-hand column of a config file renders unstyled, which is most
+        // of the file.
+        "property" | "string.special.key" => Style::default().fg(Color::Blue),
+        // Markdown, whose captures are all `text.*`.
+        "text.title" => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        "text.literal" => Style::default().fg(Color::Green),
+        "text.uri" => Style::default().fg(Color::Cyan),
+        "text.reference" => Style::default().fg(Color::LightMagenta),
+        _ => return None,
+    })
 }
 
 /// Splits one line into styled pieces, expanding tabs as it goes.
@@ -844,6 +869,26 @@ fn status_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capture_falls_back_one_dotted_segment_at_a_time() {
+        // No arm of its own — it should land on `function`.
+        assert_eq!(style_for("function.method"), style_for("function"));
+        assert_eq!(style_for("keyword.control.conditional"), style_for("keyword"));
+        // An unknown name is not an error, it is unstyled text.
+        assert_eq!(style_for("no.such.capture"), Style::default());
+    }
+
+    #[test]
+    fn a_config_key_does_not_look_like_a_string_value() {
+        // The whole reason the fallback tries the full name first: JSON
+        // spells its keys as a kind of string, and a file whose keys and
+        // values share a colour is the one thing worth avoiding here.
+        assert_ne!(style_for("string.special.key"), style_for("string"));
+        assert_eq!(style_for("string.special.key"), style_for("property"));
+        // `string.special` on its own is still just a string.
+        assert_eq!(style_for("string.special"), style_for("string"));
+    }
 
     #[test]
     fn the_footer_reads_the_message_and_no_longer_carries_the_mode() {

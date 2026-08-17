@@ -15,6 +15,12 @@ streaming-iterator = "0.1.9"
 # `toml_edit` rather than `toml`: it keeps byte spans after parsing, which is
 # the difference between "unknown option" and "config.toml:7: unknown option".
 toml_edit = "0.25.13"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-json = "0.24"
+tree-sitter-ini = "1.4"
+tree-sitter-md = "0.5"
+tree-sitter-cmake = "0.7"
 
 [profile.release]
 lto = true

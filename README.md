@@ -3,8 +3,9 @@
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
-Status: modal editing, undo, registers, tree-sitter highlighting for Rust, a
-buffer list, split windows, and a file tree.
+Status: modal editing, undo, registers, tree-sitter highlighting for Rust,
+TOML, YAML, JSON, INI, Markdown and CMake, a buffer list, split windows, and a
+file tree.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -571,10 +572,13 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   pages. The split tree is the shape that would carry both.
 - No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
   `docs/specs/registers.md`.
-- Rust is the only grammar. Adding one is a line in `syntax.rs`, but each is a
-  C library that costs build time.
-- No tree-sitter injections, so code fences in markdown and JSX would not
-  highlight. No indent queries, so no auto-indent. See
+- Seven grammars: Rust, TOML, YAML, JSON, INI, Markdown and CMake. Adding one
+  is a line in `syntax.rs`, but each is a C library that costs build time and
+  binary size.
+- No tree-sitter injections, so a code fence in markdown highlights as a fence
+  and its contents stay plain — and markdown's own inline syntax (`**bold**`,
+  links, code spans) is a second grammar reached the same way, so it is
+  unhighlighted too. No indent queries, so no auto-indent. See
   `docs/specs/tree-sitter.md`.
 - No regular expressions in search, and no `:s`. See
   [docs/specs/search.md](docs/specs/search.md).
@@ -588,7 +592,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - **Tree-sitter is not optional, so building needs a C toolchain.** Grammars
   are C compiled by `cc`, which breaks minimal containers and makes
   cross-compilation harder. A Cargo feature would fix it: `Editor::syntax` is
-  already `Option<Syntax>` and an unknown extension already renders as plain
+  already `Option<Syntax>` and an unknown file name already renders as plain
   text, so the no-syntax path exists and works.
 - ~~**The config language is undecided**~~ Decided and half built: TOML, in
   `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live.
