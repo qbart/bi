@@ -236,8 +236,18 @@ fn restore() -> Result<()> {
 
 fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
     let mut input = Input::default();
+    // The keymap lives on `Input`, which is the frontend's, while `:reload`
+    // happens inside the editor. `config_epoch` is how the two meet: the
+    // number changes, this notices, and the map is reinstalled. Cloning a map
+    // of a dozen entries once per reload is not worth a subtler arrangement.
+    let mut installed = None;
 
     loop {
+        if installed != Some(ed.config_epoch()) {
+            installed = Some(ed.config_epoch());
+            input.set_keys(ed.config().keys.clone());
+        }
+
         term.draw(|frame| tui::render::render(frame, ed, &input.pending_display()))?;
 
         match event::read()? {

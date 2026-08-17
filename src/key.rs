@@ -10,7 +10,7 @@
 //! handles is dead weight.
 
 /// A key, stripped of everything a frontend knows and the core does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyCode {
     Char(char),
     Esc,
@@ -31,14 +31,14 @@ pub enum KeyCode {
 /// This is the type a config-driven keymap will parse into, and widening it
 /// later means revisiting every match arm in `input.rs` — `<A-j>` is what the
 /// next keymap wants, and it costs nothing to have room for it now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Mods {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key {
     pub code: KeyCode,
     pub mods: Mods,

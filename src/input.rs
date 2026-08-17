@@ -9,6 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
+use crate::config::{KeyMode, Keymap};
 use crate::editor::{Action, BufferCmd, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -36,6 +37,10 @@ pub struct Input {
     /// `Ctrl-W` has been typed and is waiting for the key that says what to do
     /// with a window. Not a key on its own — the start of one.
     window_pending: bool,
+    /// The user's rewrites, from `[keys.*]`. Empty until a frontend calls
+    /// [`Input::set_keys`], and empty is the default: every key means what it
+    /// always meant.
+    keys: Keymap,
     /// `d` has been typed in a tree and is waiting to see whether the next key
     /// is the second `d`. Not a key on its own, the same way `Ctrl-W` is not.
     delete_pending: bool,
@@ -96,8 +101,62 @@ fn object_key(c: char) -> Option<TextObject> {
     })
 }
 
+/// What the keymap says about a key on its way in.
+enum Remapped {
+    To(Key),
+    Nothing,
+}
+
 impl Input {
+    /// Installs the user's keymap. Called by the frontend after the config is
+    /// loaded and after every `:reload`.
+    pub fn set_keys(&mut self, keys: Keymap) {
+        self.keys = keys;
+    }
+
+    /// Rewrites `key` into the key the user's config says it means.
+    ///
+    /// One pass, never chained: with `j = "left"` and `h = "right"` the two
+    /// swap rather than one of them winning, because each is looked up against
+    /// bi's own keys and not against the other's result.
+    ///
+    /// Nothing is remapped in the modes that are literal text entry — insert,
+    /// replace, the command line, the search line and the picker. There is no
+    /// binding there to change, and rewriting a keystroke into another
+    /// character is the one thing a keymap must never do to text.
+    fn remap(&self, key: Key, mode: &Mode, content: ContentKind) -> Remapped {
+        if self.keys.is_empty() {
+            return Remapped::To(key);
+        }
+        let mode = match mode {
+            Mode::Normal if content == ContentKind::Tree => KeyMode::Tree,
+            Mode::Normal => KeyMode::Normal,
+            Mode::Visual(_) => KeyMode::Visual,
+            _ => return Remapped::To(key),
+        };
+        // Visual falls through to `normal` for anything it does not claim, so
+        // a motion rebound in `[keys.normal]` has to be rebound here too or
+        // `v` then `j` would disagree with a bare `j`.
+        let found = match mode {
+            KeyMode::Visual => {
+                self.keys.get(KeyMode::Visual, key).or_else(|| self.keys.get(KeyMode::Normal, key))
+            }
+            mode => self.keys.get(mode, key),
+        };
+        match found {
+            Some(Some(to)) => Remapped::To(to),
+            Some(None) => Remapped::Nothing,
+            None => Remapped::To(key),
+        }
+    }
+
     pub fn on_key(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
+        let key = match self.remap(key, mode, content) {
+            Remapped::To(key) => key,
+            // Unbound. Swallowed rather than passed on, or `"h" = false` would
+            // still move left.
+            Remapped::Nothing => return None,
+        };
         match mode {
             // A tree gets its own keymap rather than an overlay on normal
             // mode's. Which one runs is a property of the window, not of the
@@ -164,7 +223,13 @@ impl Input {
     }
 
     fn reset(&mut self) {
-        *self = Self::default();
+        // Everything *except* the keymap. `reset` clears a half-typed
+        // command — a count, an operator, a pending argument — and the
+        // keymap is configuration that happens to live on the same struct.
+        // A plain `*self = Self::default()` dropped it after the first key
+        // that resolved, so a rebound `j` worked once and then stopped.
+        let keys = std::mem::take(&mut self.keys);
+        *self = Self { keys, ..Self::default() };
     }
 
     /// Counts multiply, so `2d3w` covers six words.
@@ -939,6 +1004,128 @@ mod tests {
             Action::Move(motion) => motion,
             other => panic!("{keys:?} is not a motion: {other:?}"),
         }
+    }
+
+    /// The config from the report that prompted all of this: hjkl shifted one
+    /// key right, `h` unbound, and the tree following the same shape.
+    fn shifted_layout() -> Input {
+        let src = "\
+[options]
+number = 5
+
+[keys.normal]
+\"h\" = false
+\"j\" = \"left\"
+\"k\" = \"down\"
+\"l\" = \"up\"
+\";\" = \"right\"
+
+[keys.tree]
+\"k\" = \"tree_select_down\"
+\"l\" = \"tree_select_up\"
+\";\" = \"tree_expand\"
+\"j\" = \"tree_collapse\"
+\"h\" = false
+";
+        let (config, problems) =
+            crate::config::parse(src, crate::config::Config::default()).expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let mut input = Input::default();
+        input.set_keys(config.keys);
+        input
+    }
+
+    #[test]
+    fn a_configured_layout_moves_the_motions_onto_new_keys() {
+        let mut input = shifted_layout();
+        let mut motion = |c: char| match input.on_key(key(c), &Mode::Normal, ContentKind::Text) {
+            Some(cmd) => match cmd.action {
+                Action::Move(m) => Some(m),
+                other => panic!("{c:?} is not a motion: {other:?}"),
+            },
+            None => None,
+        };
+
+        assert_eq!(motion('j'), Some(Motion::Left));
+        assert_eq!(motion('k'), Some(Motion::Down));
+        assert_eq!(motion('l'), Some(Motion::Up));
+        assert_eq!(motion(';'), Some(Motion::Right));
+        assert_eq!(motion('h'), None, "unbound, and swallowed rather than still moving left");
+    }
+
+    /// The whole argument for rewriting the key rather than the command: the
+    /// grammar never learns that anything changed, so operators, counts and
+    /// visual mode follow for nothing.
+    #[test]
+    fn a_rebound_motion_still_composes_with_operators_and_counts() {
+        let mut input = shifted_layout();
+        let mut last = None;
+        for c in "d2k".chars() {
+            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+        }
+        let cmd = last.expect("d2k resolved");
+        assert!(
+            matches!(
+                cmd.action,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Down),
+                    count: 2,
+                    ..
+                }
+            ),
+            "{:?}",
+            cmd.action
+        );
+
+        // And in visual, which has no `[keys.visual]` of its own — it borrows
+        // normal's, the same way `input.rs` falls through to it.
+        let visual = input.on_key(key('k'), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+        assert_eq!(visual.expect("resolved").action, Action::Move(Motion::Down));
+    }
+
+    #[test]
+    fn the_tree_has_its_own_map() {
+        let mut input = shifted_layout();
+        let mut act =
+            |c: char| input.on_key(key(c), &Mode::Normal, ContentKind::Tree).map(|cmd| cmd.action);
+
+        assert_eq!(act('k'), Some(Action::Tree(TreeCmd::Select { down: true, count: 1 })));
+        assert_eq!(act('l'), Some(Action::Tree(TreeCmd::Select { down: false, count: 1 })));
+        assert_eq!(act(';'), Some(Action::Tree(TreeCmd::Expand)));
+        assert_eq!(act('j'), Some(Action::Tree(TreeCmd::Collapse)));
+        assert_eq!(act('h'), None, "unbound here too");
+    }
+
+    /// Two keys that trade places must both move, not resolve through each
+    /// other and collapse into one.
+    #[test]
+    fn a_swap_is_a_swap_and_not_a_chain() {
+        let src = "[keys.normal]\n\"h\" = \"down\"\n\"j\" = \"left\"\n";
+        let (config, problems) =
+            crate::config::parse(src, crate::config::Config::default()).expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut input = Input::default();
+        input.set_keys(config.keys);
+
+        let h = input.on_key(key('h'), &Mode::Normal, ContentKind::Text).unwrap();
+        assert_eq!(h.action, Action::Move(Motion::Down));
+        let j = input.on_key(key('j'), &Mode::Normal, ContentKind::Text).unwrap();
+        assert_eq!(j.action, Action::Move(Motion::Left), "not Down via h");
+    }
+
+    /// Insert mode is literal text. A keymap that reached it would type the
+    /// wrong characters into the buffer, which is the one unrecoverable thing
+    /// a remap could do.
+    #[test]
+    fn a_remap_never_touches_the_modes_that_are_text() {
+        let mut input = shifted_layout();
+        let typed = input.on_key(key('j'), &Mode::Insert, ContentKind::Text).expect("resolved");
+        assert_eq!(typed.action, Action::InsertChar('j'));
+
+        let unbound = input.on_key(key('h'), &Mode::Insert, ContentKind::Text).expect("resolved");
+        assert_eq!(unbound.action, Action::InsertChar('h'), "`h = false` does not stop typing h");
     }
 
     #[test]

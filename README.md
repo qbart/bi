@@ -471,8 +471,7 @@ own — a config file appears because you asked for one.
 
 The file is a *patch* over bi's compiled-in defaults, never a replacement:
 an option you never mention keeps doing what bi already does, including
-whatever a later version adds. The only section today is `[options]`, which
-**is** the `:set` namespace — one key per option, spelled identically, so
+whatever a later version adds. `[options]` **is** the `:set` namespace — one key per option, spelled identically, so
 `:set number 5` and `number = 5` reach one setting:
 
 ```toml
@@ -490,7 +489,41 @@ used and swaps in whatever parsed; a failed reload changes nothing, because
 reloading yourself into a config with no way to type `:reload` again is the
 one outcome worth engineering against.
 
-The theme and the keymap are specified but not built — see
+#### Keys
+
+`[keys.normal]`, `[keys.visual]` and `[keys.tree]` rebind keys. A binding names
+a command; `false` unbinds:
+
+```toml
+[keys.normal]
+"h" = false          # unbound
+"j" = "left"         # hjkl shifted one key right
+"k" = "down"
+"l" = "up"
+";" = "right"
+
+[keys.tree]
+"k" = "tree_select_down"
+";" = "tree_expand"
+```
+
+Rebinding a motion rebinds every use of it: with the above, `d2k` deletes two
+lines down and `v` `k` extends a selection down, because the key is rewritten
+before the grammar sees it. `[keys.visual]` is a *narrower* map, not a
+replacement — visual falls back to `[keys.normal]`, matching how visual mode
+already falls through to normal for anything it does not claim. Nothing is
+remapped while you are typing text: insert, replace, the command line, the
+search line and the picker all take keys literally.
+
+An unknown command name is reported with a suggestion — `unknown command:
+tree_expnd — did you mean tree_expand?` — on the same status line as any other
+config problem.
+
+**What you cannot bind yet.** A name has to be something bi already has a key
+for, so `ge`, `g_` and `gg` are not bindable (vim spells them as two keys), and
+neither are key *sequences* like `"gd"`. Both are reported at load rather than
+ignored. The theme is specified but not built, and so is the full keymap
+design — a binding that resolves to a command rather than to another key. See
 [docs/specs/config.md](docs/specs/config.md).
 
 ## Layout

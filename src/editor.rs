@@ -860,6 +860,7 @@ pub struct Editor {
     /// an embedder that wants no config never calls `load_config`, and
     /// `:reload` then has nothing to re-read and says so.
     config_source: Option<Box<dyn ConfigSource>>,
+    config_epoch: u64,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -1044,6 +1045,18 @@ impl Editor {
     fn apply_config(&mut self, config: Config) {
         self.session.options = config.options;
         self.config = config;
+        self.config_epoch += 1;
+    }
+
+    /// Bumped every time a config is applied, so a frontend can tell that the
+    /// keymap it installed is stale without diffing one.
+    ///
+    /// A counter rather than a callback: `Input` lives in the frontend and
+    /// `:reload` happens in here, so the two need *some* way to meet, and a
+    /// number the frontend reads when it likes is the one that adds no
+    /// ownership between them.
+    pub fn config_epoch(&self) -> u64 {
+        self.config_epoch
     }
 
     /// Re-reads the config through the source a frontend supplied, and swaps
@@ -1095,6 +1108,7 @@ impl Editor {
             session: Session::default(),
             config: Config::default(),
             config_source: None,
+            config_epoch: 0,
         }
     }
 
@@ -4542,10 +4556,10 @@ mod tests {
     fn a_grammar_can_claim_a_file_by_name() {
         let d = ScratchDir::new("byname").file("CMakeLists.txt").file("notes.txt");
 
-        let cmake = Editor::open(&format!("{}/CMakeLists.txt", d.path())).unwrap();
+        let cmake = Editor::open(format!("{}/CMakeLists.txt", d.path())).unwrap();
         assert!(cmake.syntax().is_some(), "CMakeLists.txt is cmake, not plain text");
 
-        let plain = Editor::open(&format!("{}/notes.txt", d.path())).unwrap();
+        let plain = Editor::open(format!("{}/notes.txt", d.path())).unwrap();
         assert!(plain.syntax().is_none(), "an ordinary .txt still has no grammar");
     }
 

@@ -2,6 +2,7 @@
 
 use toml_edit::{Document, Item, Table, Value};
 
+use super::keys::{self, KeyMode};
 use super::{Config, Diagnostic, OptionValue, line_of};
 
 /// Parses `src` as a patch over `base`.
@@ -33,6 +34,7 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
 
         match key {
             "options" => read_options(src, table, &mut config, &mut problems),
+            "keys" => read_keys(src, table, &mut config, &mut problems),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -46,6 +48,76 @@ fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
 
         if let Err(message) = config.options.set(key, option_value(item)) {
             problems.push(Diagnostic { line, message });
+        }
+    }
+}
+
+/// `[keys.normal]`, `[keys.visual]`, `[keys.tree]`.
+///
+/// `[keys]` itself is one implicit table holding the three, which is how TOML
+/// reads a dotted header — so this is one section with sub-tables, not three
+/// sections, and a stray `[keys.nope]` is reported against its own line.
+fn read_keys(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    for (name, item) in table.iter() {
+        let line = line_for(table, name, src);
+        let Some(mode) = KeyMode::from_section(name) else {
+            let message = format!("unknown key mode: {name} — try normal, visual or tree");
+            problems.push(Diagnostic { line, message });
+            continue;
+        };
+        let Some(bindings) = item.as_table() else {
+            problems.push(Diagnostic { line, message: format!("keys.{name} is not a section") });
+            continue;
+        };
+        read_bindings(src, bindings, mode, config, problems);
+    }
+}
+
+fn read_bindings(
+    src: &str,
+    table: &Table,
+    mode: KeyMode,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+) {
+    for (spelling, item) in table.iter() {
+        let line = line_for(table, spelling, src);
+        let mut report = |message: String| problems.push(Diagnostic { line, message });
+
+        let from = match keys::parse_key(spelling) {
+            Ok(key) => key,
+            Err(message) => {
+                // A multi-key sequence is the common case here, and it is
+                // worth naming rather than calling the whole thing invalid.
+                report(if spelling.chars().count() > 1 && !spelling.starts_with('<') {
+                    format!("{message} — multi-key sequences are not bindable yet")
+                } else {
+                    message
+                });
+                continue;
+            }
+        };
+
+        match item.as_value() {
+            // `false` unbinds. `true` is not the opposite of anything: a key
+            // is bound to a name, so there is nothing for it to mean.
+            Some(Value::Boolean(b)) if !*b.value() => config.keys.insert(mode, from, None),
+            Some(Value::Boolean(_)) => report(
+                "true is not a binding — name a command, or use \
+                                               false to unbind"
+                    .into(),
+            ),
+            Some(Value::String(name)) => {
+                let name = name.value();
+                match keys::key_for_name(mode, name) {
+                    Some(to) => config.keys.insert(mode, from, Some(to)),
+                    None => report(match keys::nearest_name(mode, name) {
+                        Some(near) => format!("unknown command: {name} — did you mean {near}?"),
+                        None => format!("unknown command: {name}"),
+                    }),
+                }
+            }
+            _ => report(format!("a binding is a command name or false, not {item}")),
         }
     }
 }

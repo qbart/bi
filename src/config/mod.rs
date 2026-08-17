@@ -8,8 +8,10 @@ use std::sync::OnceLock;
 
 use crate::editor::LineNumbers;
 
+mod keys;
 mod parse;
 
+pub use keys::{KeyMode, Keymap, parse_key};
 pub use parse::parse;
 
 /// Where a frontend gets config text from.
@@ -98,11 +100,14 @@ impl Options {
     }
 }
 
-/// Everything a config file can say. Options today; a theme and a keymap join
-/// them in steps 2 and 3 of `docs/specs/config.md`.
+/// Everything a config file can say. Options and the keymap today; a theme
+/// joins them in step 2 of `docs/specs/config.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub options: Options,
+    /// Rewrites of bi's own keys, per mode. Empty is the default and means
+    /// every key keeps its built-in meaning.
+    pub keys: Keymap,
 }
 
 impl Default for Config {
@@ -115,7 +120,7 @@ impl Default for Config {
         static DEFAULT: OnceLock<Config> = OnceLock::new();
         DEFAULT
             .get_or_init(|| {
-                let bare = Config { options: Options::default() };
+                let bare = Config { options: Options::default(), keys: Keymap::default() };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })
             .clone()

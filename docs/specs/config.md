@@ -12,10 +12,12 @@ carrying it as a debt for three steps.
 
 ## Status
 
-**Step 1 built.**
+**Step 1 built. Step 3 half built.**
 
-The layer, `[options]`, `:reload` and both CLI subcommands ship. The theme
-(step 2) and the keymap (step 3) are specified below and not yet built.
+The layer, `[options]`, `:reload` and both CLI subcommands ship. `[keys.*]` now
+loads and applies — see "What step 3 actually shipped" below, which is honest
+about the half that did not. The theme (step 2) is specified below and not
+built.
 
 ## What this is not
 
@@ -113,6 +115,56 @@ This is also why `bi config init` writes the defaults **commented out**. See
 [The CLI](#the-cli).
 
 ## The keymap
+
+### What step 3 actually shipped
+
+`[keys.normal]`, `[keys.visual]` and `[keys.tree]` load, and a binding is a
+command name or `false` to unbind. What is missing is the half below: there is
+no `Binding` enum, no trie, and `input.rs` still holds the default keymap as
+`match` arms.
+
+Instead a name resolves to **the key that already produces it**, and the user's
+key is rewritten to that one at the top of `Input::on_key`. `"j" = "left"`
+makes `j` arrive as `h`.
+
+The trade is deliberate. What it buys:
+
+- The entire grammar keeps working without being touched. Rebinding `w` also
+  rebinds `dw`, `d2w`, `c2w` and `vw`, because by the time the dispatcher sees
+  the key it *is* `w`. A trie in front would have had to reimplement counts,
+  operator-pending and the four argument-taking states before a single binding
+  worked.
+- It is small enough to be obviously correct, and it is guarded by tests that
+  drive a real config through `Input`.
+
+What it costs, and what still argues for the full design:
+
+- **A name must already have a key.** `git_blame` cannot be bound, which is the
+  exact case `config.md` uses to argue for names over key-to-key mapping. So
+  the argument stands; this is a staging post, not a refutation.
+- **Multi-key targets are unreachable.** `ge`, `g_` and `gg` are two keys, so
+  they are absent from the names table rather than bound to something close.
+- **Sequences cannot be bound**, only single keys. `"gd" = …` reports rather
+  than silently doing nothing.
+- **The defaults are still in code**, not in `default.toml`.
+
+Each of those disappears when `Binding` and the trie land. Nothing here has to
+be un-built to get there: the names table, the key notation parser and the
+`[keys.*]` reader are all part of the final design.
+
+Two rules that fell out of building it, both worth keeping:
+
+- **Visual falls back to normal.** `input.rs` already falls through to `normal`
+  for anything visual does not claim, so a motion rebound in `[keys.normal]`
+  has to apply in visual too, or `v` then `j` would disagree with a bare `j`.
+- **Nothing is remapped in the modes that are text** — insert, replace, the
+  command line, the search line, the picker. Rewriting a keystroke into another
+  character is the one thing a keymap must never do to text being typed.
+
+A third came out of a bug rather than a decision: `Input::reset` was
+`*self = Self::default()`, which cleared the keymap along with the pending
+count. A rebound key worked exactly once and then reverted. Pending state and
+configuration share a struct, and `reset` means only the first.
 
 ### Vocabulary is configurable, grammar is not
 
