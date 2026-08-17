@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, BufferId, Cursor};
-use crate::config::Options;
+use crate::config::{OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind};
@@ -2201,34 +2201,46 @@ impl Editor {
     }
 
     /// `:set <option> <value>`, or `:set <option>=<value>` — vim's spelling,
-    /// which the fingers type without asking.
+    /// which the fingers type without asking. Bare `:set <option>` reports.
     ///
-    /// One option so far. A real options table wants the config layer this
-    /// file has been waiting for; until then a match arm and an honest error
-    /// for everything else is the whole of it.
+    /// The names and their meanings live in [`Options`], not here, so `:set`
+    /// and `config.toml` cannot disagree about what an option is or what it
+    /// accepts.
     fn set_option(&mut self, arg: &str) {
         let (name, value) = match arg.split_once(['=', ' ']) {
             Some((name, value)) => (name.trim(), value.trim()),
             None => (arg.trim(), ""),
         };
 
-        match name {
-            "number" => {
-                if value.is_empty() {
-                    self.session.status =
-                        format!("number={}", self.session.options.number.setting());
-                    return;
-                }
-                match value.parse::<i64>().ok().and_then(LineNumbers::from_setting) {
-                    Some(lines) => self.session.options.number = lines,
-                    None => {
-                        self.session.status =
-                            format!("number takes 0 (off), -1 (relative) or a count: {value}");
-                    }
-                }
-            }
-            "" => self.session.status = "set what?".into(),
-            _ => self.session.status = format!("unknown option: {name}"),
+        if name.is_empty() {
+            self.session.status = "set what?".into();
+            return;
+        }
+
+        if value.is_empty() {
+            self.session.status = match self.session.options.get(name) {
+                Some(OptionValue::Int(n)) => format!("{name}={n}"),
+                Some(OptionValue::Bool(on)) => format!("{name}={on}"),
+                Some(OptionValue::Other) => unreachable!("Options::get never returns Other"),
+                None => format!("unknown option: {name}"),
+            };
+            return;
+        }
+
+        // The typed value `Options::set` wants. A bare word that is neither a
+        // number nor a bool still goes through, so the option itself gets to
+        // say what it wanted rather than this function guessing.
+        let parsed = match value.parse::<i64>() {
+            Ok(n) => OptionValue::Int(n),
+            Err(_) => match value {
+                "true" => OptionValue::Bool(true),
+                "false" => OptionValue::Bool(false),
+                _ => OptionValue::Other,
+            },
+        };
+
+        if let Err(message) = self.session.options.set(name, parsed) {
+            self.session.status = message;
         }
     }
 
@@ -4989,6 +5001,31 @@ mod tests {
     }
 
     #[test]
+    fn set_reaches_every_option_the_config_file_can() {
+        let mut ed = Editor::empty();
+
+        ex(&mut ed, "set hlsearch true");
+        assert!(ed.session.options.hlsearch, "`:set` reaches an option it never used to");
+
+        ex(&mut ed, "set hlsearch");
+        assert_eq!(ed.session.status, "hlsearch=true", "and reports it back");
+
+        ex(&mut ed, "set hlsearch false");
+        assert!(!ed.session.options.hlsearch);
+    }
+
+    #[test]
+    fn set_reports_the_options_own_message_for_a_bad_value() {
+        let mut ed = Editor::empty();
+
+        ex(&mut ed, "set hlsearch maybe");
+        assert_eq!(ed.session.status, "hlsearch takes true or false");
+
+        ex(&mut ed, "set nmber 5");
+        assert_eq!(ed.session.status, "unknown option: nmber");
+    }
+
+    #[test]
     fn set_reports_and_refuses_rather_than_guessing() {
         let mut ed = editor("one");
         ex(&mut ed, "set number 5");
@@ -4998,7 +5035,7 @@ mod tests {
 
         ex(&mut ed, "set number -3");
         assert_eq!(ed.session.options.number, LineNumbers::Every(5), "left alone");
-        assert!(ed.session.status.contains("-3"));
+        assert_eq!(ed.session.status, "number takes 0 (off), -1 (relative) or a count");
 
         ex(&mut ed, "set wrap");
         assert_eq!(ed.session.status, "unknown option: wrap");
