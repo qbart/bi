@@ -12,7 +12,10 @@ carrying it as a debt for three steps.
 
 ## Status
 
-**Specified, not built.**
+**Step 1 built.**
+
+The layer, `[options]`, `:reload` and both CLI subcommands ship. The theme
+(step 2) and the keymap (step 3) are specified below and not yet built.
 
 ## What this is not
 

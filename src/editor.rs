@@ -3758,7 +3758,7 @@ mod tests {
     }
 
     /// A source whose text can change between reads, which is what `:reload`
-    /// is for. `Cell` rather than a field because `ConfigSource::config`
+    /// is for. `RefCell` rather than a field because `ConfigSource::config`
     /// takes `&self` — the source is read-only to the editor, and mutable
     /// only to its owner.
     struct Mutable(std::cell::RefCell<String>);

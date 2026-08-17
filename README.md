@@ -299,8 +299,9 @@ afterwards repeats it.
 | `:q` `:q!` | close this window; from the last one, quit — refusing unsaved changes unless forced |
 | `:wa` `:qa` `:qa!` | every buffer, including ones no window is showing |
 | `:wq` `:x` | write and quit |
-| `:e` `:e!` | reload from disk, refusing if modified unless forced |
+| `:e` `:e!` | revert this buffer from disk, refusing if modified unless forced |
 | `:e <path>` | open another file, reusing its buffer if it is already open |
+| `:reload` | re-read the config, through the same path startup uses — different job from `:e`, which reverts the buffer |
 | `:sp [path]` `:vs [path]` | split horizontally / vertically; bare, the new window duplicates this one |
 | `:close` `:only` | close this window / every other one |
 | `:bn` `:bp` | cycle the buffer list, wrapping |
@@ -444,6 +445,46 @@ and makes off a value like any other — so `:set nu` and `:set rnu` do not work
 here, and bare `:set number` reports the current value rather than turning
 numbering on.
 
+### Config
+
+`~/.config/bee/config.toml` — found via `$BEE_CONFIG`, which names the
+*directory*, not the file, since `themes/` will need to be its sibling; else
+`$XDG_CONFIG_HOME/bee`; else `~/.config/bee`. `bee config init` creates it,
+writing bee's defaults commented out, and never overwrites one that already
+exists; `bee config edit` opens the directory as a tree. Neither runs on its
+own — a config file appears because you asked for one.
+
+The file is a *patch* over bee's compiled-in defaults, never a replacement:
+an option you never mention keeps doing what bee already does, including
+whatever a later version adds. The only section today is `[options]`, which
+**is** the `:set` namespace — one key per option, spelled identically, so
+`:set number 5` and `number = 5` reach one setting:
+
+```toml
+[options]
+number   = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
+hlsearch = false
+```
+
+Every key in the file has to live under a section, this one included — a
+bare top-level key is rejected rather than silently accepted. That includes
+the lines `bee config init` writes for you: uncommenting a setting without
+also uncommenting its `[options]` header above leaves the key belonging to
+no section, and the parser is right to reject it, even though uncommenting
+just the one line you want is the obvious first thing to try.
+
+An unknown option or a value of the wrong type drops that one line and
+reports it rather than refusing to start — `1 config problem: unknown
+option: nmber` on the status line, not stderr, which the alternate screen
+swallows. Only malformed TOML falls back wholesale, and even then bee starts,
+on its defaults. `:reload` re-reads the file through the same path startup
+used and swaps in whatever parsed; a failed reload changes nothing, because
+reloading yourself into a config with no way to type `:reload` again is the
+one outcome worth engineering against.
+
+The theme and the keymap are specified but not built — see
+[docs/specs/config.md](docs/specs/config.md).
+
 ## Layout
 
 bee is a library plus a frontend. The library is the editor and knows nothing
@@ -553,10 +594,10 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   cross-compilation harder. A Cargo feature would fix it: `Editor::syntax` is
   already `Option<Syntax>` and an unknown extension already renders as plain
   text, so the no-syntax path exists and works.
-- **The config language is undecided**, and two tables are now waiting on it —
-  the keymap in `input.rs` and the highlight colours in `tui/render.rs`. Both are
-  hardcoded. RECOMMENDATION.md names this as the painful retrofit, and every
-  feature added before deciding makes it slightly worse.
+- ~~**The config language is undecided**~~ Decided and half built: TOML, in
+  `~/.config/bee/config.toml`, parsed by `bee::config`. `[options]` is live.
+  The keymap in `input.rs` and the highlight table in `tui/render.rs` are still
+  hardcoded and are steps 3 and 2 of [docs/specs/config.md](docs/specs/config.md).
 - **The core/frontend boundary is enforced by a test, not the compiler.** Fixed
   as far as it goes: there is a `lib.rs`, `input.rs` speaks `bee::key::Key`
   rather than crossterm's types, and rendering and event translation live in
@@ -575,11 +616,11 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 
 ## Next
 
-LSP, which hangs off the same `pending_edits` drain that tree-sitter and the
-window fixup now share — `Editor::settle` is where `textDocument/didChange`
-goes. Before that, the config-language decision (RECOMMENDATION.md, "what
-actually bites you" #1) is still unmade and still cheap: the keymap in
-`input.rs` and the highlight table in `tui/render.rs` are both waiting for it.
+The rest of [docs/specs/config.md](docs/specs/config.md): the theme (step 2),
+so `tui/render.rs` stops hardcoding colours, and the keymap (step 3), so
+`input.rs` stops hardcoding keys. Then LSP, which hangs off the same
+`pending_edits` drain that tree-sitter and the window fixup now share —
+`Editor::settle` is where `textDocument/didChange` goes.
 
 Previously, on windows: `Editor` became a session holding a buffer list and a
 tree of windows, with the editing commands moved onto a `View` that binds one

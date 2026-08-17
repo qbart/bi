@@ -91,6 +91,10 @@ const INIT_HEADER: &str = "\
 # commented out keeps doing what bee does by default, including settings added
 # in later versions. Uncomment a line only to change it.
 #
+# A key needs its section uncommented too. \"number = 5\" on its own, with
+# \"[options]\" still commented out, is a key with no section, and bee reports
+# that as an error rather than accepting it silently.
+#
 # `:reload` re-reads this file without restarting.
 
 ";

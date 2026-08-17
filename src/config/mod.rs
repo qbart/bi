@@ -64,7 +64,9 @@ pub enum OptionValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Options {
     pub number: LineNumbers,
-    /// Off unless asked for: vim does not light the buffer up on a plain `/`.
+    /// Off unless asked for: vim does not light the buffer up on a plain
+    /// `/`, and the status line's `[3/17]` says how many matches there are
+    /// without painting them.
     pub hlsearch: bool,
 }
 
