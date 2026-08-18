@@ -96,6 +96,21 @@ it to a font weight and an RGB value it picks itself. Producing `Style` here
 would weld the core to ratatui in the one place it is hardest to unpick, and a
 theme system wants exactly this indirection anyway.
 
+**A capture styled the colour of nothing is a capture that did not happen.**
+`operator` had an arm, and that arm was `Color::Gray` — ANSI 7, which is what
+an unstyled cell already prints. So `&` in Go, `*` and `=` in C3 and `==`
+everywhere were parsed, captured, ranked, styled and then painted invisible,
+which from the outside is indistinguishable from a grammar that never matched
+them. Operators are words of the language — `&x` and `x` are different
+programs — so they now take a colour of their own. Brackets and separators
+keep the neutral one deliberately: they are structure rather than meaning,
+they are on every line, and colouring them is what makes a screen look busy.
+
+The general form of this is worth stating, because a query test cannot catch
+it: the syntax tests assert *capture names*, and the whole point of the
+capture-name boundary is that they cannot know what colour a frontend picks.
+So the theme needs its own assertion that a style is not the default one.
+
 **Query only the visible byte range.** `QueryCursor::set_byte_range` restricted
 to the rows being drawn. Frame cost stays bounded by terminal height, which is
 the invariant the README's rendering decision commits to — highlighting a
@@ -114,6 +129,22 @@ queries disagree about which order to write them in, so any rule based on
 pattern order alone fixes one language and breaks the other. Left unresolved,
 keys take the colour of ordinary string values and a config file renders as one
 green wall.
+
+**A blanket `@variable` never outranks a real capture.** The tie-break above
+ranks by dotted segments, and that is not enough on its own, because
+`function` and `variable` both have one. `@variable` is not a claim about a
+node — it is what a query calls an identifier when it had nothing better to
+say — so it is ranked below everything, alongside `@none`, which explicitly
+asks for no colour.
+
+Without that, the tie falls through to pattern order, and the queries do not
+agree on one. C writes `(identifier) @variable` first and its `@function`
+patterns last, which is right for last-wins. Go writes them the other way
+round — `@function` on line 17, the blanket on line 26 — because that query
+targets `tree-sitter-highlight`, where the *first* pattern wins. Both are
+correct upstream and they are exact opposites. `func main()` in Go came out a
+variable, which is to say uncoloured, in the same editor where the same
+construct in C came out a function.
 
 **`@spell` and `@nospell` are dropped.** They mark where a spellchecker should
 look and say nothing about colour, but INI and CMake both hang one on the same
@@ -167,6 +198,57 @@ turns a missing or incompatible query into plain text with no message.
 That last case is why `the_queries_bi_did_not_get_from_a_crate_produce_captures`
 asserts a snippet comes back with captures in it, rather than asserting the
 query merely compiles.
+
+### And one ships only half of one
+
+**C++'s query is a delta on C's, not a query.** Upstream `queries/cpp/highlights.scm`
+opens with `; inherits: c`, and the crate ships only the C++ half — the
+inheritance is a convention of the *editor* that loads the file, not of the
+crate. Handed to `Query::new` alone it compiles, so nothing complains, and it
+matches `auto`, the C++-only keywords, raw strings, and calls through a
+`qualified_identifier`. Nothing else. No comment, no string, no number, no
+`if`, no `return`, no `int`. A C++ file therefore rendered as a white wall with
+`auto` and the odd `ns::fn` picked out of it — the same silent failure HLSL had,
+arriving from the opposite direction: not a borrowed query that matches
+nothing, but a shipped query that is only ever meant to be the second half of
+one.
+
+So `cpp` gets C's query concatenated in front of C++'s, which is exactly what
+`; inherits:` means. The order is not cosmetic: ties between two patterns over
+the same range fall through to the later pattern, so C's own
+`(call_expression function: (identifier) @function)` has to keep beating its
+own `(identifier) @variable`, and C++'s overrides have to land after both.
+
+The general lesson is that a crate shipping `HIGHLIGHTS_QUERY` is not evidence
+that the query is whole. Only a snippet with captures in it is, which is why
+the per-language snippet tests below are now the rule rather than a special
+case for the hand-written ones.
+
+### A predicate nobody runs is a guard that does not hold
+
+`QueryCursor::matches` evaluates `#eq?`, `#match?` and `#any-of?` against the
+text provider — which is the whole reason `RopeProvider` exists. Everything
+else lands in `Query::general_predicates` and is **not applied**, and an
+unapplied guard does not fail closed. The pattern simply matches everything it
+can reach.
+
+`#lua-match?` is Neovim's, and three of these queries use it. All three were
+narrowing rules, so all three were inverted into blanket ones:
+
+| pattern | meant | did |
+|---|---|---|
+| CMake `(line_comment) @keyword.directive` `"^#!/"` | colour a shebang | every comment magenta, not grey |
+| CMake `(unquoted_argument) @constant` `"^[%u@][%u%d_]+$"` | colour `SHOUTING_CASE` | every argument yellow |
+| GLSL `(identifier) @variable.builtin` `"^gl_"` | colour `gl_Position` | every identifier, `main` and `p` included |
+
+So a pattern carrying a predicate tree-sitter will not run is **dropped
+whole**. Each of the three refines something already captured more broadly, so
+what is lost is a shade on a rare node and what is fixed is a wrong colour on a
+common one — a CMake comment goes back to `@comment`. Running them properly
+means a Lua-pattern engine or a regex dependency, and three patterns do not pay
+for either. If a fourth arrives that is load-bearing rather than decorative,
+that is the moment to reconsider, and `unevaluatable()` is the one place to
+change.
 
 **Dockerfile comes from `arborium-dockerfile`.** The obvious
 `tree-sitter-dockerfile` is pinned to tree-sitter 0.20, and two versions of
@@ -269,7 +351,7 @@ tree-sitter-md = "0.5"       # LANGUAGE is the block grammar; INLINE_LANGUAGE wa
 tree-sitter-cmake = "0.7"
 tree-sitter-go = "0.25"
 tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
+tree-sitter-cpp = "0.23"     # ships the `; inherits: c` half only — prepend C's query
 tree-sitter-lua = "0.5"
 tree-sitter-bash = "0.25"
 tree-sitter-css = "0.25"
@@ -323,6 +405,11 @@ Per grammar, because a grammar fails *quietly*:
   query that will not compile against the current tree-sitter into plain text
   with no message anywhere. A grammar bumped past an ABI it shares with us
   would otherwise be noticed by a user, not by the suite.
+- **every language highlights a snippet of itself**, and the assertion is on
+  the *shape* — a comment, a keyword and a literal all come back captured.
+  Compiling is not the bar: an inherited query compiles, and a borrowed one
+  compiles, and both can match almost nothing. This is the test C++ did not
+  have.
 - a key and a value in each of TOML, YAML, JSON and INI get *different*
   captures — the tie-break above, from the side that shows
 - `CMakeLists.txt` resolves by name, not extension

@@ -171,7 +171,17 @@ fn exact_style(name: &str) -> Option<Style> {
         "comment" => Style::default().fg(Color::DarkGray),
         "constant" | "number" | "float" | "boolean" => Style::default().fg(Color::Yellow),
         "attribute" | "label" => Style::default().fg(Color::LightMagenta),
-        "operator" | "punctuation" | "delimiter" => Style::default().fg(Color::Gray),
+        // An operator is a word of the language, not scaffolding, and it is
+        // the one thing here that has to differ from plain text: `&x` and `x`
+        // are different programs. It sat on `Color::Gray` — ANSI 7, which is
+        // what an unstyled cell already prints as — so `&`, `:=`, `*` and `==`
+        // were captured, styled, and then painted the colour of nothing.
+        "operator" => Style::default().fg(Color::Red),
+        // Brackets and separators stay neutral on purpose. They are structure
+        // rather than meaning, they are everywhere, and colouring them is what
+        // makes a screen look busy. Gray is honest here in a way it was not
+        // above: this really is meant to read as ordinary text.
+        "punctuation" | "delimiter" => Style::default().fg(Color::Gray),
         // The key side of a config format — TOML, YAML and INI call it
         // `property`, JSON dresses it as a string. Without this the whole
         // left-hand column of a config file renders unstyled, which is most
@@ -879,6 +889,19 @@ mod tests {
         assert_eq!(style_for("keyword.control.conditional"), style_for("keyword"));
         // An unknown name is not an error, it is unstyled text.
         assert_eq!(style_for("no.such.capture"), Style::default());
+    }
+
+    /// The bug this catches is not a missing arm — `operator` had one. It is
+    /// an arm whose colour was the same colour unstyled text already prints
+    /// as, so `&` in Go and `*` in C3 came out looking uncaptured next to a
+    /// neovim that colours them.
+    #[test]
+    fn an_operator_does_not_look_like_plain_text() {
+        assert_ne!(style_for("operator"), Style::default());
+        // Brackets and separators are the deliberate exception: structure, not
+        // meaning, and everywhere.
+        assert_ne!(style_for("operator"), style_for("punctuation.bracket"));
+        assert_ne!(style_for("operator"), style_for("punctuation.delimiter"));
     }
 
     #[test]

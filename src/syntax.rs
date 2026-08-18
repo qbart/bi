@@ -68,7 +68,7 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
         "go" => Some((tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY)),
         "c3" | "c3i" => Some((tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY)),
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
-            Some((tree_sitter_cpp::LANGUAGE.into(), tree_sitter_cpp::HIGHLIGHT_QUERY))
+            Some((tree_sitter_cpp::LANGUAGE.into(), &CPP_HIGHLIGHTS))
         }
         // `.h` is ambiguous and always will be. C, because a C++ project that
         // uses it gets a grammar that reads most of the file anyway, while a C
@@ -98,6 +98,24 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
 
 /// HCL's highlights, which the grammar crate does not ship. See the file.
 const HCL_HIGHLIGHTS: &str = include_str!("queries/hcl.scm");
+
+/// C++'s highlights are C's, then C++'s own.
+///
+/// The crate's `HIGHLIGHT_QUERY` is *half* a query: upstream writes
+/// `; inherits: c` at the top of it, and that line is an instruction to the
+/// editor loading the file, not something the crate resolves. Alone it
+/// compiles — so nothing complains — and then matches `auto`, the C++-only
+/// keywords, raw strings and calls through a `qualified_identifier`. No
+/// comment, no string, no number, no `if`, no `int`. A C++ file came out a
+/// white wall with `auto` picked out of it.
+///
+/// Concatenation *is* what `; inherits:` means, and the order carries weight:
+/// a tie between two patterns over the same range falls to the later one, so
+/// C's `(call_expression function: (identifier) @function)` must stay after
+/// its own `(identifier) @variable`, and C++'s overrides after both.
+static CPP_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY)
+});
 
 fn is_spell(capture: &str) -> bool {
     matches!(capture, "spell" | "nospell")
@@ -130,10 +148,62 @@ pub struct Syntax {
     parser: Parser,
     tree: Tree,
     query: Query,
-    /// Dotted segments per capture, indexed by capture id. Precomputed
-    /// because it is consulted while sorting every visible span, and it
-    /// never changes for a given query.
+    /// How hard each capture argues for itself, indexed by capture id. See
+    /// [`specificity`]. Precomputed because it is consulted while sorting
+    /// every visible span, and it never changes for a given query.
     specificity: Vec<u8>,
+    /// Patterns carrying a predicate tree-sitter cannot evaluate, indexed by
+    /// pattern id. See [`unevaluatable`].
+    unevaluatable: Vec<bool>,
+}
+
+/// Whether a pattern is guarded by a predicate tree-sitter will not run.
+///
+/// `#eq?`, `#match?` and `#any-of?` are evaluated by `QueryCursor::matches`
+/// against the text provider. Anything else lands in `general_predicates` and
+/// is simply **not applied** — the pattern then matches unconditionally, which
+/// turns a narrowing rule into a blanket one.
+///
+/// That is not hypothetical. `#lua-match?` is Neovim's, and three queries here
+/// use it: a CMake comment starting `#!/` is a `keyword.directive`, a CMake
+/// argument in SHOUTING_CASE is a `constant`, and a GLSL identifier starting
+/// `gl_` is a `variable.builtin`. Unevaluated, *every* CMake comment came out
+/// magenta, *every* unquoted argument yellow, and *every* GLSL identifier a
+/// builtin — `main` and `p` included.
+///
+/// Dropping the pattern is the safe direction. Each of the three is a
+/// refinement of something already captured more broadly, so what is lost is a
+/// shade on a rare node; what is fixed is a wrong colour on a common one.
+/// Evaluating them properly means a Lua-pattern engine or a regex dependency,
+/// and neither is worth three patterns.
+fn unevaluatable(query: &Query, pattern: usize) -> bool {
+    !query.general_predicates(pattern).is_empty()
+}
+
+/// How strong a claim a capture name makes on a node, for breaking a tie
+/// between two patterns over the identical range.
+///
+/// Dotted segments, mostly: `string.special.key` is a narrower claim than
+/// `string` and beats it. Zero for the names that are a query's *fallback*
+/// rather than a claim — `@variable` is what an identifier is called when
+/// nothing more interesting was said about it, and `@none` explicitly asks for
+/// no colour at all.
+///
+/// Without the exception, the tie falls through to pattern order, and the
+/// queries do not agree on one. C writes `(identifier) @variable` first and its
+/// `@function` patterns last, so later-wins is right there. Go writes them the
+/// other way round — `(function_declaration name: (identifier) @function)` on
+/// line 17, the blanket `(identifier) @variable` on line 26 — because that
+/// query is written for `tree-sitter-highlight`, where the *first* pattern
+/// wins. Both spellings are correct upstream and they are exact opposites, so
+/// no rule reading pattern order alone can serve them both. `func main()` in Go
+/// came out a variable, which is to say uncoloured, next to a C file where the
+/// same construct came out a function.
+fn specificity(name: &str) -> u8 {
+    if matches!(name, "variable" | "none") {
+        return 0;
+    }
+    name.matches('.').count() as u8 + 1
 }
 
 impl Syntax {
@@ -146,9 +216,10 @@ impl Syntax {
         parser.set_language(&language).ok()?;
         let query = Query::new(&language, highlights).ok()?;
         let tree = parse(&mut parser, rope, None)?;
-        let specificity =
-            query.capture_names().iter().map(|n| n.matches('.').count() as u8 + 1).collect();
-        Some(Self { parser, tree, query, specificity })
+        let specificity = query.capture_names().iter().map(|n| specificity(n)).collect();
+        let unevaluatable =
+            (0..query.pattern_count()).map(|p| unevaluatable(&query, p)).collect::<Vec<_>>();
+        Some(Self { parser, tree, query, specificity, unevaluatable })
     }
 
     pub fn capture_name(&self, capture: u32) -> &str {
@@ -183,6 +254,12 @@ impl Syntax {
         let mut raw: Vec<(usize, usize, u32, usize)> = Vec::new();
         let mut matches = cursor.matches(&self.query, self.tree.root_node(), RopeProvider(rope));
         while let Some(m) = matches.next() {
+            // A predicate tree-sitter did not run is a guard that did not
+            // hold, so the whole pattern goes rather than firing on every
+            // node it can reach.
+            if self.unevaluatable[m.pattern_index] {
+                continue;
+            }
             for capture in m.captures {
                 // `@spell` / `@nospell` mark where a spellchecker should look;
                 // they say nothing about colour. Several grammars hang one on
@@ -202,11 +279,13 @@ impl Syntax {
         //
         // Two patterns capturing the *same* range is not nesting, and the
         // order they arrive in is not meaningful, so it is broken explicitly:
-        // the more dotted name wins, then the later pattern. A JSON key is
-        // both `string.special.key` and `string`, a YAML key is both
-        // `property` and `string`, and the queries disagree about which
-        // order to write them in — without this, keys take the colour of
-        // ordinary string values and a config file reads as one green wall.
+        // the stronger claim wins (see `specificity`), then the later pattern.
+        // A JSON key is both `string.special.key` and `string`, a YAML key is
+        // both `property` and `string`, and a Go function name is both
+        // `function` and the blanket `variable` — and the queries disagree
+        // about which order to write each pair in. Without this, keys take the
+        // colour of ordinary string values and a config file reads as one
+        // green wall, and every Go declaration goes uncoloured.
         raw.sort_by_key(|(start, end, capture, pattern)| {
             (std::cmp::Reverse(end - start), self.specificity[*capture as usize], *pattern)
         });
@@ -465,6 +544,178 @@ mod tests {
             covers(&found, "function", "main");
             assert!(found.len() > 3, "{shader} matched almost nothing: {found:?}");
         }
+    }
+
+    /// A crate that exports `HIGHLIGHTS_QUERY` is not evidence the query is
+    /// whole. C++'s is a `; inherits: c` delta and compiled happily on its own
+    /// while matching `auto` and almost nothing else, so every language gets a
+    /// snippet whose comment, keyword and literal must all come back captured.
+    #[test]
+    fn every_language_captures_a_comment_a_keyword_and_a_literal() {
+        // (one key per grammar, snippet, comment, keyword, literal)
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            ("rs", "// note\nfn f() { let s = \"hi\"; }\n", "// note", "fn", "\"hi\""),
+            ("go", "// note\nfunc f() { s := \"hi\" }\n", "// note", "func", "\"hi\""),
+            ("py", "# note\ndef f():\n    return \"hi\"\n", "# note", "def", "\"hi\""),
+            ("lua", "-- note\nlocal s = \"hi\"\n", "-- note", "local", "\"hi\""),
+            ("sh", "# note\nif true; then s=\"hi\"; fi\n", "# note", "if", "\"hi\""),
+            (
+                "c",
+                "// note\nint f(void) { char *s = \"hi\"; return 0; }\n",
+                "// note",
+                "return",
+                "\"hi\"",
+            ),
+            // The regression: C++ alone captured `auto` and nothing else.
+            (
+                "cpp",
+                "// note\nint f() { const char *s = \"hi\"; return 0; }\n",
+                "// note",
+                "return",
+                "\"hi\"",
+            ),
+            (
+                "c3",
+                "// note\nfn int f() { String s = \"hi\"; return 0; }\n",
+                "// note",
+                "fn",
+                "\"hi\"",
+            ),
+            // GLSL's query captures no boolean, so the literal here is a
+            // number — the assertion is that literals reach the frontend at
+            // all, not that a particular spelling of one does.
+            ("glsl", "// note\nvoid main() { if (1) {} }\n", "// note", "if", "1"),
+            ("hlsl", "// note\nfloat f() { if (1) {} return 0; }\n", "// note", "return", "0"),
+            ("slang", "// note\nfloat f() { if (1) {} return 0; }\n", "// note", "return", "0"),
+            // CSS leaves a bare `red` uncaptured — a `plain_value` is not a
+            // literal to that query — so the number carries the third slot.
+            ("css", "/* note */\na { color: red; margin: 0 }\n", "/* note */", "color", "0"),
+            ("toml", "# note\n[s]\nk = \"hi\"\n", "# note", "k", "\"hi\""),
+            ("yaml", "# note\nk: \"hi\"\n", "# note", "k", "\"hi\""),
+            ("cmake", "# note\nif(A)\n  project(bi)\nendif()\n", "# note", "if", "project"),
+            (
+                "tf",
+                "# note\nresource \"a\" \"b\" {\n  k = \"hi\"\n}\n",
+                "# note",
+                "resource",
+                "\"hi\"",
+            ),
+        ];
+
+        for (file, text, comment, keyword, literal) in cases {
+            let found = captures(file, text);
+            for wanted in [comment, keyword, literal] {
+                assert!(
+                    found.iter().any(|(_, t)| t.trim() == *wanted),
+                    "{file}: nothing captured {wanted:?} — got {found:?}"
+                );
+            }
+            covers(&found, "comment", comment);
+        }
+
+        // Three that cannot fill all three slots, asserted on what they do
+        // have rather than left untested: JSON has no comment, INI captures
+        // no value, and Dockerfile no literal.
+        let json = captures("json", "{\"a\": 1}");
+        covers(&json, "string.special.key", "\"a\"");
+        covers(&json, "number", "1");
+
+        let ini = captures("ini", "; note\n[s]\nk = hi\n");
+        covers(&ini, "comment", "; note");
+        covers(&ini, "property", "k");
+
+        let docker = captures("Dockerfile", "# note\nFROM alpine:3.19\n");
+        covers(&docker, "comment", "# note");
+        covers(&docker, "keyword", "FROM");
+
+        // Markdown is neither: it has no comment, keyword or literal at all.
+        // `markdown_highlights_its_block_structure` is its equivalent.
+    }
+
+    /// C++'s crate query is the `; inherits: c` half. On its own it captured
+    /// `auto` and nothing else, so a C++ file rendered as a white wall — the
+    /// C half has to be in front of it, and its own overrides still on top.
+    #[test]
+    fn cpp_gets_cs_query_as_well_as_its_own() {
+        let found = captures(
+            "cpp",
+            "// note\n#include <a.hpp>\nint f() {\n  auto s = \"hi\";\n  if (s) return 1;\n}\n",
+        );
+
+        // From C's half, none of which C++'s ships.
+        covers(&found, "comment", "// note");
+        covers(&found, "keyword", "#include");
+        covers(&found, "string", "<a.hpp>");
+        covers(&found, "type", "int");
+        covers(&found, "string", "\"hi\"");
+        covers(&found, "keyword", "if");
+        covers(&found, "keyword", "return");
+        covers(&found, "number", "1");
+        covers(&found, "function", "f");
+
+        // From C++'s own half, which must still win where the two overlap.
+        covers(&found, "type", "auto");
+
+        // C's `(identifier) @variable` is the first pattern in the combined
+        // query and matches every identifier there is. Concatenating in the
+        // other order would let it beat the function it contains, since a tie
+        // over one range falls to the later pattern.
+        assert!(
+            !found.iter().any(|(n, t)| n == "variable" && t == "f"),
+            "the blanket @variable outran @function: {found:?}"
+        );
+    }
+
+    /// `@variable` is what a query calls an identifier when it had nothing
+    /// better to say, so it must never outrank something that did. Go writes
+    /// the blanket after its `@function` patterns — correct for
+    /// `tree-sitter-highlight`, where the first pattern wins — and C writes it
+    /// before, correct for last-wins. Pattern order alone cannot serve both.
+    #[test]
+    fn a_blanket_variable_never_outranks_a_real_capture() {
+        let go = captures("go", "func main() {\n\ttype T int\n}\n");
+        covers(&go, "function", "main");
+        assert!(
+            !go.iter().any(|(n, t)| n == "variable" && t == "main"),
+            "the blanket @variable swallowed a declaration: {go:?}"
+        );
+
+        // The same tie in the order C writes it, which already worked and has
+        // to keep working.
+        let c = captures("c", "int f(void) { return g(); }\n");
+        covers(&c, "function", "f");
+        covers(&c, "function", "g");
+    }
+
+    /// A predicate tree-sitter does not evaluate is a guard that does not
+    /// hold, and the pattern then fires on everything it can reach. `#lua-match?`
+    /// is Neovim's and three queries here use it, so all three used to paint
+    /// far more than they meant to.
+    #[test]
+    fn a_predicate_tree_sitter_cannot_run_takes_its_pattern_with_it() {
+        // `((line_comment) @keyword.directive (#lua-match? … "^#!/"))` — every
+        // CMake comment came back a directive, so comments rendered magenta.
+        let cmake = captures("CMakeLists.txt", "# note\nproject(bi)\n");
+        covers(&cmake, "comment", "# note");
+        assert!(
+            !cmake.iter().any(|(n, _)| n.starts_with("keyword.directive")),
+            "an unrun #lua-match? still painted: {cmake:?}"
+        );
+
+        // `((unquoted_argument) @constant (#lua-match? … "^[%u@][%u%d_]+$"))`
+        // — `bi` is not SHOUTING_CASE and is not a constant.
+        assert!(
+            !cmake.iter().any(|(n, t)| n.starts_with("constant") && t == "bi"),
+            "a lowercase argument came back a constant: {cmake:?}"
+        );
+
+        // `((identifier) @variable.builtin (#lua-match? … "^gl_"))` — this one
+        // caught *every* GLSL identifier, `main` included.
+        let glsl = captures("glsl", "void main() { float x = 1.0; }\n");
+        assert!(
+            !glsl.iter().any(|(n, t)| n.starts_with("variable.builtin") && t == "main"),
+            "every glsl identifier is still a builtin: {glsl:?}"
+        );
     }
 
     #[test]
