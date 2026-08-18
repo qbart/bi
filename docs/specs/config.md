@@ -303,17 +303,31 @@ Two rules that fell out of building it, both worth keeping:
 - **Visual falls back to normal.** `input.rs` already falls through to `normal`
   for anything visual does not claim, so a motion rebound in `[keys.normal]`
   has to apply in visual too, or `v` then `j` would disagree with a bare `j`.
-- **A tree falls back to normal for sequences only.** Its keymap is a complete
-  allowlist rather than an overlay, which is what stops `"j" = "left"` from
-  meaning "collapse" in a pane sitting on a filesystem — so a single key is
-  never borrowed. A *sequence* is: `<leader>e` is a command the user invented,
-  and every key the tree binds by default is a single one, so there is nothing
-  for it to collide with. Without this, a leader binding for `window_tree`
-  opened the sidebar and then could not close it, because the second press
-  happened with the tree focused. The borrowed keys still mean whatever they
-  mean in a tree — `goto_first_line` is `gg`, which is the tree's first row —
-  and the tree dispatcher remains an allowlist, so nothing it does not name
-  can arrive by this route.
+- **A tree falls back to normal for the keys it has no meaning for.** Three
+  layers, in this order: `[keys.tree]`, then the tree's own vocabulary, then
+  `[keys.normal]`. The middle layer is what stops `"j" = "left"` from meaning
+  "collapse" in a pane sitting on a filesystem; the last is what makes
+  `"<C-b>" = "window_tree"` close the sidebar it opened, because nothing in a
+  tree spells `<C-b>`.
+
+  The test is the *key*, not the length of the binding. A sequence-only rule
+  stood in for this first — `<leader>e` was borrowed, a single key never was —
+  and it got the common case wrong: one key bound to `window_tree` opened the
+  tree and then could not put it away, because the second press happened with
+  the tree focused. "Does the tree claim this key?" is the question that was
+  always being asked, and `"j"` and `"<C-b>"` only answer it differently.
+
+  A tree claims a key if its dispatcher has a meaning for it, prefixes
+  included: `hjkl`, the arrows, `-`, `+`, `G`, `R`, `y`, `c`, `x`, `p`, `a`,
+  `r`, `:`, `<CR>`, `<Esc>`, `<Tab>`, a count, `Ctrl-D`, `Ctrl-U`, `Ctrl-I`,
+  `Ctrl-O`, `Ctrl-^`, and the `g`, `d` and `Ctrl-W` prefixes. Claiming the
+  prefix claims the whole sequence: a normal-mode `"gd"` never fires in a tree,
+  because `g` is already `gg` and `gh` there.
+
+  What is borrowed still means whatever it means *here*: `goto_first_line` is
+  `gg`, which is the tree's first row. The tree dispatcher remains an
+  allowlist, so a borrowed binding for something a tree has no use for —
+  `word_forward` — is a no-op rather than a way into normal mode.
 - **Nothing is remapped in the modes that are text** — insert, replace, the
   command line, the search line, the picker. Rewriting a keystroke into another
   character is the one thing a keymap must never do to text being typed.

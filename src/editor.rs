@@ -5167,13 +5167,46 @@ mod tests {
         press(&mut ed, &mut input, 'e');
         assert_eq!(ed.window_ids().len(), 1, "and the same keys put it away");
 
-        // What the tree's own keymap still refuses to borrow: a single key
-        // rebound in normal mode. `j` must select down here, not collapse.
+        // What the tree's own keymap still refuses to borrow: a key it has a
+        // meaning for. `j` must select down here, not collapse.
         press(&mut ed, &mut input, ' ');
         press(&mut ed, &mut input, 'e');
         let before = ed.window().tree().map(|t| t.selected());
         press(&mut ed, &mut input, 'j');
         assert_ne!(ed.window().tree().map(|t| t.selected()), before, "j still moves down");
+    }
+
+    /// The same toggle as one key. A tree borrows what it has no meaning for,
+    /// and `<C-b>` — the key most people reach for — is not in its vocabulary,
+    /// so it has to work from both sides exactly as `<leader>e` does.
+    #[test]
+    fn a_single_key_binding_toggles_the_tree_from_either_side() {
+        let d = ScratchDir::new("ctrl-b-tree").file("a.rs").file("b.rs");
+        let (config, problems) = crate::config::parse(
+            "[keys.normal]\n\"<C-b>\" = \"window_tree\"\n",
+            crate::config::Config::default(),
+        )
+        .expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let mut input = crate::input::Input::default();
+        input.set_keys(config.keys);
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+
+        let mut press = |ed: &mut Editor| {
+            let key = crate::key::Key::ctrl('b');
+            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+                ed.apply(command);
+            }
+        };
+
+        press(&mut ed);
+        assert_eq!(ed.window_ids().len(), 2, "the tree opened");
+        assert!(ed.window().tree().is_some(), "and took focus");
+
+        press(&mut ed);
+        assert_eq!(ed.window_ids().len(), 1, "and the same key put it away");
     }
 
     #[test]

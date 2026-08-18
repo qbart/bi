@@ -160,31 +160,30 @@ impl Input {
     /// has to be rebound here too or `v` then `j` would disagree with a bare
     /// `j`.
     ///
-    /// **A tree borrows sequences only.** Its keymap is a complete allowlist,
-    /// not an overlay, and that is what stops `"j" = "left"` from turning `j`
-    /// into "collapse" in a pane sitting on a filesystem. But a *sequence* —
-    /// `<leader>e` — is a command the user invented, and there is nothing in
-    /// the tree's own vocabulary for it to collide with: every key the tree
-    /// binds by default is a single one. Without this, a leader binding for
-    /// `window_tree` opened the tree and then could not close it, because the
-    /// second press happened with the tree focused.
+    /// **A tree borrows the keys it has no meaning for.** Its own vocabulary
+    /// comes first, which is what stops `"j" = "left"` from turning `j` into
+    /// "collapse" in a pane sitting on a filesystem. Everything else falls
+    /// through: `"<C-b>" = "window_tree"` has to close the sidebar it opened,
+    /// and nothing in a tree spells `<C-b>`.
     ///
-    /// The rule is about the *binding*, not about how much has been typed: a
-    /// single key that normal rebinds is refused even mid-sequence, and a
-    /// prefix is always borrowed, or the first key of `<leader>e` would be
-    /// dropped before the second one arrived.
+    /// The test is the *key*, not how long the binding is. Borrowing sequences
+    /// only stood in for this first, and got the common case wrong — one key
+    /// bound to `window_tree` opened the tree and then could not put it away,
+    /// because the second press happened with the tree focused.
+    ///
+    /// Claiming a prefix claims the whole sequence: `g` is the tree's `gg` and
+    /// `gh`, so a normal-mode `"gd"` never fires here. The check is on the
+    /// first key for that reason, and it runs ahead of [`Lookup::Prefix`] so a
+    /// half-typed borrow cannot swallow a key the tree needs.
     fn borrowed_from_normal(&self, mode: KeyMode) -> Lookup {
         let found = match mode {
             KeyMode::Normal => return Lookup::Miss,
             _ => self.keys.lookup(KeyMode::Normal, &self.remap_pending),
         };
-        match (mode, &found) {
-            (KeyMode::Visual, _) => found,
-            // The start of a sequence, which is not yet a rebinding of
-            // anything.
-            (_, Lookup::Prefix) => found,
-            (_, _) if self.remap_pending.len() > 1 => found,
-            _ => Lookup::Miss,
+        match mode {
+            KeyMode::Visual => found,
+            _ if self.remap_pending.first().is_some_and(|&k| self.tree_claims(k)) => Lookup::Miss,
+            _ => found,
         }
     }
 
@@ -476,6 +475,38 @@ impl Input {
     /// someone noticed. For a pane sitting on a filesystem that is worth the
     /// keys it leaves out.
     ///
+    /// Whether the tree's own keymap has a meaning for `key`.
+    ///
+    /// [`Input::tree`]'s allowlist as a predicate, prefixes included — the
+    /// question [`Input::borrowed_from_normal`] asks before letting a
+    /// `[keys.normal]` binding through to a tree. The two are one list written
+    /// twice, and `tree_claims_is_the_tree_dispatchers_own_allowlist` runs
+    /// every key through both rather than trusting them to stay that way.
+    ///
+    /// A tighter answer would be to *ask* the dispatcher, but it answers by
+    /// mutating: a prefix leaves state behind and an unclaimed key resets. The
+    /// predicate is the price of asking without committing.
+    fn tree_claims(&self, key: Key) -> bool {
+        let ctrl = key.mods.ctrl;
+        match key.code {
+            // A count, on the same terms the dispatcher takes one: a leading
+            // `0` is not a count, it is a key the tree does not have.
+            KeyCode::Char(c) if c.is_ascii_digit() => !(c == '0' && self.count.is_none()),
+            // The window prefix, the two half-page keys, and the three that
+            // ask to see a buffer.
+            KeyCode::Char('w' | 'u' | 'i' | 'o' | '^') if ctrl => true,
+            // Movement, marks, the two prompts, the command line, and `g` and
+            // `d`, which are prefixes rather than keys.
+            KeyCode::Char(
+                'h' | 'j' | 'k' | 'l' | 'g' | 'd' | 'G' | 'R' | 'y' | 'c' | 'x' | 'p' | 'a' | 'r'
+                | '-' | '+' | ':',
+            ) => true,
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => true,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => true,
+            _ => false,
+        }
+    }
+
     /// Nothing here enters insert or visual mode, and `Ctrl-W` is normal-mode
     /// only, so a tree can never be focused in either.
     fn tree(&mut self, key: Key) -> Option<Command> {
@@ -1409,6 +1440,94 @@ leader = \" \"
         // a map of its own: `j` selects down here whatever normal says.
         let cmd = feed(&mut input, "j", ContentKind::Tree).expect("resolved");
         assert_eq!(cmd.action, Action::Tree(TreeCmd::Select { down: true, count: 1 }));
+    }
+
+    /// The rule the sequence-only version of this got wrong: what a tree
+    /// refuses to borrow is a key it has a meaning for, not a key that happens
+    /// to be typed on its own. `"<C-b>" = "window_tree"` opened the sidebar and
+    /// then could not close it, because `<C-b>` is one key.
+    #[test]
+    fn a_normal_binding_the_tree_does_not_claim_is_borrowed() {
+        let mut input =
+            with_leader("[keys.normal]\n\"<C-b>\" = \"window_tree\"\n\"j\" = \"left\"\n");
+
+        let cmd = input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Tree));
+        let cmd = input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Tree).expect("borrowed");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Tree), "and the same key puts it away");
+
+        // What the tree does claim it keeps: `j` selects down whatever normal
+        // says, which is the reason the tree has a map of its own at all.
+        let cmd = input.on_key(key('j'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        assert_eq!(cmd.action, Action::Tree(TreeCmd::Select { down: true, count: 1 }));
+    }
+
+    /// A borrowed binding whose keys mean nothing in a tree is a no-op, not an
+    /// escape hatch into normal mode: the tree dispatcher is still an allowlist
+    /// and `w` is not on it.
+    #[test]
+    fn a_borrowed_binding_the_tree_has_no_use_for_does_nothing() {
+        let mut input = with_leader("[keys.normal]\n\"<C-n>\" = \"word_forward\"\n");
+        assert!(input.on_key(ctrl('n'), &Mode::Normal, ContentKind::Tree).is_none());
+        assert_eq!(input.pending_display(), "", "and nothing is left half-typed");
+    }
+
+    /// A tree's own map still wins over what normal lends it, whether the key
+    /// is one the tree binds or the start of a sequence it binds.
+    #[test]
+    fn the_trees_own_keys_win_over_a_borrowed_binding() {
+        // Not `with_leader`: `"gd"` takes over `g` in normal mode and says so,
+        // which is the diagnostic working, not a problem with this config.
+        let src = "[keys.normal]\n\"y\" = \"left\"\n\"gd\" = \"delete\"\n\"<C-d>\" = \"undo\"\n";
+        let (config, _) =
+            crate::config::parse(src, crate::config::Config::default()).expect("parses");
+        let mut input = Input::default();
+        input.set_keys(config.keys);
+        assert_eq!(
+            feed(&mut input, "y", ContentKind::Tree).expect("resolved").action,
+            Action::Tree(TreeCmd::Yank),
+            "the tree's y, not normal's h"
+        );
+        assert_eq!(
+            feed(&mut input, "gg", ContentKind::Tree).expect("resolved").action,
+            Action::Tree(TreeCmd::First),
+            "g is the tree's prefix, so `gd` never gets to claim it"
+        );
+        assert_eq!(
+            input.on_key(ctrl('d'), &Mode::Normal, ContentKind::Tree).expect("resolved").action,
+            Action::Tree(TreeCmd::HalfPage { down: true })
+        );
+    }
+
+    /// The predicate and the dispatcher below it are one list written twice,
+    /// and this is what keeps them the same list.
+    #[test]
+    fn tree_claims_is_the_tree_dispatchers_own_allowlist() {
+        let codes = (' '..='~').map(KeyCode::Char).chain([
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ]);
+        for code in codes {
+            for held in [false, true] {
+                let key = Key::new(code, crate::key::Mods { ctrl: held, ..Default::default() });
+                let mut input = Input::default();
+                let claimed = input.tree_claims(key);
+                // A key the tree has a meaning for either resolves to a
+                // command or leaves something pending — a count, or the `g`,
+                // `d` and `Ctrl-W` prefixes. Anything else resets and is gone.
+                let acted =
+                    input.tree(key).is_some() || input.mid_command() || input.count.is_some();
+                assert_eq!(claimed, acted, "{}", crate::config::spell(&[key]));
+            }
+        }
     }
 
     /// Insert mode is literal text. A keymap that reached it would type the
