@@ -483,9 +483,30 @@ shows, a window closing, and a buffer being opened. A window whose `alt` names
 the swept buffer drops it to `None`, the same as deletion — an alternate
 pointing at a blank is not worth the `Ctrl-^`.
 
-**`:bd` closes no windows.** Any window showing the deleted buffer falls to the
-next one in the list. Deleting a file should not rearrange the screen — vim gets
-this right and the alternative is losing a pane you were using as a reference.
+**`:bd` closes the windows that showed the buffer**, and the layout collapses
+around them the same way `Ctrl-W c` makes it collapse — there is one close, in
+`Layout::close`, and this goes through it rather than growing a second.
+
+This is a reversal. It shipped the other way, with every window showing the
+deleted buffer falling to the next in the list, on the argument that deleting a
+file should not rearrange the screen. What that misses is that the screen was
+*already* arranged: three splits on one file are three views of one thing, and
+deleting it leaves three views of some other file nobody asked to see three
+times. Falling through is right for the window you are *in* — that one is where
+you are looking — and wrong for the ones you are not. It cannot be both, and
+"the windows that survive are the ones showing something you did not delete" is
+the rule with fewer surprises.
+
+What it costs is the pane held open as a reference: a `:bd` of the file in it
+now takes the pane with it. That is a split away, and the shape it replaces
+took a `:b` per pane to undo.
+
+**The window you are in is the one that survives** when every window showed the
+deleted buffer. Something has to — the last window cannot close — and closing
+the unfocused ones first leaves the choice where the user's attention already
+is, showing the heir buffer. Focus never moves in that case. A tree pane shows
+no buffer and so is never one of the windows in question; a session of nothing
+but a tree is already reachable, and `bi .` is it.
 
 Deletion also clears the id everywhere else it is held: any window whose `alt`
 names the deleted buffer drops it to `None`. A `BufferId` that resolves to
@@ -630,6 +651,11 @@ where the screen says it should in a nested layout.
 The buffer list gets its own: `:bd` falls through to the next buffer, deleting
 the last one yields `[No Name]`, `:bn` wraps, and `:e` on an open path returns
 the existing id rather than a new one.
+
+`:bd` across splits gets three: a layout of two files in three panes loses only
+the panes showing the deleted one and the rest collapses to fill; a layout where
+every pane showed it keeps the focused pane, on the heir, with focus unmoved;
+and a `:bd` beside a tree leaves the tree standing.
 
 The one that matters is two windows on one buffer: edit in A, assert B's cursor
 moved with the text rather than staying on a stale offset — and the same after

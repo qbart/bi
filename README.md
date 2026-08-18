@@ -339,7 +339,7 @@ afterwards repeats it.
 | `:bn` `:bp` | cycle the buffer list, wrapping |
 | `:b <partial>` `:b#` | switch by path substring / to the alternate buffer |
 | `:ls` `:buffers` | pick from the open buffers |
-| `:bd` `:bd!` | delete this buffer, refusing unsaved changes unless forced |
+| `:bd` `:bd!` | delete this buffer and close the windows showing it, refusing unsaved changes unless forced |
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
 | `:{n}` | go to line *n* |
@@ -374,8 +374,11 @@ An edit in one moves the other's cursor *with the text* rather than clamping it
 — including an undo, which reaches them through the same edit log.
 
 Closing a window discards nothing, so it never asks about unsaved changes: the
-buffer stays in the list. Deleting a buffer closes no windows either — a window
-showing it falls through to the next one.
+buffer stays in the list. Deleting one is the other way round — every window
+showing it closes, and the layout collapses to fill the space, so what is left
+on screen is what you did not delete. The window you are in is the one that
+survives if they all showed it; there is always a window, and it falls through
+to the next buffer.
 
 ### The file tree
 

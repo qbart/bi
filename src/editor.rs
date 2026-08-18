@@ -1583,10 +1583,17 @@ impl Editor {
         }
     }
 
-    /// Removes a buffer from the list, leaving every window open.
+    /// Removes a buffer from the list, and with it the windows that showed it.
     ///
-    /// Deleting a file should not rearrange the screen: a window showing the
-    /// deleted buffer falls to the next one in the list instead of closing.
+    /// Three splits on one file are three views of one thing; deleting it and
+    /// falling through would leave three views of some other file nobody asked
+    /// to see three times. The layout collapses around the closed windows
+    /// through [`Layout::close`], which is the same collapse `Ctrl-W c` gets —
+    /// there is one close, and this is not a second.
+    ///
+    /// The focused window survives when every window showed the buffer: one has
+    /// to, since the last window cannot close, and leaving it where the user is
+    /// already looking means focus never moves.
     fn delete_buffer(&mut self, id: BufferId, force: bool) {
         if self.is_modified(id) && !force {
             self.session.status = "unsaved changes (use `:bd!` to discard)".into();
@@ -1597,37 +1604,41 @@ impl Editor {
         let at = ids.iter().position(|&b| b == id).unwrap_or(0);
         let name = self.name_of(id);
 
-        // The list is never empty: deleting the last buffer leaves a fresh one
-        // in its place, so no path has to handle a session with nothing open.
-        // (A window may still show no buffer — that is a tree, not an empty
-        // list.)
-        let heir = if ids.len() == 1 {
-            let fresh = self.fresh_buffer_id();
-            let buffer = Buffer::empty();
-            self.buffers.push(BufferEntry {
-                id: fresh,
-                syntax: syntax_for(&buffer),
-                buffer,
-                last: Vec::new(),
-            });
-            fresh
-        } else {
-            ids[(at + 1) % ids.len()]
-        };
+        // The focused window goes last, so that when it is the only one left to
+        // close it is the one `Layout::close` refuses — and the pane the user
+        // is looking at is the pane that stays. At most one refuses, since only
+        // the last window in a session can.
+        let mut showing: Vec<WindowId> =
+            self.windows.iter().filter(|w| w.buffer() == Some(id)).map(|w| w.id).collect();
+        showing.sort_by_key(|&w| w == self.focus);
+        let orphan = showing
+            .into_iter()
+            .fold(None, |orphan, w| if self.close_window(w) { orphan } else { Some(w) });
 
-        for window in 0..self.windows.len() {
-            if self.windows[window].buffer() == Some(id) {
-                let w = self.windows[window].id;
-                self.show(w, heir);
-            }
-            // A stable id that resolves to nothing is the one way it is worse
-            // than an index, which at least fails loudly.
-            if self.windows[window].alt_buffer() == Some(id) {
-                self.windows[window].alt = None;
+        // Only now, because closing a window sweeps blanks nobody is looking
+        // at, and a fresh heir is exactly that until it is shown.
+        if let Some(w) = orphan {
+            let heir =
+                if ids.len() == 1 { self.fresh_scratch() } else { ids[(at + 1) % ids.len()] };
+            self.show(w, heir);
+        }
+
+        // A stable id that resolves to nothing is the one way it is worse than
+        // an index, which at least fails loudly.
+        for window in &mut self.windows {
+            if window.alt_buffer() == Some(id) {
+                window.alt = None;
             }
         }
 
         self.buffers.retain(|b| b.id != id);
+        // The list is never empty, so no path has to handle a session with
+        // nothing open — and closing the last window that showed the last
+        // buffer is the other way it could have become so. (A window may still
+        // show no buffer; that is a tree, not an empty list.)
+        if self.buffers.is_empty() {
+            self.fresh_scratch();
+        }
         self.session.status = format!("\"{name}\" deleted");
     }
 
@@ -6699,8 +6710,10 @@ mod tests {
         assert!(ed.session.status.contains("no buffer matching"));
     }
 
+    /// The only window cannot close, so it falls to the next buffer instead —
+    /// which is what `:bd` does in a session that never split.
     #[test]
-    fn bd_falls_through_to_the_next_buffer_without_closing_anything() {
+    fn bd_in_the_only_window_falls_through_to_the_next_buffer() {
         let a = Scratch::new("del_a.txt", "a\n");
         let b = Scratch::new("del_b.txt", "b\n");
         let mut ed = opened(&a);
@@ -6708,11 +6721,109 @@ mod tests {
 
         ex(&mut ed, "bd");
         assert_eq!(ed.buffer_ids().len(), 1);
+        assert_eq!(ed.window_ids().len(), 1, "and nothing to collapse");
         assert_eq!(
             ed.buffer().unwrap().rope().to_string(),
             "a\n",
             "the window fell to the next one"
         );
+    }
+
+    /// The panes showing a deleted buffer go with it, and the layout collapses
+    /// to fill — three views of one file should not become three views of some
+    /// other file nobody asked to see three times.
+    #[test]
+    fn bd_closes_the_windows_that_showed_the_buffer_and_collapses_the_splits() {
+        let a = Scratch::new("split_del_a.txt", "a\n");
+        let b = Scratch::new("split_del_b.txt", "b\n");
+        let mut ed = opened(&a);
+
+        // Three panes: two on `a`, one on `b`.
+        split(&mut ed, Dir::Vertical);
+        split(&mut ed, Dir::Horizontal);
+        ex(&mut ed, &format!("e {}", b.path()));
+        assert_eq!(ed.window_ids().len(), 3);
+        let survivor = ed.focus();
+
+        // `:bd` deletes the focused window's buffer, so move onto one of the
+        // two panes showing `a` — which means the pane deleting it is one of
+        // the panes that goes.
+        while ed.window().buffer() != Some(ed.buffer_ids()[0]) {
+            ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        }
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n");
+        ex(&mut ed, "bd");
+
+        assert_eq!(ed.window_ids(), vec![survivor], "both panes on `a` closed");
+        assert_eq!(ed.focus(), survivor, "and focus landed on the one on `b`");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n");
+        assert_eq!(ed.buffer_ids().len(), 1);
+        // The collapse gives the space back: the vertical split had halved it.
+        let rect = ed.layout.rect_of(survivor, ed.area, &ed.chrome).expect("laid out");
+        assert_eq!(rect.width, 80, "and the survivor fills the screen again");
+    }
+
+    /// Something has to survive — the last window cannot close — and the pane
+    /// the user is in is the one worth keeping.
+    #[test]
+    fn bd_keeps_the_focused_pane_when_every_pane_showed_the_buffer() {
+        let a = Scratch::new("all_del_a.txt", "a\n");
+        let b = Scratch::new("all_del_b.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+        ex(&mut ed, "b all_del_a");
+
+        split(&mut ed, Dir::Vertical);
+        split(&mut ed, Dir::Horizontal);
+        let focused = ed.focus();
+        assert!(ed.window_ids().iter().all(|&w| ed.window_of(w).unwrap().buffer().is_some()));
+
+        ex(&mut ed, "bd");
+
+        assert_eq!(ed.window_ids(), vec![focused], "the focused pane is the one left");
+        assert_eq!(ed.focus(), focused, "and focus never moved");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\n", "on the next buffer");
+    }
+
+    /// A tree shows no buffer, so it is never one of the panes that closes —
+    /// and a session of nothing but a tree is already reachable with `bi .`.
+    #[test]
+    fn bd_beside_a_tree_closes_only_the_pane_that_showed_the_buffer() {
+        let d = ScratchDir::new("bd-tree").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        assert_eq!(ed.window_ids().len(), 2);
+        let tree = ed.focus();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        assert!(ed.window().buffer().is_some(), "focus is on the text pane");
+        ex(&mut ed, "bd");
+
+        assert_eq!(ed.window_ids(), vec![tree], "only the tree is left");
+        assert!(ed.window().tree().is_some());
+        assert_eq!(ed.buffer_ids().len(), 1, "and the list is never empty");
+        assert!(ed.entry(ed.buffer_ids()[0]).buffer.path.is_none(), "a fresh no-name buffer");
+    }
+
+    /// The heir is made before the survivor can show it, and closing a window
+    /// sweeps blanks nobody is looking at — so an heir made too early is swept
+    /// out from under the `show` that was about to save it. Deleting the only
+    /// buffer out of a split is the one path where both happen at once.
+    #[test]
+    fn bd_of_the_only_buffer_across_splits_leaves_a_fresh_one_to_land_on() {
+        let a = Scratch::new("only_del.txt", "a\n");
+        let mut ed = opened(&a);
+        split(&mut ed, Dir::Vertical);
+        split(&mut ed, Dir::Horizontal);
+        let focused = ed.focus();
+
+        ex(&mut ed, "bd");
+
+        assert_eq!(ed.window_ids(), vec![focused]);
+        assert_eq!(ed.buffer_ids().len(), 1);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "");
+        assert_eq!(ed.buffer().unwrap().path, None, "and it is a no-name buffer");
     }
 
     #[test]
