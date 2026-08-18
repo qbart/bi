@@ -14,30 +14,91 @@ use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
 use bi::picker::{Picker, PickerKind};
 use bi::selection::Selections;
 use bi::syntax::{Span as HlSpan, Syntax};
+use bi::theme::{Ansi, Color as ThemeColor, Style as ThemeStyle, Theme, Ui};
 use bi::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
 use bi::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
 
 const TAB_WIDTH: usize = 4;
 
-/// Background for the line the cursor is on.
+/// A theme colour, in the one spelling a terminal understands.
 ///
-/// Dark, because the rest of this table already assumes a dark terminal
-/// (comments are `DarkGray`). It has to stay subtle: it sits behind syntax
-/// colours rather than replacing them, so anything strong makes `comment`
-/// unreadable. Goes wherever the highlight table goes when a theme file exists.
-const CURSOR_LINE_BG: Color = Color::Indexed(236);
+/// This function is the whole of what `tui/` knows that a GUI frontend would
+/// not — the rest of the palette is `bi::theme`, which names colours and never
+/// draws them.
+fn color(c: ThemeColor) -> Color {
+    match c {
+        ThemeColor::Indexed(n) => Color::Indexed(n),
+        ThemeColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        ThemeColor::Ansi(name) => match name {
+            Ansi::Black => Color::Black,
+            Ansi::Red => Color::Red,
+            Ansi::Green => Color::Green,
+            Ansi::Yellow => Color::Yellow,
+            Ansi::Blue => Color::Blue,
+            Ansi::Magenta => Color::Magenta,
+            Ansi::Cyan => Color::Cyan,
+            Ansi::Gray => Color::Gray,
+            Ansi::DarkGray => Color::DarkGray,
+            Ansi::LightRed => Color::LightRed,
+            Ansi::LightGreen => Color::LightGreen,
+            Ansi::LightYellow => Color::LightYellow,
+            Ansi::LightBlue => Color::LightBlue,
+            Ansi::LightMagenta => Color::LightMagenta,
+            Ansi::LightCyan => Color::LightCyan,
+            Ansi::White => Color::White,
+        },
+    }
+}
 
-/// Background for selected text. Lighter than the cursor line, so a selection
-/// that covers the cursor's line still reads as a selection.
-const SELECTION_BG: Color = Color::Indexed(239);
+/// A theme style as ratatui's.
+fn tui(s: ThemeStyle) -> Style {
+    let mut out = Style::default();
+    if let Some(fg) = s.fg {
+        out = out.fg(color(fg));
+    }
+    if let Some(bg) = s.bg {
+        out = out.bg(color(bg));
+    }
+    for (on, modifier) in [
+        (s.bold, Modifier::BOLD),
+        (s.italic, Modifier::ITALIC),
+        (s.underline, Modifier::UNDERLINED),
+        (s.reverse, Modifier::REVERSED),
+    ] {
+        if on {
+            out = out.add_modifier(modifier);
+        }
+    }
+    out
+}
 
-/// A terminal has exactly one real cursor, and the primary selection gets it.
-/// Every other head is drawn as a reversed cell instead.
-const EXTRA_CURSOR_BG: Color = Color::Magenta;
+/// The base every cell starts from: the theme's background and foreground, or
+/// nothing at all where the theme declined to name them.
+///
+/// A theme that names neither is invisible here, which is the point — bi drew
+/// on the terminal's own colours before it had themes, and `ansi` still does.
+fn base_style(ui: &Ui) -> Style {
+    let mut out = Style::default();
+    if let Some(fg) = ui.foreground {
+        out = out.fg(color(fg));
+    }
+    if let Some(bg) = ui.background {
+        out = out.bg(color(bg));
+    }
+    out
+}
 
-/// Background for search matches. Distinct from the selection, since a match
-/// can sit inside one.
-const SEARCH_BG: Color = Color::Indexed(58);
+/// Paints the theme's base over `area`.
+///
+/// Called for the whole frame before anything draws, and again after `Clear`,
+/// which resets cells to the terminal's own and would otherwise punch a hole
+/// in the background wherever the picker opens.
+fn paint_base(frame: &mut Frame, area: Rect, ui: &Ui) {
+    let base = base_style(ui);
+    if base != Style::default() {
+        frame.buffer_mut().set_style(area, base);
+    }
+}
 
 /// Repaints the background of the columns in `cols` within an already-built
 /// line, leaving the foreground alone.
@@ -47,8 +108,9 @@ const SEARCH_BG: Color = Color::Indexed(58);
 fn paint_range(
     spans: Vec<Span<'static>>,
     cols: std::ops::Range<usize>,
-    bg: Color,
+    over: ThemeStyle,
 ) -> Vec<Span<'static>> {
+    let over = tui(over);
     let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
     let mut col = 0usize;
     for span in spans {
@@ -69,7 +131,7 @@ fn paint_range(
         if lo > 0 {
             out.push(Span::styled(take(0, lo), span.style));
         }
-        out.push(Span::styled(take(lo, hi), span.style.bg(bg)));
+        out.push(Span::styled(take(lo, hi), span.style.patch(over)));
         if hi < width {
             out.push(Span::styled(take(hi, width), span.style));
         }
@@ -80,9 +142,13 @@ fn paint_range(
 /// Paints `bg` behind a line and pads it to `width`, so the highlight reaches
 /// the edge of the pane instead of stopping at the last character.
 ///
+/// `None` is a theme that asked for no such highlight, and leaves the line
+/// alone rather than painting it a colour nobody chose.
+///
 /// Span styles are patched rather than replaced — the syntax colours are the
 /// foreground and have to survive.
-fn fill_line(spans: Vec<Span<'static>>, bg: Color, width: usize) -> Line<'static> {
+fn fill_line(spans: Vec<Span<'static>>, bg: Option<ThemeColor>, width: usize) -> Line<'static> {
+    let Some(bg) = bg.map(color) else { return Line::from(spans) };
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let mut spans: Vec<Span<'static>> = spans
         .into_iter()
@@ -140,62 +206,6 @@ fn display_col(line: &str, char_col: usize) -> usize {
     col
 }
 
-/// Capture name to colour.
-///
-/// Tries the whole name, then drops one dotted segment at a time:
-/// `string.special.key` asks for `string.special` and then `string`. So
-/// `function.method` needs no arm of its own, while a name that wants to
-/// differ from its own prefix — a JSON key is a `string.special.key`, and
-/// should not look like a string value — can say so. This table is the whole
-/// reason `syntax.rs` emits names rather than styles: a GUI frontend writes
-/// its own, and a theme file eventually replaces it.
-fn style_for(name: &str) -> Style {
-    let mut key = name;
-    loop {
-        if let Some(style) = exact_style(key) {
-            return style;
-        }
-        match key.rfind('.') {
-            Some(dot) => key = &key[..dot],
-            None => return Style::default(),
-        }
-    }
-}
-
-fn exact_style(name: &str) -> Option<Style> {
-    Some(match name {
-        "keyword" => Style::default().fg(Color::Magenta),
-        "function" | "constructor" => Style::default().fg(Color::Blue),
-        "type" | "module" => Style::default().fg(Color::Cyan),
-        "string" | "escape" | "character" => Style::default().fg(Color::Green),
-        "comment" => Style::default().fg(Color::DarkGray),
-        "constant" | "number" | "float" | "boolean" => Style::default().fg(Color::Yellow),
-        "attribute" | "label" => Style::default().fg(Color::LightMagenta),
-        // An operator is a word of the language, not scaffolding, and it is
-        // the one thing here that has to differ from plain text: `&x` and `x`
-        // are different programs. It sat on `Color::Gray` — ANSI 7, which is
-        // what an unstyled cell already prints as — so `&`, `:=`, `*` and `==`
-        // were captured, styled, and then painted the colour of nothing.
-        "operator" => Style::default().fg(Color::Red),
-        // Brackets and separators stay neutral on purpose. They are structure
-        // rather than meaning, they are everywhere, and colouring them is what
-        // makes a screen look busy. Gray is honest here in a way it was not
-        // above: this really is meant to read as ordinary text.
-        "punctuation" | "delimiter" => Style::default().fg(Color::Gray),
-        // The key side of a config format — TOML, YAML and INI call it
-        // `property`, JSON dresses it as a string. Without this the whole
-        // left-hand column of a config file renders unstyled, which is most
-        // of the file.
-        "property" | "string.special.key" => Style::default().fg(Color::Blue),
-        // Markdown, whose captures are all `text.*`.
-        "text.title" => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-        "text.literal" => Style::default().fg(Color::Green),
-        "text.uri" => Style::default().fg(Color::Cyan),
-        "text.reference" => Style::default().fg(Color::LightMagenta),
-        _ => return None,
-    })
-}
-
 /// Splits one line into styled pieces, expanding tabs as it goes.
 ///
 /// Tab expansion has to happen *inside* the split: expanding first would shift
@@ -205,6 +215,7 @@ fn styled_line(
     line_start: usize,
     spans: &[HlSpan],
     syntax: &Syntax,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
@@ -239,7 +250,8 @@ fn styled_line(
             continue;
         }
         push(&raw[pos..start], Style::default(), &mut col);
-        push(&raw[start..end], style_for(syntax.capture_name(span.capture)), &mut col);
+        let named = theme.style(syntax.capture_name(span.capture));
+        push(&raw[start..end], named.map(tui).unwrap_or_default(), &mut col);
         pos = end;
     }
     push(&raw[pos..], Style::default(), &mut col);
@@ -293,6 +305,14 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         ed.size_window(id, rect.width as usize, height as usize);
     }
 
+    // Copied out once: `Ui` is `Copy`, and the picker below borrows the
+    // editor mutably, which a `&Theme` held across it could not survive.
+    let ui = ed.theme().ui;
+    // The theme's own background, under everything, before anything draws. A
+    // theme that named none leaves the terminal's showing through — which is
+    // what bi did before it had themes, and what `ansi` still does.
+    paint_base(frame, frame.area(), &ui);
+
     let focus = ed.focus();
     let mut cursor_at = None;
 
@@ -316,7 +336,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         if rect.x > body.x {
             let rule = Rect { x: rect.x - 1, y: rect.y, width: 1, height: rect.height };
             let bar: Vec<Line> = (0..rect.height)
-                .map(|_| Line::from(Span::styled("│", Style::default().fg(Color::DarkGray))))
+                .map(|_| Line::from(Span::styled("│", tui(ed.theme().ui.rule))))
                 .collect();
             frame.render_widget(Paragraph::new(bar), rule);
         }
@@ -330,7 +350,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     if matches!(ed.session.mode, Mode::Pick)
         && let Some(picker) = ed.session.picker.as_mut()
     {
-        render_picker(frame, picker, body);
+        render_picker(frame, picker, body, &ui);
         return;
     }
 
@@ -347,18 +367,6 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         }
     }
 }
-
-/// Colour for a directory row. Blue is what `ls` has used for decades, and the
-/// fingers know it before the eyes do.
-const TREE_DIR: Color = Color::Blue;
-
-/// A symlink. Cyan, again following `ls`.
-const TREE_LINK: Color = Color::Cyan;
-
-/// Marked to copy, and marked to cut. Yellow says "noted"; red says "this one
-/// is leaving".
-const MARK_COPY: Color = Color::Yellow;
-const MARK_CUT: Color = Color::Red;
 
 /// Everything to the left of a row's name: the mark column, the indent and the
 /// open/closed marker.
@@ -398,6 +406,7 @@ fn render_tree(
     clipboard: &Clipboard,
     area: Rect,
     focused: bool,
+    ui: &Ui,
 ) -> Option<(u16, u16)> {
     let rows = tree.rows();
     let last = (tree.scroll() + area.height as usize).min(rows.len());
@@ -411,13 +420,13 @@ fn render_tree(
         let (indent, name) = tree_row_parts(row, mark);
 
         let style = match row.kind {
-            Kind::Dir => Style::default().fg(TREE_DIR).add_modifier(Modifier::BOLD),
-            Kind::Link => Style::default().fg(TREE_LINK),
+            Kind::Dir => tui(ui.tree_dir).add_modifier(Modifier::BOLD),
+            Kind::Link => tui(ui.tree_link),
             Kind::File => Style::default(),
         };
         let mark_style = match mark {
-            Some(ClipMode::Copy) => Style::default().fg(MARK_COPY).add_modifier(Modifier::BOLD),
-            Some(ClipMode::Cut) => Style::default().fg(MARK_CUT).add_modifier(Modifier::BOLD),
+            Some(ClipMode::Copy) => tui(ui.mark_copy).add_modifier(Modifier::BOLD),
+            Some(ClipMode::Cut) => tui(ui.mark_cut).add_modifier(Modifier::BOLD),
             None => Style::default(),
         };
 
@@ -430,7 +439,7 @@ fn render_tree(
         // Shown in every tree pane, not only the focused one: unlike a text
         // cursor this is where the *next* Enter goes, so hiding it would make
         // switching to a tree a guess.
-        let bg = if focused { SELECTION_BG } else { CURSOR_LINE_BG };
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
         lines.push(fill_line(spans, bg, area.width as usize));
         if focused {
             let col = indent.chars().count() as u16;
@@ -457,7 +466,14 @@ fn render_window(
     let (text, buffer, syntax) = match ed.pane(id)? {
         Pane::Text { text, buffer, syntax, .. } => (text, buffer, syntax),
         Pane::Tree { tree, .. } => {
-            return render_tree(frame, tree, &ed.session.clipboard, text_area, focused);
+            return render_tree(
+                frame,
+                tree,
+                &ed.session.clipboard,
+                text_area,
+                focused,
+                &ed.theme().ui,
+            );
         }
     };
     let (scroll, selections) = (text.scroll, &text.selections);
@@ -493,10 +509,10 @@ fn render_window(
             _ if gutter == 0 => Vec::new(),
             Some(n) => vec![Span::styled(
                 format!("{n:>width$} ", width = gutter - 1),
-                Style::default().fg(if row == cursor_row {
-                    Color::Yellow
+                tui(if row == cursor_row {
+                    ed.theme().ui.gutter_current
                 } else {
-                    Color::DarkGray
+                    ed.theme().ui.gutter
                 }),
             )],
             None => vec![Span::raw(" ".repeat(gutter))],
@@ -510,7 +526,7 @@ fn render_window(
                     .copied()
                     .filter(|s| s.end_byte > line_start && s.start_byte < line_end)
                     .collect();
-                spans.extend(styled_line(raw, line_start, &mine, syntax));
+                spans.extend(styled_line(raw, line_start, &mine, syntax, ed.theme()));
             }
             None => spans.push(Span::raw(expand_tabs(raw))),
         }
@@ -526,7 +542,7 @@ fn render_window(
             {
                 let from = display_col(raw, start.saturating_sub(line_start));
                 let to = display_col(raw, (end - line_start).min(raw.chars().count()));
-                spans = paint_range(spans, (from + gutter)..(to + gutter), SEARCH_BG);
+                spans = paint_range(spans, (from + gutter)..(to + gutter), ed.theme().ui.search);
             }
         }
 
@@ -567,7 +583,7 @@ fn render_window(
                 }
             };
             let cols = (cols.start + gutter)..(cols.end + gutter);
-            spans = paint_range(spans, cols, SELECTION_BG);
+            spans = paint_range(spans, cols, ed.theme().ui.selection);
         }
 
         // The terminal's own cursor sits on the primary head; the others have
@@ -582,7 +598,7 @@ fn render_window(
                     continue;
                 }
                 let col = display_col(raw, buffer.col_at(head)) + gutter;
-                spans = paint_range(spans, col..col + 1, EXTRA_CURSOR_BG);
+                spans = paint_range(spans, col..col + 1, ed.theme().ui.cursor_alt);
             }
         }
 
@@ -590,7 +606,7 @@ fn render_window(
         // `'cursorline'` is. A dark bar in every pane reads as noise rather
         // than as a place.
         lines.push(if row == cursor_row && focused {
-            fill_line(spans, CURSOR_LINE_BG, text_area.width as usize)
+            fill_line(spans, ed.theme().ui.cursorline.bg, text_area.width as usize)
         } else {
             Line::from(spans)
         });
@@ -598,7 +614,7 @@ fn render_window(
 
     // Past-the-end rows, so an empty buffer doesn't look like a hang.
     while lines.len() < text_area.height as usize {
-        lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("~", tui(ed.theme().ui.filler))));
     }
 
     frame.render_widget(Paragraph::new(lines), text_area);
@@ -616,15 +632,12 @@ fn render_window(
 /// Reverse-video when focused, dim when not. This is the focus indicator,
 /// which is why the panes need no borders around them.
 /// The colour a mode announces itself in. One table, wherever it is drawn.
-fn mode_style(mode: &Mode) -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(match mode {
-            Mode::Insert => Color::Green,
-            Mode::Pick => Color::Magenta,
-            _ => Color::Blue,
-        })
-        .add_modifier(Modifier::BOLD)
+fn mode_style(mode: &Mode, ui: &Ui) -> Style {
+    tui(match mode {
+        Mode::Insert => ui.mode_insert,
+        Mode::Pick => ui.mode_pick,
+        _ => ui.mode_normal,
+    })
 }
 
 /// One window's status row.
@@ -634,18 +647,15 @@ fn mode_style(mode: &Mode) -> Style {
 /// rest is reverse-video against dim, which is the focus indicator windows.md
 /// picked instead of borders.
 fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Span<'static>> {
-    let style = if focused {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let row =
+        if focused { tui(ed.theme().ui.statusline) } else { tui(ed.theme().ui.status_inactive) };
     let left = window_status_text(ed, id, focused);
     let right = if focused { format!(" {} ", ed.session.mode.label()) } else { String::new() };
 
     let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
-    let mut spans = vec![Span::styled(left, style), Span::styled(" ".repeat(pad), style)];
+    let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     if focused {
-        spans.push(Span::styled(right, mode_style(&ed.session.mode)));
+        spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }
     spans
 }
@@ -703,7 +713,7 @@ fn row_label(text: &str, width: usize) -> String {
 ///
 /// Viewport-bounded like the main pass — only visible rows are formatted, no
 /// matter how deep the ring is.
-fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
+fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
     let w = (area.width * 3 / 5).clamp(24, area.width.saturating_sub(2).max(24));
     let h = (area.height * 3 / 5).clamp(6, area.height.saturating_sub(2).max(6));
     let rect = Rect {
@@ -714,9 +724,12 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
     };
 
     frame.render_widget(Clear, rect);
+    // `Clear` resets cells to the terminal's own, which would punch a hole in
+    // a theme that claimed the background.
+    paint_base(frame, rect, ui);
     let outer = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(tui(ui.picker_border))
         .title(match picker.kind {
             PickerKind::Register { .. } => " registers ",
             PickerKind::Buffer => " buffers ",
@@ -737,7 +750,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Magenta)),
+            Span::styled("> ", tui(ui.picker_prompt)),
             Span::raw(picker.query().to_string()),
         ])),
         query_area,
@@ -760,14 +773,10 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
             // whether it will open a line or splice inline.
             let badge = item.badge.unwrap_or(' ');
             let label = row_label(&item.text, width.saturating_sub(4));
-            let style = if selected {
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let style = if selected { tui(ui.picker_selected) } else { Style::default() };
             Line::from(vec![
                 Span::styled(format!("{marker} "), style),
-                Span::styled(format!("{badge} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{badge} "), tui(ui.picker_badge)),
                 Span::styled(label, style),
             ])
         })
@@ -776,8 +785,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
     let empty = rows.is_empty();
     frame.render_widget(Paragraph::new(rows), list_area);
 
-    let preview =
-        Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray));
+    let preview = Block::default().borders(Borders::TOP).border_style(tui(ui.picker_divider));
     let preview_inner = preview.inner(preview_area);
     frame.render_widget(preview, preview_area);
 
@@ -788,10 +796,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
             .take(preview_inner.height as usize)
             .map(|l| Line::from(expand_tabs(l)))
             .collect();
-        frame.render_widget(
-            Paragraph::new(body).style(Style::default().fg(Color::Gray)),
-            preview_inner,
-        );
+        frame.render_widget(Paragraph::new(body).style(tui(ui.picker_preview)), preview_inner);
     }
 
     frame.set_cursor_position((
@@ -851,14 +856,12 @@ fn status_spans(
         return vec![
             left,
             Span::raw(" ".repeat(pad)),
-            Span::styled(right, Style::default().fg(Color::DarkGray)),
+            Span::styled(right, tui(ed.theme().ui.status_muted)),
         ];
     }
 
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(ed.session.status.clone(), Style::default().fg(Color::Cyan)),
-    ];
+    let mut spans =
+        vec![Span::raw(" "), Span::styled(ed.session.status.clone(), tui(ed.theme().ui.status))];
 
     // Several cursors is a state you cannot otherwise tell from the mode: the
     // label still says NORMAL, and the only other sign is coloured cells that
@@ -873,7 +876,7 @@ fn status_spans(
     let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (width as usize).saturating_sub(left_width + keys.chars().count());
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(keys, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(keys, tui(ed.theme().ui.status_muted)));
 
     spans
 }
@@ -882,37 +885,55 @@ fn status_spans(
 mod tests {
     use super::*;
 
+    /// Any background will do for the padding tests below — they are about
+    /// geometry, not colour.
+    const CURSOR_LINE: ThemeColor = ThemeColor::Indexed(236);
+
+    /// The colour table left this file — it is `bi::theme` now, and the
+    /// fallback walk with it, because a GUI frontend needs the identical one.
+    /// What stays here is the conversion, and all three spellings have to
+    /// survive it.
     #[test]
-    fn a_capture_falls_back_one_dotted_segment_at_a_time() {
-        // No arm of its own — it should land on `function`.
-        assert_eq!(style_for("function.method"), style_for("function"));
-        assert_eq!(style_for("keyword.control.conditional"), style_for("keyword"));
-        // An unknown name is not an error, it is unstyled text.
-        assert_eq!(style_for("no.such.capture"), Style::default());
+    fn every_colour_spelling_survives_the_trip_to_ratatui() {
+        assert_eq!(color(ThemeColor::Ansi(Ansi::Magenta)), Color::Magenta);
+        assert_eq!(color(ThemeColor::Indexed(236)), Color::Indexed(236));
+        assert_eq!(color(ThemeColor::Rgb(0xfb, 0x49, 0x34)), Color::Rgb(0xfb, 0x49, 0x34));
+
+        let bold_italic = ThemeStyle {
+            fg: Some(ThemeColor::Ansi(Ansi::Green)),
+            bold: true,
+            italic: true,
+            ..ThemeStyle::default()
+        };
+        let converted = tui(bold_italic);
+        assert_eq!(converted.fg, Some(Color::Green));
+        assert!(converted.add_modifier.contains(Modifier::BOLD));
+        assert!(converted.add_modifier.contains(Modifier::ITALIC));
     }
 
-    /// The bug this catches is not a missing arm — `operator` had one. It is
-    /// an arm whose colour was the same colour unstyled text already prints
-    /// as, so `&` in Go and `*` in C3 came out looking uncaptured next to a
-    /// neovim that colours them.
+    /// A capture styled the colour of nothing is a capture that did not
+    /// happen — `operator` sat on `Color::Gray`, which is what an unstyled
+    /// cell already prints, so `&` in Go looked uncaptured. The default theme
+    /// has to keep clearing that bar after the table moved.
     #[test]
-    fn an_operator_does_not_look_like_plain_text() {
-        assert_ne!(style_for("operator"), Style::default());
-        // Brackets and separators are the deliberate exception: structure, not
-        // meaning, and everywhere.
-        assert_ne!(style_for("operator"), style_for("punctuation.bracket"));
-        assert_ne!(style_for("operator"), style_for("punctuation.delimiter"));
+    fn the_default_theme_draws_an_operator_as_something() {
+        let theme = Theme::default();
+        let operator = tui(theme.style("operator").expect("operator is themed"));
+        assert_ne!(operator, Style::default());
+        assert_ne!(operator, tui(theme.style("punctuation.bracket").unwrap()));
     }
 
+    /// A theme that claims a background gets one painted; a theme that does
+    /// not is invisible here, and the terminal's own shows through.
     #[test]
-    fn a_config_key_does_not_look_like_a_string_value() {
-        // The whole reason the fallback tries the full name first: JSON
-        // spells its keys as a kind of string, and a file whose keys and
-        // values share a colour is the one thing worth avoiding here.
-        assert_ne!(style_for("string.special.key"), style_for("string"));
-        assert_eq!(style_for("string.special.key"), style_for("property"));
-        // `string.special` on its own is still just a string.
-        assert_eq!(style_for("string.special"), style_for("string"));
+    fn only_a_theme_that_names_a_background_paints_one() {
+        let gruvbox = Theme::default();
+        assert_ne!(base_style(&gruvbox.ui), Style::default());
+        assert_eq!(base_style(&gruvbox.ui).bg, Some(Color::Rgb(0x28, 0x28, 0x28)));
+
+        let (ansi, problems) = Theme::resolve("ansi", None);
+        assert_eq!(problems, []);
+        assert_eq!(base_style(&ansi.ui), Style::default(), "ansi must not paint one");
     }
 
     #[test]
@@ -1063,25 +1084,25 @@ mod tests {
 
     #[test]
     fn the_cursor_line_is_padded_to_the_full_width() {
-        let line = fill_line(vec![Span::raw("abc")], CURSOR_LINE_BG, 10);
+        let line = fill_line(vec![Span::raw("abc")], Some(CURSOR_LINE), 10);
         let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 10, "highlight must reach the edge of the pane");
-        assert!(line.spans.iter().all(|s| s.style.bg == Some(CURSOR_LINE_BG)));
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(color(CURSOR_LINE))));
     }
 
     #[test]
     fn the_background_does_not_disturb_syntax_colours() {
         let spans =
             vec![Span::styled("kw", Style::default().fg(Color::Magenta)), Span::raw(" plain")];
-        let line = fill_line(spans, CURSOR_LINE_BG, 20);
+        let line = fill_line(spans, Some(CURSOR_LINE), 20);
         assert_eq!(line.spans[0].style.fg, Some(Color::Magenta));
-        assert_eq!(line.spans[0].style.bg, Some(CURSOR_LINE_BG));
+        assert_eq!(line.spans[0].style.bg, Some(color(CURSOR_LINE)));
         assert_eq!(line.spans[1].style.fg, None);
     }
 
     #[test]
     fn a_line_wider_than_the_pane_is_not_truncated_or_panicked_on() {
-        let line = fill_line(vec![Span::raw("a".repeat(30))], CURSOR_LINE_BG, 10);
+        let line = fill_line(vec![Span::raw("a".repeat(30))], Some(CURSOR_LINE), 10);
         let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 30);
     }

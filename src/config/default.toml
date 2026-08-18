@@ -8,6 +8,14 @@
 number = 1
 hlsearch = false
 
+# The palette. A name in themes/ beside this file wins, then a built-in of the
+# same name, then this one. Built in: gruvbox-dark, ansi.
+#
+# `ansi` is bi's pre-theme colours in the sixteen ANSI names, so it uses YOUR
+# terminal palette and its background rather than bringing its own.
+# See docs/specs/theme.md.
+theme = "gruvbox-dark"
+
 [keys]
 # The key <leader> stands for in a binding. Nothing uses it until you write a
 # binding that spells it — and the moment one does, this key stops meaning

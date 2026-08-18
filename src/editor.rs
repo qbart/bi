@@ -17,6 +17,7 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
+use crate::theme::Theme;
 use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
     Chrome, Content, ContentKind, Dir, Layout, Place, Rect, Side, Text, Window, WindowId,
@@ -958,6 +959,9 @@ pub struct Editor {
     chrome: Chrome,
     pub session: Session,
     config: Config,
+    /// The palette named by `config.options.theme`, already resolved. Held
+    /// rather than resolved per frame, because resolving reads a file.
+    theme: Theme,
     /// Kept so `:reload` can ask again. `None` until a frontend supplies one —
     /// an embedder that wants no config never calls `load_config`, and
     /// `:reload` then has nothing to re-read and says so.
@@ -1108,12 +1112,11 @@ impl Editor {
     /// mutates `Session::options` alone, so after `:set number 5` this
     /// still reports whatever the file said. `apply_config` copies loaded
     /// options into `Session::options` on load, but the two copies diverge
-    /// the moment `:set` touches one of them. A GUI frontend reading
-    /// `ed.config().theme` in step 2 is unaffected — `:set` has no theme
-    /// spelling to move — but an option read through here can be stale.
-    /// Giving runtime state one owner is a decision for step 2, when the
-    /// theme becomes a second consumer; see "Ownership" in
-    /// `docs/specs/config.md`.
+    /// the moment `:set` touches one of them, so an option read through here
+    /// can be stale. Read the *palette* through [`Editor::theme`] rather than
+    /// this: `:set theme` moves `Session::options.theme` and re-resolves, and
+    /// this copy keeps saying whatever the file said. Giving runtime state one
+    /// owner is still open; see "Ownership" in `docs/specs/config.md`.
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -1137,16 +1140,16 @@ impl Editor {
             // rather than leaving whatever was last applied, is what keeps
             // this path agreeing with startup on an editor that has never
             // seen a file at all.
-            Ok(None) => {
-                self.apply_config(Config::default());
-                return Ok(Vec::new());
-            }
+            Ok(None) => return Ok(self.apply_config(Config::default(), Some(source))),
             Err(e) => return Err(Diagnostic { line: 1, message: e.to_string() }),
         };
 
         match crate::config::parse(&text, Config::default()) {
-            Ok((config, problems)) => {
-                self.apply_config(config);
+            Ok((config, mut problems)) => {
+                // Theme problems join config problems: both came out of
+                // loading, and a frontend that reports one should report the
+                // other without learning there were two files.
+                problems.extend(self.apply_config(config, Some(source)));
                 Ok(problems)
             }
             // Unsalvageable: the running config stays exactly as it was.
@@ -1154,10 +1157,37 @@ impl Editor {
         }
     }
 
-    fn apply_config(&mut self, config: Config) {
-        self.session.options = config.options;
+    fn apply_config(
+        &mut self,
+        config: Config,
+        source: Option<&dyn ConfigSource>,
+    ) -> Vec<Diagnostic> {
+        self.session.options = config.options.clone();
         self.config = config;
         self.config_epoch += 1;
+        self.resolve_theme(source)
+    }
+
+    /// Turns the *name* in `options.theme` into a palette.
+    ///
+    /// Split from `apply_config` because `:set theme` reaches it too — the
+    /// name can change without a config being loaded, and a theme the editor
+    /// never re-resolved is a `:set` that silently did nothing.
+    fn resolve_theme(&mut self, source: Option<&dyn ConfigSource>) -> Vec<Diagnostic> {
+        let name = self.session.options.theme.clone();
+        // A source that cannot be read is not fatal here: a missing themes/
+        // directory is the normal case, and a built-in of that name is very
+        // likely what was wanted anyway.
+        let user = source.and_then(|s| s.theme(&name).ok().flatten());
+        let (theme, problems) = Theme::resolve(&name, user.as_deref());
+        self.theme = theme;
+        problems
+    }
+
+    /// The resolved palette. A frontend maps [`crate::theme::Color`] to
+    /// whatever it draws with; the core never names a terminal colour.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     /// Bumped every time a config is applied, so a frontend can tell that the
@@ -1219,6 +1249,7 @@ impl Editor {
             chrome: Chrome::default(),
             session: Session::default(),
             config: Config::default(),
+            theme: Theme::default(),
             config_source: None,
             config_epoch: 0,
         }
@@ -2600,6 +2631,7 @@ impl Editor {
             self.session.status = match self.session.options.get(name) {
                 Some(OptionValue::Int(n)) => format!("{name}={n}"),
                 Some(OptionValue::Bool(on)) => format!("{name}={on}"),
+                Some(OptionValue::Str(s)) => format!("{name}={s}"),
                 // `get` never yields `Other`: no option stores one. Reported
                 // as unknown rather than asserted away, because a future
                 // option whose `get` arm is wrong should produce a message,
@@ -2620,10 +2652,13 @@ impl Editor {
             Err(_) => match value {
                 "true" => OptionValue::Bool(true),
                 "false" => OptionValue::Bool(false),
-                _ => OptionValue::Other,
+                // A bare word is a string now that one option takes one.
+                // An option that wants something else still gets to say so.
+                other => OptionValue::Str(other.to_string()),
             },
         };
 
+        let was = self.session.options.theme.clone();
         if let Err(message) = self.session.options.set(name, parsed) {
             // A real option given a bad value gets the value echoed — you
             // want to see what you fat-fingered. An unknown option does not:
@@ -2631,6 +2666,19 @@ impl Editor {
             self.session.status = match self.session.options.get(name) {
                 Some(_) => format!("{message}: {value}"),
                 None => message,
+            };
+            return;
+        }
+
+        // A name is not a palette. `:set theme ansi` that left `self.theme`
+        // alone would report success and change nothing on screen.
+        if self.session.options.theme != was {
+            let source = self.config_source.take();
+            let problems = self.resolve_theme(source.as_deref());
+            self.config_source = source;
+            self.session.status = match problems.first() {
+                Some(problem) => problem.message.clone(),
+                None => format!("theme={}", self.session.options.theme),
             };
         }
     }
@@ -4856,6 +4904,60 @@ mod tests {
 
     fn ex(ed: &mut Editor, line: &str) {
         ed.run_ex(line);
+    }
+
+    /// Out of the box, before any config is loaded.
+    #[test]
+    fn the_default_theme_is_gruvbox_dark() {
+        let ed = Editor::empty();
+        assert_eq!(ed.session.options.theme, crate::theme::DEFAULT_THEME);
+        assert_eq!(ed.theme(), &Theme::default());
+        assert!(ed.theme().ui.background.is_some(), "gruvbox claims the background");
+    }
+
+    /// A name is not a palette. `:set theme ansi` that moved the string and
+    /// left `self.theme` alone would report success and change nothing on
+    /// screen, which is the one failure worth engineering against here.
+    #[test]
+    fn setting_the_theme_resolves_it_rather_than_just_naming_it() {
+        let mut ed = Editor::empty();
+        let before = ed.theme().clone();
+
+        ex(&mut ed, "set theme ansi");
+        assert_eq!(ed.session.options.theme, "ansi");
+        assert_ne!(ed.theme(), &before, "the palette did not follow the name");
+        // The whole point of the ANSI spelling: the terminal's own background.
+        assert_eq!(ed.theme().ui.background, None);
+        assert_eq!(ed.session.status, "theme=ansi");
+
+        ex(&mut ed, "set theme gruvbox-dark");
+        assert_eq!(ed.theme(), &before, "and back again");
+    }
+
+    #[test]
+    fn an_unknown_theme_name_says_so_and_keeps_an_editor() {
+        let mut ed = Editor::empty();
+        ex(&mut ed, "set theme nosuch");
+        assert!(ed.session.status.contains("nosuch"), "{}", ed.session.status);
+        // Fell back rather than leaving the screen colourless.
+        assert_eq!(ed.theme(), &Theme::default());
+    }
+
+    #[test]
+    fn a_config_file_can_name_the_theme() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(ConfigText(Some("[options]\ntheme = \"ansi\"\n")));
+        assert_eq!(problems, []);
+        assert_eq!(ed.theme().ui.background, None, "ansi leaves the terminal's alone");
+    }
+
+    #[test]
+    fn a_theme_that_is_not_a_string_is_reported_and_not_fatal() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(ConfigText(Some("[options]\ntheme = 7\n")));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].message.contains("theme"), "{:?}", problems[0].message);
+        assert_eq!(ed.theme(), &Theme::default());
     }
 
     /// A directory under the temp dir, gone when the test ends.

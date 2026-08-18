@@ -1,0 +1,82 @@
+# gruvbox dark, medium contrast — bi's default theme.
+#
+# Palette from github.com/morhetz/gruvbox. Compiled into the binary; a file at
+# <config dir>/themes/gruvbox-dark.toml is a PATCH over this one, so changing a
+# single colour does not mean copying the rest. See docs/specs/theme.md.
+
+[syntax]
+keyword     = "#fb4934"                              # red
+function    = { fg = "#b8bb26", bold = true }        # green, bold
+constructor = { fg = "#b8bb26", bold = true }
+type        = "#fabd2f"                              # yellow
+module      = "#fabd2f"
+string      = "#b8bb26"
+escape      = "#b8bb26"
+character   = "#b8bb26"
+comment     = { fg = "#928374", italic = true }      # gray
+constant    = "#d3869b"                              # purple
+number      = "#d3869b"
+float       = "#d3869b"
+boolean     = "#d3869b"
+attribute   = "#8ec07c"                              # aqua
+label       = "#8ec07c"
+
+# Orange, where gruvbox.vim says plain foreground. Deliberate: `&x` and `x` are
+# different programs, and painting the `&` the colour of the text around it is
+# the failure docs/specs/tree-sitter.md names as "a capture styled the colour
+# of nothing".
+operator    = "#fe8019"
+
+# Brackets and separators stay quiet on purpose — structure, not meaning, and
+# on every line.
+punctuation = "#a89984"                              # fg4
+delimiter   = "#a89984"
+
+# The key side of a config format. Without this the whole left-hand column of
+# a TOML or JSON file reads as ordinary string values.
+property             = "#83a598"                     # blue
+"string.special.key" = "#83a598"
+
+# Markdown, whose captures are all text.*
+"text.title"     = { fg = "#b8bb26", bold = true }
+"text.literal"   = "#b8bb26"
+"text.uri"       = { fg = "#83a598", underline = true }
+"text.reference" = "#8ec07c"
+
+[ui]
+# gruvbox's colours were chosen against this background, so this theme claims
+# it rather than drifting on whatever the terminal happens to use. A theme that
+# omits both of these leaves the terminal's own alone — see `ansi`.
+background = "#282828"                               # bg0
+foreground = "#ebdbb2"                               # fg1
+
+cursorline = { bg = "#32302f" }                      # bg0_s
+selection  = { bg = "#504945" }                      # bg2
+search     = { bg = "#665c54" }                      # bg3
+cursor_alt = { bg = "#b16286" }                      # purple, dim
+
+gutter         = "#7c6f64"                           # bg4
+gutter_current = "#fabd2f"
+rule           = "#504945"
+filler         = "#504945"
+
+mode_normal = { fg = "#282828", bg = "#83a598", bold = true }
+mode_insert = { fg = "#282828", bg = "#b8bb26", bold = true }
+mode_pick   = { fg = "#282828", bg = "#d3869b", bold = true }
+
+status          = "#8ec07c"
+status_muted    = "#928374"
+status_inactive = "#665c54"
+statusline      = { fg = "#ebdbb2", bg = "#3c3836" }  # bg1
+
+tree_dir  = "#83a598"
+tree_link = "#8ec07c"
+mark_copy = "#fabd2f"
+mark_cut  = "#fb4934"
+
+picker_border   = "#fe8019"
+picker_prompt   = "#fe8019"
+picker_selected = { fg = "#fabd2f", bold = true }
+picker_badge    = "#928374"
+picker_divider  = "#504945"
+picker_preview  = "#bdae93"                          # fg3

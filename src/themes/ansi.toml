@@ -1,0 +1,77 @@
+# The sixteen ANSI names, which means YOUR terminal's palette rather than bi's
+# idea of one.
+#
+# This is what bi looked like before it had themes, colour for colour, and that
+# is its job: choosing a theme is not a one-way door, and `:set theme ansi`
+# is the way back. It is also the test — if this file cannot say what
+# tui/render.rs used to hardcode, the theme type is missing something. That is
+# how `reverse` came to exist.
+#
+# It sets no `background` and no `foreground`, so the terminal's own show
+# through. That is the point of naming `green` instead of `#b8bb26`: you asked
+# for yours, and the background that was tuned alongside it comes too.
+
+[syntax]
+keyword     = "magenta"
+function    = "blue"
+constructor = "blue"
+type        = "cyan"
+module      = "cyan"
+string      = "green"
+escape      = "green"
+character   = "green"
+comment     = "darkgray"
+constant    = "yellow"
+number      = "yellow"
+float       = "yellow"
+boolean     = "yellow"
+attribute   = "lightmagenta"
+label       = "lightmagenta"
+operator    = "red"
+punctuation = "gray"
+delimiter   = "gray"
+
+property             = "blue"
+"string.special.key" = "blue"
+
+"text.title"     = { fg = "blue", bold = true }
+"text.literal"   = "green"
+"text.uri"       = "cyan"
+"text.reference" = "lightmagenta"
+
+[ui]
+# The two 256-colour indices the old code used. Neither is an ANSI name, and
+# both are here rather than approximated, because "exactly what it was" is the
+# whole promise of this file.
+cursorline = { bg = "color236" }
+selection  = { bg = "color239" }
+search     = { bg = "color58" }
+cursor_alt = { bg = "magenta" }
+
+gutter         = "darkgray"
+gutter_current = "yellow"
+rule           = "darkgray"
+filler         = "darkgray"
+
+mode_normal = { fg = "black", bg = "blue", bold = true }
+mode_insert = { fg = "black", bg = "green", bold = true }
+mode_pick   = { fg = "black", bg = "magenta", bold = true }
+
+status          = "cyan"
+status_muted    = "darkgray"
+status_inactive = "darkgray"
+# Reverse video against the terminal's own colours, which is the focus
+# indicator windows.md chose instead of borders.
+statusline      = { reverse = true }
+
+tree_dir  = "blue"
+tree_link = "cyan"
+mark_copy = "yellow"
+mark_cut  = "red"
+
+picker_border   = "magenta"
+picker_prompt   = "magenta"
+picker_selected = { fg = "magenta", bold = true }
+picker_badge    = "darkgray"
+picker_divider  = "darkgray"
+picker_preview  = "gray"

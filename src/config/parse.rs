@@ -277,7 +277,7 @@ fn line_for(table: &Table, key: &str, src: &str) -> usize {
     table.get_key_value(key).and_then(|(k, _)| k.span()).map_or(1, |s| line_of(src, s.start))
 }
 
-/// A TOML scalar as an [`OptionValue`]. Anything else — a string, an array, a
+/// A TOML scalar as an [`OptionValue`]. Anything else — an array, a
 /// nested table — is not something an option can hold, so it becomes
 /// [`OptionValue::Other`] and it is left to the option itself, through
 /// `Options::set`, to say what it wanted.
@@ -285,6 +285,7 @@ fn option_value(item: &Item) -> OptionValue {
     match item.as_value() {
         Some(Value::Integer(n)) => OptionValue::Int(*n.value()),
         Some(Value::Boolean(b)) => OptionValue::Bool(*b.value()),
+        Some(Value::String(s)) => OptionValue::Str(s.value().clone()),
         _ => OptionValue::Other,
     }
 }

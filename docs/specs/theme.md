@@ -4,7 +4,7 @@ Every colour bi draws, named, in one place, replaceable from a file.
 
 ## Status
 
-**Specified, not built.** Step 2 of `docs/specs/config.md` sketched this and
+**Built.** Step 2 of `docs/specs/config.md` sketched this and
 that sketch is superseded here — config.md keeps the `theme` *option* and
 points at this file for what a theme is.
 
@@ -102,8 +102,9 @@ comment     = { fg = "#928374", italic = true }
 
 ## `[ui]`
 
-Everything else on the screen. config.md named eight keys here; `render.rs`
-hardcodes **twenty-six** colours, and eight of twenty-six is worse than none
+Everything else on the screen. config.md named eight keys here; the screen has
+**twenty-five** required colours in it plus the two optional ones below, and
+eight of twenty-five is worse than none
 — a theme that recolours the text and leaves a magenta picker border and a
 blue mode badge behind produces a screen that looks broken rather than
 themed. The list is therefore what is actually drawn, named for the role
@@ -121,8 +122,7 @@ rather than for the constant it replaces:
 | `gutter_current` | the number on the cursor's own row |
 | `rule` | the `│` between panes |
 | `filler` | the `~` past the end of the buffer |
-| `mode_fg` | text of the mode badge |
-| `mode_normal` `mode_insert` `mode_pick` | its background, per mode |
+| `mode_normal` `mode_insert` `mode_pick` | the mode badge, per mode |
 | `status` | the session message |
 | `status_muted` | pending keys, the cursor position |
 | `status_inactive` | an unfocused window's status row |
@@ -241,9 +241,11 @@ It sets no `background`.
 
 ## Testing
 
-- every key in `[ui]` is set by both built-ins — a theme that forgets one is
-  a hole on the screen, and the compiler cannot see it. This is the test that
-  makes "twenty-six" a checkable number rather than a claim.
+- every key in `Ui::REQUIRED` is set by both built-ins — a theme that forgets
+  one is a hole on the screen, and the compiler cannot see it. This is the
+  test that makes "twenty-five" a checkable number rather than a claim.
+  `background` and `foreground` are excluded: they are exactly the two a theme
+  is allowed to decline, and `ansi` declines both.
 - the `ansi` built-in round-trips to the styles `render.rs` uses today. This
   is the one that says the door swings both ways.
 - all three colour spellings parse, and a fourth thing does not
@@ -252,7 +254,13 @@ It sets no `background`.
 - a theme naming a colour that will not parse loses that key, keeps the rest,
   and reports the line
 - an unknown `theme` name falls back to `gruvbox-dark` and says so
-- a user `themes/<name>.toml` beats a built-in of the same name
+- a user `themes/<name>.toml` beats a built-in of the same name, and patches
+  it rather than replacing it
+- a theme name cannot escape the themes directory — it reaches the filesystem,
+  so `../../etc/passwd` is not a theme
+- `:set theme ansi` re-resolves rather than only moving the string: a name is
+  not a palette, and a `:set` that reports success and changes nothing on
+  screen is the failure worth engineering against
 - both built-ins parse — via `Theme::default()` being the parsed default, the
   same trick `Config::default()` uses so the shipped file is exercised on
   every run rather than only in a test

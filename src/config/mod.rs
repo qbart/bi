@@ -26,11 +26,24 @@ pub use parse::parse;
 /// `Err` means there was one and it could not be read, which is.
 pub trait ConfigSource {
     fn config(&self) -> anyhow::Result<Option<String>>;
+
+    /// The text of `themes/<name>.toml`, if the frontend has one.
+    ///
+    /// `Ok(None)` means no such file — try a built-in — and is normal, not a
+    /// problem. It has a default so an embedder that has no themes directory
+    /// keeps compiling and gets the built-ins. See `docs/specs/theme.md`.
+    fn theme(&self, _name: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 impl<T: ConfigSource> ConfigSource for std::rc::Rc<T> {
     fn config(&self) -> anyhow::Result<Option<String>> {
         (**self).config()
+    }
+
+    fn theme(&self, name: &str) -> anyhow::Result<Option<String>> {
+        (**self).theme(name)
     }
 }
 
@@ -50,10 +63,14 @@ pub const DEFAULT_TOML: &str = include_str!("default.toml");
 /// A value an option can hold, in the one shape both `:set` and TOML can
 /// produce. `:set` parses a string into one; the parser converts a TOML value
 /// into one. Neither needs to know what any particular option is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptionValue {
     Int(i64),
     Bool(bool),
+    /// A string, which `theme` is and nothing else is yet. Its arrival is why
+    /// this enum is no longer `Copy`: one owned `String` costs less than a
+    /// lifetime on a type both `:set` and the TOML parser construct.
+    Str(String),
     /// A value no option can hold — a string, an array, a table. Carried
     /// rather than rejected on the spot so the option itself gets to say what
     /// it wanted, in the one place those messages live.
@@ -63,13 +80,35 @@ pub enum OptionValue {
 /// The `:set` namespace. One field per option, spelled as `:set` spells it,
 /// because `:set number 5` and `number = 5` are two ways to reach one setting
 /// and there is nothing to be gained by giving it two names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub number: LineNumbers,
+    /// The theme by name, resolved through `Theme::resolve` — a file in the
+    /// frontend's `themes/` directory, else a built-in, else the default.
+    ///
+    /// An option rather than a `:theme` command, so that `:set theme ansi`
+    /// and `theme = "ansi"` are two ways to reach one setting, exactly as
+    /// `:set number 5` and `number = 5` are. That is a feature *removed*
+    /// rather than added: there is no second command to design.
+    pub theme: String,
     /// Off unless asked for: vim does not light the buffer up on a plain
     /// `/`, and the status line's `[3/17]` says how many matches there are
     /// without painting them.
     pub hlsearch: bool,
+}
+
+impl Default for Options {
+    /// Hand-written since `theme` has a name for a default rather than an
+    /// empty one, and `Options::default()` is what an embedder with no config
+    /// gets. `shipped_defaults_agree_with_the_rust_fallback` keeps this and
+    /// `default.toml` saying the same thing.
+    fn default() -> Self {
+        Options {
+            number: LineNumbers::default(),
+            hlsearch: false,
+            theme: crate::theme::DEFAULT_THEME.to_string(),
+        }
+    }
 }
 
 impl Options {
@@ -85,6 +124,8 @@ impl Options {
             ("number", _) => return Err("number takes 0 (off), -1 (relative) or a count".into()),
             ("hlsearch", OptionValue::Bool(on)) => self.hlsearch = on,
             ("hlsearch", _) => return Err("hlsearch takes true or false".into()),
+            ("theme", OptionValue::Str(name)) => self.theme = name,
+            ("theme", _) => return Err("theme takes the name of a theme, in quotes".into()),
             _ => return Err(format!("unknown option: {name}")),
         }
         Ok(())
@@ -95,13 +136,15 @@ impl Options {
         Some(match name {
             "number" => OptionValue::Int(self.number.setting()),
             "hlsearch" => OptionValue::Bool(self.hlsearch),
+            "theme" => OptionValue::Str(self.theme.clone()),
             _ => return None,
         })
     }
 }
 
-/// Everything a config file can say. Options and the keymap today; a theme
-/// joins them in step 2 of `docs/specs/config.md`.
+/// Everything a config file can say. The theme is named here and resolved by
+/// [`crate::theme::Theme::resolve`], because a name is config and a palette is
+/// a second file — see `docs/specs/theme.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub options: Options,

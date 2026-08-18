@@ -215,16 +215,34 @@ struct XdgConfig {
     dir: Option<PathBuf>,
 }
 
-impl ConfigSource for XdgConfig {
-    fn config(&self) -> Result<Option<String>> {
+impl XdgConfig {
+    /// The shared body of both reads: a missing file is the normal case and
+    /// not a problem, an unreadable one is.
+    fn read(&self, relative: &Path) -> Result<Option<String>> {
         let Some(dir) = &self.dir else { return Ok(None) };
-        let path = dir.join("config.toml");
+        let path = dir.join(relative);
         match std::fs::read_to_string(&path) {
             Ok(text) => Ok(Some(text)),
-            // No config file is the normal case, not a problem.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).context(format!("reading {}", path.display())),
         }
+    }
+}
+
+impl ConfigSource for XdgConfig {
+    fn config(&self) -> Result<Option<String>> {
+        self.read(Path::new("config.toml"))
+    }
+
+    /// `themes/<name>.toml`, which is why the config location is a directory
+    /// rather than a file. A name with a separator in it would reach outside
+    /// that directory, so it does not get to: a theme is one file beside the
+    /// config, not a path.
+    fn theme(&self, name: &str) -> Result<Option<String>> {
+        if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+            return Ok(None);
+        }
+        self.read(&Path::new("themes").join(format!("{name}.toml")))
     }
 }
 
@@ -317,6 +335,19 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A theme name reaches the filesystem, so it does not get to be a
+    /// path. `../../etc/passwd` is not a theme.
+    #[test]
+    fn a_theme_name_cannot_escape_the_themes_directory() {
+        let source = XdgConfig { dir: Some(PathBuf::from("/nonexistent")) };
+        for escape in ["../secrets", "..", "a/b", "a\\b", ""] {
+            assert!(
+                source.theme(escape).unwrap().is_none(),
+                "{escape:?} should not have been looked up at all"
+            );
+        }
+    }
 
     #[test]
     fn config_dir_prefers_bi_config_then_xdg_then_home() {

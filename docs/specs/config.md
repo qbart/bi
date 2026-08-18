@@ -92,8 +92,10 @@ half it belonged to. One table has no edge to be arbitrary at.
 
 It also removes a feature rather than adding one: with `theme` an ordinary
 option, `:set theme onedark` is how you try a theme, and no `:theme` command
-needs to exist. That does oblige [`OptionValue`](#options) to grow a string
-variant in step 2, which is a line of work, not a design question.
+needs to exist. That obliged [`OptionValue`](#options) to grow a string
+variant, which was a line of work rather than a design question, and cost it
+`Copy` — one owned `String` beats a lifetime on a type both `:set` and the
+TOML parser construct.
 
 ## The user file is a patch
 
@@ -621,7 +623,8 @@ recorded here so the difference is not a surprise:
   default should reproduce today's colours exactly so that installing the
   step changed nothing on screen. It does change what you see now. Today's
   colours survive as the `ansi` built-in.
-- **`[ui]` has twenty-six keys, not eight.** The eight named here were the
+- **`[ui]` has twenty-five required keys, not eight**, plus `background` and
+  `foreground`, which a theme may decline. The eight named here were the
   constants at the top of `tui/render.rs`; the rest of the screen — the mode
   badge, the status rows, the picker, the gutter — was hardcoded further
   down, and a theme that recolours the text and leaves those behind looks
