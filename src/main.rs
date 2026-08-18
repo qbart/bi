@@ -9,11 +9,14 @@ mod tui;
 use std::io::{self, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -46,6 +49,9 @@ fn main() -> Result<()> {
     };
 
     let problems = editor.load_config(XdgConfig { dir: config_dir() });
+    // `"+y` and `"+p`. The library holds the trait; the terminal is what knows
+    // how to reach a clipboard from inside one.
+    editor.set_clipboard(tui::clipboard::Osc52);
 
     let mut term = setup().context("entering raw mode")?;
 
@@ -102,7 +108,7 @@ const INIT_HEADER: &str = "\
 /// invisibly and permanently. Commented out it is a self-documenting menu that
 /// is semantically empty.
 ///
-/// Section headers (`[options]` and, later, `[keys.normal]` and friends) are
+/// Section headers (`[options]`, `[keys.normal]` and friends) are
 /// written *live*, uncommented, even though every key beneath one is
 /// commented out. An empty table parses to nothing — `read_options` walks a
 /// table with no items and produces no diagnostics — so the file stays
@@ -131,6 +137,18 @@ fn commented(defaults: &str) -> String {
     out
 }
 
+/// Every default bi has, as the file that would set them.
+///
+/// `default.toml` holds the options and the leader; the keymap is still `match`
+/// arms in `input.rs`, so its half is *generated* from the names table rather
+/// than written out here. That matters more than the tidiness: a hand-kept copy
+/// of 90 bindings beside the real ones is a second source of truth, and the day
+/// they disagree the file is worse than useless. Generated, the listing cannot
+/// say anything the parser would not accept.
+fn defaults() -> String {
+    format!("{}\n{}", bi::config::DEFAULT_TOML.trim_end(), bi::config::listing())
+}
+
 /// Creates the config directory and writes `config.toml` if it is absent.
 ///
 /// Never automatic: a config file appears because you asked for one.
@@ -143,7 +161,7 @@ fn config_init(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&path, commented(bi::config::DEFAULT_TOML))
+    std::fs::write(&path, commented(&defaults()))
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
@@ -213,7 +231,10 @@ impl ConfigSource for XdgConfig {
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste is what makes a paste arrive as one event instead of as
+    // one keystroke per character. Without it the terminal has no way to say
+    // "this is a paste", and a 2 KB paste costs 2000 redraws.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
     // Without this, a panic anywhere leaves the user in a wrecked terminal with
     // no echo and no prompt.
@@ -229,7 +250,9 @@ fn setup() -> Result<Term> {
 fn restore() -> Result<()> {
     if terminal::is_raw_mode_enabled()? {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        // Bracketed paste comes off here too, panic hook included: a terminal
+        // left in it pastes escape noise into the next shell prompt.
+        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
     }
     Ok(())
 }
@@ -250,25 +273,43 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
 
         term.draw(|frame| tui::render::render(frame, ed, &input.pending_display()))?;
 
-        match event::read()? {
-            // Windows terminals emit Release too; without this filter every key
-            // fires twice.
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if let Some(key) = tui::keys::translate(key)
-                    && let Some(cmd) = input.on_key(key, &ed.session.mode, ed.content_kind())
-                {
-                    ed.session.status.clear();
-                    ed.apply(cmd);
+        // Everything that has already arrived is applied before the next draw.
+        // A frame the user never sees is a frame not worth rendering, and this
+        // is what makes a burst — a paste into a terminal that does not support
+        // bracketed paste, or a held-down `j` — cost one redraw instead of one
+        // per keystroke. The first `read` blocks; the loop then drains whatever
+        // is queued behind it without waiting.
+        let mut pending = true;
+        while pending {
+            match event::read()? {
+                // Windows terminals emit Release too; without this filter every
+                // key fires twice.
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(key) = tui::keys::translate(key)
+                        && let Some(cmd) = input.on_key(key, &ed.session.mode, ed.content_kind())
+                    {
+                        ed.session.status.clear();
+                        ed.apply(cmd);
+                    }
                 }
-                // Feed the parse tree. LSP will hang off the same drain.
-                ed.settle();
+                // A bracketed paste: one event, one insertion, one undo entry.
+                // The terminal sends it whole, so nothing here has to guess
+                // where it ends.
+                Event::Paste(text) => ed.paste_text(text),
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-            Event::Resize(_, _) => {}
-            _ => {}
-        }
-
-        if ed.session.quit {
-            return Ok(());
+            // Feed the parse tree. LSP will hang off the same drain.
+            //
+            // Per event rather than once per burst, even though once would be
+            // cheaper: `settle` skips the focused window because the command
+            // that moved the text moved its cursor too, and a burst that
+            // changes focus would apply that skip to the wrong window.
+            ed.settle();
+            if ed.session.quit {
+                return Ok(());
+            }
+            pending = event::poll(Duration::ZERO)?;
         }
     }
 }
@@ -340,11 +381,46 @@ mod tests {
         // The synthetic test above pins the line-shape mechanics; this one
         // exercises the actual file `bi config init` writes, which is what
         // the review that found the section-header trap said was missing.
-        let out = commented(bi::config::DEFAULT_TOML);
+        let out = commented(&defaults());
 
         let (config, problems) = bi::config::parse(&out, bi::config::Config::default()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(config, bi::config::Config::default(), "semantically empty");
+    }
+
+    /// The point of writing the keymap out: every binding bi has is in the
+    /// file, so the answer to "what can I rebind, and to what?" is the file
+    /// itself rather than the source.
+    #[test]
+    fn the_written_config_lists_every_binding_and_every_one_of_them_parses() {
+        let out = commented(&defaults());
+
+        for expected in [
+            "[keys.normal]",
+            "[keys.visual]",
+            "[keys.tree]",
+            "# \"h\"",
+            "= \"left\"",
+            "= \"goto_first_line\"",
+            "= \"window_tree\"",
+            "= \"tree_delete\"",
+            "# leader = \" \"",
+        ] {
+            assert!(out.contains(expected), "missing {expected}:\n{out}");
+        }
+
+        // Uncommenting the lot must be a keymap that binds every key to what it
+        // already does — which is what makes the listing a menu rather than
+        // decoration. Anything the generator got wrong shows up here as a
+        // diagnostic instead of in a user's config file.
+        let live: String = out
+            .lines()
+            .map(|line| line.strip_prefix("# ").filter(|l| l.contains(" = ")).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, problems) =
+            bi::config::parse(&live, bi::config::Config::default()).expect("it is still TOML");
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[test]

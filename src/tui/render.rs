@@ -395,7 +395,9 @@ fn render_tree(
     let mut lines = Vec::with_capacity(area.height as usize);
 
     for (index, row) in rows.iter().enumerate().take(last).skip(tree.scroll()) {
-        let mark = clipboard.contains(&row.path).then(|| clipboard.mode());
+        // Per row, so a mixed clipboard shows which of its paths are being
+        // copied and which are leaving.
+        let mark = clipboard.mode_of(&row.path);
         let (indent, name) = tree_row_parts(row, mark);
 
         let style = match row.kind {

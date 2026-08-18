@@ -760,6 +760,22 @@ Writing the keys live would silently turn every user's file into a full
 replacement, which is the failure the patch model exists to prevent. Commented
 out, it is a self-documenting menu that is semantically empty.
 
+**The keymap half is generated, not written out.** `default.toml` holds the
+options and the leader; the bindings are still `match` arms in `input.rs`, so
+`config init` renders them from the [names table](#names-live-in-one-table)
+instead of from a copy kept beside it. A hand-maintained list of ninety
+bindings is a second source of truth, and the day it disagrees with `input.rs`
+the file is worse than no file: it documents a keymap bi does not have.
+Generated, every line is a binding the parser would accept, and a test
+uncomments the lot and asserts exactly that — which is how the `"` register's
+spelling was caught being written as `"""` rather than `"\""`.
+
+It also settles what the shadowing diagnostic means. Binding `ge` takes `g`
+over, and the listing binds `ge`, `gE`, `gg` and `g_` — so nothing is lost and
+nothing is reported. The check therefore runs once per section, after every
+binding is in, and ignores the sequences the same file binds back. Per line it
+would have flagged bi's own defaults seventeen times.
+
 **`bi config edit`** opens `~/.config/bi/` as a tree. `Editor::open` already
 opens a directory as a tree (`editor.rs:947`), so this is argument routing and
 no new editor code — and `themes/` is in the same tree. If the directory does

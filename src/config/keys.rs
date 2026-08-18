@@ -386,6 +386,46 @@ pub fn key_for_name(mode: KeyMode, name: &str) -> Option<Vec<Key>> {
     parse_keys(spelling, None).ok()
 }
 
+/// Every name, as the `[keys.*]` sections that would bind it to what it
+/// already does — the listing `bi config init` writes.
+///
+/// Generated from `NAMES` rather than kept as text beside it, because a second
+/// copy of the keymap is a second copy to drift. Every line is a real binding
+/// that would parse; `config init` comments them out, which is what makes the
+/// file a menu rather than a replacement.
+pub fn listing() -> String {
+    let mut out = String::new();
+    for (mode, section) in
+        [(KeyMode::Normal, "normal"), (KeyMode::Visual, "visual"), (KeyMode::Tree, "tree")]
+    {
+        out.push_str(&format!("[keys.{section}]\n"));
+        if mode == KeyMode::Visual {
+            out.push_str(
+                "# Visual falls back to [keys.normal] for everything it does not\n\
+                 # claim, so a motion rebound there applies here too. Only put a\n\
+                 # key here to make the two modes differ.\n",
+            );
+            continue;
+        }
+        let width = NAMES
+            .iter()
+            .filter(|(m, _, _)| *m == mode)
+            .map(|(_, _, spelling)| spelling.len() + spelling.matches(['"', '\\']).count() + 2)
+            .max()
+            .unwrap_or(0);
+        for (_, name, spelling) in NAMES.iter().filter(|(m, _, _)| *m == mode) {
+            // `"` is a key — the register prefix — so the spelling has to be
+            // escaped rather than dropped between quotes as it comes. Written
+            // raw it produced `"""`, which is not TOML at all and took the
+            // rest of the file with it.
+            let key = format!("\"{}\"", spelling.replace('\\', "\\\\").replace('"', "\\\""));
+            out.push_str(&format!("{key:width$} = \"{name}\"\n"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The built-in sequences a binding on `bound` would make unreachable.
 ///
 /// Binding anything that starts with `g` turns `g` into the user's prefix, and

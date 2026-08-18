@@ -46,6 +46,13 @@ pub enum ClipMode {
     Cut,
 }
 
+/// One marked path and what the paste will do with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub path: PathBuf,
+    pub mode: ClipMode,
+}
+
 /// Paths marked for the next paste.
 ///
 /// Session state rather than the tree's: you mark in one place and paste in
@@ -53,61 +60,76 @@ pub enum ClipMode {
 /// marks show wherever those paths appear.
 #[derive(Debug, Clone, Default)]
 pub struct Clipboard {
-    paths: Vec<PathBuf>,
-    mode: ClipMode,
+    marks: Vec<Mark>,
 }
 
 impl Clipboard {
-    pub fn paths(&self) -> &[PathBuf] {
-        &self.paths
-    }
-
-    pub fn mode(&self) -> ClipMode {
-        self.mode
+    pub fn marks(&self) -> &[Mark] {
+        &self.marks
     }
 
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.marks.is_empty()
     }
 
     pub fn contains(&self, path: &Path) -> bool {
-        self.paths.iter().any(|p| p == path)
+        self.mode_of(path).is_some()
+    }
+
+    /// What `path` is marked for, if anything. The tree asks this per row, so
+    /// two rows in one paste can show different verbs.
+    pub fn mode_of(&self, path: &Path) -> Option<ClipMode> {
+        self.marks.iter().find(|m| m.path == path).map(|m| m.mode)
     }
 
     /// Marks or unmarks `path`, and says what the set is for.
     ///
-    /// One mode for the whole set, so a paste cannot both duplicate and destroy
-    /// on one keystroke. Pressing the *other* key converts what is already
-    /// marked rather than unmarking this one: "make these a move" is what you
-    /// meant, and a key that means two opposite things depending on state it
-    /// does not show you is the kind of thing that costs a file.
+    /// The verb belongs to the path, not to the set: marking a fourth file to
+    /// copy leaves the three already marked to move alone. An earlier design
+    /// converted the whole set instead, so that a paste could not both
+    /// duplicate and destroy at once — but the mark column shows every row's
+    /// verb all the time, which is what that was really protecting against,
+    /// and one shared mode made "move these three, copy this one" two trips.
+    ///
+    /// Pressing the *other* key on a path already marked converts that one
+    /// rather than unmarking it: "make this a move" is what you meant, and a
+    /// key that means two opposite things depending on state it does not show
+    /// you is the kind of thing that costs a file. The key that put a mark
+    /// there is the key that takes it away.
     pub fn mark(&mut self, path: PathBuf, mode: ClipMode) {
-        if self.mode != mode && !self.paths.is_empty() {
-            self.mode = mode;
-            if !self.contains(&path) {
-                self.paths.push(path);
+        match self.marks.iter_mut().find(|m| m.path == path) {
+            Some(mark) if mark.mode == mode => {
+                self.marks.retain(|m| m.path != path);
             }
-            return;
-        }
-        self.mode = mode;
-        match self.paths.iter().position(|p| *p == path) {
-            Some(at) => drop(self.paths.remove(at)),
-            None => self.paths.push(path),
+            Some(mark) => mark.mode = mode,
+            None => self.marks.push(Mark { path, mode }),
         }
     }
 
     pub fn clear(&mut self) {
-        self.paths.clear();
+        self.marks.clear();
     }
 
-    /// What the footer says, so the mode is never something you have to
-    /// remember.
+    /// Forgets the marks a paste has spent. A cut is spent — the source is not
+    /// there any more — and a copy is not.
+    pub fn clear_cuts(&mut self) {
+        self.marks.retain(|m| m.mode != ClipMode::Cut);
+    }
+
+    fn count(&self, mode: ClipMode) -> usize {
+        self.marks.iter().filter(|m| m.mode == mode).count()
+    }
+
+    /// What the footer says, so what a paste is about to do is never something
+    /// you have to remember. Both halves when the set is mixed, because the
+    /// summary is the one place the whole set is visible at once.
     pub fn summary(&self) -> String {
-        let verb = match self.mode {
-            ClipMode::Copy => "copy",
-            ClipMode::Cut => "move",
-        };
-        format!("{} to {verb}", self.paths.len())
+        let (copies, cuts) = (self.count(ClipMode::Copy), self.count(ClipMode::Cut));
+        match (copies, cuts) {
+            (0, cuts) => format!("{cuts} to move"),
+            (copies, 0) => format!("{copies} to copy"),
+            (copies, cuts) => format!("{copies} to copy, {cuts} to move"),
+        }
     }
 }
 
@@ -735,7 +757,11 @@ mod tests {
     }
 
     fn marked(clipboard: &Clipboard) -> Vec<String> {
-        clipboard.paths().iter().map(|p| p.display().to_string()).collect()
+        clipboard.marks().iter().map(|m| m.path.display().to_string()).collect()
+    }
+
+    fn mode(clipboard: &Clipboard, path: &str) -> Option<ClipMode> {
+        clipboard.mode_of(&PathBuf::from(path))
     }
 
     #[test]
@@ -748,28 +774,47 @@ mod tests {
         assert_eq!(marked(&clipboard), ["b.rs"]);
     }
 
-    /// "Make these a move" is what the other key means. Unmarking on it would
+    /// "Make this a move" is what the other key means. Unmarking on it would
     /// be the same key doing two opposite things depending on state it does
     /// not show you.
     #[test]
-    fn marking_the_other_way_converts_the_set_rather_than_unmarking() {
+    fn marking_the_other_way_converts_that_one_rather_than_unmarking() {
         let mut clipboard = clip(&["a.rs", "b.rs"], ClipMode::Copy);
 
         clipboard.mark(PathBuf::from("a.rs"), ClipMode::Cut);
 
         assert_eq!(marked(&clipboard), ["a.rs", "b.rs"], "still both");
-        assert_eq!(clipboard.mode(), ClipMode::Cut, "and both are a move now");
-        assert_eq!(clipboard.summary(), "2 to move");
+        assert_eq!(mode(&clipboard, "a.rs"), Some(ClipMode::Cut), "this one moves");
+        assert_eq!(mode(&clipboard, "b.rs"), Some(ClipMode::Copy), "and this one still copies");
+    }
+
+    /// The verb belongs to the path, not to the set: three to move and one to
+    /// copy is one paste, not two trips.
+    #[test]
+    fn a_clipboard_can_hold_both_verbs_at_once() {
+        let mut clipboard = clip(&["a.rs", "b.rs"], ClipMode::Cut);
+        clipboard.mark(PathBuf::from("c.rs"), ClipMode::Copy);
+
+        assert_eq!(clipboard.summary(), "1 to copy, 2 to move");
+        assert_eq!(mode(&clipboard, "c.rs"), Some(ClipMode::Copy));
+        assert_eq!(mode(&clipboard, "d.rs"), None, "never marked");
+
+        // A paste spends the cuts and keeps the copies, which with a mixed set
+        // is a partial clear rather than a choice between the two.
+        clipboard.clear_cuts();
+        assert_eq!(marked(&clipboard), ["c.rs"]);
+        assert_eq!(clipboard.summary(), "1 to copy");
     }
 
     #[test]
-    fn converting_picks_up_a_path_that_was_not_marked_yet() {
+    fn marking_a_new_path_leaves_the_others_alone() {
         let mut clipboard = clip(&["a.rs"], ClipMode::Copy);
 
         clipboard.mark(PathBuf::from("b.rs"), ClipMode::Cut);
 
         assert_eq!(marked(&clipboard), ["a.rs", "b.rs"]);
-        assert_eq!(clipboard.mode(), ClipMode::Cut);
+        assert_eq!(mode(&clipboard, "a.rs"), Some(ClipMode::Copy), "unchanged");
+        assert_eq!(mode(&clipboard, "b.rs"), Some(ClipMode::Cut));
     }
 
     #[test]

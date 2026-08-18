@@ -630,9 +630,10 @@ has no use for the ring itself; it is a producer, not a consumer.
 
 ```rust
 pub struct Clipboard {
-    paths: Vec<PathBuf>,
-    mode: ClipMode,
+    marks: Vec<Mark>,
 }
+
+pub struct Mark { path: PathBuf, mode: ClipMode }
 
 pub enum ClipMode { Copy, Cut }
 ```
@@ -641,16 +642,31 @@ On `Session`, beside the registers, and for the same reason: you mark in one
 place and paste in another, and re-rooting the tree must not lose what you
 marked. It also means the marks show in the tree wherever those paths appear.
 
-`c` marks for copying, `x` for cutting, and both toggle. **One mode for the
-whole set**: pressing the other key converts everything rather than leaving a
-clipboard that both duplicates and destroys on one keystroke. Two files marked
-to copy and then an `x` is three files to move, and the footer says so.
+`c` marks for copying, `x` for cutting, and both toggle. **The verb belongs to
+the path, not to the set**: a clipboard can hold two files to copy and one to
+move, and the paste does each what its own mark says.
 
-Converting does not unmark. `x` on a path already marked for copying means "make
-this a move", not "forget this one" — the same key doing two opposite things
-depending on state it does not show you is the kind of thing that costs a file.
-Toggling off is `c` on a copy-marked path, `x` on a cut-marked one: the key that
-put it there takes it away.
+An earlier design gave the whole set one mode, so that `x` on a copy-marked
+clipboard converted everything — the reasoning being that a paste should not
+both duplicate and destroy on one keystroke. That reasoning was about a paste
+you cannot *see*, and the mark column already fixes that: `+` on the rows being
+copied, `~` on the rows leaving, in different colours, on every row, all the
+time. With the verb visible per row there is nothing left for one shared mode
+to protect, and it cost the obvious reading of the two keys — moving three
+files and copying a fourth meant two trips.
+
+The footer says both halves rather than one, because the summary is the one
+place the whole set is visible at once:
+
+```
+2 to copy, 1 to move
+```
+
+Converting still does not unmark. `x` on a path already marked for copying
+means "make this a move", not "forget this one" — the same key doing two
+opposite things depending on state it does not show you is the kind of thing
+that costs a file. Toggling off is `c` on a copy-marked path, `x` on a
+cut-marked one: the key that put it there takes it away.
 
 `Esc` clears the marks, which is the only way out that does not involve pressing
 the right key on every one of them.
@@ -660,13 +676,17 @@ the right key on every one of them.
 `p` puts them in the selected directory — the one holding the file, when the
 cursor is on a file, which is how `a` already picks its directory. Copying a
 directory copies it whole. Cutting is a rename, falling back to copy-then-delete
-across filesystems, because a rename between devices is not a rename.
+across filesystems, because a rename between devices is not a rename. Each queued
+path carries its own verb, so a mixed set does both in one pass, in the order
+they were marked.
 
 Refused: pasting a directory into itself or into anything below it. That one is
 a loop rather than a mistake, and no name for the destination fixes it.
 
-A cut clears the clipboard afterwards, because the sources are not there any
-more. A copy keeps it, so the same set can go to a second place.
+Afterwards the cut marks are gone — their sources are not there any more — and
+the copy marks stay, so the same files can go to a second place. With a mixed
+set that is a partial clear rather than a choice between the two, and it falls
+out of the verb being per path: what survives is exactly what still exists.
 
 ### Conflicts
 

@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::buffer::{Buffer, BufferId, Cursor};
+use crate::clipboard::SystemClipboard;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -16,7 +17,7 @@ use crate::picker::{Item, Picker, PickerKind};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
-use crate::tree::{ClipMode, Clipboard, Kind, Tree, copy_into, move_into};
+use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
     Chrome, Content, ContentKind, Dir, Layout, Rect, Side, Text, Window, WindowId,
 };
@@ -147,10 +148,12 @@ pub enum Action {
         count: usize,
         sink: Sink,
     },
-    /// `p` / `P`. Reads the front of the ring.
+    /// `p` / `P`. Reads the front of the ring, or the system clipboard when
+    /// the command was spelled `"+p`.
     Paste {
         before: bool,
         count: usize,
+        sink: Sink,
     },
 
     OpenPicker(PickerKind),
@@ -272,6 +275,9 @@ pub enum Action {
     },
 
     InsertChar(char),
+    /// A run of text arriving at once — a terminal's bracketed paste. One
+    /// insertion, one undo entry, one reparse, however long it is.
+    InsertText(String),
     InsertNewline,
     Backspace,
 
@@ -399,6 +405,7 @@ impl Action {
         matches!(
             self,
             Action::InsertChar(_)
+                | Action::InsertText(_)
                 | Action::InsertNewline
                 | Action::Backspace
                 | Action::ReplaceTyped(_)
@@ -435,7 +442,7 @@ fn cmd_of(action: Action) -> Command {
 fn with_count(command: Command, count: usize) -> Command {
     let action = match command.action {
         Action::Operate { op, target, sink, .. } => Action::Operate { op, target, count, sink },
-        Action::Paste { before, .. } => Action::Paste { before, count },
+        Action::Paste { before, sink, .. } => Action::Paste { before, count, sink },
         Action::ReplaceChar { ch, .. } => Action::ReplaceChar { ch, count },
         Action::ToggleCase { .. } => Action::ToggleCase { count },
         Action::JoinLines { .. } => Action::JoinLines { count },
@@ -462,10 +469,10 @@ pub struct Command {
 /// is left has to wait somewhere while the command line asks for a name.
 #[derive(Debug, Clone)]
 pub struct Pasting {
-    /// Still to place, the head first.
-    queue: Vec<std::path::PathBuf>,
+    /// Still to place, the head first. Each carries its own verb, so a mixed
+    /// set copies some and moves others in one pass.
+    queue: Vec<Mark>,
     into: std::path::PathBuf,
-    mode: ClipMode,
     /// How many landed before it stopped, for the message when it is abandoned.
     done: usize,
 }
@@ -488,6 +495,10 @@ pub struct Session {
     pub clipboard: Clipboard,
     /// A paste waiting on a name for the file it stopped at.
     pub pasting: Option<Pasting>,
+    /// The world's clipboard, when a frontend has supplied one. `None` is an
+    /// embedder that has not, and every test: `"+y` then says so and changes
+    /// nothing, which is a diagnostic rather than a panic.
+    system: Option<Box<dyn SystemClipboard>>,
     pub picker: Option<Picker>,
     pub mode: Mode,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
@@ -543,6 +554,56 @@ pub struct Session {
     pending_search_op: Option<(Operator, Sink, usize)>,
     pub status: String,
     pub quit: bool,
+}
+
+impl Session {
+    /// Where an operator's text goes.
+    ///
+    /// The one place a `Sink` is spent, so a new register is a new arm here
+    /// rather than a fourth copy of this decision at a third call site.
+    fn capture(&mut self, entry: Entry, sink: Sink) {
+        match sink {
+            Sink::Ring => self.registers.push(entry),
+            // Nothing ever reaches the black hole, which is the point of it.
+            Sink::BlackHole => {}
+            Sink::System => {
+                let wrote = match &self.system {
+                    Some(clipboard) => clipboard.set(&entry.text).map_err(|e| format!("{e:#}")),
+                    None => Err("no system clipboard".into()),
+                };
+                if let Err(message) = wrote {
+                    self.status = message;
+                }
+            }
+        }
+    }
+
+    /// What `"+p` puts, or `None` with a message saying why not.
+    ///
+    /// The kind is read off the text, because the clipboard carries none: text
+    /// ending in a newline came from whole lines and goes back as whole lines,
+    /// which is the same rule vim applies to a register it did not fill.
+    fn clipboard_entry(&mut self) -> Option<Entry> {
+        let got = match &self.system {
+            Some(clipboard) => clipboard.get().map_err(|e| format!("{e:#}")),
+            None => Err("no system clipboard".into()),
+        };
+        let text = match got {
+            Ok(Some(text)) if !text.is_empty() => text,
+            // Not an error: many terminals refuse to read the clipboard back,
+            // and an empty clipboard is an ordinary state.
+            Ok(_) => {
+                self.status = "the clipboard is empty, or the terminal would not say".into();
+                return None;
+            }
+            Err(message) => {
+                self.status = message;
+                return None;
+            }
+        };
+        let kind = if text.ends_with('\n') { EntryKind::Linewise } else { EntryKind::Charwise };
+        Some(Entry { text, kind })
+    }
 }
 
 /// An open buffer, and what belongs to it rather than to a window.
@@ -681,8 +742,13 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "wa" | "wall" => ExLine::WriteAll,
         "qa" | "qall" => ExLine::QuitAll { force },
         "q" | "quit" => ExLine::Quit { force },
-        "sp" | "split" | "new" => split(Dir::Horizontal),
-        "vs" | "vsp" | "vsplit" | "vnew" => split(Dir::Vertical),
+        "sp" | "split" => split(Dir::Horizontal),
+        "vs" | "vsp" | "vsplit" => split(Dir::Vertical),
+        // Not aliases for the two above: vim's `new` forms land on an empty
+        // buffer. None takes a path, because `:new <path>` is `:sp <path>`.
+        "new" => ExLine::Window(WindowCmd::New { dir: Some(Dir::Horizontal) }),
+        "vnew" => ExLine::Window(WindowCmd::New { dir: Some(Dir::Vertical) }),
+        "ene" | "enew" => ExLine::Window(WindowCmd::New { dir: None }),
         "clo" | "close" => ExLine::Window(WindowCmd::Close),
         "on" | "only" => ExLine::Window(WindowCmd::Only),
         // Bare `:e` reloads this buffer; with a path it changes what the
@@ -743,6 +809,11 @@ pub enum WindowCmd {
     Split {
         dir: Dir,
         path: Option<String>,
+    },
+    /// `:new`, `:vnew`, `:enew` — an unnamed buffer, in a split or in this
+    /// window. `None` is `:enew`: no split, this window.
+    New {
+        dir: Option<Dir>,
     },
     /// `Ctrl-W e` — a tree beside this window, rooted at the file it is
     /// showing, with that file selected.
@@ -983,6 +1054,16 @@ impl Editor {
     /// The returned diagnostics are the frontend's to show. Startup and
     /// `:reload` run this same path, which is the only way the two stay in
     /// agreement.
+    /// Installs the world's clipboard, for `"+y` and `"+p`.
+    ///
+    /// Supplied by the frontend rather than built here, exactly as
+    /// `load_config` supplies a `ConfigSource`: the library does not learn what
+    /// a clipboard is. Without one, `"+` reports and changes nothing. See
+    /// `docs/specs/clipboard.md`.
+    pub fn set_clipboard(&mut self, clipboard: impl SystemClipboard + 'static) {
+        self.session.system = Some(Box::new(clipboard));
+    }
+
     pub fn load_config(&mut self, source: impl ConfigSource + 'static) -> Vec<Diagnostic> {
         let problems = self.read_config(&source).unwrap_or_else(|d| vec![d]);
         self.config_source = Some(Box::new(source));
@@ -1346,6 +1427,58 @@ impl Editor {
         }
         let window = self.window_mut_of(window).expect("checked above");
         window.show(Content::Text(text));
+        self.sweep_scratch();
+    }
+
+    /// Drops a `[No Name]` nobody is looking at.
+    ///
+    /// Unnamed, empty and unmodified, and displayed by no window: there is
+    /// nothing in it, nothing to save it to, and no way back to it. Keeping it
+    /// only puts a blank in the `Ctrl-I` cycle.
+    ///
+    /// This is what stops `bi .` leaving one behind forever. `Editor::open` on
+    /// a directory makes an empty session and then replaces the window's
+    /// content with the tree, orphaning the buffer it just made; the sweep
+    /// collects it as soon as a real file arrives to keep the list non-empty.
+    /// Plain `bi` followed by `:e file` lands in the same place, which is how
+    /// vim reuses its initial blank.
+    ///
+    /// Each condition earns its place. Unnamed, or `:w` would have somewhere
+    /// to write. Unmodified *and* empty, because a buffer emptied by deleting
+    /// its text is modified and its undo history is a reason to keep it. Shown
+    /// nowhere, which is what makes it unreachable — a `:enew` you are looking
+    /// at survives.
+    fn sweep_scratch(&mut self) {
+        if self.buffers.len() < 2 {
+            return;
+        }
+        let doomed: Vec<BufferId> = self
+            .buffers
+            .iter()
+            .filter(|entry| {
+                entry.buffer.path.is_none()
+                    && entry.buffer.rope().len_chars() == 0
+                    && !entry.buffer.is_modified()
+            })
+            .map(|entry| entry.id)
+            .filter(|id| !self.windows.iter().any(|w| w.buffer() == Some(*id)))
+            .collect();
+
+        for id in doomed {
+            // The invariant outranks the sweep: something has to be left.
+            if self.buffers.len() < 2 {
+                return;
+            }
+            // An alternate pointing at a blank is not worth a `Ctrl-^`, and a
+            // `BufferId` resolving to nothing is the one way a stable id is
+            // worse than an index.
+            for window in &mut self.windows {
+                if window.alt_buffer() == Some(id) {
+                    window.alt = None;
+                }
+            }
+            self.buffers.retain(|entry| entry.id != id);
+        }
     }
 
     fn run_buffer_cmd(&mut self, cmd: BufferCmd) {
@@ -1604,6 +1737,46 @@ impl Editor {
         id
     }
 
+    /// A new, unnamed, empty buffer in the list.
+    ///
+    /// Ordinary in every way: `:w` wants a name for it, and the scratch sweep
+    /// collects it if you walk away without typing anything.
+    fn fresh_scratch(&mut self) -> BufferId {
+        let buffer = Buffer::empty();
+        let id = self.fresh_buffer_id();
+        self.buffers.push(BufferEntry {
+            id,
+            syntax: syntax_for(&buffer),
+            buffer,
+            last: Vec::new(),
+        });
+        id
+    }
+
+    /// Splits the focused window, moves focus into the new one, and hands back
+    /// its id. `None` means there was no room, and it has already said so.
+    ///
+    /// The new window is a clone of the old, so a split lands on the line you
+    /// were reading rather than at the top of the file. What it then shows is
+    /// the caller's business.
+    fn split_focus(&mut self, dir: Dir) -> Option<WindowId> {
+        let (focus, area, chrome) = (self.focus, self.area, self.chrome);
+        let new = self.fresh_window_id();
+        if !self.layout.split(focus, new, dir, area, &chrome) {
+            // Hand the id back rather than leaving a hole in the sequence;
+            // nothing depends on it, but a gap invites the question of what
+            // used to be there.
+            self.next_window -= 1;
+            self.session.status = "not enough room to split".into();
+            return None;
+        }
+        let mut window = self.window().clone();
+        window.id = new;
+        self.windows.push(window);
+        self.set_focus(new);
+        Some(new)
+    }
+
     fn run_window_cmd(&mut self, cmd: WindowCmd) {
         let focus = self.focus;
         let (area, chrome) = (self.area, self.chrome);
@@ -1632,22 +1805,7 @@ impl Editor {
                     },
                 };
 
-                let new = self.fresh_window_id();
-                if !self.layout.split(focus, new, dir, area, &chrome) {
-                    // Hand the id back rather than leaving a hole in the
-                    // sequence; nothing depends on it, but a gap invites the
-                    // question of what used to be there.
-                    self.next_window -= 1;
-                    self.session.status = "not enough room to split".into();
-                    return;
-                }
-
-                // Duplicates the window, so the split lands where you were
-                // reading rather than at the top of the file.
-                let mut window = self.window().clone();
-                window.id = new;
-                self.windows.push(window);
-                self.set_focus(new);
+                let Some(new) = self.split_focus(dir) else { return };
                 match content {
                     // Through `show`, so the new window records where the
                     // duplicated one was before it moves off that buffer.
@@ -1655,6 +1813,22 @@ impl Editor {
                     Some(tree) => self.window_mut().show(tree),
                     None => {}
                 }
+            }
+
+            // `:new`, `:vnew`, `:enew`. Not a spelling of `:split`: vim's
+            // `new` forms land on an *empty* buffer, and shipping them as
+            // aliases gave anyone who typed one a second view of the file they
+            // already had, silently. `None` is `:enew` — this window, no split.
+            WindowCmd::New { dir } => {
+                let target = match dir {
+                    Some(dir) => match self.split_focus(dir) {
+                        Some(new) => new,
+                        None => return,
+                    },
+                    None => focus,
+                };
+                let id = self.fresh_scratch();
+                self.show(target, id);
             }
 
             WindowCmd::Tree => {
@@ -1751,6 +1925,9 @@ impl Editor {
         if self.focus == id {
             self.set_focus(heir);
         }
+        // Closing the only window that showed a blank is the other way one
+        // becomes unreachable.
+        self.sweep_scratch();
         true
     }
 
@@ -2169,17 +2346,16 @@ impl Editor {
             self.session.status = "nothing marked".into();
             return;
         }
-        let queue: Vec<std::path::PathBuf> = self.session.clipboard.paths().to_vec();
+        let queue: Vec<Mark> = self.session.clipboard.marks().to_vec();
 
         // A directory cannot hold itself. That is a loop rather than a
         // mistake, and no name for the destination would fix it.
-        if let Some(source) = queue.iter().find(|source| into.starts_with(source)) {
-            self.session.status = format!("cannot paste \"{}\" into itself", source.display());
+        if let Some(mark) = queue.iter().find(|mark| into.starts_with(&mark.path)) {
+            self.session.status = format!("cannot paste \"{}\" into itself", mark.path.display());
             return;
         }
 
-        let mode = self.session.clipboard.mode();
-        self.session.pasting = Some(Pasting { queue, into: into.to_path_buf(), mode, done: 0 });
+        self.session.pasting = Some(Pasting { queue, into: into.to_path_buf(), done: 0 });
         self.run_paste(None);
     }
 
@@ -2191,7 +2367,8 @@ impl Editor {
         let Some(mut pasting) = self.session.pasting.take() else { return };
         let mut rename = rename;
 
-        while let Some(source) = pasting.queue.first().cloned() {
+        while let Some(mark) = pasting.queue.first().cloned() {
+            let source = mark.path;
             let target = match rename.take() {
                 Some(named) => named,
                 None => match source.file_name() {
@@ -2211,7 +2388,8 @@ impl Editor {
                 return;
             }
 
-            let result = match pasting.mode {
+            // Each path's own verb, so a mixed set does both in one pass.
+            let result = match mark.mode {
                 ClipMode::Copy => copy_into(&source, &target),
                 ClipMode::Cut => move_into(&source, &target),
             };
@@ -2224,16 +2402,12 @@ impl Editor {
             pasting.done += 1;
         }
 
-        let verb = match pasting.mode {
-            ClipMode::Copy => "copied",
-            ClipMode::Cut => "moved",
-        };
-        // A cut is spent — the sources are not there any more. A copy is not,
-        // so the same set can go to a second place.
-        if pasting.mode == ClipMode::Cut {
-            self.session.clipboard.clear();
-        }
-        self.session.status = format!("{} {verb} into {}", pasting.done, pasting.into.display());
+        // The cuts are spent — their sources are not there any more — and the
+        // copies are not, so the same files can go to a second place. With a
+        // mixed set that is a partial clear rather than a choice between the
+        // two: what survives is exactly what still exists.
+        self.session.clipboard.clear_cuts();
+        self.session.status = format!("{} pasted into {}", pasting.done, pasting.into.display());
         self.refresh_trees();
     }
 
@@ -2462,6 +2636,44 @@ impl Editor {
     /// other window inside the rope, but its cursor would slide relative to the
     /// text every time a line was inserted above it, which is precisely what a
     /// second window on one file exists to avoid.
+    /// A bracketed paste from the terminal: text arriving all at once rather
+    /// than as the keystrokes it looks like.
+    ///
+    /// One action however long it is, so it costs one undo entry and one
+    /// reparse instead of one per character — which is what made a paste
+    /// appear a letter at a time.
+    ///
+    /// A paste is *typed text*, so it goes where typed text goes: the buffer in
+    /// insert or replace, the `:` line, the search line. In the modes that take
+    /// no text it is refused rather than invented into a put — `"+p` is the
+    /// command for that, and it says what it does. See
+    /// `docs/specs/clipboard.md`.
+    pub fn paste_text(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let action = match self.session.mode {
+            Mode::Insert | Mode::Replace => Action::InsertText(text),
+            Mode::Command(_) => {
+                for c in text.chars().filter(|c| *c != '\n' && *c != '\r') {
+                    self.apply(Command { count: 1, action: Action::CommandChar(c) });
+                }
+                return;
+            }
+            Mode::Search { .. } => {
+                for c in text.chars().filter(|c| *c != '\n' && *c != '\r') {
+                    self.apply(Command { count: 1, action: Action::SearchChar(c) });
+                }
+                return;
+            }
+            _ => {
+                self.session.status = "paste into insert mode, or use \"+p".into();
+                return;
+            }
+        };
+        self.apply(Command { count: 1, action });
+    }
+
     pub fn settle(&mut self) {
         let focus = self.focus;
         for entry in &mut self.buffers {
@@ -2716,14 +2928,12 @@ impl View<'_> {
     /// it becomes real.
     fn operate_block(&mut self, op: Operator, sink: Sink) {
         let spans = self.block_spans();
-        if sink == Sink::Ring {
+        if sink != Sink::BlackHole {
             let rows: Vec<String> =
                 spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
             // One entry, not one per row: what was taken is a rectangle, and
             // pasting it back has to know that.
-            self.session
-                .registers
-                .push(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise });
+            self.session.capture(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise }, sink);
         }
 
         let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
@@ -2993,9 +3203,7 @@ impl View<'_> {
                 self.for_each_selection(|ed, sel| {
                     match ed.buffer.operate(sel.head, op, target, count) {
                         Some((entry, landed)) => {
-                            if sink == Sink::Ring {
-                                ed.session.registers.push(entry);
-                            }
+                            ed.session.capture(entry, sink);
                             Selection::collapsed(landed)
                         }
                         None => sel,
@@ -3005,11 +3213,19 @@ impl View<'_> {
                     self.session.mode = Mode::Insert;
                 }
             }
-            Action::Paste { before, count } => {
+            Action::Paste { before, count, sink } => {
                 // Cloned because pasting borrows the buffer mutably while the
                 // entry is still owned by the ring.
-                let Some(entry) = self.session.registers.front().cloned() else {
-                    self.session.status = "nothing to paste".into();
+                let entry = match sink {
+                    Sink::System => self.session.clipboard_entry(),
+                    _ => self.session.registers.front().cloned(),
+                };
+                let Some(entry) = entry else {
+                    // `clipboard_entry` has already said which of its several
+                    // ways it came back empty; the ring has only one.
+                    if *sink != Sink::System {
+                        self.session.status = "nothing to paste".into();
+                    }
                     return;
                 };
                 let (before, count) = (*before, *count);
@@ -3121,6 +3337,12 @@ impl View<'_> {
                     Selection::collapsed(ed.buffer.insert_char(sel.head, c))
                 });
             }
+            Action::InsertText(text) => {
+                let text = text.clone();
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(ed.buffer.insert_str(sel.head, &text))
+                });
+            }
             Action::InsertNewline => {
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.insert_char(sel.head, '\n'))
@@ -3209,9 +3431,7 @@ impl View<'_> {
                     };
                     match ed.buffer.operate_range(sel.head, op, start, end, linewise) {
                         Some((entry, landed)) => {
-                            if sink == Sink::Ring {
-                                ed.session.registers.push(entry);
-                            }
+                            ed.session.capture(entry, sink);
                             Selection::collapsed(landed)
                         }
                         None => Selection::collapsed(sel.head),
@@ -3966,6 +4186,41 @@ mod tests {
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "", "all five chars, not one");
     }
 
+    /// A bracketed paste is one action however long it is. Before it existed
+    /// the terminal sent a paste as keystrokes, and every character cost its
+    /// own undo entry, its own reparse and a full redraw — which is what made
+    /// pasting look like a typewriter.
+    #[test]
+    fn a_bracketed_paste_is_one_insertion_and_one_undo_step() {
+        let mut ed = editor("");
+        ed.apply(cmd(Action::EnterInsert));
+
+        ed.paste_text("one\ntwo\nthree".into());
+        ed.apply(cmd(Action::EnterNormal));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\ntwo\nthree");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "", "the whole paste, not a letter");
+    }
+
+    /// A paste is typed text, so it goes where typed text goes. In the modes
+    /// that take none it is refused rather than invented into a put — `"+p` is
+    /// the command that does that, and it says so.
+    #[test]
+    fn a_paste_reaches_the_command_line_and_is_refused_in_normal_mode() {
+        let mut ed = editor("hello");
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        ed.paste_text("w out.txt\n".into());
+
+        assert_eq!(ed.session.mode, Mode::Command("w out.txt".into()), "the newline is not typed");
+
+        ed.apply(cmd(Action::CommandCancel));
+        ed.paste_text("junk".into());
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello", "nothing went in");
+        assert!(ed.session.status.contains("\"+p"), "{}", ed.session.status);
+    }
+
     /// `o` edits *and* enters insert mode. The newline it inserts belongs to the
     /// same undo unit as everything typed after it.
     #[test]
@@ -4075,7 +4330,73 @@ mod tests {
     }
 
     fn paste(before: bool, count: usize) -> Command {
-        cmd(Action::Paste { before, count })
+        cmd(Action::Paste { before, count, sink: Sink::Ring })
+    }
+
+    /// A clipboard that stays in the process, which is the whole reason the
+    /// core takes a trait: `"+y` and `"+p` are testable without a terminal,
+    /// and the escape sequence is tested where it is built.
+    #[derive(Default, Clone)]
+    struct FakeClipboard(std::rc::Rc<std::cell::RefCell<Option<String>>>);
+
+    impl crate::clipboard::SystemClipboard for FakeClipboard {
+        fn set(&self, text: &str) -> anyhow::Result<()> {
+            *self.0.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }
+        fn get(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.0.borrow().clone())
+        }
+    }
+
+    #[test]
+    fn the_system_register_yanks_out_and_pastes_back_without_touching_the_ring() {
+        let clipboard = FakeClipboard::default();
+        let mut ed = editor("foo bar");
+        ed.set_clipboard(clipboard.clone());
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+            count: 1,
+            sink: Sink::System,
+        }));
+
+        assert_eq!(clipboard.0.borrow().as_deref(), Some("foo "), "it went outside");
+        assert!(ed.session.registers.front().is_none(), "and not into the ring");
+
+        // And back in, from what another program could have put there.
+        *clipboard.0.borrow_mut() = Some("zzz".into());
+        ed.apply(cmd(Action::Paste { before: true, count: 1, sink: Sink::System }));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "zzzfoo bar");
+    }
+
+    /// No clipboard is the ordinary state for an embedder that has not supplied
+    /// one. It reports; it does not panic, and it does not quietly succeed.
+    #[test]
+    fn the_system_register_says_so_when_there_is_no_clipboard() {
+        let mut ed = editor("foo");
+
+        ed.apply(cmd(Action::Paste { before: false, count: 1, sink: Sink::System }));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "foo", "nothing pasted");
+        assert_eq!(ed.session.status, "no system clipboard");
+    }
+
+    #[test]
+    fn a_clipboard_ending_in_a_newline_comes_back_linewise() {
+        let clipboard = FakeClipboard::default();
+        *clipboard.0.borrow_mut() = Some("added\n".into());
+        let mut ed = editor("first\nsecond");
+        ed.set_clipboard(clipboard);
+
+        ed.apply(cmd(Action::Paste { before: false, count: 1, sink: Sink::System }));
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "first\nadded\nsecond",
+            "a whole line, not spliced into the middle of one"
+        );
     }
 
     #[test]
@@ -4396,7 +4717,111 @@ mod tests {
         let ed = Editor::open(d.path()).unwrap();
 
         assert!(ed.window().tree().is_some());
-        assert_eq!(ed.buffer_ids().len(), 1, "with a [No Name] behind it");
+        assert_eq!(ed.buffer_ids().len(), 1, "with a [No Name] behind it, until a file arrives");
+    }
+
+    /// The `[No Name]` `bi .` leaves behind is a placeholder for the invariant,
+    /// not a buffer anyone asked for. Opening a file from the tree collects it,
+    /// or `Ctrl-I` would cycle between the file and a blank forever.
+    #[test]
+    fn the_placeholder_buffer_goes_when_a_real_file_arrives() {
+        let d = ScratchDir::new("sweep-tree").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+
+        tree_key(&mut ed, TreeCmd::Enter);
+
+        assert_eq!(ed.buffer_ids().len(), 1, "the file, and nothing behind it");
+        assert!(ed.buffer().and_then(|b| b.path.as_ref()).is_some(), "and it is the file");
+    }
+
+    /// The same wart by the other road: plain `bi`, then `:e`. This is how vim
+    /// reuses its initial blank.
+    #[test]
+    fn the_initial_blank_goes_when_it_is_edited_away_from() {
+        let d = ScratchDir::new("sweep-edit").file("a.rs");
+        let mut ed = Editor::empty();
+
+        ex(&mut ed, &format!("e {}/a.rs", d.path()));
+
+        assert_eq!(ed.buffer_ids().len(), 1);
+        assert!(ed.window().alt_buffer().is_none(), "and no Ctrl-^ back to a blank");
+    }
+
+    /// The three conditions are each load-bearing. A blank you are looking at
+    /// stays; one holding text stays; one that is modified stays even when the
+    /// text has been deleted back to nothing.
+    #[test]
+    fn a_scratch_buffer_that_is_in_use_is_not_swept() {
+        let d = ScratchDir::new("sweep-keep").file("a.rs");
+        let mut ed = editor("hello");
+        sized(&mut ed);
+        ex(&mut ed, &format!("sp {}/a.rs", d.path()));
+
+        assert_eq!(ed.buffer_ids().len(), 2, "the unnamed buffer is still on screen below");
+
+        // Emptied by editing is not the same as never written in: the undo
+        // history is a reason to keep it.
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        ex(&mut ed, "close");
+
+        assert_eq!(ed.buffer_ids().len(), 2, "modified, so it survives having no window");
+    }
+
+    /// `:new` is not `:split`. It shipped as an alias, which gave anyone who
+    /// typed it a second view of the file they already had and said nothing.
+    #[test]
+    fn the_new_commands_open_an_unnamed_buffer_rather_than_this_one() {
+        let mut ed = editor("hello");
+        sized(&mut ed);
+
+        ex(&mut ed, "new");
+
+        assert_eq!(ed.window_ids().len(), 2, "a split");
+        assert_eq!(ed.buffer_ids().len(), 2, "onto a buffer of its own");
+        assert!(ed.buffer().unwrap().path.is_none(), "unnamed");
+        assert_eq!(ed.buffer().unwrap().rope().len_chars(), 0, "and empty");
+
+        // `:enew` is the same buffer without the split.
+        let windows = ed.window_ids().len();
+        ex(&mut ed, "enew");
+        assert_eq!(ed.window_ids().len(), windows, "this window");
+        assert!(ed.buffer().unwrap().path.is_none());
+    }
+
+    #[test]
+    fn vnew_splits_the_other_way() {
+        let mut ed = editor("hello");
+        sized(&mut ed);
+
+        ex(&mut ed, "vnew");
+
+        let rects: Vec<_> = ed
+            .window_ids()
+            .into_iter()
+            .filter_map(|id| ed.layout.rect_of(id, ed.area, &ed.chrome))
+            .collect();
+        assert_eq!(rects.len(), 2);
+        assert_ne!(rects[0].x, rects[1].x, "side by side, not stacked");
+        assert!(ed.buffer().unwrap().path.is_none());
+    }
+
+    /// The spellings that were already right stay right: a bare `:sp` is a
+    /// second view of this buffer, not a new one.
+    #[test]
+    fn a_bare_split_still_duplicates_the_window() {
+        let mut ed = editor("hello");
+        sized(&mut ed);
+
+        ex(&mut ed, "sp");
+
+        assert_eq!(ed.window_ids().len(), 2);
+        assert_eq!(ed.buffer_ids().len(), 1);
     }
 
     #[test]
@@ -4802,9 +5227,9 @@ mod tests {
     fn marked(ed: &Editor) -> Vec<String> {
         ed.session
             .clipboard
-            .paths()
+            .marks()
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect()
     }
 
@@ -4870,6 +5295,30 @@ mod tests {
         assert!(std::path::Path::new(&format!("{}/pkg/a.rs", d.path())).is_file());
         assert!(!std::path::Path::new(&format!("{}/a.rs", d.path())).exists(), "moved");
         assert!(ed.session.clipboard.is_empty(), "the sources are not there any more");
+    }
+
+    /// The verb belongs to the path, so one paste can do both. The mark column
+    /// is what makes that safe to offer — every row shows which it is.
+    #[test]
+    fn one_paste_copies_some_and_moves_others() {
+        let d = ScratchDir::new("paste-mixed").file("a.rs").file("b.rs").dir("pkg");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed); // pkg/ sorts first
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Copy)); // a.rs
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+        tree_key(&mut ed, TreeCmd::Mark(ClipMode::Cut)); // b.rs
+
+        assert_eq!(ed.session.status, "1 to copy, 1 to move", "the footer says both halves");
+
+        tree_key(&mut ed, TreeCmd::Select { down: false, count: 2 });
+        tree_key(&mut ed, TreeCmd::Paste);
+
+        let at = |p: &str| std::path::Path::new(&format!("{}/{p}", d.path())).exists();
+        assert!(at("pkg/a.rs") && at("pkg/b.rs"), "both landed");
+        assert!(at("a.rs"), "the copy is still where it was");
+        assert!(!at("b.rs"), "the cut is not");
+        assert_eq!(marked(&ed), ["a.rs"], "the spent cut is forgotten, the copy is not");
     }
 
     #[test]
@@ -6398,7 +6847,7 @@ mod tests {
         let mut ed = block(GRID, 1, 2, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
         ed.set_cursor(Cursor::at(4)); // row 0, column 4
-        ed.apply(cmd(Action::Paste { before: false, count: 1 }));
+        ed.apply(cmd(Action::Paste { before: false, count: 1, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcdebcf\nghijkhil\nmnopqnor");
     }
 
@@ -6407,7 +6856,7 @@ mod tests {
         let mut ed = editor("xy");
         ed.session.registers.push(Entry { text: "bc\nhi\nno".into(), kind: EntryKind::Blockwise });
         ed.set_cursor(Cursor::at(1));
-        ed.apply(cmd(Action::Paste { before: true, count: 1 }));
+        ed.apply(cmd(Action::Paste { before: true, count: 1, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "xbcy\n hi\n no");
     }
 

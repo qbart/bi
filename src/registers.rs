@@ -43,6 +43,11 @@ pub enum Sink {
     /// `"_` — capture nothing. The escape hatch for throwing away a big junk
     /// block without pushing real history one step closer to the exit.
     BlackHole,
+    /// `"+` and `"*` — the system clipboard, through whatever the frontend
+    /// supplied. Explicit rather than mirrored onto every yank: a delete is not
+    /// a copy, and exporting every `dd` to the desktop is a surprise in the
+    /// direction that cannot be undone.
+    System,
 }
 
 pub struct Registers {

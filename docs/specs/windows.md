@@ -349,7 +349,10 @@ now has.
 ```
 :sp[lit] [path]     split horizontally — the new window is above
 :vs[plit] [path]    split vertically — the new window is left
-Ctrl-W s, Ctrl-W v  the same two
+:new                split horizontally onto a new unnamed buffer
+:vnew               the same, vertically
+:enew               an unnamed buffer in this window
+Ctrl-W s, Ctrl-W v  the same first two
 Ctrl-W e            show or hide the file tree — see tree.md
 Ctrl-W h j k l      focus the window in that direction
 Ctrl-W w, Ctrl-W W  cycle focus forwards, backwards
@@ -363,6 +366,19 @@ Ctrl-W =            equalise every weight
 A bare `:sp` duplicates the current window: same buffer, same cursor, same
 scroll, so the split lands on the line you were reading. With a path it opens
 that file in the new window, and focus follows the new window in both cases.
+
+**`:new` is not a spelling of `:split`.** It shipped as one, which was wrong in
+the way an alias is worse than a missing command: vim's `:new` splits onto an
+*empty* buffer, so anyone typing it got a second view of the file they already
+had and no message saying otherwise. The three `new` forms differ only in where
+the buffer lands — a horizontal split, a vertical one, or this window — and
+none of them takes a path, because a `new` with a filename is `:sp <path>`.
+
+The buffer they make is an ordinary unnamed one: `:w` needs a name, and the
+[scratch sweep](#leaving-and-entering) collects it if you leave it untouched
+and look at something else. That is deliberate — an empty buffer you typed one
+character into is yours and survives; one you opened by accident is not worth
+a `:bd`.
 
 **Closing a window never checks for unsaved changes**, because it discards
 nothing — the buffer stays in the list, and this is what "hidden buffer" means.
@@ -430,6 +446,31 @@ Three invariants:
 **The list is never empty.** Deleting the last buffer leaves a fresh `[No Name]`
 in its place, so `Editor::buffer()` is always valid and no code path has to
 handle a session with nothing open.
+
+**A scratch buffer no window shows is not kept.** Unnamed, empty and unmodified
+— the three together — and displayed nowhere, and it goes, provided another
+buffer is there to keep the list non-empty.
+
+This is the rule that stops `bi .` leaving a `[No Name]` in the cycle forever.
+`Editor::open` on a directory builds an empty session and then replaces the
+window's content with the tree, which orphans the buffer it just made; nothing
+ever showed it again, and `Ctrl-I` and `Ctrl-O` cycled between the file you
+opened and a blank that was never asked for. The same wart appeared from
+plain `bi` followed by `:e file`, where the initial blank stayed in the list
+behind the file — vim reuses that one, and this is how bi reuses it.
+
+The three conditions are each doing work. **Unnamed**, or `:w` would have
+somewhere to write and the buffer is a file you have not saved yet.
+**Unmodified and empty** are not the same check: a buffer holding text you
+deleted back to nothing is still modified, and its undo history is a reason to
+keep it. **Shown nowhere** is what makes it unreachable — a `:enew` you are
+looking at is displayed, so it stays, and one you switched away from without
+typing anything is exactly the thing you meant to discard.
+
+The sweep runs after anything that can orphan one: a window changing what it
+shows, a window closing, and a buffer being opened. A window whose `alt` names
+the swept buffer drops it to `None`, the same as deletion — an alternate
+pointing at a blank is not worth the `Ctrl-^`.
 
 **`:bd` closes no windows.** Any window showing the deleted buffer falls to the
 next one in the list. Deleting a file should not rearrange the screen — vim gets

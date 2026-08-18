@@ -109,7 +109,6 @@ fn read_bindings(
 
     for (spelling, item) in table.iter() {
         let line = line_for(table, spelling, src);
-        let count = added.len();
         let mut report = |message: String| problems.push(Diagnostic { line, message });
 
         let from = match keys::parse_keys(spelling, config.keys.leader()) {
@@ -147,13 +146,9 @@ fn read_bindings(
             }
             _ => report(format!("a binding is a command name or false, not {item}")),
         }
-
-        if added.len() > count {
-            let (from, _) = added.last().expect("just added");
-            report_shadowed(from, mode, line, problems);
-        }
     }
 
+    report_shadowed(&added, mode, config, problems);
     report_unreachable(&added, mode, config, problems);
 }
 
@@ -162,22 +157,52 @@ fn read_bindings(
 /// `"gd" = …` makes `g` the user's prefix, and a prefix has no meaning of its
 /// own — so `gg`, `ge`, `gE` and `g_` stop resolving. The binding still
 /// applies; this only refuses to let it happen quietly.
-fn report_shadowed(from: &[Key], mode: KeyMode, line: usize, problems: &mut Vec<Diagnostic>) {
-    let lost = keys::shadowed(mode, from);
-    if lost.is_empty() {
-        return;
+///
+/// Run once over the whole section rather than per line, because what is lost
+/// is not knowable until every binding is in: a file that takes `g` over and
+/// then binds `gg`, `ge`, `gE` and `g_` back has lost nothing, and the listing
+/// `bi config init` writes is exactly that file. One report per prefix, too —
+/// four bindings on `g` are one fact, not four.
+fn report_shadowed(
+    added: &[(Vec<Key>, usize)],
+    mode: KeyMode,
+    config: &Config,
+    problems: &mut Vec<Diagnostic>,
+) {
+    let mut reported: Vec<Key> = Vec::new();
+    for (from, line) in added {
+        let Some(&first) = from.first() else { continue };
+        if reported.contains(&first) {
+            continue;
+        }
+        reported.push(first);
+
+        let lost: Vec<&str> = keys::shadowed(mode, from)
+            .into_iter()
+            .filter(|name| {
+                // Bound by this file to something is not lost, whatever it was
+                // bound to: the user has said what those keys mean now.
+                let keys = keys::key_for_name(mode, name).unwrap_or_default();
+                !matches!(config.keys.lookup(mode, &keys), Lookup::Keys(_) | Lookup::Unbound)
+            })
+            .collect();
+        if lost.is_empty() {
+            continue;
+        }
+
+        // Eleven window names would bury the point rather than making it.
+        let listed = lost.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+        let rest =
+            if lost.len() > 4 { format!(" and {} more", lost.len() - 4) } else { String::new() };
+        let (binding, prefix) = (keys::spell(from), keys::spell(&from[..1]));
+        problems.push(Diagnostic {
+            line: *line,
+            message: format!(
+                "{binding:?} takes over {prefix:?}, so {listed}{rest} can no longer be typed — \
+                 bind them by name to keep them"
+            ),
+        });
     }
-    // Eleven window names would bury the point rather than making it.
-    let listed = lost.iter().take(4).copied().collect::<Vec<_>>().join(", ");
-    let rest = if lost.len() > 4 { format!(" and {} more", lost.len() - 4) } else { String::new() };
-    let (binding, prefix) = (keys::spell(from), keys::spell(&from[..1]));
-    problems.push(Diagnostic {
-        line,
-        message: format!(
-            "{binding:?} takes over {prefix:?}, so {listed}{rest} can no longer be typed — \
-             bind them by name to keep them"
-        ),
-    });
 }
 
 /// A binding whose own prefix is already a binding can never fire: the shorter

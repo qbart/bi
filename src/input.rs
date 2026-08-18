@@ -627,6 +627,13 @@ impl Input {
                 self.sink = Sink::BlackHole;
                 return None;
             }
+            // `+` and `*` are one register here. X11's split between the
+            // clipboard and the primary selection is real, but OSC 52 addresses
+            // them with one code and it is not worth a second letter.
+            if c == '+' || c == '*' {
+                self.sink = Sink::System;
+                return None;
+            }
             // Nothing ever reaches the black hole, so nothing comes out of it.
             if (c == 'p' || c == 'P') && self.sink != Sink::BlackHole {
                 self.reset();
@@ -747,10 +754,11 @@ impl Input {
                     return None;
                 }
                 let count = self.fold_count();
+                let sink = self.sink;
                 self.reset();
                 return Some(Command {
                     count: 1,
-                    action: Action::Paste { before: c == 'P', count },
+                    action: Action::Paste { before: c == 'P', count, sink },
                 });
             }
             // `Y` is `yy`, as in vim.
@@ -1785,9 +1793,10 @@ leader = \" \"
 
     #[test]
     fn p_and_big_p_paste() {
-        assert_eq!(typed("p").action, Action::Paste { before: false, count: 1 });
-        assert_eq!(typed("P").action, Action::Paste { before: true, count: 1 });
-        assert_eq!(typed("3p").action, Action::Paste { before: false, count: 3 });
+        let ring = Sink::Ring;
+        assert_eq!(typed("p").action, Action::Paste { before: false, count: 1, sink: ring });
+        assert_eq!(typed("P").action, Action::Paste { before: true, count: 1, sink: ring });
+        assert_eq!(typed("3p").action, Action::Paste { before: false, count: 3, sink: ring });
     }
 
     /// The one register that exists so far. This must survive the reset that
@@ -1834,6 +1843,32 @@ leader = \" \"
     #[test]
     fn nothing_comes_back_out_of_the_black_hole() {
         assert!(nothing("\"_p").is_none());
+    }
+
+    /// `"+` and `"*` are one register: X11's split between the clipboard and
+    /// the primary selection is real, but OSC 52 addresses them with one code.
+    #[test]
+    fn the_system_register_reaches_both_the_operator_and_the_paste() {
+        for spelling in ["\"+yy", "\"*yy"] {
+            assert_eq!(
+                typed(spelling).action,
+                Action::Operate {
+                    op: Operator::Yank,
+                    target: Target::Motion(Motion::CurrentLine),
+                    count: 1,
+                    sink: Sink::System
+                },
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            typed("\"+p").action,
+            Action::Paste { before: false, count: 1, sink: Sink::System }
+        );
+        assert_eq!(
+            typed("\"+2P").action,
+            Action::Paste { before: true, count: 2, sink: Sink::System }
+        );
     }
 
     /// An unknown register name discards the command. Keys after it are fresh

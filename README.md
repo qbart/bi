@@ -91,9 +91,17 @@ pulling the next line up.
 | `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise |
 | `"p` `"P` | open the picker to choose from everything captured, then paste |
 | `"_` | black hole prefix — `"_dd` deletes without capturing |
+| `"+y` `"+p` | the system clipboard; `"*` is a spelling of the same register |
 
 Every `y`, `d`, `c` and `x` captures automatically into a 4096-deep ring, so
 there is nothing to decide at yank time. A count goes before the quote: `3"p`.
+
+The system clipboard is explicit rather than mirrored: a delete is not a copy,
+and exporting every `dd` to the desktop is a surprise in the direction that
+cannot be undone. It travels by OSC 52, so it works over SSH — but reading it
+back is something many terminals refuse on purpose, and `"+p` says so when one
+does. Pasting *into* bi with the terminal's own paste needs none of that: it
+arrives whole, as one undo step.
 
 **Entering insert mode**
 
@@ -318,6 +326,8 @@ afterwards repeats it.
 | `:e <path>` | open another file, reusing its buffer if it is already open |
 | `:reload` | re-read the config, through the same path startup uses — different job from `:e`, which reverts the buffer |
 | `:sp [path]` `:vs [path]` | split horizontally / vertically; bare, the new window duplicates this one |
+| `:new` `:vnew` | split onto a new unnamed buffer, rather than a second view of this one |
+| `:enew` | an unnamed buffer in this window |
 | `:close` `:only` | close this window / every other one |
 | `:bn` `:bp` | cycle the buffer list, wrapping |
 | `:b <partial>` `:b#` | switch by path substring / to the alternate buffer |
@@ -395,17 +405,19 @@ you are reading, rooted at its directory with the file already selected, and
 keeps its share of the terminal from then on, like every other pane. Pressed
 again, from anywhere, it puts the tree away.
 
-`c` and `x` build one set with one mode: pressing the other key converts
-everything rather than leaving a clipboard that both duplicates and destroys on
-a single `p`. Marked rows carry a `+` or a `~` in a column that is there whether
-anything is marked or not, so marking never shifts the tree sideways, and the
-footer says `2 to copy` or `3 to move` so the mode is never something you have
-to remember.
+`c` and `x` mark **per path**, so one `p` can copy some files and move others.
+Pressing the other key on an already-marked path converts that one rather than
+unmarking it — "make this a move" is what you meant — and the key that put a
+mark there is the key that takes it away. Marked rows carry a `+` or a `~` in a
+column that is there whether anything is marked or not, so marking never shifts
+the tree sideways, and the footer says `1 to copy, 2 to move`. That column is
+what makes mixing safe to offer: every row shows which it is, all the time.
 
 A paste never overwrites. It stops on the first clash and offers the path on the
 `:` line — edit it and press Enter to place that one and carry on, or press Esc
-to abandon the rest. A cut clears the marks afterwards; a copy keeps them, so
-the same set can go somewhere else too.
+to abandon the rest. Afterwards the cut marks are gone — their sources are not
+there any more — and the copy marks stay, so the same files can go somewhere
+else too.
 
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a
@@ -637,7 +649,9 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - No horizontal scrolling — long lines clip.
 - No moving a window around the tree (`Ctrl-W x` / `r` / `H J K L`), and no tab
   pages. The split tree is the shape that would carry both.
-- No named registers (`"n`) and no system clipboard (`"+` / `"*`). See
+- No named registers (`"n`). The system clipboard is in — `"+y` and `"+p`, with
+  `"*` as a spelling of the same — over OSC 52, so it works over SSH. See
+  [docs/specs/clipboard.md](docs/specs/clipboard.md) and
   `docs/specs/registers.md`.
 - Twenty grammars: Rust, C, C++, C3, Go, Python, Lua, Bash, CSS, GLSL, HLSL,
   Slang, HCL/Terraform, Dockerfile, CMake, TOML, YAML, JSON, INI and Markdown.

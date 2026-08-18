@@ -11,7 +11,7 @@ use crate::editor::LineNumbers;
 mod keys;
 mod parse;
 
-pub use keys::{KeyMode, Keymap, Lookup, parse_key, parse_keys, spell};
+pub use keys::{KeyMode, Keymap, Lookup, listing, parse_key, parse_keys, spell};
 pub use parse::parse;
 
 /// Where a frontend gets config text from.
