@@ -175,8 +175,17 @@ so cargo refuses to resolve rather than letting a duplicate native runtime
 link. Any future grammar has to be on 0.26 or it cannot be used at all.
 
 **C3 is a git dependency**, `c3lang/tree-sitter-c3` — there is no crates.io
-release. That is a real cost: it pins a commit rather than a version, and it
-would block publishing bi to crates.io.
+release. `cargo publish` refuses a crate with a git dependency, because a
+published crate has to stay buildable from the registry alone and a git URL can
+be force-pushed, renamed or deleted.
+
+**Accepted, and not a debt.** bi is a library for its own frontends, not a
+crate for strangers to depend on, so nothing is lost by never being on
+crates.io — `cargo build`, `make install` and `cargo install --git` all work
+untouched, and so does a frontend depending on bi by git. The `rev` is pinned
+in `Cargo.toml` rather than left to `Cargo.lock`, so `cargo update` cannot
+quietly move C3 onto whatever is on their default branch that day; taking a
+newer grammar is then a visible edit.
 
 ### Languages
 

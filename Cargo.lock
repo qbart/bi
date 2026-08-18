@@ -736,7 +736,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-c3"
 version = "0.8.2"
-source = "git+https://github.com/c3lang/tree-sitter-c3#1c6a95234c62130763ed1c479f958b74fdbfdb2a"
+source = "git+https://github.com/c3lang/tree-sitter-c3?rev=1c6a95234c62130763ed1c479f958b74fdbfdb2a#1c6a95234c62130763ed1c479f958b74fdbfdb2a"
 dependencies = [
  "cc",
  "tree-sitter-language",

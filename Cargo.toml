@@ -33,7 +33,12 @@ tree-sitter-glsl = "0.2.0"
 tree-sitter-hlsl = "0.2.0"
 tree-sitter-python = "0.25.0"
 arborium-dockerfile = "2.18.1"
-tree-sitter-c3 = { git = "https://github.com/c3lang/tree-sitter-c3", version = "0.8.2" }
+# No crates.io release, so this one comes from git. Deliberate and
+# permanent: bi is a library for its own frontends, not a crate for
+# strangers, so `cargo publish` refusing a git dependency costs nothing.
+# `rev` is pinned so `cargo update` cannot move it onto whatever is on
+# their default branch that day.
+tree-sitter-c3 = { git = "https://github.com/c3lang/tree-sitter-c3", rev = "1c6a95234c62130763ed1c479f958b74fdbfdb2a" }
 
 [profile.release]
 lto = true
