@@ -1162,6 +1162,81 @@ impl Buffer {
         }
     }
 
+    /// Replaces `start..end` with `entry`, `count` times. Visual mode's `p`.
+    ///
+    /// One edit rather than a delete followed by a paste, because the two would
+    /// disagree about where the text goes the moment the kinds differ: a
+    /// linewise entry pasted after a charwise delete would open a line below
+    /// the whole line, not where the selection was.
+    ///
+    /// Returns what it removed instead of capturing it — the same division
+    /// `operate_range` draws, and what lets `P` drop it — along with where the
+    /// cursor lands. `linewise` is the *selection's* kind; the entry carries
+    /// its own. A blockwise selection is spans rather than a range and never
+    /// reaches here; `Editor` walks those.
+    ///
+    /// See `docs/specs/registers.md`.
+    pub fn paste_over(
+        &mut self,
+        start: usize,
+        end: usize,
+        linewise: bool,
+        entry: &Entry,
+        count: usize,
+    ) -> (Entry, Cursor) {
+        let count = count.max(1);
+        let mut text = self.rope.slice(start..end).to_string();
+        // Whether the range carried its line's terminator, which is what says
+        // if the replacement may end in one.
+        let terminated = text.ends_with('\n');
+        if linewise && !terminated {
+            text.push('\n');
+        }
+        let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
+        let removed = Entry { text, kind };
+
+        let landed = match (linewise, entry.kind) {
+            // A rectangle goes back where the range was, so the range goes
+            // first and the block paste does the rest.
+            (_, EntryKind::Blockwise) => {
+                self.apply_edit(start, end, "");
+                let at = self.clamped(Cursor::at(start), true);
+                self.paste(at, entry, true, count)
+            }
+            (false, EntryKind::Charwise) => {
+                let text = entry.text.repeat(count);
+                let len = text.chars().count();
+                self.apply_edit(start, end, &text);
+                self.clamped(Cursor::at(start + len.saturating_sub(1)), false)
+            }
+            // Lines cannot sit inside a line, so the line splits where the
+            // selection was and they land between the halves.
+            (false, EntryKind::Linewise) => {
+                self.apply_edit(start, end, &format!("\n{}", entry.text.repeat(count)));
+                let row = self.row_at(Cursor::at(start)) + 1;
+                self.first_non_blank(self.at_row(row, false))
+            }
+            // Whole lines for whole lines. A charwise entry becomes a line of
+            // its own; either way the trailing newline goes only where the
+            // range took one, so a file that ended without one still does.
+            (true, kind) => {
+                let mut text = entry.text.repeat(count);
+                if kind == EntryKind::Charwise {
+                    text.push('\n');
+                }
+                // One newline, not every trailing one: an entry of blank lines
+                // is mostly newlines and they are its content.
+                if !terminated && text.ends_with('\n') {
+                    text.pop();
+                }
+                let row = self.row_at(Cursor::at(start));
+                self.apply_edit(start, end, &text);
+                self.first_non_blank(self.at_row(row, false))
+            }
+        };
+        (removed, landed)
+    }
+
     /// Where `motion` lands from `at`. Pure, like every other motion here —
     /// the buffer has no cursor of its own to move.
     pub fn moved(&self, at: Cursor, motion: Motion, allow_eol: bool) -> Cursor {

@@ -57,6 +57,58 @@ def vim_run(text, keys):
     return out
 
 
+def vim_pty_run(text, keys):
+    """The same oracle, driven interactively rather than through `-es`.
+
+    `vim -es -c "normal ..."` is not vim enough for some sequences: a visual
+    mode paste is silently dropped by it, which reads as "vim changes nothing"
+    and would pin the wrong answer. Anything that behaves differently under
+    `-es` goes in PTY_CASES and comes through here, where it is the real
+    editor answering.
+
+    Slow — a second or so per case — so it is not the default runner.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(text)
+        path = f.name
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(TERM="xterm")
+        # `-i NONE`: a viminfo file carries registers between runs, and a case
+        # that pastes would then read what the *previous* case yanked.
+        os.execv("/usr/bin/env", ["env", "vim", "-u", "NONE", "-N", "-X", "-i", "NONE", path])
+
+    def drain():
+        while select.select([fd], [], [], 0)[0]:
+            try:
+                if not os.read(fd, 65536):
+                    return
+            except OSError:
+                return
+
+    time.sleep(0.6)
+    for k in list(keys) + [":", "w", "q", "\r"]:
+        os.write(fd, k.encode())
+        time.sleep(0.1)
+        drain()
+
+    end = time.time() + 6
+    while time.time() < end:
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid:
+            break
+        drain()
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+
+    out = open(path).read()
+    os.unlink(path)
+    return out
+
+
 def bi_run(text, keys):
     """Sends `keys` one character at a time, then :wq."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
@@ -306,17 +358,46 @@ CASES = [
     ("yyp",            "one\ntwo\n",           "yyp"),
 ]
 
+# Cases `vim -es` cannot answer for, run against interactive vim instead. A
+# visual mode paste is one of them: `-es` drops it and leaves the file
+# untouched, so the whole table would "pass" against a vim that did nothing.
+#
+# See `docs/specs/registers.md` — every row of the kinds table is here.
+PTY_CASES = [
+    ("v p",            "one two\nthree\n",         "yiwwviwp"),
+    ("v P",            "one two\nthree\n",         "yiwwviwP"),
+    ("v p linewise",   "one\ntwo three\n",         "yyjviwp"),
+    ("V p charwise",   "one two\nthree\nfour\n",   "yiwjVp"),
+    ("V p",            "one\ntwo\nthree\n",        "yyjVp"),
+    ("v 3p",           "one two\nthree\n",         "yiwwviw3p"),
+    # `p` puts what it displaced on the ring, so the second one pastes it back.
+    ("v p swaps",      "one two\nthree\n",         "yiwwviwpjviwp"),
+    # `P` does not, so the same entry lands on both words.
+    ("v P keeps",      "aa bb cc\n",               "yiwwviwPwviwP"),
+    ("v$ p",           "abcdef\nxy\n",             "yyj0v$p"),
+    ("v j p",          "one two three\nfour\n",    "yiwwvjp"),
+    ("C-v p charwise", "abc\ndef\nghi\n",          "yiwj0\x16jlp"),
+    ("C-v p linewise", "abc\ndef\nghi\n",          "yyj0\x16jlp"),
+    ("C-v p block",    "abcd\nefgh\nijkl\nmnop\n", "\x16jly2j0\x16lp"),
+    ("v p block",      "abcd\nefgh\nijkl\nmnop\n", "\x16jly2j0vlp"),
+    # Where the cursor ends up, read off by deleting the character under it.
+    ("v p cursor",     "one two\nthree\n",         "yiwwviwpx"),
+    ("V p cursor",     "one\n  two\nthree\n",      "jjyy0kVpx"),
+    ("v p lines cur",  "one\ntwo three\n",         "yyjviwpx"),
+]
+
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     same = diverged = 0
     failures = []
-    for label, text, keys in CASES:
+    cases = [(case, vim_run) for case in CASES] + [(case, vim_pty_run) for case in PTY_CASES]
+    for (label, text, keys), oracle in cases:
         if only and only not in label:
             continue
         # vim -es starts on the LAST line; bi starts on the first. Normalise
         # both to line 1, column 0 so the cases mean what they say.
-        v = vim_run(text, "gg0" + keys)
+        v = oracle(text, "gg0" + keys)
         b = bi_run(text, "gg0" + keys)
         if v == b:
             same += 1

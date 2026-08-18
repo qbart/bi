@@ -88,7 +88,7 @@ pulling the next line up.
 
 | Key | Does |
 |---|---|
-| `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise |
+| `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise — over a selection they replace it |
 | `"p` `"P` | open the picker to choose from everything captured, then paste |
 | `"_` | black hole prefix — `"_dd` deletes without capturing |
 | `"+y` `"+p` | the system clipboard; `"*` is a spelling of the same register |
@@ -229,11 +229,18 @@ expect.
 | `d` `x` | delete the selection |
 | `c` `s` | change it |
 | `y` | yank it |
+| `p` `P` | replace it with the register |
 | `r{char}` | overwrite every selected character |
 | `o` | swap the ends, to adjust the other one |
 | `iw` `i(` … | make that text object the selection |
 
 Charwise selections include the character under the cursor, as in vim.
+
+`p` and `P` differ only in what happens to the text they displaced: `p` puts it
+on the ring, so select-`p` swaps two things, and `P` leaves the ring alone, so
+the same entry can be pasted over one selection after another. A linewise
+entry pasted over part of a line splits the line and lands between the halves,
+which is vim's rule and the reason the kinds are worth keeping apart.
 
 ### Blockwise visual
 
@@ -246,7 +253,7 @@ Charwise selections include the character under the cursor, as in vim.
 | `I` `A` | insert at the left / right edge of every row |
 | `$` | ragged right edge — every row to its own end |
 | `O` | swap the columns and keep the rows (`o` swaps corners diagonally) |
-| `p` `P` | a yanked block goes back in as a rectangle |
+| `p` `P` | replace the rectangle — a charwise entry lands on every row |
 
 Rows too short to reach the block are skipped rather than mangled — except by
 `A`, which pads them out so what you append lines up. A block yanks as one

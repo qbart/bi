@@ -7,3 +7,5 @@
    core and its logic stay easily embeddable.
 3. Always suggest the best architectural choice first, no matter the cost. Think
    about the future.
+4. When the work is done, commit and push it. Straight to `master` — never a
+   feature branch.

@@ -983,6 +983,28 @@ impl Input {
             return Some(Command { count: 1, action: Action::OperateSelection { op, sink } });
         }
 
+        // `p` here replaces the selection rather than inserting beside it, so
+        // it cannot fall through to normal mode's put. `P` is the same paste
+        // that keeps the ring — "before the cursor" means nothing when the
+        // selection says exactly where the text goes.
+        //
+        // Not while `"` is waiting: there the `p` names the picker, and the
+        // register it lands on is pasted over the selection all the same.
+        if (c == 'p' || c == 'P') && !self.quote_pending {
+            if self.sink == Sink::BlackHole {
+                // Nothing ever reaches the black hole, so nothing comes out.
+                self.reset();
+                return None;
+            }
+            let count = self.fold_count();
+            let sink = self.sink;
+            self.reset();
+            return Some(Command {
+                count: 1,
+                action: Action::PasteSelection { capture: c == 'p', count, sink },
+            });
+        }
+
         match c {
             'o' => {
                 self.reset();
@@ -1851,6 +1873,46 @@ leader = \" \"
         assert_eq!(typed("p").action, Action::Paste { before: false, count: 1, sink: ring });
         assert_eq!(typed("P").action, Action::Paste { before: true, count: 1, sink: ring });
         assert_eq!(typed("3p").action, Action::Paste { before: false, count: 3, sink: ring });
+    }
+
+    /// In visual mode `p` replaces the selection, so it must be claimed here
+    /// rather than falling through to normal mode's put.
+    #[test]
+    fn p_over_a_selection_is_a_paste_of_its_own() {
+        let visual = Mode::Visual(VisualKind::Char);
+        let ring = Sink::Ring;
+        let mut input = Input::default();
+
+        let put = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        assert_eq!(put.action, Action::PasteSelection { capture: true, count: 1, sink: ring });
+
+        // `P` is the same paste, keeping the ring rather than swapping into it.
+        let keep = input.on_key(key('P'), &visual, ContentKind::Text).expect("resolved");
+        assert_eq!(keep.action, Action::PasteSelection { capture: false, count: 1, sink: ring });
+
+        assert!(input.on_key(key('3'), &visual, ContentKind::Text).is_none(), "counting");
+        let thrice = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        assert_eq!(thrice.action, Action::PasteSelection { capture: true, count: 3, sink: ring });
+    }
+
+    /// The picker still owns `"p` in visual mode: there the `p` names the
+    /// picker, and what it lands on is pasted over the selection anyway.
+    #[test]
+    fn quote_p_over_a_selection_still_opens_the_picker() {
+        let visual = Mode::Visual(VisualKind::Char);
+        let mut input = Input::default();
+        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none(), "armed");
+        let cmd = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::OpenPicker(PickerKind::Register { before: false }));
+    }
+
+    #[test]
+    fn nothing_comes_out_of_the_black_hole_over_a_selection_either() {
+        let visual = Mode::Visual(VisualKind::Line);
+        let mut input = Input::default();
+        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none());
+        assert!(input.on_key(key('_'), &visual, ContentKind::Text).is_none());
+        assert!(input.on_key(key('p'), &visual, ContentKind::Text).is_none(), "and no delete");
     }
 
     /// The one register that exists so far. This must survive the reset that

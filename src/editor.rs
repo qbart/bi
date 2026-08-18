@@ -155,6 +155,17 @@ pub enum Action {
         count: usize,
         sink: Sink,
     },
+    /// `p` / `P` in visual mode — the selection is replaced by the register.
+    ///
+    /// Its own action rather than a flag on `Paste`: the range comes from the
+    /// selection, the edit replaces rather than inserts, and it ends visual
+    /// mode. `capture` is the `p`/`P` difference — whether what it displaced
+    /// goes on the ring, which is what makes `p` a swap.
+    PasteSelection {
+        capture: bool,
+        count: usize,
+        sink: Sink,
+    },
 
     OpenPicker(PickerKind),
     PickChar(char),
@@ -376,6 +387,7 @@ impl Action {
                 *op != Operator::Yank
             }
             Action::Paste { .. }
+            | Action::PasteSelection { .. }
             | Action::ReplaceChar { .. }
             | Action::ToggleCase { .. }
             | Action::JoinLines { .. }
@@ -454,6 +466,9 @@ fn with_count(command: Command, count: usize) -> Command {
     let action = match command.action {
         Action::Operate { op, target, sink, .. } => Action::Operate { op, target, count, sink },
         Action::Paste { before, sink, .. } => Action::Paste { before, count, sink },
+        Action::PasteSelection { capture, sink, .. } => {
+            Action::PasteSelection { capture, count, sink }
+        }
         Action::ReplaceChar { ch, .. } => Action::ReplaceChar { ch, count },
         Action::ToggleCase { .. } => Action::ToggleCase { count },
         Action::JoinLines { .. } => Action::JoinLines { count },
@@ -511,6 +526,11 @@ pub struct Session {
     /// nothing, which is a diagnostic rather than a panic.
     system: Option<Box<dyn SystemClipboard>>,
     pub picker: Option<Picker>,
+    /// The visual mode the picker was opened from, so a register picked over a
+    /// selection replaces it and a cancel gives the selection back. On the
+    /// session rather than in `PickerKind` because the picker is a general
+    /// overlay and this is the editor's business, not the widget's.
+    pick_over: Option<VisualKind>,
     pub mode: Mode,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
@@ -2047,9 +2067,15 @@ impl Editor {
         true
     }
 
+    /// Cancelling gives back the mode the picker was opened from, so `"p` over
+    /// a selection and then `Esc` leaves the selection where it was rather
+    /// than silently ending it.
     fn close_picker(&mut self) {
         self.session.picker = None;
-        self.session.mode = Mode::Normal;
+        self.session.mode = match self.session.pick_over.take() {
+            Some(kind) => Mode::Visual(kind),
+            None => Mode::Normal,
+        };
     }
 
     /// Runs whatever the highlighted row meant.
@@ -2059,8 +2085,17 @@ impl Editor {
     /// tree pane has nothing to paste into.
     fn accept_pick(&mut self) {
         let picker = self.session.picker.take();
-        self.session.mode = Mode::Normal;
-        let Some(chosen) = picker.as_ref().and_then(Picker::selected) else { return };
+        // The selection the picker was opened over is still there, and the
+        // paste is about to consume it — so the mode goes back to what it was
+        // for `paste_pick` to read, and the paste itself ends visual mode.
+        self.session.mode = match self.session.pick_over.take() {
+            Some(kind) => Mode::Visual(kind),
+            None => Mode::Normal,
+        };
+        let Some(chosen) = picker.as_ref().and_then(Picker::selected) else {
+            self.session.mode = Mode::Normal;
+            return;
+        };
         match picker.expect("checked above").kind {
             // A position rather than an id, because the rows were built from
             // the list in order and it cannot change while the picker holds
@@ -2852,7 +2887,9 @@ impl View<'_> {
             let extent = match cmd.action {
                 // The selection is gone by the time `.` runs, so remember how
                 // much it covered.
-                Action::OperateSelection { .. } => Some(self.selection_extent()),
+                Action::OperateSelection { .. } | Action::PasteSelection { .. } => {
+                    Some(self.selection_extent())
+                }
                 _ => None,
             };
             let change = Change { command: cmd.clone(), typed: Vec::new(), extent };
@@ -2994,6 +3031,121 @@ impl View<'_> {
         }
     }
 
+    /// The entry a paste puts, or `None` with the reason already reported.
+    ///
+    /// Cloned because pasting borrows the buffer mutably while the entry is
+    /// still owned by the ring.
+    fn paste_source(&mut self, sink: Sink) -> Option<Entry> {
+        match sink {
+            // Nothing ever reaches the black hole, so nothing comes out of it.
+            // The parser refuses `"_p` before it arrives here; this is the same
+            // rule said where the paste happens.
+            Sink::BlackHole => None,
+            // `clipboard_entry` has already said which of its several ways it
+            // came back empty; the ring has only one.
+            Sink::System => self.session.clipboard_entry(),
+            Sink::Ring => {
+                let entry = self.session.registers.front().cloned();
+                if entry.is_none() {
+                    self.session.status = "nothing to paste".into();
+                }
+                entry
+            }
+        }
+    }
+
+    /// Visual mode's `p` — the selection is replaced by `entry`.
+    ///
+    /// `capture` puts what it displaced on the ring, which is what makes `p` a
+    /// swap and `P` a plain overwrite. The ring, never the sink: `"+p` reads
+    /// the clipboard, but what it pushed out is ordinary editing history.
+    ///
+    /// See `docs/specs/registers.md`.
+    fn paste_over_selection(&mut self, entry: &Entry, capture: bool, count: usize) {
+        if self.session.mode.visual() == Some(VisualKind::Block) {
+            self.paste_over_block(entry, capture, count);
+            return;
+        }
+        let linewise = self.session.mode.visual() == Some(VisualKind::Line);
+        self.for_each_selection(|ed, sel| {
+            let len = ed.buffer.rope().len_chars();
+            let (start, end) = if linewise {
+                let (lo, hi) = sel.range();
+                ed.buffer.line_range(lo, hi, true)
+            } else {
+                // Charwise visual includes the character under the head.
+                sel.inclusive_range(len)
+            };
+            let (removed, landed) = ed.buffer.paste_over(start, end, linewise, entry, count);
+            if capture {
+                ed.session.registers.push(removed);
+            }
+            Selection::collapsed(landed)
+        });
+        self.session.mode = Mode::Normal;
+    }
+
+    /// The blockwise case, which is spans rather than a range.
+    ///
+    /// A charwise entry goes into every row — each span is a range in its own
+    /// right, and replacing them one by one is what "paste over this
+    /// rectangle" means when the thing being pasted is not one. The other two
+    /// kinds cut the rectangle out first and then paste as they always do:
+    /// lines below the block, a rectangle at its corner.
+    fn paste_over_block(&mut self, entry: &Entry, capture: bool, count: usize) {
+        let spans = self.block_spans();
+        if capture {
+            let rows: Vec<String> =
+                spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
+            // One entry, not one per row: what was taken is a rectangle, and
+            // pasting it back has to know that.
+            self.session
+                .registers
+                .push(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise });
+        }
+
+        let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
+        let bottom = spans.last().map(|&(start, _)| start).unwrap_or(0);
+        let last_row = self.buffer.row_at(Cursor::at(bottom));
+
+        let landed = match entry.kind {
+            EntryKind::Charwise => {
+                self.replace_spans(&spans, entry, count);
+                self.buffer.clamped(Cursor::at(top_left), false)
+            }
+            EntryKind::Linewise => {
+                self.cut_spans(&spans);
+                let at = self.buffer.at_row(last_row, false);
+                self.buffer.paste(at, entry, false, count)
+            }
+            EntryKind::Blockwise => {
+                self.cut_spans(&spans);
+                let at = self.buffer.clamped(Cursor::at(top_left), true);
+                self.buffer.paste(at, entry, true, count)
+            }
+        };
+
+        self.session.mode = Mode::Normal;
+        *self.selections = Selections::single(landed);
+    }
+
+    /// Cuts every span, bottom to top: a cut shifts everything below it and
+    /// nothing above, so descending order keeps the rest valid.
+    fn cut_spans(&mut self, spans: &[(usize, usize)]) {
+        for &(start, end) in spans.iter().rev() {
+            if end > start {
+                self.buffer.operate_range(Cursor::at(start), Operator::Delete, start, end, false);
+            }
+        }
+    }
+
+    /// The same walk, replacing each span with `entry` rather than emptying it.
+    fn replace_spans(&mut self, spans: &[(usize, usize)], entry: &Entry, count: usize) {
+        for &(start, end) in spans.iter().rev() {
+            self.buffer.paste_over(start, end, false, entry, count);
+        }
+    }
+
     /// Where the block's cursors go for `I` and `A`.
     ///
     /// `I` skips a row that does not reach the left edge; `A` pads one out to
@@ -3057,9 +3209,15 @@ impl View<'_> {
         self.session.last_change = Some(change);
     }
 
-    /// Re-selects `extent` from the cursor and applies the operator to it.
+    /// Re-selects `extent` from the cursor and applies the visual command to
+    /// it — the operators, and the paste that replaces what it covers.
     fn repeat_over(&mut self, change: &Change, extent: Extent) {
-        let Action::OperateSelection { op, sink } = change.command.action else { return };
+        if !matches!(
+            change.command.action,
+            Action::OperateSelection { .. } | Action::PasteSelection { .. }
+        ) {
+            return;
+        }
         let kind = match extent {
             Extent::Chars(_) => VisualKind::Char,
             Extent::Lines(_) => VisualKind::Line,
@@ -3085,7 +3243,7 @@ impl View<'_> {
             };
             Selection { anchor: sel.head, head }
         });
-        self.apply(cmd_of(Action::OperateSelection { op, sink }));
+        self.apply(cmd_of(change.command.action.clone()));
     }
 
     /// Runs `f` for every selection, highest position first.
@@ -3237,24 +3395,15 @@ impl View<'_> {
                 }
             }
             Action::Paste { before, count, sink } => {
-                // Cloned because pasting borrows the buffer mutably while the
-                // entry is still owned by the ring.
-                let entry = match sink {
-                    Sink::System => self.session.clipboard_entry(),
-                    _ => self.session.registers.front().cloned(),
-                };
-                let Some(entry) = entry else {
-                    // `clipboard_entry` has already said which of its several
-                    // ways it came back empty; the ring has only one.
-                    if *sink != Sink::System {
-                        self.session.status = "nothing to paste".into();
-                    }
-                    return;
-                };
+                let Some(entry) = self.paste_source(*sink) else { return };
                 let (before, count) = (*before, *count);
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.paste(sel.head, &entry, before, count))
                 });
+            }
+            Action::PasteSelection { capture, count, sink } => {
+                let Some(entry) = self.paste_source(*sink) else { return };
+                self.paste_over_selection(&entry, *capture, *count);
             }
 
             Action::OpenPicker(kind) => self.open_picker(*kind),
@@ -3851,16 +4000,27 @@ impl View<'_> {
             })
             .collect();
         self.session.picker = Some(Picker::new(kind, items));
+        // Remembered rather than dropped: the selection is what the chosen
+        // entry will replace, and `Mode::Pick` is about to hide that it exists.
+        self.session.pick_over = self.session.mode.visual();
         self.session.mode = Mode::Pick;
     }
 
     /// Pastes the register the picker landed on.
+    ///
+    /// Over a selection it replaces it, exactly as `p` does — the picker only
+    /// chooses which entry, and `before` is the `p`/`P` distinction whichever
+    /// of the two pastes it turns into.
     fn paste_pick(&mut self, chosen: usize, before: bool) {
         let Some(entry) = self.session.registers.get(chosen).cloned() else { return };
         // Push before pasting: move-to-front makes this the ring's head, so
         // `.` and a later bare `p` repeat the entry you chose rather than
         // whatever happened to be most recent.
         self.session.registers.push(entry.clone());
+        if self.session.mode.visual().is_some() {
+            self.paste_over_selection(&entry, !before, 1);
+            return;
+        }
         let landed = self.buffer.paste(self.selections.cursor(), &entry, before, 1);
         *self.selections = Selections::single(landed);
     }
@@ -7071,6 +7231,216 @@ mod tests {
             "adef\ngjkl\nmpqr",
             "one row, two columns"
         );
+    }
+
+    // ---- paste over a selection --------------------------------------------
+
+    /// Visual mode's `p` and `P`. See `docs/specs/registers.md`.
+    fn paste_over(capture: bool, count: usize) -> Command {
+        cmd(Action::PasteSelection { capture, count, sink: Sink::Ring })
+    }
+
+    /// A selection of `chars` characters from `at`, with `text` on the ring.
+    fn ready(text: &str, at: usize, chars: usize, entry: Entry) -> Editor {
+        let mut ed = visual(text, at, VisualKind::Char);
+        for _ in 1..chars {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ed.session.registers.push(entry);
+        ed
+    }
+
+    fn charwise(text: &str) -> Entry {
+        Entry { text: text.into(), kind: EntryKind::Charwise }
+    }
+
+    fn linewise(text: &str) -> Entry {
+        Entry { text: text.into(), kind: EntryKind::Linewise }
+    }
+
+    #[test]
+    fn pasting_over_a_charwise_selection_replaces_it() {
+        let mut ed = ready("one two", 4, 3, charwise("one"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one one");
+        assert_eq!(heads(&ed), vec![6], "on the last char of what was pasted");
+        assert_eq!(ed.session.mode, Mode::Normal, "and visual mode is over");
+    }
+
+    /// The register is read before the removal, or the paste would put back
+    /// the text it had just taken out.
+    #[test]
+    fn the_paste_reads_the_register_the_selection_is_about_to_overwrite() {
+        let mut ed = ready("one two", 4, 3, charwise("one"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one one", "not \"one two\"");
+    }
+
+    #[test]
+    fn p_leaves_what_it_replaced_on_the_ring_and_capital_p_does_not() {
+        let mut ed = ready("one two", 4, 3, charwise("one"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.session.registers.front().unwrap().text, "two", "ready to swap it in");
+
+        let mut ed = ready("one two", 4, 3, charwise("one"));
+        ed.apply(paste_over(false, 1));
+        assert_eq!(ed.session.registers.front().unwrap().text, "one", "the ring is untouched");
+    }
+
+    /// A linewise entry is lines, and lines cannot sit inside one — so the
+    /// line splits where the selection was.
+    #[test]
+    fn a_linewise_entry_over_a_charwise_selection_splits_the_line() {
+        let mut ed = ready("one\ntwo three", 4, 3, linewise("one\n"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\n\none\n three");
+        assert_eq!(heads(&ed), vec![5], "the first non-blank of the pasted line");
+    }
+
+    #[test]
+    fn a_charwise_entry_over_a_linewise_selection_becomes_one_line() {
+        let mut ed = visual("one two\nthree\nfour", 8, VisualKind::Line);
+        ed.session.registers.push(charwise("one"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two\none\nfour");
+        assert_eq!(heads(&ed), vec![8]);
+    }
+
+    #[test]
+    fn a_linewise_entry_over_a_linewise_selection_replaces_the_lines() {
+        let mut ed = visual("one\ntwo\nthree", 4, VisualKind::Line);
+        ed.session.registers.push(linewise("one\n"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\none\nthree");
+        assert_eq!(ed.session.registers.front().unwrap().text, "two\n", "captured linewise");
+    }
+
+    /// A file that ended without a newline still does.
+    #[test]
+    fn pasting_over_the_last_line_invents_no_terminator() {
+        let mut ed = visual("one\ntwo", 4, VisualKind::Line);
+        ed.session.registers.push(linewise("three\n"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nthree");
+    }
+
+    #[test]
+    fn a_count_pastes_several_copies_over_the_selection_in_one_undo_step() {
+        let mut ed = ready("one two", 4, 3, charwise("ab"));
+        ed.apply(paste_over(true, 3));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one ababab");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two", "one step, not three");
+    }
+
+    /// Vim deletes here on the reasoning that `v_p` is a delete and a put. That
+    /// stops being true the moment the register is empty.
+    #[test]
+    fn an_empty_ring_leaves_the_selection_alone() {
+        let mut ed = visual("one two", 4, VisualKind::Char);
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two");
+        assert_eq!(ed.session.status, "nothing to paste");
+        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char), "still selecting");
+    }
+
+    #[test]
+    fn the_black_hole_pastes_nothing_over_a_selection() {
+        let mut ed = ready("one two", 4, 3, charwise("one"));
+        ed.apply(cmd(Action::PasteSelection { capture: true, count: 1, sink: Sink::BlackHole }));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two", "nothing comes out");
+    }
+
+    /// The sink names where the paste comes *from*. What it displaced is
+    /// ordinary editing history and belongs on the ring.
+    #[test]
+    fn a_clipboard_paste_over_a_selection_leaves_the_removed_text_on_the_ring() {
+        let clipboard = FakeClipboard::default();
+        *clipboard.0.borrow_mut() = Some("zzz".into());
+        let mut ed = visual("one two", 4, VisualKind::Char);
+        ed.set_clipboard(clipboard.clone());
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ed.apply(cmd(Action::PasteSelection { capture: true, count: 1, sink: Sink::System }));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one zzz");
+        assert_eq!(ed.session.registers.front().unwrap().text, "two");
+        assert_eq!(clipboard.0.borrow().as_deref(), Some("zzz"), "and the clipboard is unchanged");
+    }
+
+    #[test]
+    fn a_blockwise_entry_over_a_charwise_selection_goes_in_as_a_rectangle() {
+        let mut ed =
+            ready("ab\ncd\nefgh", 6, 2, Entry { text: "a\nc".into(), kind: EntryKind::Blockwise });
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ab\ncd\nagh\nc");
+    }
+
+    #[test]
+    fn a_charwise_entry_over_a_block_lands_on_every_row() {
+        let mut ed = block("abc\ndef\nghi", 4, 1, 1);
+        ed.session.registers.push(charwise("abc"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc\nabcf\nabci");
+        assert_eq!(
+            ed.session.registers.front().unwrap().kind,
+            EntryKind::Blockwise,
+            "and the rectangle it replaced comes back as one"
+        );
+    }
+
+    #[test]
+    fn a_linewise_entry_over_a_block_opens_lines_below_it() {
+        let mut ed = block("abc\ndef\nghi", 4, 1, 1);
+        ed.session.registers.push(linewise("abc\n"));
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc\nf\ni\nabc");
+    }
+
+    #[test]
+    fn a_blockwise_entry_over_a_block_replaces_the_rectangle() {
+        let mut ed = block("abcd\nefgh\nijkl", 10, 0, 1);
+        ed.session.registers.push(Entry { text: "ab\nef".into(), kind: EntryKind::Blockwise });
+        ed.apply(paste_over(true, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcd\nefgh\nabkl\nef");
+    }
+
+    /// `P` is the one that repeats usefully: `p` put what it displaced on the
+    /// front of the ring, so repeating a swap swaps again.
+    #[test]
+    fn dot_repeats_a_visual_paste_over_the_same_extent() {
+        let mut ed = ready("aa bb cc", 0, 2, charwise("zz"));
+        ed.apply(paste_over(false, 1));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "zz bb cc");
+
+        ed.set_cursor(Cursor::at(3));
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "zz zz cc", "two characters again");
+    }
+
+    #[test]
+    fn the_register_picker_over_a_selection_replaces_it_too() {
+        let mut ed = visual("one two", 4, VisualKind::Char);
+        ed.session.registers.push(charwise("one"));
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ed.apply(cmd(Action::OpenPicker(PickerKind::Register { before: false })));
+        ed.apply(cmd(Action::PickAccept));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one one");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn cancelling_the_picker_goes_back_to_the_selection_it_was_opened_from() {
+        let mut ed = visual("one two", 4, VisualKind::Char);
+        ed.session.registers.push(charwise("one"));
+        ed.apply(cmd(Action::OpenPicker(PickerKind::Register { before: false })));
+        ed.apply(cmd(Action::PickCancel));
+        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
     }
 
     // ---- replace mode ------------------------------------------------------
