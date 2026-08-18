@@ -251,6 +251,17 @@ Two rules that fell out of building it, both worth keeping:
 - **Visual falls back to normal.** `input.rs` already falls through to `normal`
   for anything visual does not claim, so a motion rebound in `[keys.normal]`
   has to apply in visual too, or `v` then `j` would disagree with a bare `j`.
+- **A tree falls back to normal for sequences only.** Its keymap is a complete
+  allowlist rather than an overlay, which is what stops `"j" = "left"` from
+  meaning "collapse" in a pane sitting on a filesystem — so a single key is
+  never borrowed. A *sequence* is: `<leader>e` is a command the user invented,
+  and every key the tree binds by default is a single one, so there is nothing
+  for it to collide with. Without this, a leader binding for `window_tree`
+  opened the sidebar and then could not close it, because the second press
+  happened with the tree focused. The borrowed keys still mean whatever they
+  mean in a tree — `goto_first_line` is `gg`, which is the tree's first row —
+  and the tree dispatcher remains an allowlist, so nothing it does not name
+  can arrive by this route.
 - **Nothing is remapped in the modes that are text** — insert, replace, the
   command line, the search line, the picker. Rewriting a keystroke into another
   character is the one thing a keymap must never do to text being typed.

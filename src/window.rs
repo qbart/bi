@@ -152,6 +152,21 @@ impl Text {
     }
 }
 
+/// Which side of the window being split the new one takes.
+///
+/// `After` is what a split wants: the new window opens *beside* what you were
+/// reading rather than on top of the space it occupied, so focus moving into
+/// it is something you can see. Vim's default is `Before` — and the first
+/// thing most vim users do is set `splitright` and `splitbelow` to get this.
+///
+/// `Before` is still what the tree sidebar wants, because a file tree belongs
+/// on the left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Before,
+    After,
+}
+
 /// How a split divides its children.
 ///
 /// `Vertical` divides with a vertical line — children side by side, which is
@@ -323,6 +338,7 @@ impl Layout {
         at: WindowId,
         new: WindowId,
         dir: Dir,
+        place: Place,
         area: Rect,
         chrome: &Chrome,
     ) -> bool {
@@ -331,7 +347,7 @@ impl Layout {
         if extent(rect, dir) < chrome.min(dir) * 2 + chrome.gap(dir) {
             return false;
         }
-        split_at(&mut self.root, at, new, dir);
+        split_at(&mut self.root, at, new, dir, place);
         true
     }
 
@@ -474,14 +490,18 @@ fn collect(node: &Node, out: &mut Vec<WindowId>) {
 /// A split of the same direction as its parent joins the parent instead of
 /// nesting inside it, so three `:vsplit`s give three columns rather than a
 /// right-leaning staircase that resizes strangely.
-fn split_at(node: &mut Node, at: WindowId, new: WindowId, dir: Dir) -> bool {
+fn split_at(node: &mut Node, at: WindowId, new: WindowId, dir: Dir, place: Place) -> bool {
     match node {
         Node::Leaf(id) if *id == at => {
+            let (first, second) = match place {
+                Place::Before => (new, at),
+                Place::After => (at, new),
+            };
             *node = Node::Split {
                 dir,
                 children: vec![
-                    Child { weight: 0.5, node: Node::Leaf(new) },
-                    Child { weight: 0.5, node: Node::Leaf(at) },
+                    Child { weight: 0.5, node: Node::Leaf(first) },
+                    Child { weight: 0.5, node: Node::Leaf(second) },
                 ],
             };
             true
@@ -495,10 +515,14 @@ fn split_at(node: &mut Node, at: WindowId, new: WindowId, dir: Dir) -> bool {
                     // so the siblings keep theirs.
                     let half = children[i].weight / 2.0;
                     children[i].weight = half;
-                    children.insert(i, Child { weight: half, node: Node::Leaf(new) });
+                    let side = match place {
+                        Place::Before => i,
+                        Place::After => i + 1,
+                    };
+                    children.insert(side, Child { weight: half, node: Node::Leaf(new) });
                     return true;
                 }
-                if split_at(&mut children[i].node, at, new, dir) {
+                if split_at(&mut children[i].node, at, new, dir, place) {
                     return true;
                 }
             }
@@ -699,7 +723,7 @@ mod tests {
     fn a_vertical_split_puts_the_new_window_on_the_left() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        assert!(layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME));
+        assert!(layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME));
 
         let rects = layout.rects(area(), &CHROME);
         // 80 wide, one column of rule between: 40 | rule | 39.
@@ -711,7 +735,7 @@ mod tests {
     fn a_horizontal_split_puts_the_new_window_above() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        assert!(layout.split(w[0], w[1], Dir::Horizontal, area(), &CHROME));
+        assert!(layout.split(w[0], w[1], Dir::Horizontal, Place::Before, area(), &CHROME));
 
         let rects = layout.rects(area(), &CHROME);
         assert_eq!(rects[0], (w[1], Rect::new(0, 0, 80, 12)));
@@ -725,8 +749,8 @@ mod tests {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
         let area = Rect::new(0, 0, 81, 24);
-        layout.split(w[0], w[1], Dir::Vertical, area, &CHROME);
-        layout.split(w[1], w[2], Dir::Vertical, area, &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area, &CHROME);
+        layout.split(w[1], w[2], Dir::Vertical, Place::Before, area, &CHROME);
         layout.equalize();
 
         let rects = layout.rects(area, &CHROME);
@@ -741,8 +765,8 @@ mod tests {
     fn splitting_the_same_way_twice_widens_the_row_rather_than_nesting() {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[1], w[2], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[1], w[2], Dir::Vertical, Place::Before, area(), &CHROME);
 
         match layout.root() {
             Node::Split { dir: Dir::Vertical, children } => {
@@ -756,8 +780,8 @@ mod tests {
     fn splitting_the_other_way_nests() {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[0], w[2], Dir::Horizontal, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[0], w[2], Dir::Horizontal, Place::Before, area(), &CHROME);
 
         assert_eq!(layout.leaves(), vec![w[1], w[2], w[0]]);
         let rects = layout.rects(area(), &CHROME);
@@ -771,7 +795,7 @@ mod tests {
         let mut layout = Layout::new(w[0]);
         // 3 rows cannot hold two 2-row panes.
         let cramped = Rect::new(0, 0, 80, 3);
-        assert!(!layout.split(w[0], w[1], Dir::Horizontal, cramped, &CHROME));
+        assert!(!layout.split(w[0], w[1], Dir::Horizontal, Place::Before, cramped, &CHROME));
         assert_eq!(layout.len(), 1, "and nothing changed");
     }
 
@@ -779,7 +803,7 @@ mod tests {
     fn closing_gives_the_space_to_the_sibling_and_focuses_it() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
 
         assert_eq!(layout.close(w[1]), Some(w[0]));
         assert_eq!(layout.rects(area(), &CHROME), vec![(w[0], area())]);
@@ -790,8 +814,8 @@ mod tests {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
         // Left: w0. Right column: w2 above w1.
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[1], w[2], Dir::Horizontal, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[1], w[2], Dir::Horizontal, Place::Before, area(), &CHROME);
 
         // Close the left pane; the stacked column grows into it, and focus
         // lands on its top-left-most window.
@@ -809,8 +833,8 @@ mod tests {
     fn only_leaves_one_window_filling_everything() {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[1], w[2], Dir::Horizontal, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[1], w[2], Dir::Horizontal, Place::Before, area(), &CHROME);
 
         layout.only(w[0]);
         assert_eq!(layout.rects(area(), &CHROME), vec![(w[0], area())]);
@@ -822,8 +846,8 @@ mod tests {
         // left, `l` picks by where the cursor is, not by tree order.
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[0], w[2], Dir::Horizontal, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[0], w[2], Dir::Horizontal, Place::Before, area(), &CHROME);
         // w1 is the left column; the right column is w2 above w0.
 
         let l = |anchor| layout.neighbour(w[1], Side::Right, area(), &CHROME, anchor);
@@ -835,7 +859,7 @@ mod tests {
     fn there_is_nothing_past_the_edge_of_the_screen() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
 
         assert_eq!(layout.neighbour(w[1], Side::Left, area(), &CHROME, 0), None);
         assert_eq!(layout.neighbour(w[1], Side::Up, area(), &CHROME, 0), None);
@@ -848,8 +872,8 @@ mod tests {
         // pane, `k` finds the top row, but `l` from it must not.
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Horizontal, area(), &CHROME);
-        layout.split(w[0], w[2], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Horizontal, Place::Before, area(), &CHROME);
+        layout.split(w[0], w[2], Dir::Vertical, Place::Before, area(), &CHROME);
         // w1 across the top; w2 and w0 side by side below.
 
         assert_eq!(layout.neighbour(w[2], Side::Up, area(), &CHROME, 0), Some(w[1]));
@@ -861,8 +885,8 @@ mod tests {
     fn cycling_wraps_in_layout_order() {
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[1], w[2], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[1], w[2], Dir::Vertical, Place::Before, area(), &CHROME);
 
         let order = layout.leaves();
         assert_eq!(layout.cycle(order[0], false), Some(order[1]));
@@ -874,7 +898,7 @@ mod tests {
     fn resizing_moves_the_divider_by_the_cells_asked_for() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
         let before = layout.rect_of(w[1], area(), &CHROME).unwrap().width;
 
         assert!(layout.resize(w[1], Dir::Vertical, 5, area(), &CHROME));
@@ -886,7 +910,7 @@ mod tests {
     fn resizing_along_an_axis_with_no_divider_does_nothing() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
 
         // Side by side, so there is no horizontal divider to push.
         assert!(!layout.resize(w[1], Dir::Horizontal, 3, area(), &CHROME));
@@ -896,7 +920,7 @@ mod tests {
     fn resizing_stops_at_the_floor_rather_than_squeezing_a_pane_out() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
 
         layout.resize(w[1], Dir::Vertical, 200, area(), &CHROME);
         let other = layout.rect_of(w[0], area(), &CHROME).unwrap();
@@ -909,8 +933,8 @@ mod tests {
         // vertically must move the divider inside the right column.
         let w = ids(3);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
-        layout.split(w[0], w[2], Dir::Horizontal, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
+        layout.split(w[0], w[2], Dir::Horizontal, Place::Before, area(), &CHROME);
 
         let left_before = layout.rect_of(w[1], area(), &CHROME).unwrap();
         assert!(layout.resize(w[2], Dir::Horizontal, 3, area(), &CHROME));
@@ -923,7 +947,7 @@ mod tests {
     fn equalize_undoes_a_resize() {
         let w = ids(2);
         let mut layout = Layout::new(w[0]);
-        layout.split(w[0], w[1], Dir::Vertical, area(), &CHROME);
+        layout.split(w[0], w[1], Dir::Vertical, Place::Before, area(), &CHROME);
         layout.resize(w[1], Dir::Vertical, 10, area(), &CHROME);
 
         layout.equalize();

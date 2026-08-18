@@ -325,7 +325,7 @@ afterwards repeats it.
 | `:e` `:e!` | revert this buffer from disk, refusing if modified unless forced |
 | `:e <path>` | open another file, reusing its buffer if it is already open |
 | `:reload` | re-read the config, through the same path startup uses — different job from `:e`, which reverts the buffer |
-| `:sp [path]` `:vs [path]` | split horizontally / vertically; bare, the new window duplicates this one |
+| `:sp [path]` `:vs [path]` | split below / right; bare, the new window duplicates this one |
 | `:new` `:vnew` | split onto a new unnamed buffer, rather than a second view of this one |
 | `:enew` | an unnamed buffer in this window |
 | `:close` `:only` | close this window / every other one |
@@ -398,6 +398,11 @@ Enter on a file opens it in the last window focused before this one, so a tree
 pane is a sidebar that stays put and files land in whichever pane you reached it
 from. With one window it opens in place, and `Ctrl-^` brings the tree back with
 its expansion intact.
+
+A split opens on the far side — below for `:sp`, right for `:vs` — and focus
+goes there, so you can see that you moved. Vim's default is the other way
+round, which made focus look broken: the new pane took the space the old one
+occupied. The tree sidebar is the exception and still opens on the left.
 
 `Ctrl-W e` is the shortcut for that layout: it opens the tree beside the file
 you are reading, rooted at its directory with the file already selected, and

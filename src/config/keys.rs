@@ -370,6 +370,20 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Tree, "tree_create", "a"),
     (KeyMode::Tree, "tree_rename", "r"),
     (KeyMode::Tree, "tree_delete", "dd"),
+    // The window prefix works in a tree too — `input.rs` routes `<C-w>` there
+    // before anything else — so its names have to be bindable here or a tree
+    // pane could be opened by a leader binding and not closed by one.
+    (KeyMode::Tree, "window_split", "<C-w>s"),
+    (KeyMode::Tree, "window_vsplit", "<C-w>v"),
+    (KeyMode::Tree, "window_close", "<C-w>c"),
+    (KeyMode::Tree, "window_only", "<C-w>o"),
+    (KeyMode::Tree, "window_tree", "<C-w>e"),
+    (KeyMode::Tree, "window_cycle", "<C-w>w"),
+    (KeyMode::Tree, "window_equalize", "<C-w>="),
+    (KeyMode::Tree, "window_focus_left", "<C-w>h"),
+    (KeyMode::Tree, "window_focus_down", "<C-w>j"),
+    (KeyMode::Tree, "window_focus_up", "<C-w>k"),
+    (KeyMode::Tree, "window_focus_right", "<C-w>l"),
     (KeyMode::Tree, "tree_first", "gg"),
     (KeyMode::Tree, "tree_toggle_hidden", "gh"),
 ];

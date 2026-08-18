@@ -19,7 +19,7 @@ use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
 use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
-    Chrome, Content, ContentKind, Dir, Layout, Rect, Side, Text, Window, WindowId,
+    Chrome, Content, ContentKind, Dir, Layout, Place, Rect, Side, Text, Window, WindowId,
 };
 
 /// Charwise, linewise or blockwise.
@@ -1762,7 +1762,10 @@ impl Editor {
     fn split_focus(&mut self, dir: Dir) -> Option<WindowId> {
         let (focus, area, chrome) = (self.focus, self.area, self.chrome);
         let new = self.fresh_window_id();
-        if !self.layout.split(focus, new, dir, area, &chrome) {
+        // Beside what you were reading, not on top of it: the new window
+        // taking the space the old one occupied is why focus moving into it
+        // looked like focus not moving at all.
+        if !self.layout.split(focus, new, dir, Place::After, area, &chrome) {
             // Hand the id back rather than leaving a hole in the sequence;
             // nothing depends on it, but a gap invites the question of what
             // used to be there.
@@ -1855,7 +1858,9 @@ impl Editor {
                 };
 
                 let new = self.fresh_window_id();
-                if !self.layout.split(focus, new, Dir::Vertical, area, &chrome) {
+                // A file tree belongs on the left, whichever side a plain
+                // split opens on.
+                if !self.layout.split(focus, new, Dir::Vertical, Place::Before, area, &chrome) {
                     self.next_window -= 1;
                     self.session.status = "not enough room to split".into();
                     return;
@@ -4824,6 +4829,125 @@ mod tests {
         assert_eq!(ed.buffer_ids().len(), 1);
     }
 
+    /// Every way of making a window moves focus into it. One test over all of
+    /// them, because the promise is the spec's and the arms that keep it are
+    /// spread across `run_window_cmd`.
+    #[test]
+    fn focus_follows_every_way_of_making_a_window() {
+        let d = ScratchDir::new("probe").file("a.rs");
+        for line in ["sp", "vs", "new", "vnew"] {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let before = ed.focus();
+            ex(&mut ed, line);
+            assert_ne!(ed.focus(), before, ":{line} did not move focus");
+        }
+        // With a path.
+        let mut ed = editor("hello");
+        sized(&mut ed);
+        let before = ed.focus();
+        ex(&mut ed, &format!("sp {}/a.rs", d.path()));
+        assert_ne!(ed.focus(), before, ":sp <path> did not move focus");
+
+        // Ctrl-W s / v / e.
+        for cmd_ in [
+            WindowCmd::Split { dir: Dir::Horizontal, path: None },
+            WindowCmd::Split { dir: Dir::Vertical, path: None },
+            WindowCmd::Tree,
+        ] {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let before = ed.focus();
+            ed.apply(cmd(Action::Window(cmd_.clone())));
+            assert_ne!(ed.focus(), before, "{cmd_:?} did not move focus");
+        }
+    }
+
+    /// A split opens *beside* what you were reading, not on top of the space
+    /// it occupied. Focus followed the new window before this too, but the new
+    /// window took the old one's place on screen, so moving into it looked
+    /// exactly like not moving at all.
+    #[test]
+    fn a_split_opens_on_the_far_side_and_focus_is_there() {
+        let mut ed = editor("hello");
+        sized(&mut ed);
+        let before = ed.focus();
+
+        ex(&mut ed, "vs");
+
+        let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
+        assert_ne!(ed.focus(), before, "focus moved");
+        assert!(rect(&ed, ed.focus()).x > rect(&ed, before).x, "and it moved to the right");
+
+        // Horizontally the same, downwards.
+        let mut ed = editor("hello");
+        sized(&mut ed);
+        let before = ed.focus();
+        ex(&mut ed, "sp");
+        assert!(rect(&ed, ed.focus()).y > rect(&ed, before).y, "below, not above");
+    }
+
+    /// The sidebar is the exception: a file tree belongs on the left whichever
+    /// side a plain split opens on.
+    #[test]
+    fn the_tree_sidebar_still_opens_on_the_left() {
+        let d = ScratchDir::new("sidebar").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        let before = ed.focus();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
+        assert!(ed.window().tree().is_some(), "focus is in the tree");
+        assert!(rect(&ed, ed.focus()).x < rect(&ed, before).x, "and the tree is on the left");
+    }
+
+    /// A leader binding for a window command has to work from inside the tree,
+    /// or the key that opens the sidebar cannot close it — which is exactly
+    /// what happened. The tree keymap is an allowlist and borrows no single
+    /// key from `[keys.normal]`, but a sequence is a command the user invented
+    /// and collides with nothing the tree binds.
+    #[test]
+    fn a_leader_binding_toggles_the_tree_from_either_side() {
+        let d = ScratchDir::new("leader-tree").file("a.rs").file("b.rs");
+        let (config, problems) = crate::config::parse(
+            "[keys.normal]\n\"<leader>e\" = \"window_tree\"\n\"j\" = \"left\"\n",
+            crate::config::Config::default(),
+        )
+        .expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let mut input = crate::input::Input::default();
+        input.set_keys(config.keys);
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+
+        let press = |ed: &mut Editor, input: &mut crate::input::Input, c: char| {
+            let key = crate::key::Key::char(c);
+            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+                ed.apply(command);
+            }
+        };
+
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'e');
+        assert_eq!(ed.window_ids().len(), 2, "the tree opened");
+        assert!(ed.window().tree().is_some(), "and took focus");
+
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'e');
+        assert_eq!(ed.window_ids().len(), 1, "and the same keys put it away");
+
+        // What the tree's own keymap still refuses to borrow: a single key
+        // rebound in normal mode. `j` must select down here, not collapse.
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'e');
+        let before = ed.window().tree().map(|t| t.selected());
+        press(&mut ed, &mut input, 'j');
+        assert_ne!(ed.window().tree().map(|t| t.selected()), before, "j still moves down");
+    }
+
     #[test]
     fn splitting_on_a_directory_gives_the_new_window_a_tree() {
         let d = ScratchDir::new("split").file("a.rs");
@@ -5581,23 +5705,28 @@ mod tests {
         let second = ed.focus();
         assert_ne!(first, second);
 
-        ex(&mut ed, &format!("vs {}", d.path()));
-        let tree = ed.focus();
-        select_first_entry(&mut ed);
-        tree_key(&mut ed, TreeCmd::Enter);
-        assert_eq!(ed.focus(), second, "came from the second, went back to it");
-
-        // Now reach the tree from the *first* window instead.
-        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        // The tree goes between the two files, so a single step reaches it
+        // from either one — which is what makes "the window you came from"
+        // the thing under test rather than the cycling order.
         while ed.focus() != first {
             ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
         }
-        while ed.focus() != tree {
+        ex(&mut ed, &format!("vs {}", d.path()));
+        let tree = ed.focus();
+
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Enter);
+        assert_eq!(ed.focus(), first, "came from the first, went back to it");
+
+        // Now reach the tree from the *second* window instead.
+        while ed.focus() != second {
             ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
         }
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: true })));
+        assert_eq!(ed.focus(), tree, "one step onto the tree");
         tree_key(&mut ed, TreeCmd::Enter);
 
-        assert_eq!(ed.focus(), first, "and this time back to the first");
+        assert_eq!(ed.focus(), second, "and this time back to the second");
     }
 
     fn tree_key(ed: &mut Editor, tree_cmd: TreeCmd) {
@@ -6099,11 +6228,11 @@ mod tests {
         split(&mut ed, Dir::Vertical);
         let first = ed.focus();
 
-        // The new window is on the left, so its neighbour is to the right.
-        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Right))));
+        // The new window opens on the right, so its neighbour is to the left.
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
         assert_ne!(ed.focus(), first);
 
-        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Right))));
         assert_eq!(ed.focus(), first, "and back");
     }
 
@@ -6113,7 +6242,8 @@ mod tests {
         split(&mut ed, Dir::Vertical);
         let first = ed.focus();
 
-        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Left))));
+        // Focus is in the new window, which is the rightmost one.
+        ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Right))));
         assert_eq!(ed.focus(), first);
     }
 

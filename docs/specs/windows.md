@@ -347,8 +347,8 @@ now has.
 ## Window commands
 
 ```
-:sp[lit] [path]     split horizontally — the new window is above
-:vs[plit] [path]    split vertically — the new window is left
+:sp[lit] [path]     split horizontally — the new window is below
+:vs[plit] [path]    split vertically — the new window is right
 :new                split horizontally onto a new unnamed buffer
 :vnew               the same, vertically
 :enew               an unnamed buffer in this window
@@ -366,6 +366,17 @@ Ctrl-W =            equalise every weight
 A bare `:sp` duplicates the current window: same buffer, same cursor, same
 scroll, so the split lands on the line you were reading. With a path it opens
 that file in the new window, and focus follows the new window in both cases.
+
+**The new window opens on the far side** — below for `:sp`, right for `:vs` —
+and focus goes there. Vim's default is the opposite, and it made focus look
+broken: the new window took the space the old one occupied, so moving into it
+was indistinguishable from not moving at all. You split, you are in the new
+pane, and you can see that you are. Vim users reach the same place by setting
+`splitbelow` and `splitright`, which is the first thing most of them do.
+
+The tree sidebar is the exception and still opens on the **left**, because that
+is where a file tree belongs. `Layout::split` takes a `Place` saying which, so
+the two are one decision at the call site rather than two layout functions.
 
 **`:new` is not a spelling of `:split`.** It shipped as one, which was wrong in
 the way an alias is worse than a missing command: vim's `:new` splits onto an

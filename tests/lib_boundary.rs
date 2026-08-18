@@ -142,7 +142,9 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
     let other = *s.editor.window_ids().iter().find(|&&id| id != s.editor.focus()).unwrap();
     assert_eq!(s.editor.buffer_of(other).unwrap().rope().to_string(), "Xalpha");
 
-    s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Focus(Side::Right)) });
+    // The split opened on the right and took focus with it, so the window it
+    // came from is the one to the left.
+    s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Focus(Side::Left)) });
     assert_eq!(s.editor.focus(), other, "switched by geometry");
 
     s.editor.apply(Command { count: 1, action: Action::Window(WindowCmd::Close) });

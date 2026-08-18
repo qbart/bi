@@ -150,6 +150,41 @@ impl Input {
             || self.delete_pending
     }
 
+    /// What `[keys.normal]` lends to another mode for the keys held so far.
+    ///
+    /// **Visual borrows everything.** `input.rs` falls through to `normal` for
+    /// anything visual does not claim, so a motion rebound in `[keys.normal]`
+    /// has to be rebound here too or `v` then `j` would disagree with a bare
+    /// `j`.
+    ///
+    /// **A tree borrows sequences only.** Its keymap is a complete allowlist,
+    /// not an overlay, and that is what stops `"j" = "left"` from turning `j`
+    /// into "collapse" in a pane sitting on a filesystem. But a *sequence* —
+    /// `<leader>e` — is a command the user invented, and there is nothing in
+    /// the tree's own vocabulary for it to collide with: every key the tree
+    /// binds by default is a single one. Without this, a leader binding for
+    /// `window_tree` opened the tree and then could not close it, because the
+    /// second press happened with the tree focused.
+    ///
+    /// The rule is about the *binding*, not about how much has been typed: a
+    /// single key that normal rebinds is refused even mid-sequence, and a
+    /// prefix is always borrowed, or the first key of `<leader>e` would be
+    /// dropped before the second one arrived.
+    fn borrowed_from_normal(&self, mode: KeyMode) -> Lookup {
+        let found = match mode {
+            KeyMode::Normal => return Lookup::Miss,
+            _ => self.keys.lookup(KeyMode::Normal, &self.remap_pending),
+        };
+        match (mode, &found) {
+            (KeyMode::Visual, _) => found,
+            // The start of a sequence, which is not yet a rebinding of
+            // anything.
+            (_, Lookup::Prefix) => found,
+            (_, _) if self.remap_pending.len() > 1 => found,
+            _ => Lookup::Miss,
+        }
+    }
+
     /// Rewrites `key` into the keys the user's config says it means.
     ///
     /// One pass, never chained: with `j = "left"` and `h = "right"` the two
@@ -183,12 +218,9 @@ impl Input {
 
         self.remap_pending.push(key);
         loop {
-            // Visual falls through to `normal` for anything it does not claim,
-            // so a motion rebound in `[keys.normal]` has to be rebound here
-            // too or `v` then `j` would disagree with a bare `j`.
             let mut found = self.keys.lookup(mode, &self.remap_pending);
-            if mode == KeyMode::Visual && found == Lookup::Miss {
-                found = self.keys.lookup(KeyMode::Normal, &self.remap_pending);
+            if found == Lookup::Miss {
+                found = self.borrowed_from_normal(mode);
             }
             match found {
                 Lookup::Keys(to) => {
@@ -1331,8 +1363,16 @@ leader = \" \"
         let cmd = feed(&mut input, " d", ContentKind::Tree).expect("resolved");
         assert_eq!(cmd.action, Action::Tree(TreeCmd::Delete));
 
-        // The normal-mode leader bindings do not leak into it.
-        assert!(feed(&mut input, " e", ContentKind::Tree).is_none(), "no window_tree here");
+        // A sequence the tree does not claim is borrowed from `[keys.normal]`,
+        // which is what lets one leader binding work on both sides. Its keys
+        // then mean whatever they mean *here*: `gg` is the tree's first row.
+        let cmd = feed(&mut input, " t", ContentKind::Tree).expect("borrowed from normal");
+        assert_eq!(cmd.action, Action::Tree(TreeCmd::First));
+
+        // A single key is not borrowed, which is the whole reason the tree has
+        // a map of its own: `j` selects down here whatever normal says.
+        let cmd = feed(&mut input, "j", ContentKind::Tree).expect("resolved");
+        assert_eq!(cmd.action, Action::Tree(TreeCmd::Select { down: true, count: 1 }));
     }
 
     /// Insert mode is literal text. A keymap that reached it would type the
