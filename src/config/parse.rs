@@ -2,8 +2,9 @@
 
 use toml_edit::{Document, Item, Table, Value};
 
-use super::keys::{self, KeyMode};
+use super::keys::{self, KeyMode, Lookup};
 use super::{Config, Diagnostic, OptionValue, line_of};
+use crate::key::Key;
 
 /// Parses `src` as a patch over `base`.
 ///
@@ -52,16 +53,38 @@ fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
     }
 }
 
-/// `[keys.normal]`, `[keys.visual]`, `[keys.tree]`.
+/// `leader`, `[keys.normal]`, `[keys.visual]`, `[keys.tree]`.
 ///
-/// `[keys]` itself is one implicit table holding the three, which is how TOML
-/// reads a dotted header — so this is one section with sub-tables, not three
-/// sections, and a stray `[keys.nope]` is reported against its own line.
+/// `[keys]` itself is one implicit table holding the three modes and the
+/// leader, which is how TOML reads a dotted header — so this is one section
+/// with sub-tables, not three sections, and a stray `[keys.nope]` is reported
+/// against its own line.
+///
+/// `leader` is read in a pass of its own, before any binding, because a
+/// binding may spell `<leader>` and TOML is free to hand `[keys.normal]` back
+/// first. A leader that depended on where in the file it sat would be a trap.
 fn read_keys(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    if let Some((_, item)) = table.iter().find(|(name, _)| *name == "leader") {
+        let line = line_for(table, "leader", src);
+        match item.as_value().and_then(Value::as_str) {
+            Some(spelling) => match keys::parse_key(spelling) {
+                Ok(key) => config.keys.set_leader(key),
+                Err(message) => problems.push(Diagnostic { line, message }),
+            },
+            None => problems.push(Diagnostic {
+                line,
+                message: "leader takes one key, like \" \" or \"<C-Space>\"".into(),
+            }),
+        }
+    }
+
     for (name, item) in table.iter() {
+        if name == "leader" {
+            continue;
+        }
         let line = line_for(table, name, src);
         let Some(mode) = KeyMode::from_section(name) else {
-            let message = format!("unknown key mode: {name} — try normal, visual or tree");
+            let message = format!("unknown key mode: {name} — try normal, visual, tree or leader");
             problems.push(Diagnostic { line, message });
             continue;
         };
@@ -80,20 +103,19 @@ fn read_bindings(
     config: &mut Config,
     problems: &mut Vec<Diagnostic>,
 ) {
+    // Every binding this file adds to this mode, so the unreachability check
+    // below can name the line the shorter one sits on.
+    let mut added: Vec<(Vec<Key>, usize)> = Vec::new();
+
     for (spelling, item) in table.iter() {
         let line = line_for(table, spelling, src);
+        let count = added.len();
         let mut report = |message: String| problems.push(Diagnostic { line, message });
 
-        let from = match keys::parse_key(spelling) {
-            Ok(key) => key,
+        let from = match keys::parse_keys(spelling, config.keys.leader()) {
+            Ok(keys) => keys,
             Err(message) => {
-                // A multi-key sequence is the common case here, and it is
-                // worth naming rather than calling the whole thing invalid.
-                report(if spelling.chars().count() > 1 && !spelling.starts_with('<') {
-                    format!("{message} — multi-key sequences are not bindable yet")
-                } else {
-                    message
-                });
+                report(message);
                 continue;
             }
         };
@@ -101,7 +123,10 @@ fn read_bindings(
         match item.as_value() {
             // `false` unbinds. `true` is not the opposite of anything: a key
             // is bound to a name, so there is nothing for it to mean.
-            Some(Value::Boolean(b)) if !*b.value() => config.keys.insert(mode, from, None),
+            Some(Value::Boolean(b)) if !*b.value() => {
+                config.keys.insert(mode, from.clone(), None);
+                added.push((from, line));
+            }
             Some(Value::Boolean(_)) => report(
                 "true is not a binding — name a command, or use \
                                                false to unbind"
@@ -110,7 +135,10 @@ fn read_bindings(
             Some(Value::String(name)) => {
                 let name = name.value();
                 match keys::key_for_name(mode, name) {
-                    Some(to) => config.keys.insert(mode, from, Some(to)),
+                    Some(to) => {
+                        config.keys.insert(mode, from.clone(), Some(to));
+                        added.push((from, line));
+                    }
                     None => report(match keys::nearest_name(mode, name) {
                         Some(near) => format!("unknown command: {name} — did you mean {near}?"),
                         None => format!("unknown command: {name}"),
@@ -118,6 +146,67 @@ fn read_bindings(
                 }
             }
             _ => report(format!("a binding is a command name or false, not {item}")),
+        }
+
+        if added.len() > count {
+            let (from, _) = added.last().expect("just added");
+            report_shadowed(from, mode, line, problems);
+        }
+    }
+
+    report_unreachable(&added, mode, config, problems);
+}
+
+/// Says so when a binding takes over a key bi uses to *start* a command.
+///
+/// `"gd" = …` makes `g` the user's prefix, and a prefix has no meaning of its
+/// own — so `gg`, `ge`, `gE` and `g_` stop resolving. The binding still
+/// applies; this only refuses to let it happen quietly.
+fn report_shadowed(from: &[Key], mode: KeyMode, line: usize, problems: &mut Vec<Diagnostic>) {
+    let lost = keys::shadowed(mode, from);
+    if lost.is_empty() {
+        return;
+    }
+    // Eleven window names would bury the point rather than making it.
+    let listed = lost.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+    let rest = if lost.len() > 4 { format!(" and {} more", lost.len() - 4) } else { String::new() };
+    let (binding, prefix) = (keys::spell(from), keys::spell(&from[..1]));
+    problems.push(Diagnostic {
+        line,
+        message: format!(
+            "{binding:?} takes over {prefix:?}, so {listed}{rest} can no longer be typed — \
+             bind them by name to keep them"
+        ),
+    });
+}
+
+/// A binding whose own prefix is already a binding can never fire: the shorter
+/// one completes and resolves, with no timer to wait and see. Reported rather
+/// than silently dropped, which is the whole reason `docs/specs/config.md`
+/// refuses `timeoutlen`.
+///
+/// Checked against the merged keymap, not just this file, so a user sequence
+/// starting on top of a shipped binding is caught too.
+fn report_unreachable(
+    added: &[(Vec<Key>, usize)],
+    mode: KeyMode,
+    config: &Config,
+    problems: &mut Vec<Diagnostic>,
+) {
+    for (seq, line) in added {
+        for len in 1..seq.len() {
+            let shorter = &seq[..len];
+            if matches!(config.keys.lookup(mode, shorter), Lookup::Keys(_) | Lookup::Unbound) {
+                let (long, short) = (keys::spell(seq), keys::spell(shorter));
+                let at = added
+                    .iter()
+                    .find(|(other, _)| other == shorter)
+                    .map(|(_, line)| format!(" on line {line}"))
+                    .unwrap_or_default();
+                let message = format!("{long:?} is unreachable — {short:?}{at} already fires");
+                problems.push(Diagnostic { line: *line, message });
+                break;
+            }
         }
     }
 }
@@ -147,6 +236,7 @@ fn option_value(item: &Item) -> OptionValue {
 
 #[cfg(test)]
 mod tests {
+    use super::{KeyMode, Lookup};
     use crate::config::{Config, OptionValue, parse};
     use crate::editor::LineNumbers;
 
@@ -211,6 +301,85 @@ mod tests {
             .expect_err("an unterminated table header cannot be salvaged");
         assert_eq!(err.line, 1);
         assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn a_sequence_binds_on_both_sides() {
+        let (config, problems) = ok("[keys.normal]\n\"<leader>t\" = \"goto_first_line\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let space = crate::key::Key::char(' ');
+        let seq = [space, crate::key::Key::char('t')];
+        assert_eq!(
+            config.keys.lookup(KeyMode::Normal, &seq),
+            Lookup::Keys(vec![crate::key::Key::char('g'), crate::key::Key::char('g')])
+        );
+        assert_eq!(config.keys.lookup(KeyMode::Normal, &[space]), Lookup::Prefix);
+    }
+
+    /// `leader` is read in a pass of its own, so a binding that spells it does
+    /// not depend on sitting after it in the file. TOML allows a super-table
+    /// to be defined after its children, and a user will do exactly that.
+    #[test]
+    fn leader_is_read_before_the_bindings_that_spell_it() {
+        let (config, problems) =
+            ok("[keys.normal]\n\"<leader>t\" = \"goto_first_line\"\n\n[keys]\nleader = \"\\\\\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let seq = [crate::key::Key::char('\\'), crate::key::Key::char('t')];
+        assert!(matches!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Keys(_)));
+    }
+
+    #[test]
+    fn leader_takes_one_key_and_says_so_when_it_does_not() {
+        assert_eq!(
+            ok("[keys]\nleader = 5\n").1,
+            ["2: leader takes one key, like \" \" or \"<C-Space>\""]
+        );
+        assert_eq!(ok("[keys]\nleader = \"gg\"\n").1, ["2: not a key: gg"]);
+    }
+
+    /// The message that sent a user looking for this feature in the first
+    /// place: `leader` under `[keys]` used to read as a mode name.
+    #[test]
+    fn leader_is_not_mistaken_for_a_mode() {
+        assert!(ok("[keys]\nleader = \" \"\n").1.is_empty());
+        assert_eq!(
+            ok("[keys.nope]\n\"x\" = \"left\"\n").1,
+            ["1: unknown key mode: nope — try normal, visual, tree or leader"]
+        );
+    }
+
+    /// The no-timeout rule's other half: the shorter binding fires, so the
+    /// longer one can never happen, and the loader says which line already
+    /// claimed it.
+    #[test]
+    fn a_binding_whose_prefix_is_bound_is_unreachable() {
+        let (_, problems) =
+            ok("[keys.normal]\n\"<leader>\" = \"left\"\n\"<leader>e\" = \"undo\"\n");
+        assert_eq!(
+            problems,
+            ["3: \"<Space>e\" is unreachable — \"<Space>\" on line 2 already fires"]
+        );
+    }
+
+    /// Taking over a key bi uses to start a command is allowed and reported:
+    /// `g` becomes the user's prefix, and the built-in `g` sequences stop
+    /// resolving.
+    #[test]
+    fn taking_over_a_built_in_prefix_is_reported() {
+        let (_, problems) = ok("[keys.normal]\n\"gd\" = \"left\"\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let message = &problems[0];
+        assert!(message.contains("\"gd\" takes over \"g\""), "{message}");
+        assert!(message.contains("word_end_backward"), "{message}");
+
+        // A binding that starts somewhere harmless says nothing.
+        assert!(ok("[keys.normal]\n\"<leader>d\" = \"left\"\n").1.is_empty());
+        // Nor does binding one of the built-in sequences itself, beyond the
+        // siblings it really does shadow.
+        let (_, problems) = ok("[keys.tree]\n\"dd\" = \"tree_cut\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[test]

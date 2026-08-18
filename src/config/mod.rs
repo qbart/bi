@@ -11,7 +11,7 @@ use crate::editor::LineNumbers;
 mod keys;
 mod parse;
 
-pub use keys::{KeyMode, Keymap, parse_key};
+pub use keys::{KeyMode, Keymap, Lookup, parse_key, parse_keys, spell};
 pub use parse::parse;
 
 /// Where a frontend gets config text from.
@@ -158,6 +158,16 @@ mod tests {
         // `Options::default()` is what an embedder with no config gets. They
         // must say the same thing, and nothing but this test keeps them honest.
         assert_eq!(Config::default().options, Options::default());
+    }
+
+    /// The same rule as the options above, for the one keymap setting that has
+    /// a value rather than being a table: `default.toml` documents the leader
+    /// and `Keymap::default()` is what an embedder with no config gets, so the
+    /// two must say the same key.
+    #[test]
+    fn the_shipped_leader_agrees_with_the_rust_fallback() {
+        assert_eq!(Config::default().keys.leader(), Keymap::default().leader());
+        assert_eq!(Keymap::default().leader(), Some(crate::key::Key::char(' ')));
     }
 
     #[test]

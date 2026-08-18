@@ -7,3 +7,13 @@
 [options]
 number = 1
 hlsearch = false
+
+[keys]
+# The key <leader> stands for in a binding. Nothing uses it until you write a
+# binding that spells it — and the moment one does, this key stops meaning
+# whatever it meant on its own, because there is no timeout to decide between
+# them.
+leader = " "
+
+# The rest of the keymap is still `match` arms in src/input.rs; only your
+# overrides live in [keys.normal], [keys.visual] and [keys.tree].

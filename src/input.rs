@@ -9,7 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::config::{KeyMode, Keymap};
+use crate::config::{KeyMode, Keymap, Lookup};
 use crate::editor::{Action, BufferCmd, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -44,6 +44,10 @@ pub struct Input {
     /// `d` has been typed in a tree and is waiting to see whether the next key
     /// is the second `d`. Not a key on its own, the same way `Ctrl-W` is not.
     delete_pending: bool,
+    /// Keys typed that begin a binding in the user's keymap without completing
+    /// one yet — the `<Space>` of a half-typed `<leader>e`. Pending state, so
+    /// `reset` clears it; the keymap beside it is configuration and survives.
+    remap_pending: Vec<Key>,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
 }
@@ -103,60 +107,136 @@ fn object_key(c: char) -> Option<TextObject> {
 
 /// What the keymap says about a key on its way in.
 enum Remapped {
-    To(Key),
+    /// The key means itself, and nothing was rewritten.
+    Same(Key),
+    /// A binding fired: feed these keys through the grammar instead.
+    Keys(Vec<Key>),
+    /// Swallowed — either unbound, or the start of a binding that is still
+    /// waiting for its next key.
     Nothing,
 }
 
 impl Input {
     /// Installs the user's keymap. Called by the frontend after the config is
     /// loaded and after every `:reload`.
+    ///
+    /// Any half-typed sequence goes with the old map: it was a prefix of a
+    /// binding that may no longer exist, and resolving it against the new one
+    /// would be answering a question nobody asked.
     pub fn set_keys(&mut self, keys: Keymap) {
         self.keys = keys;
+        self.remap_pending.clear();
     }
 
-    /// Rewrites `key` into the key the user's config says it means.
+    /// Whether a command has already started and is holding out for a specific
+    /// next key.
+    ///
+    /// That key is the command's **argument**, not a binding, and arguments are
+    /// never looked up in the keymap: `r<Space>` has to write a space even
+    /// when `<Space>` is the leader, and `f<Space>` has to find one. The same
+    /// goes for the keys that only exist inside a sequence — `gg`, `<C-w>s`,
+    /// the tree's `dd`, and the object of `di(`.
+    ///
+    /// A count and a pending operator are deliberately absent: after `d` the
+    /// next key is a fresh motion lookup, which is what makes a rebound `w`
+    /// also rebind `dw`.
+    fn mid_command(&self) -> bool {
+        self.replace_pending
+            || self.quote_pending
+            || self.find_pending.is_some()
+            || self.object_pending.is_some()
+            || self.window_pending
+            || self.g_pending
+            || self.delete_pending
+    }
+
+    /// Rewrites `key` into the keys the user's config says it means.
     ///
     /// One pass, never chained: with `j = "left"` and `h = "right"` the two
     /// swap rather than one of them winning, because each is looked up against
-    /// bi's own keys and not against the other's result.
+    /// bi's own keys and not against the other's result. A binding's target is
+    /// fed through the grammar without passing here again, for the same
+    /// reason.
+    ///
+    /// A key that begins a longer binding is held rather than resolved. If the
+    /// next key does not continue it, the held keys are dropped — they had no
+    /// meaning of their own to fall back on — and the one that broke the
+    /// sequence is looked up afresh, so it still does what it always did.
     ///
     /// Nothing is remapped in the modes that are literal text entry — insert,
     /// replace, the command line, the search line and the picker. There is no
     /// binding there to change, and rewriting a keystroke into another
     /// character is the one thing a keymap must never do to text.
-    fn remap(&self, key: Key, mode: &Mode, content: ContentKind) -> Remapped {
-        if self.keys.is_empty() {
-            return Remapped::To(key);
-        }
+    fn remap(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Remapped {
         let mode = match mode {
             Mode::Normal if content == ContentKind::Tree => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
-            _ => return Remapped::To(key),
-        };
-        // Visual falls through to `normal` for anything it does not claim, so
-        // a motion rebound in `[keys.normal]` has to be rebound here too or
-        // `v` then `j` would disagree with a bare `j`.
-        let found = match mode {
-            KeyMode::Visual => {
-                self.keys.get(KeyMode::Visual, key).or_else(|| self.keys.get(KeyMode::Normal, key))
+            _ => {
+                self.remap_pending.clear();
+                return Remapped::Same(key);
             }
-            mode => self.keys.get(mode, key),
         };
-        match found {
-            Some(Some(to)) => Remapped::To(to),
-            Some(None) => Remapped::Nothing,
-            None => Remapped::To(key),
+        if self.keys.is_empty() || (self.remap_pending.is_empty() && self.mid_command()) {
+            return Remapped::Same(key);
+        }
+
+        self.remap_pending.push(key);
+        loop {
+            // Visual falls through to `normal` for anything it does not claim,
+            // so a motion rebound in `[keys.normal]` has to be rebound here
+            // too or `v` then `j` would disagree with a bare `j`.
+            let mut found = self.keys.lookup(mode, &self.remap_pending);
+            if mode == KeyMode::Visual && found == Lookup::Miss {
+                found = self.keys.lookup(KeyMode::Normal, &self.remap_pending);
+            }
+            match found {
+                Lookup::Keys(to) => {
+                    self.remap_pending.clear();
+                    return Remapped::Keys(to);
+                }
+                // Unbound. Swallowed rather than passed on, or `"h" = false`
+                // would still move left.
+                Lookup::Unbound => {
+                    self.remap_pending.clear();
+                    return Remapped::Nothing;
+                }
+                Lookup::Prefix => return Remapped::Nothing,
+                // A dead end. Anything held was a prefix and means nothing on
+                // its own, so it goes, and `key` starts again from the root —
+                // where a second miss can only be a plain unmapped key.
+                Lookup::Miss if self.remap_pending.len() > 1 => {
+                    self.remap_pending.clear();
+                    self.remap_pending.push(key);
+                }
+                Lookup::Miss => {
+                    self.remap_pending.clear();
+                    return Remapped::Same(key);
+                }
+            }
         }
     }
 
     pub fn on_key(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
-        let key = match self.remap(key, mode, content) {
-            Remapped::To(key) => key,
-            // Unbound. Swallowed rather than passed on, or `"h" = false` would
-            // still move left.
-            Remapped::Nothing => return None,
-        };
+        match self.remap(key, mode, content) {
+            Remapped::Same(key) => self.dispatch(key, mode, content),
+            // A target may be several keys — `gg`, `<C-w>s`, a tree's `dd`.
+            // They go through the grammar one at a time exactly as if typed,
+            // so the earlier ones set the pending state the last one needs.
+            // Only the last can resolve to a command: every key before it is a
+            // prefix, by construction of the names table.
+            Remapped::Keys(keys) => {
+                let mut resolved = None;
+                for key in keys {
+                    resolved = self.dispatch(key, mode, content).or(resolved);
+                }
+                resolved
+            }
+            Remapped::Nothing => None,
+        }
+    }
+
+    fn dispatch(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
         match mode {
             // A tree gets its own keymap rather than an overlay on normal
             // mode's. Which one runs is a property of the window, not of the
@@ -178,6 +258,11 @@ impl Input {
     /// What's been typed but not yet resolved, for the status line.
     pub fn pending_display(&self) -> String {
         let mut s = String::new();
+        // A half-typed binding comes first because it was typed first, and
+        // showing it is what stops a leader from looking like a hang.
+        if !self.remap_pending.is_empty() {
+            s.push_str(&crate::config::spell(&self.remap_pending));
+        }
         if let Some(n) = self.count {
             s.push_str(&n.to_string());
         }
@@ -1113,6 +1198,133 @@ number = 5
         assert_eq!(h.action, Action::Move(Motion::Down));
         let j = input.on_key(key('j'), &Mode::Normal, ContentKind::Text).unwrap();
         assert_eq!(j.action, Action::Move(Motion::Left), "not Down via h");
+    }
+
+    /// A config with a leader and three bindings that spell it, which is the
+    /// shape every leader test below needs.
+    fn with_leader(src: &str) -> Input {
+        let (config, problems) =
+            crate::config::parse(src, crate::config::Config::default()).expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut input = Input::default();
+        input.set_keys(config.keys);
+        input
+    }
+
+    fn leader_layout() -> Input {
+        with_leader(
+            "\
+[keys]
+leader = \" \"
+
+[keys.normal]
+\"<leader>e\" = \"window_tree\"
+\"<leader>t\" = \"goto_first_line\"
+
+[keys.tree]
+\"<leader>d\" = \"tree_delete\"
+",
+        )
+    }
+
+    fn feed(input: &mut Input, keys: &str, content: ContentKind) -> Option<Command> {
+        let mut last = None;
+        for c in keys.chars() {
+            last = input.on_key(key(c), &Mode::Normal, content);
+        }
+        last
+    }
+
+    /// The leader itself resolves nothing: it is the start of a binding and
+    /// the second key is what fires.
+    #[test]
+    fn a_leader_binding_fires_on_its_last_key() {
+        let mut input = leader_layout();
+
+        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none(), "waiting");
+        let cmd = input.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Tree));
+    }
+
+    /// The target is two keys, and they go through the grammar exactly as if
+    /// they had been typed — `gg` reaching `FirstLine` through `g_pending`.
+    #[test]
+    fn a_multi_key_target_travels_through_the_grammar() {
+        let mut input = leader_layout();
+        let cmd = feed(&mut input, " t", ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Move(Motion::FirstLine));
+
+        // And it composes with an operator, because the grammar never learns
+        // that anything was rewritten.
+        let cmd = feed(&mut input, "d t", ContentKind::Text).expect("resolved");
+        assert!(
+            matches!(
+                cmd.action,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::FirstLine),
+                    ..
+                }
+            ),
+            "{:?}",
+            cmd.action
+        );
+    }
+
+    /// A sequence that goes nowhere drops the prefix — which had no meaning of
+    /// its own — and lets the key that broke it act normally.
+    #[test]
+    fn a_dead_end_drops_the_prefix_and_keeps_the_last_key() {
+        let mut input = leader_layout();
+        let cmd = feed(&mut input, " j", ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Move(Motion::Down), "the j still moves");
+
+        // And the next key starts from the root again rather than continuing
+        // the abandoned sequence.
+        let cmd = feed(&mut input, " e", ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Tree));
+    }
+
+    /// `<Space>` is `Motion::Right` in bi, and binding `<leader>e` takes that
+    /// away. Deliberate: there is no timeout to tell the two apart.
+    #[test]
+    fn a_prefix_loses_its_own_meaning() {
+        let mut input = leader_layout();
+        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
+        assert_eq!(input.pending_display(), "<Space>", "and the status line says so");
+
+        // Without a binding that spells it, the leader is just a key.
+        let mut plain = with_leader("[keys]\nleader = \" \"\n");
+        let cmd = plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Move(Motion::Right));
+    }
+
+    /// The rule that keeps a leader from eating arguments: once a command is
+    /// waiting for a specific key, that key is not a binding. Without it,
+    /// `r<Space>` would type a leader instead of a space.
+    #[test]
+    fn an_argument_is_never_looked_up_in_the_keymap() {
+        let mut input = leader_layout();
+        let cmd = feed(&mut input, "r ", ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::ReplaceChar { ch: ' ', count: 1 });
+
+        let cmd = feed(&mut input, "f ", ContentKind::Text).expect("resolved");
+        assert_eq!(
+            cmd.action,
+            Action::Move(Motion::FindChar { ch: ' ', forward: true, till: false, repeat: false })
+        );
+    }
+
+    /// The tree has its own map, so a leader binding there is its own binding
+    /// — and `dd` is reachable as a target now that targets can be sequences.
+    #[test]
+    fn a_leader_binding_reaches_the_trees_two_key_delete() {
+        let mut input = leader_layout();
+        let cmd = feed(&mut input, " d", ContentKind::Tree).expect("resolved");
+        assert_eq!(cmd.action, Action::Tree(TreeCmd::Delete));
+
+        // The normal-mode leader bindings do not leak into it.
+        assert!(feed(&mut input, " e", ContentKind::Tree).is_none(), "no window_tree here");
     }
 
     /// Insert mode is literal text. A keymap that reached it would type the

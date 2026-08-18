@@ -12,12 +12,13 @@ carrying it as a debt for three steps.
 
 ## Status
 
-**Step 1 built. Step 3 half built.**
+**Step 1 built. Step 3 mostly built.**
 
-The layer, `[options]`, `:reload` and both CLI subcommands ship. `[keys.*]` now
-loads and applies — see "What step 3 actually shipped" below, which is honest
-about the half that did not. The theme (step 2) is specified below and not
-built.
+The layer, `[options]`, `:reload` and both CLI subcommands ship. `[keys.*]`
+loads and applies, and so do `[keys] leader`, multi-key sequences on both sides
+of a binding, and the rules that make a prefix unambiguous without a timeout —
+see "What step 3 actually shipped" below, which is honest about what is left.
+The theme (step 2) is specified below and not built.
 
 ## What this is not
 
@@ -118,14 +119,15 @@ This is also why `bi config init` writes the defaults **commented out**. See
 
 ### What step 3 actually shipped
 
-`[keys.normal]`, `[keys.visual]` and `[keys.tree]` load, and a binding is a
-command name or `false` to unbind. What is missing is the half below: there is
-no `Binding` enum, no trie, and `input.rs` still holds the default keymap as
-`match` arms.
+`[keys.normal]`, `[keys.visual]`, `[keys.tree]` and `[keys] leader` load. A
+binding is a command name or `false` to unbind, and **either side may be more
+than one key**. What is missing is the half below: there is no `Binding` enum,
+and `input.rs` still holds the default keymap as `match` arms.
 
-Instead a name resolves to **the key that already produces it**, and the user's
-key is rewritten to that one at the top of `Input::on_key`. `"j" = "left"`
-makes `j` arrive as `h`.
+Instead a name resolves to **the keys that already produce it**, and the user's
+keys are rewritten to those at the top of `Input::on_key`. `"j" = "left"` makes
+`j` arrive as `h`; `"<leader>g" = "goto_first_line"` makes Space then `g`
+arrive as `g` then `g`.
 
 The trade is deliberate. What it buys:
 
@@ -134,23 +136,115 @@ The trade is deliberate. What it buys:
   the key it *is* `w`. A trie in front would have had to reimplement counts,
   operator-pending and the four argument-taking states before a single binding
   worked.
+- Multi-key targets cost nothing extra: the target's keys are fed through the
+  grammar one at a time, so `gg` reaches `Motion::FirstLine` through the same
+  `g_pending` the typed keys use.
 - It is small enough to be obviously correct, and it is guarded by tests that
   drive a real config through `Input`.
 
 What it costs, and what still argues for the full design:
 
-- **A name must already have a key.** `git_blame` cannot be bound, which is the
+- **A name must already have keys.** `git_blame` cannot be bound, which is the
   exact case `config.md` uses to argue for names over key-to-key mapping. So
   the argument stands; this is a staging post, not a refutation.
-- **Multi-key targets are unreachable.** `ge`, `g_` and `gg` are two keys, so
-  they are absent from the names table rather than bound to something close.
-- **Sequences cannot be bound**, only single keys. `"gd" = …` reports rather
-  than silently doing nothing.
 - **The defaults are still in code**, not in `default.toml`.
 
-Each of those disappears when `Binding` and the trie land. Nothing here has to
-be un-built to get there: the names table, the key notation parser and the
-`[keys.*]` reader are all part of the final design.
+Both disappear when `Binding` lands. Nothing here has to be un-built to get
+there: the names table, the key notation parser, the sequence store and the
+`[keys.*]` reader are all part of the final design — the store *is* the trie's
+data, held as a map beside a set of live prefixes exactly as
+[Structure](#structure) says it may be.
+
+### Sequences, and the leader
+
+**`leader` is a key, and it lives on `[keys]`.**
+
+```toml
+[keys]
+leader = " "
+
+[keys.normal]
+"<leader>e" = "window_tree"
+```
+
+It takes one key in the same notation as any binding — `" "`, `"<Space>"`,
+`"\\"`, `"<C-Space>"` — and defaults to `<Space>`, which `default.toml` ships
+so that `<leader>` is spellable without configuring anything.
+
+`<leader>` is expanded **at parse time**: the binding above is stored as the
+two keys `<Space>` `e`, and nothing at runtime knows a leader was involved.
+That is what makes changing one line re-point every binding that spells it,
+which is the entire reason a leader exists. It also means `leader` is read
+before the mode tables regardless of where in the file it sits — TOML is free
+to hand back `[keys.normal]` first, and a leader that depended on file order
+would be a trap.
+
+**A prefix has no meaning of its own.** Binding `<leader>e` makes `<Space>` a
+prefix, and `<Space>` stops being `Motion::Right` — there is no timeout to
+decide between them. Vim resolves this pair with a clock, which is the source
+of its most-complained-about input behaviour and is refused here. So the
+decision is made at load, not at 500ms: a key that begins a binding is a prefix
+and nothing else.
+
+**A dead end drops the prefix, not the keystroke.** With only `<leader>e`
+bound, typing `<Space>` then `j` discards the `<Space>` — it had no meaning of
+its own to fall back to — and looks `j` up from the root, so it still moves
+down. Swallowing both would lose a keystroke with nothing on screen to explain
+it. The half-typed sequence shows in the status line beside the count and the
+operator, for the same reason those do.
+
+Note what this does *not* cover: `<Space>`'s built-in meaning is not a binding,
+so shadowing it is not the ambiguous pair
+[Ambiguity](#ambiguity-the-first-complete-match-fires-no-timers) is about. Two
+*bindings* where one is the other's prefix still are, and still report — the
+shorter fires and the longer is unreachable:
+
+```
+config.toml:5: "<Space>e" is unreachable — "<Space>" on line 4 already fires
+```
+
+**Taking over a key bi starts a command with is reported too.** `"gd" = …`
+makes `g` the user's prefix, and a prefix has no meaning of its own — so `gg`,
+`ge`, `gE` and `g_` stop resolving. The same for `<C-w>` and, in a tree, `d`.
+
+```
+config.toml:2: "gd" takes over "g", so word_end_backward, big_word_end_backward,
+goto_first_line and last_non_blank can no longer be typed — bind them by name
+to keep them
+```
+
+Not a refusal: taking `g` over is a thing a user may well mean, and every name
+in that message can be bound straight back now that a target may be a sequence.
+The list is derived from the multi-key entries in the names table, not written
+out a second time, so it cannot drift from what bi actually has.
+
+This is the one place the missing half is visible as more than a limitation.
+When the defaults live in `default.toml`, `gg` and `ge` will be *bindings*, a
+new `gd` will be their sibling in the same map, and the three of them will
+coexist with nothing to report.
+
+**Remapping stops at the first key of a command.** Once `r`, `f`/`F`/`t`/`T`,
+`"`, `i`/`a`, `g`, `Ctrl-W` or a tree's `d` is waiting, the next key is that
+command's **argument**, and an argument is not looked up in the keymap. Without
+this rule `r<Space>` would type a leader instead of a space, and `f<Space>`
+could not find one.
+
+It is not a new rule so much as one this step is forced to state: it was
+already wrong for single keys, where `"x" = "y"` quietly made `rx` write a `y`.
+The trie design says the same thing in other words — a lookup starts at the
+root, and every one of those states is already inside a production.
+
+Counts and a pending operator are deliberately *not* on that list. After `d`
+the next key is a fresh motion lookup, and that is exactly what makes a rebound
+`w` also rebind `dw`.
+
+**Multi-key names.** With targets able to be sequences, the names that were
+absent because vim spells them with two keys now exist: `goto_first_line`,
+`word_end_backward`, `big_word_end_backward`, `last_non_blank`, the tree's
+`tree_delete`, `tree_first` and `tree_toggle_hidden`, and the window prefix —
+`window_split`, `window_vsplit`, `window_close`, `window_only`, `window_tree`,
+`window_cycle` and the four `window_focus_*`. Each is still a key sequence bi
+already has; none is a new command.
 
 Two rules that fell out of building it, both worth keeping:
 
@@ -283,12 +377,18 @@ user who creates one is told at load rather than discovering it as lag.
 ### Notation
 
 `<C-x>` ctrl · `<A-x>` alt · `<S-Up>` shift · `<Esc>` `<CR>` `<Tab>` `<BS>`
-`<Space>` `<Home>` `<End>` `<leader>`.
+`<Space>` `<Home>` `<End>` `<leader>` · `<lt>` for a literal `<`.
 
 Bare characters carry their own shift — `K`, not `<S-k>` — matching how
 terminals and `KeyCode::Char` already report them. `<S-…>` is for the named keys
 where shift is not folded into the character, which is what `<S-Up>` needs
 today.
+
+Anything not in a `<…>` group is one key, so a spelling is a sequence without
+needing a separator: `gg`, `<C-w>s`, `<leader>gd`. A `<` that nothing closes is
+the literal key — which is what `<C-w><` needs — and `<lt>` writes one where a
+`>` later in the spelling would otherwise close a group around it. A group that
+*does* close has to parse: `<Esk>` is a typo worth reporting, not five keys.
 
 This parses into `key.rs` unchanged: `Mods` already carries `alt` and `shift`
 unread, with a comment saying they are there for exactly this.

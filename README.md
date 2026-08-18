@@ -492,19 +492,27 @@ one outcome worth engineering against.
 #### Keys
 
 `[keys.normal]`, `[keys.visual]` and `[keys.tree]` rebind keys. A binding names
-a command; `false` unbinds:
+a command; `false` unbinds. Either side may be more than one key, and
+`<leader>` stands for whatever `[keys] leader` says — `<Space>` unless you
+change it:
 
 ```toml
+[keys]
+leader = " "
+
 [keys.normal]
-"h" = false          # unbound
-"j" = "left"         # hjkl shifted one key right
+"h" = false            # unbound
+"j" = "left"           # hjkl shifted one key right
 "k" = "down"
 "l" = "up"
 ";" = "right"
+"<leader>e" = "window_tree"
+"<leader>t" = "goto_first_line"
 
 [keys.tree]
 "k" = "tree_select_down"
 ";" = "tree_expand"
+"<leader>d" = "tree_delete"
 ```
 
 Rebinding a motion rebinds every use of it: with the above, `d2k` deletes two
@@ -519,11 +527,23 @@ An unknown command name is reported with a suggestion — `unknown command:
 tree_expnd — did you mean tree_expand?` — on the same status line as any other
 config problem.
 
-**What you cannot bind yet.** A name has to be something bi already has a key
-for, so `ge`, `g_` and `gg` are not bindable (vim spells them as two keys), and
-neither are key *sequences* like `"gd"`. Both are reported at load rather than
-ignored. The theme is specified but not built, and so is the full keymap
-design — a binding that resolves to a command rather than to another key. See
+**A prefix has no meaning of its own.** The moment a binding spells
+`<leader>e`, `<Space>` stops being "move right": there is no timeout to decide
+between the two, which is deliberate — it is the reason vim pauses before `j`
+moves. Type `<Space>` and something unbound and the `<Space>` is dropped, with
+the other key still doing its job. Half-typed sequences show in the footer
+beside the count. The same rule is why binding `"gd"` is reported: it takes `g`
+over, and `gg`, `ge`, `gE` and `g_` stop resolving until you bind them back by
+name.
+
+Keys a command is already waiting for are never remapped, so `r<Space>` still
+writes a space and `f<Space>` still finds one.
+
+**What you cannot bind yet.** A name has to be something bi already has keys
+for, so a command with no key at all — `git_blame` — is not bindable, and it is
+reported at load rather than ignored. The theme is specified but not built, and
+so is the last piece of the keymap design: a binding that resolves to a command
+rather than to bi's own keys. See
 [docs/specs/config.md](docs/specs/config.md).
 
 ## Layout
@@ -645,10 +665,12 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   Cargo feature per grammar fixes both: `Editor::syntax` is already
   `Option<Syntax>` and an unknown file name already renders as plain text, so
   the no-syntax path exists and works.
-- ~~**The config language is undecided**~~ Decided and half built: TOML, in
-  `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live.
-  The keymap in `input.rs` and the highlight table in `tui/render.rs` are still
-  hardcoded and are steps 3 and 2 of [docs/specs/config.md](docs/specs/config.md).
+- ~~**The config language is undecided**~~ Decided and mostly built: TOML, in
+  `~/.config/bi/config.toml`, parsed by `bi::config`. `[options]` is live, and
+  so are `[keys.*]`, sequences and `<leader>`. What is left is that a binding
+  resolves to bi's own keys rather than to a command, so the defaults still
+  live in `input.rs`; the highlight table in `tui/render.rs` is still hardcoded
+  and is step 2 of [docs/specs/config.md](docs/specs/config.md).
 - **The core/frontend boundary is enforced by a test, not the compiler.** Fixed
   as far as it goes: there is a `lib.rs`, `input.rs` speaks `bi::key::Key`
   rather than crossterm's types, and rendering and event translation live in
