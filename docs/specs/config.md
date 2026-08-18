@@ -18,7 +18,8 @@ The layer, `[options]`, `:reload` and both CLI subcommands ship. `[keys.*]`
 loads and applies, and so do `[keys] leader`, multi-key sequences on both sides
 of a binding, and the rules that make a prefix unambiguous without a timeout —
 see "What step 3 actually shipped" below, which is honest about what is left.
-The theme (step 2) is specified below and not built.
+The theme (step 2) has its own spec now — `docs/specs/theme.md` — and this
+file keeps only the decision that `theme` is an ordinary option.
 
 ## What this is not
 
@@ -603,75 +604,32 @@ keymap never learns what any of them are.
 
 ## Theme
 
-The `theme` option names a file in `~/.config/bi/themes/`, falling back to a
-built-in of the same name, falling back to `default` with a diagnostic.
+The `theme` option names a theme; **what a theme *is* moved to
+`docs/specs/theme.md`** — the colour type, the `[syntax]` and `[ui]` tables,
+resolution order, and the two built-ins.
 
-A theme file has its own two sections, and the `[ui]` inside one is unrelated to
-the `[ui]` this design dropped from `config.toml`: here it distinguishes the
-colours of bi's own furniture from the colours of parsed code.
+What stays here is the decision that put it in `[options]` at all. `theme` is
+an ordinary option, so `:set theme gruvbox-dark` and `theme = "gruvbox-dark"`
+are two ways to reach one setting, exactly as `:set number 5` and
+`number = 5` are. It also *removes* a feature rather than adding one: with
+`theme` an ordinary option there is no `:theme` command to design.
 
-```toml
-# themes/onedark.toml
-[syntax]
-keyword   = "#c678dd"
-function  = "#61afef"
-type      = "#e5c07b"
-string    = "#98c379"
-comment   = "#5c6370"
-constant  = "#d19a66"
-operator  = "#abb2bf"
+Two things the theme spec settled that contradict what this file used to say,
+recorded here so the difference is not a surprise:
 
-[ui]
-cursorline = { bg = "#2c323c" }
-selection  = { bg = "#3e4451" }
-search     = { bg = "#4a4520" }
-cursor_alt = { bg = "#c678dd" }
-tree_dir   = "#61afef"
-tree_link  = "#56b6c2"
-mark_copy  = "#e5c07b"
-mark_cut   = "#e06c75"
-```
+- **The default is `gruvbox-dark`, not `ansi`.** This file argued the shipped
+  default should reproduce today's colours exactly so that installing the
+  step changed nothing on screen. It does change what you see now. Today's
+  colours survive as the `ansi` built-in.
+- **`[ui]` has twenty-six keys, not eight.** The eight named here were the
+  constants at the top of `tui/render.rs`; the rest of the screen — the mode
+  badge, the status rows, the picker, the gutter — was hardcoded further
+  down, and a theme that recolours the text and leaves those behind looks
+  broken rather than themed.
 
-`[syntax]` keys are the capture names `syntax.rs` already emits — `keyword`,
-`function`, `type`, `string`, `comment`, `constant`, `attribute`, `operator` and
-the aliases beside them at `tui/render.rs:152`. `[ui]` keys are the constants
-above it: `CURSOR_LINE_BG`, `SELECTION_BG`, `EXTRA_CURSOR_BG`, `SEARCH_BG`,
-`TREE_DIR`, `TREE_LINK`, `MARK_COPY`, `MARK_CUT`.
-
-### Colours are bi's own type
-
-```rust
-pub enum Color { Ansi(Ansi), Indexed(u8), Rgb(u8, u8, u8) }
-
-pub struct Style {
-    pub fg: Option<Color>,
-    pub bg: Option<Color>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-}
-```
-
-The frontend converts to `ratatui::Style`; a GUI converts to whatever it draws
-with. This is decision #6 held to: the core says `keyword`, never
-`ratatui::Color::Magenta`. `key.rs` made the identical move for keys and gives
-the precedent.
-
-### Three spellings, on purpose
-
-- `"magenta"` — one of the sixteen ANSI names, which **respects the user's
-  terminal palette**.
-- `"color236"` — 256-colour index.
-- `"#c678dd"` — 24-bit.
-
-A bare string is shorthand for `{ fg = … }`; the table form adds `bg` and
-attributes.
-
-Hex-only was rejected: a user with a carefully-tuned solarized terminal would
-get bi's idea of green instead of theirs, and it needs truecolor to look right
-at all. The shipped `default` theme is ANSI, and reproduces today's colours
-exactly — installing this step changes nothing on screen until a theme is
-chosen. Shipped themes may be hex.
+`ConfigSource` grows a `theme(&self, name)` method for it, with a default
+returning `Ok(None)` so an embedder that has no themes directory keeps
+compiling and gets the built-ins. See `### ConfigSource` below.
 
 ## Options
 
