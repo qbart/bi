@@ -282,6 +282,10 @@ pub enum Action {
     Backspace,
 
     EnterCommandMode,
+    /// A `:` line run without being typed — what a `"<leader>d" = ":bd"`
+    /// binding resolves to. Through `run_ex`, the same entry point the command
+    /// line uses, which is the only way the two stay in agreement.
+    Ex(String),
     CommandChar(char),
     CommandBackspace,
     CommandExecute,
@@ -1993,6 +1997,10 @@ impl Editor {
                 };
                 self.run_ex(&line);
             }
+            Action::Ex(line) => {
+                let line = line.clone();
+                self.run_ex(&line);
+            }
 
             Action::PickChar(c) => {
                 if let Some(picker) = &mut self.session.picker {
@@ -3616,6 +3624,7 @@ impl View<'_> {
             // Handled by `Editor` before this view was built: the window
             // tree, the buffer list, the command line and the picker.
             Action::EnterCommandMode
+            | Action::Ex(_)
             | Action::CommandChar(_)
             | Action::CommandBackspace
             | Action::CommandCancel
@@ -4901,6 +4910,49 @@ mod tests {
         let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
         assert!(ed.window().tree().is_some(), "focus is in the tree");
         assert!(rect(&ed, ed.focus()).x < rect(&ed, before).x, "and the tree is on the left");
+    }
+
+    /// The whole point of an ex binding: `:bd` was not reachable by any name,
+    /// because a name has to be something bi already has keys for.
+    #[test]
+    fn a_leader_binding_runs_an_ex_line() {
+        let d = ScratchDir::new("ex-bind").file("a.rs").file("b.rs");
+        let (config, problems) = crate::config::parse(
+            "[keys.normal]\n\"<leader>d\" = \":bd\"\n\"<leader>n\" = \":set number 0\"\n",
+            crate::config::Config::default(),
+        )
+        .expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let mut input = crate::input::Input::default();
+        input.set_keys(config.keys);
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+        assert_eq!(ed.buffer_ids().len(), 2);
+
+        let press = |ed: &mut Editor, input: &mut crate::input::Input, c: char| {
+            let key = crate::key::Key::char(c);
+            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+                ed.apply(command);
+            }
+        };
+
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'd');
+        assert_eq!(ed.buffer_ids().len(), 1, "the buffer was deleted");
+        assert!(ed.session.status.contains("deleted"), "{}", ed.session.status);
+
+        // An ex line with an argument, and one that is not about buffers.
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'n');
+        assert_eq!(ed.session.options.number, LineNumbers::Off);
+
+        // The count does not repeat it: `3<leader>n` is one `:set`, not three.
+        press(&mut ed, &mut input, '3');
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'n');
+        assert_eq!(ed.session.options.number, LineNumbers::Off, "still just set once");
     }
 
     /// A leader binding for a window command has to work from inside the tree,

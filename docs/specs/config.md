@@ -155,6 +155,45 @@ there: the names table, the key notation parser, the sequence store and the
 data, held as a map beside a set of live prefixes exactly as
 [Structure](#structure) says it may be.
 
+### A binding can be an ex line
+
+```toml
+[keys.normal]
+"<leader>d" = ":bd"
+"<leader>w" = ":w"
+"<leader>e" = ":vnew"
+"<leader>n" = ":set number 0"
+```
+
+A value starting with `:` is a **command line to run**, not a name. Everything
+`:` can do is bindable the moment this exists — which is most of what a user
+actually wants a leader for, and none of it was reachable before, because a
+name had to be something bi already had keys for.
+
+This is `Binding::Ex(String)` from [What a name resolves to](#what-a-name-resolves-to),
+arriving before the rest of that enum. It fits the eventual design unchanged:
+the trie's value type was always going to be a `Binding`, and this is one of
+its variants rather than a special case bolted beside it.
+
+**No `<CR>`.** Vim needs one because vim maps *keystrokes*, so `:bd` there is
+four keys and the Enter is the fifth. Here the value is the command, not the
+typing of it. A trailing `<CR>` or `<Enter>` is stripped rather than reported —
+every vim user will write one for years, no ex line legitimately ends in one,
+and a diagnostic would be pedantry with a known cause.
+
+It cannot be a key sequence, and that is deliberate: `":bd"` runs `bd`, it does
+not "press `:`, then `b`, then `d`". A binding that replayed keystrokes would
+re-introduce the key-to-key mapping this design [rejected in favour of
+names](#what-this-is-not) — with the added problem that `Input::on_key` returns
+one command per key, so the mode would still be normal when `b` arrived.
+
+**The count does not repeat it.** `3<leader>d` runs `:bd` once. An ex line is
+not a motion or an operator, and vim does not repeat one either.
+
+Errors are the ordinary ones: a bad line reports on the status row exactly as
+typing it would, because it *is* typing it — `run_ex` is the same entry point
+the `:` line uses, which is the only way the two stay in agreement.
+
 ### Sequences, and the leader
 
 **`leader` is a key, and it lives on `[keys]`.**
@@ -309,6 +348,7 @@ pub enum Binding {
     Object(TextObject),    // "word"  — only reachable from [keys.object]
     Action(Action),        // "undo", "paste_after", … stored with count = 1
     Pending(Pending),      // needs a further keystroke before it means anything
+    Ex(String),            // ":bd" — built, ahead of the rest of this enum
 }
 
 pub enum Pending {

@@ -9,7 +9,7 @@
 //! waiting for its motion, a second count belonging to that motion, and whether
 //! `g` is holding out for its second key.
 
-use crate::config::{KeyMode, Keymap, Lookup};
+use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{Action, BufferCmd, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -111,6 +111,8 @@ enum Remapped {
     Same(Key),
     /// A binding fired: feed these keys through the grammar instead.
     Keys(Vec<Key>),
+    /// A `:` line to run, from a binding like `"<leader>d" = ":bd"`.
+    Ex(String),
     /// Swallowed — either unbound, or the start of a binding that is still
     /// waiting for its next key.
     Nothing,
@@ -223,9 +225,15 @@ impl Input {
                 found = self.borrowed_from_normal(mode);
             }
             match found {
-                Lookup::Keys(to) => {
+                Lookup::Bound(Bind::Keys(to)) => {
                     self.remap_pending.clear();
                     return Remapped::Keys(to);
+                }
+                // An ex line is not keys and never goes through the grammar:
+                // it is the command, not the typing of it.
+                Lookup::Bound(Bind::Ex(line)) => {
+                    self.remap_pending.clear();
+                    return Remapped::Ex(line);
                 }
                 // Unbound. Swallowed rather than passed on, or `"h" = false`
                 // would still move left.
@@ -264,6 +272,9 @@ impl Input {
                 }
                 resolved
             }
+            // Straight to a command: an ex line has no keys to dispatch, and
+            // the count does not repeat it — `3<leader>d` deletes one buffer.
+            Remapped::Ex(line) => Some(Command { count: 1, action: Action::Ex(line) }),
             Remapped::Nothing => None,
         }
     }

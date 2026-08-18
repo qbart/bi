@@ -2,7 +2,7 @@
 
 use toml_edit::{Document, Item, Table, Value};
 
-use super::keys::{self, KeyMode, Lookup};
+use super::keys::{self, Bind, KeyMode, Lookup};
 use super::{Config, Diagnostic, OptionValue, line_of};
 use crate::key::Key;
 
@@ -131,11 +131,23 @@ fn read_bindings(
                                                false to unbind"
                     .into(),
             ),
+            // A value starting with `:` is a command line to run, not a name.
+            // Everything `:` can do is bindable, which is most of what a leader
+            // is for and none of which a name could reach.
+            Some(Value::String(value)) if value.value().starts_with(':') => {
+                let ex = ex_line(value.value());
+                if ex.is_empty() {
+                    report("bind a command after the `:`".into());
+                } else {
+                    config.keys.insert(mode, from.clone(), Some(Bind::Ex(ex)));
+                    added.push((from, line));
+                }
+            }
             Some(Value::String(name)) => {
                 let name = name.value();
                 match keys::key_for_name(mode, name) {
                     Some(to) => {
-                        config.keys.insert(mode, from.clone(), Some(to));
+                        config.keys.insert(mode, from.clone(), Some(Bind::Keys(to)));
                         added.push((from, line));
                     }
                     None => report(match keys::nearest_name(mode, name) {
@@ -150,6 +162,18 @@ fn read_bindings(
 
     report_shadowed(&added, mode, config, problems);
     report_unreachable(&added, mode, config, problems);
+}
+
+/// The ex line a `":bd"` binding runs.
+///
+/// The leading `:` is the marker that says "this is a command line", not part
+/// of the line. A trailing `<CR>` is stripped rather than reported: vim needs
+/// one because vim maps keystrokes, every vim user will write one here for
+/// years, and no ex line legitimately ends in it.
+fn ex_line(value: &str) -> String {
+    let line = value.trim_start_matches(':').trim();
+    let line = line.strip_suffix("<CR>").or_else(|| line.strip_suffix("<Enter>")).unwrap_or(line);
+    line.trim().to_string()
 }
 
 /// Says so when a binding takes over a key bi uses to *start* a command.
@@ -183,7 +207,7 @@ fn report_shadowed(
                 // Bound by this file to something is not lost, whatever it was
                 // bound to: the user has said what those keys mean now.
                 let keys = keys::key_for_name(mode, name).unwrap_or_default();
-                !matches!(config.keys.lookup(mode, &keys), Lookup::Keys(_) | Lookup::Unbound)
+                !matches!(config.keys.lookup(mode, &keys), Lookup::Bound(_) | Lookup::Unbound)
             })
             .collect();
         if lost.is_empty() {
@@ -221,7 +245,7 @@ fn report_unreachable(
     for (seq, line) in added {
         for len in 1..seq.len() {
             let shorter = &seq[..len];
-            if matches!(config.keys.lookup(mode, shorter), Lookup::Keys(_) | Lookup::Unbound) {
+            if matches!(config.keys.lookup(mode, shorter), Lookup::Bound(_) | Lookup::Unbound) {
                 let (long, short) = (keys::spell(seq), keys::spell(shorter));
                 let at = added
                     .iter()
@@ -261,7 +285,7 @@ fn option_value(item: &Item) -> OptionValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyMode, Lookup};
+    use super::{Bind, KeyMode, Lookup};
     use crate::config::{Config, OptionValue, parse};
     use crate::editor::LineNumbers;
 
@@ -337,7 +361,7 @@ mod tests {
         let seq = [space, crate::key::Key::char('t')];
         assert_eq!(
             config.keys.lookup(KeyMode::Normal, &seq),
-            Lookup::Keys(vec![crate::key::Key::char('g'), crate::key::Key::char('g')])
+            Lookup::Bound(Bind::Keys(vec![crate::key::Key::char('g'), crate::key::Key::char('g')]))
         );
         assert_eq!(config.keys.lookup(KeyMode::Normal, &[space]), Lookup::Prefix);
     }
@@ -345,6 +369,35 @@ mod tests {
     /// `leader` is read in a pass of its own, so a binding that spells it does
     /// not depend on sitting after it in the file. TOML allows a super-table
     /// to be defined after its children, and a user will do exactly that.
+    /// The feature this exists for: everything `:` can do becomes bindable,
+    /// none of which a name could reach.
+    #[test]
+    fn a_binding_can_be_an_ex_line() {
+        let (config, problems) = ok("[keys.normal]\n\"<leader>d\" = \":bd\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let seq = [crate::key::Key::char(' '), crate::key::Key::char('d')];
+        assert_eq!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Bound(Bind::Ex("bd".into())));
+    }
+
+    /// Vim needs a `<CR>` because vim maps keystrokes; here the value is the
+    /// command rather than the typing of it. Every vim user will write one
+    /// anyway, so it is stripped rather than reported.
+    #[test]
+    fn a_trailing_cr_is_stripped_from_an_ex_binding() {
+        let (config, problems) = ok("[keys.normal]\n\"<leader>w\" = \":w<CR>\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let seq = [crate::key::Key::char(' '), crate::key::Key::char('w')];
+        assert_eq!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Bound(Bind::Ex("w".into())));
+
+        // A bare `:` has nothing to run and says so.
+        assert_eq!(
+            ok("[keys.normal]\n\"<leader>x\" = \":\"\n").1,
+            ["2: bind a command after the `:`"]
+        );
+    }
+
     #[test]
     fn leader_is_read_before_the_bindings_that_spell_it() {
         let (config, problems) =
@@ -352,7 +405,7 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
 
         let seq = [crate::key::Key::char('\\'), crate::key::Key::char('t')];
-        assert!(matches!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Keys(_)));
+        assert!(matches!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Bound(_)));
     }
 
     #[test]

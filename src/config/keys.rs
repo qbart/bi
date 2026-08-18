@@ -45,11 +45,25 @@ impl KeyMode {
     }
 }
 
+/// What a binding does.
+///
+/// The `Binding` enum of `docs/specs/config.md`, as far as it is built: keys
+/// to feed through the grammar, or an ex line to run. The rest of that enum —
+/// `Motion`, `Operator`, `Pending` — arrives when the defaults move out of
+/// `input.rs`, and joins this one rather than replacing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bind {
+    /// Bi's own keys, fed through the grammar as if typed.
+    Keys(Vec<Key>),
+    /// A `:` line, run through the same entry point the command line uses.
+    Ex(String),
+}
+
 /// What a sequence of typed keys means in one mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lookup {
-    /// A complete binding: feed these keys through the grammar instead.
-    Keys(Vec<Key>),
+    /// A complete binding.
+    Bound(Bind),
     /// A complete binding to nothing — `"h" = false`. Swallowed, or `h` would
     /// still move left.
     Unbound,
@@ -81,7 +95,7 @@ pub struct Keymap {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Bindings {
-    bound: HashMap<Vec<Key>, Option<Vec<Key>>>,
+    bound: HashMap<Vec<Key>, Option<Bind>>,
     prefixes: HashSet<Vec<Key>>,
 }
 
@@ -109,7 +123,7 @@ impl Keymap {
         self.leader = Some(key);
     }
 
-    pub fn insert(&mut self, mode: KeyMode, from: Vec<Key>, to: Option<Vec<Key>>) {
+    pub fn insert(&mut self, mode: KeyMode, from: Vec<Key>, to: Option<Bind>) {
         let map = self.maps.entry(mode).or_default();
         for len in 1..from.len() {
             map.prefixes.insert(from[..len].to_vec());
@@ -125,7 +139,7 @@ impl Keymap {
     pub fn lookup(&self, mode: KeyMode, keys: &[Key]) -> Lookup {
         let Some(map) = self.maps.get(&mode) else { return Lookup::Miss };
         match map.bound.get(keys) {
-            Some(Some(to)) => Lookup::Keys(to.clone()),
+            Some(Some(bind)) => Lookup::Bound(bind.clone()),
             Some(None) => Lookup::Unbound,
             None if map.prefixes.contains(keys) => Lookup::Prefix,
             None => Lookup::Miss,
@@ -603,12 +617,12 @@ mod tests {
     fn an_unbinding_is_not_the_same_as_an_absent_key() {
         let mut map = Keymap::default();
         map.insert(KeyMode::Normal, vec![Key::char('h')], None);
-        map.insert(KeyMode::Normal, vec![Key::char('j')], Some(vec![Key::char('h')]));
+        map.insert(KeyMode::Normal, vec![Key::char('j')], Some(Bind::Keys(vec![Key::char('h')])));
 
         assert_eq!(map.lookup(KeyMode::Normal, &[Key::char('h')]), Lookup::Unbound);
         assert_eq!(
             map.lookup(KeyMode::Normal, &[Key::char('j')]),
-            Lookup::Keys(vec![Key::char('h')])
+            Lookup::Bound(Bind::Keys(vec![Key::char('h')]))
         );
         assert_eq!(map.lookup(KeyMode::Normal, &[Key::char('k')]), Lookup::Miss, "never mentioned");
         assert_eq!(map.lookup(KeyMode::Tree, &[Key::char('j')]), Lookup::Miss, "a different mode");
@@ -618,12 +632,16 @@ mod tests {
     fn a_sequence_is_a_prefix_until_it_is_complete() {
         let space = Key::char(' ');
         let mut map = Keymap::default();
-        map.insert(KeyMode::Normal, vec![space, Key::char('e')], Some(vec![Key::ctrl('w')]));
+        map.insert(
+            KeyMode::Normal,
+            vec![space, Key::char('e')],
+            Some(Bind::Keys(vec![Key::ctrl('w')])),
+        );
 
         assert_eq!(map.lookup(KeyMode::Normal, &[space]), Lookup::Prefix);
         assert_eq!(
             map.lookup(KeyMode::Normal, &[space, Key::char('e')]),
-            Lookup::Keys(vec![Key::ctrl('w')])
+            Lookup::Bound(Bind::Keys(vec![Key::ctrl('w')]))
         );
         assert_eq!(map.lookup(KeyMode::Normal, &[space, Key::char('j')]), Lookup::Miss);
         // A prefix in one mode is not one in another.
@@ -637,10 +655,17 @@ mod tests {
     fn a_complete_binding_wins_over_being_a_prefix() {
         let g = Key::char('g');
         let mut map = Keymap::default();
-        map.insert(KeyMode::Normal, vec![g], Some(vec![Key::char('h')]));
-        map.insert(KeyMode::Normal, vec![g, Key::char('d')], Some(vec![Key::char('j')]));
+        map.insert(KeyMode::Normal, vec![g], Some(Bind::Keys(vec![Key::char('h')])));
+        map.insert(
+            KeyMode::Normal,
+            vec![g, Key::char('d')],
+            Some(Bind::Keys(vec![Key::char('j')])),
+        );
 
-        assert_eq!(map.lookup(KeyMode::Normal, &[g]), Lookup::Keys(vec![Key::char('h')]));
+        assert_eq!(
+            map.lookup(KeyMode::Normal, &[g]),
+            Lookup::Bound(Bind::Keys(vec![Key::char('h')]))
+        );
     }
 
     /// A round trip, because both users of `spell` — a diagnostic and the
