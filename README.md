@@ -540,21 +540,22 @@ already falls through to normal for anything it does not claim. Nothing is
 remapped while you are typing text: insert, replace, the command line, the
 search line and the picker all take keys literally.
 
-**A binding can be a `:` line.** A value starting with `:` is a command to run
-rather than a name, which makes everything `:` can do bindable — and none of it
-was reachable before, because a name has to be something bi already has keys
-for:
+**A binding can be a `:` line.** A value starting with `:` is a command rather
+than a name, which makes everything `:` can do bindable — and none of it was
+reachable before, because a name has to be something bi already has keys for:
 
 ```toml
 [keys.normal]
-"<leader>d" = ":bd"
-"<leader>w" = ":w"
-"<leader>n" = ":set number 0"
+"<leader>d" = ":bd<CR>"          # runs it
+"<leader>n" = ":set number 0<CR>"
+"<leader>e" = ":e "              # prefills it, and waits for the path
 ```
 
-No `<CR>`: vim needs one because vim maps keystrokes, but here the value *is*
-the command. One written out of habit is stripped rather than reported. The
-count does not repeat it either — `3<leader>d` deletes one buffer.
+The `<CR>` is what runs the line. Leave it off and the line is **prefilled** on
+the command line for you to finish — which is how you bind a command that takes
+an argument, and is the same trick the tree's `a` and `r` keys use. A bare `":"`
+just opens the command line. The count never repeats either form: `3<leader>d`
+deletes one buffer.
 
 An unknown command name is reported with a suggestion — `unknown command:
 tree_expnd — did you mean tree_expand?` — on the same status line as any other

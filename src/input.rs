@@ -111,8 +111,9 @@ enum Remapped {
     Same(Key),
     /// A binding fired: feed these keys through the grammar instead.
     Keys(Vec<Key>),
-    /// A `:` line to run, from a binding like `"<leader>d" = ":bd"`.
-    Ex(String),
+    /// A `:` line, from a binding like `"<leader>d" = ":bd<CR>"`. Without the
+    /// `<CR>` it is prefilled rather than run.
+    Ex { line: String, run: bool },
     /// Swallowed — either unbound, or the start of a binding that is still
     /// waiting for its next key.
     Nothing,
@@ -231,9 +232,9 @@ impl Input {
                 }
                 // An ex line is not keys and never goes through the grammar:
                 // it is the command, not the typing of it.
-                Lookup::Bound(Bind::Ex(line)) => {
+                Lookup::Bound(Bind::Ex { line, run }) => {
                     self.remap_pending.clear();
-                    return Remapped::Ex(line);
+                    return Remapped::Ex { line, run };
                 }
                 // Unbound. Swallowed rather than passed on, or `"h" = false`
                 // would still move left.
@@ -274,7 +275,9 @@ impl Input {
             }
             // Straight to a command: an ex line has no keys to dispatch, and
             // the count does not repeat it — `3<leader>d` deletes one buffer.
-            Remapped::Ex(line) => Some(Command { count: 1, action: Action::Ex(line) }),
+            Remapped::Ex { line, run } => {
+                Some(Command { count: 1, action: Action::Ex { line, run } })
+            }
             Remapped::Nothing => None,
         }
     }

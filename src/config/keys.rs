@@ -55,8 +55,10 @@ impl KeyMode {
 pub enum Bind {
     /// Bi's own keys, fed through the grammar as if typed.
     Keys(Vec<Key>),
-    /// A `:` line, run through the same entry point the command line uses.
-    Ex(String),
+    /// A `:` line. `run` is what the trailing `<CR>` says: with it the line is
+    /// executed, without it the line is *prefilled* on the command line and
+    /// left for you to finish — which is how a binding asks for an argument.
+    Ex { line: String, run: bool },
 }
 
 /// What a sequence of typed keys means in one mode.

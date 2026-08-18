@@ -159,33 +159,46 @@ data, held as a map beside a set of live prefixes exactly as
 
 ```toml
 [keys.normal]
-"<leader>d" = ":bd"
-"<leader>w" = ":w"
-"<leader>e" = ":vnew"
-"<leader>n" = ":set number 0"
+"<leader>d" = ":bd<CR>"          # runs it
+"<leader>w" = ":w<CR>"
+"<leader>n" = ":set number 0<CR>"
+"<leader>e" = ":e "              # prefills it, and waits
+"<leader>m" = ":m "
 ```
 
-A value starting with `:` is a **command line to run**, not a name. Everything
-`:` can do is bindable the moment this exists — which is most of what a user
-actually wants a leader for, and none of it was reachable before, because a
-name had to be something bi already had keys for.
+A value starting with `:` is a **command line**, not a name. Everything `:` can
+do is bindable the moment this exists — which is most of what a user actually
+wants a leader for, and none of it was reachable before, because a name had to
+be something bi already had keys for.
 
-This is `Binding::Ex(String)` from [What a name resolves to](#what-a-name-resolves-to),
+This is `Binding::Ex` from [What a name resolves to](#what-a-name-resolves-to),
 arriving before the rest of that enum. It fits the eventual design unchanged:
 the trie's value type was always going to be a `Binding`, and this is one of
 its variants rather than a special case bolted beside it.
 
-**No `<CR>`.** Vim needs one because vim maps *keystrokes*, so `:bd` there is
-four keys and the Enter is the fifth. Here the value is the command, not the
-typing of it. A trailing `<CR>` or `<Enter>` is stripped rather than reported —
-every vim user will write one for years, no ex line legitimately ends in one,
-and a diagnostic would be pedantry with a known cause.
+**The `<CR>` is mandatory, and it is what makes the line run.** Without one the
+line is *prefilled* on the command line and left for you to finish, which is
+the other half of what a binding is for: `":e "` puts you on an `:e ` line with
+the path still to type. That is not a new mechanism — it is exactly how the
+tree's `a` and `r` keys already work, filling in a `:create` or `:rename` line
+for you to agree to.
 
-It cannot be a key sequence, and that is deliberate: `":bd"` runs `bd`, it does
-not "press `:`, then `b`, then `d`". A binding that replayed keystrokes would
-re-introduce the key-to-key mapping this design [rejected in favour of
-names](#what-this-is-not) — with the added problem that `Input::on_key` returns
-one command per key, so the mode would still be normal when `b` arrived.
+An earlier draft stripped the `<CR>` as vim-habit noise, on the grounds that
+the value is the command rather than the typing of it. That was wrong: it threw
+away the one bit of information that distinguishes "do this" from "help me
+write this", and the second is worth more for exactly the commands that take an
+argument. Only the executed form is trimmed — a prefill's trailing space is the
+whole point of writing one.
+
+`":"` on its own is a legal prefill: it opens the command line, which is a
+thing to want. `":<CR>"` runs nothing and says so.
+
+It cannot be a key sequence, and that is deliberate: `":bd<CR>"` runs `bd`, it
+does not "press `:`, then `b`, then `d`, then Enter". A binding that replayed
+keystrokes would re-introduce the key-to-key mapping this design [rejected in
+favour of names](#what-this-is-not) — with the added problem that
+`Input::on_key` returns one command per key, so the mode would still be normal
+when `b` arrived.
 
 **The count does not repeat it.** `3<leader>d` runs `:bd` once. An ex line is
 not a motion or an operator, and vim does not repeat one either.
@@ -348,7 +361,7 @@ pub enum Binding {
     Object(TextObject),    // "word"  — only reachable from [keys.object]
     Action(Action),        // "undo", "paste_after", … stored with count = 1
     Pending(Pending),      // needs a further keystroke before it means anything
-    Ex(String),            // ":bd" — built, ahead of the rest of this enum
+    Ex { line: String, run: bool },   // ":bd<CR>" — built, ahead of the rest
 }
 
 pub enum Pending {

@@ -135,11 +135,11 @@ fn read_bindings(
             // Everything `:` can do is bindable, which is most of what a leader
             // is for and none of which a name could reach.
             Some(Value::String(value)) if value.value().starts_with(':') => {
-                let ex = ex_line(value.value());
-                if ex.is_empty() {
+                let bind = ex_line(value.value());
+                if matches!(&bind, Bind::Ex { line, run: true } if line.is_empty()) {
                     report("bind a command after the `:`".into());
                 } else {
-                    config.keys.insert(mode, from.clone(), Some(Bind::Ex(ex)));
+                    config.keys.insert(mode, from.clone(), Some(bind));
                     added.push((from, line));
                 }
             }
@@ -164,16 +164,22 @@ fn read_bindings(
     report_unreachable(&added, mode, config, problems);
 }
 
-/// The ex line a `":bd"` binding runs.
+/// The `:` line a binding carries, and whether it runs.
 ///
-/// The leading `:` is the marker that says "this is a command line", not part
-/// of the line. A trailing `<CR>` is stripped rather than reported: vim needs
-/// one because vim maps keystrokes, every vim user will write one here for
-/// years, and no ex line legitimately ends in it.
-fn ex_line(value: &str) -> String {
-    let line = value.trim_start_matches(':').trim();
-    let line = line.strip_suffix("<CR>").or_else(|| line.strip_suffix("<Enter>")).unwrap_or(line);
-    line.trim().to_string()
+/// The leading `:` marks the value as a command line rather than a name, and
+/// is not part of it. The trailing `<CR>` is what says *run it*: without one
+/// the line is prefilled and left on the command line, which is how a binding
+/// asks for an argument — `":e "` puts you on a `:e ` line with the path still
+/// to type, exactly as the tree's `a` and `r` keys already work.
+///
+/// Only the executed form is trimmed. A prefill's trailing space is the whole
+/// point of writing one.
+fn ex_line(value: &str) -> Bind {
+    let line = value.strip_prefix(':').unwrap_or(value);
+    match line.trim_end().strip_suffix("<CR>").or_else(|| line.trim_end().strip_suffix("<Enter>")) {
+        Some(line) => Bind::Ex { line: line.trim().to_string(), run: true },
+        None => Bind::Ex { line: line.to_string(), run: false },
+    }
 }
 
 /// Says so when a binding takes over a key bi uses to *start* a command.
@@ -373,27 +379,41 @@ mod tests {
     /// none of which a name could reach.
     #[test]
     fn a_binding_can_be_an_ex_line() {
-        let (config, problems) = ok("[keys.normal]\n\"<leader>d\" = \":bd\"\n");
+        let (config, problems) = ok("[keys.normal]\n\"<leader>d\" = \":bd<CR>\"\n");
         assert!(problems.is_empty(), "{problems:?}");
 
         let seq = [crate::key::Key::char(' '), crate::key::Key::char('d')];
-        assert_eq!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Bound(Bind::Ex("bd".into())));
+        assert_eq!(
+            config.keys.lookup(KeyMode::Normal, &seq),
+            Lookup::Bound(Bind::Ex { line: "bd".into(), run: true })
+        );
     }
 
-    /// Vim needs a `<CR>` because vim maps keystrokes; here the value is the
-    /// command rather than the typing of it. Every vim user will write one
-    /// anyway, so it is stripped rather than reported.
+    /// The `<CR>` is what says *run it*. Without one the line is prefilled and
+    /// left for you to finish, which is how a binding asks for an argument —
+    /// and why the trailing space of `":e "` survives when a run's does not.
     #[test]
-    fn a_trailing_cr_is_stripped_from_an_ex_binding() {
-        let (config, problems) = ok("[keys.normal]\n\"<leader>w\" = \":w<CR>\"\n");
+    fn no_cr_prefills_the_line_instead_of_running_it() {
+        let (config, problems) =
+            ok("[keys.normal]\n\"<leader>e\" = \":e \"\n\"<leader>w\" = \":w <CR>\"\n");
         assert!(problems.is_empty(), "{problems:?}");
 
-        let seq = [crate::key::Key::char(' '), crate::key::Key::char('w')];
-        assert_eq!(config.keys.lookup(KeyMode::Normal, &seq), Lookup::Bound(Bind::Ex("w".into())));
-
-        // A bare `:` has nothing to run and says so.
+        let seq = |c| [crate::key::Key::char(' '), crate::key::Key::char(c)];
         assert_eq!(
-            ok("[keys.normal]\n\"<leader>x\" = \":\"\n").1,
+            config.keys.lookup(KeyMode::Normal, &seq('e')),
+            Lookup::Bound(Bind::Ex { line: "e ".into(), run: false }),
+            "the space is the point of writing one"
+        );
+        assert_eq!(
+            config.keys.lookup(KeyMode::Normal, &seq('w')),
+            Lookup::Bound(Bind::Ex { line: "w".into(), run: true })
+        );
+
+        // A bare `:` opens the command line, which is a thing to want. A bare
+        // `:<CR>` runs nothing and says so.
+        assert!(ok("[keys.normal]\n\"<leader>;\" = \":\"\n").1.is_empty());
+        assert_eq!(
+            ok("[keys.normal]\n\"<leader>x\" = \":<CR>\"\n").1,
             ["2: bind a command after the `:`"]
         );
     }

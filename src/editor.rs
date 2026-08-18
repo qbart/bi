@@ -282,10 +282,17 @@ pub enum Action {
     Backspace,
 
     EnterCommandMode,
-    /// A `:` line run without being typed — what a `"<leader>d" = ":bd"`
-    /// binding resolves to. Through `run_ex`, the same entry point the command
-    /// line uses, which is the only way the two stay in agreement.
-    Ex(String),
+    /// A `:` line from a binding, rather than one that was typed.
+    ///
+    /// `run` is what the binding's trailing `<CR>` said. With it, straight
+    /// through `run_ex` — the same entry point the command line uses, which is
+    /// the only way the two stay in agreement. Without it, the line is
+    /// prefilled and left for you to finish, which is how `":e "` asks for a
+    /// path and how the tree's `a` and `r` keys have always worked.
+    Ex {
+        line: String,
+        run: bool,
+    },
     CommandChar(char),
     CommandBackspace,
     CommandExecute,
@@ -1997,9 +2004,12 @@ impl Editor {
                 };
                 self.run_ex(&line);
             }
-            Action::Ex(line) => {
+            Action::Ex { line, run } => {
                 let line = line.clone();
-                self.run_ex(&line);
+                match run {
+                    true => self.run_ex(&line),
+                    false => self.session.mode = Mode::Command(line),
+                }
             }
 
             Action::PickChar(c) => {
@@ -3624,7 +3634,7 @@ impl View<'_> {
             // Handled by `Editor` before this view was built: the window
             // tree, the buffer list, the command line and the picker.
             Action::EnterCommandMode
-            | Action::Ex(_)
+            | Action::Ex { .. }
             | Action::CommandChar(_)
             | Action::CommandBackspace
             | Action::CommandCancel
@@ -4918,7 +4928,7 @@ mod tests {
     fn a_leader_binding_runs_an_ex_line() {
         let d = ScratchDir::new("ex-bind").file("a.rs").file("b.rs");
         let (config, problems) = crate::config::parse(
-            "[keys.normal]\n\"<leader>d\" = \":bd\"\n\"<leader>n\" = \":set number 0\"\n",
+            "[keys.normal]\n\"<leader>d\" = \":bd<CR>\"\n\"<leader>n\" = \":set number 0<CR>\"\n\"<leader>e\" = \":e \"\n",
             crate::config::Config::default(),
         )
         .expect("parses");
@@ -4953,6 +4963,12 @@ mod tests {
         press(&mut ed, &mut input, ' ');
         press(&mut ed, &mut input, 'n');
         assert_eq!(ed.session.options.number, LineNumbers::Off, "still just set once");
+
+        // Without a `<CR>` the line is prefilled and waits, which is how a
+        // binding asks for an argument.
+        press(&mut ed, &mut input, ' ');
+        press(&mut ed, &mut input, 'e');
+        assert_eq!(ed.session.mode, Mode::Command("e ".into()), "left for you to finish");
     }
 
     /// A leader binding for a window command has to work from inside the tree,
