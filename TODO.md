@@ -139,18 +139,6 @@ the one i mentioned above should be built-in but i clearly need configurability
 i should be able to invoke buffer switcher basd on names with fuzzy autocomplete
 prefer C-Tab
 
-### Trim
-
-extra options to set with defaults (bool):
-
-trim.on_wite = true
-trim.trailing = true
-trim.last_line = false
-trim.first_line = true
-trim.ft_blocklist = ["markdown"]
-
-if you feel lkie we need new concept
-
 ### highlit on action
 
 when yanking would be nice to see some visual feedback that what was copied, so maybe quick selection coloration before it disappears

@@ -18,6 +18,7 @@ use crate::history::{Change, Cursors, History};
 use crate::indent::{self, Indent};
 use crate::motion::{Kind, Motion, Operator, Target, TextObject};
 use crate::registers::{Entry, EntryKind};
+use crate::trim::Trim;
 
 /// A position as (row, byte-column-within-row).
 ///
@@ -609,6 +610,65 @@ impl Buffer {
             }
         }
         self.backspace(at)
+    }
+
+    // ---- trimming ----------------------------------------------------------
+
+    /// Tidies the text on its way to disk, and hands back the edits it made so
+    /// the caller can carry its cursors across them.
+    ///
+    /// Edits rather than a rewritten rope: a cursor on line 400 must not move
+    /// because three blank lines went from the top of the file, and only a
+    /// mapping can promise that. It is also what keeps the reparse
+    /// proportional to what changed. See `docs/specs/trim.md`.
+    pub fn trim(&mut self, trim: &Trim) -> Vec<Edit> {
+        let base = self.pending_edits.len();
+
+        // Trailing first, so a line of nothing but spaces has become empty by
+        // the time the two below ask whether it is blank.
+        if trim.trailing {
+            // Bottom-up: an edit on one row must not move the rows still to
+            // come.
+            for row in (0..self.line_count()).rev() {
+                let text = self.line_text(row);
+                let spare = crate::trim::trailing(&text);
+                if spare == 0 {
+                    continue;
+                }
+                let end = self.rope.line_to_char(row) + text.chars().count();
+                self.apply_edit(end - spare, end, "");
+            }
+        }
+
+        if trim.last_line {
+            let rows = self.line_count();
+            let keep = (0..rows).rev().find(|&row| !indent::is_blank(&self.line_text(row)));
+            if let Some(keep) = keep
+                && keep + 1 < rows
+            {
+                self.apply_edit(self.rope.line_to_char(keep + 1), self.rope.len_chars(), "");
+            }
+        }
+
+        if trim.first_line {
+            let rows = self.line_count();
+            let blank = (0..rows).take_while(|&row| indent::is_blank(&self.line_text(row))).count();
+            // A file of nothing but blank lines is left alone: there would be
+            // nothing left of it, and "your file is now empty" is a bad thing
+            // to learn from a write.
+            if blank > 0 && blank < rows {
+                self.apply_edit(0, self.rope.line_to_char(blank), "");
+            }
+        }
+
+        // An empty file stays empty: a newline is a line terminator, and there
+        // is no line here to terminate.
+        if trim.final_newline && self.rope.len_chars() > 0 && !self.ends_with_newline() {
+            let end = self.rope.len_chars();
+            self.apply_edit(end, end, "\n");
+        }
+
+        self.pending_edits[base..].to_vec()
     }
 
     /// Clears a line that is nothing but whitespace, on the way out of insert
@@ -2156,6 +2216,73 @@ mod tests {
         let mut buffer = rows("alpha   \n");
         assert_eq!(buffer.clear_blank_line(Cursor::at(8)).at, 8);
         assert_eq!(shown(&buffer), "alpha   \n");
+    }
+
+    // ---- trimming -----------------------------------------------------------
+
+    fn trimmed(text: &str, trim: Trim) -> String {
+        let mut buffer = rows(text);
+        buffer.trim(&trim);
+        shown(&buffer)
+    }
+
+    #[test]
+    fn trailing_whitespace_goes_from_every_line() {
+        assert_eq!(
+            trimmed("a  \nb\t\n   \nc\n", Trim::default()),
+            "a\nb\n\nc\n",
+            "and a line of nothing but whitespace becomes empty"
+        );
+    }
+
+    #[test]
+    fn blank_lines_go_from_the_top_and_stay_at_the_bottom() {
+        let default = Trim::default();
+        assert_eq!(trimmed("\n\na\n\n\n", default), "a\n\n\n");
+        assert_eq!(trimmed("\n\na\n\n\n", Trim { last_line: true, ..default }), "a\n");
+    }
+
+    #[test]
+    fn a_file_of_nothing_but_blank_lines_is_left_alone() {
+        // There would be nothing left of it, and "your file is now empty" is a
+        // bad thing to learn from a write.
+        assert_eq!(trimmed("\n\n\n", Trim { last_line: true, ..Trim::default() }), "\n\n\n");
+    }
+
+    #[test]
+    fn a_final_newline_is_added_and_never_doubled() {
+        let trim = Trim { final_newline: true, ..Trim::default() };
+        assert_eq!(trimmed("a", trim), "a\n");
+        assert_eq!(trimmed("a\n", trim), "a\n");
+        assert_eq!(trimmed("", trim), "", "an empty file has no line to terminate");
+    }
+
+    #[test]
+    fn each_switch_is_read_on_its_own() {
+        let nothing =
+            Trim { trailing: false, first_line: false, last_line: false, ..Trim::default() };
+        assert_eq!(trimmed("\n a  \n\n", nothing), "\n a  \n\n");
+        assert_eq!(trimmed("\n a  \n\n", Trim { trailing: true, ..nothing }), "\n a\n\n");
+        assert_eq!(trimmed("\n a  \n\n", Trim { first_line: true, ..nothing }), " a  \n\n");
+    }
+
+    #[test]
+    fn trimming_hands_back_the_edits_so_a_cursor_can_follow() {
+        let mut buffer = rows("\n\nalpha  \nbeta\n");
+
+        let edits = buffer.trim(&Trim::default());
+
+        // `beta` started at 10, and the two blank lines and two spaces before
+        // it are gone.
+        let at = edits.iter().fold(10, |at, edit| edit.map(at));
+        assert_eq!(shown(&buffer), "alpha\nbeta\n");
+        assert_eq!(buffer.rope().slice(at..at + 4).to_string(), "beta");
+    }
+
+    #[test]
+    fn nothing_to_trim_is_no_edit_at_all() {
+        let mut buffer = rows("alpha\nbeta\n");
+        assert!(buffer.trim(&Trim::default()).is_empty(), "and so no undo entry either");
     }
 
     /// A buffer with a cursor attached.

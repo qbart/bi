@@ -563,11 +563,34 @@ then the project's `.editorconfig`, then anything you `:set` this session — so
 a Makefile keeps its tabs however you like your spaces, and `:set` still wins
 when you mean it. See [docs/specs/options.md](docs/specs/options.md).
 
+#### Trimming
+
+`:w` tidies the file on its way out: trailing whitespace goes, blank lines at
+the top go, and `trim.last_line` / `trim.final_newline` are off until you or
+the project asks for them — bi's job out of the box is to write the file you
+have, not the one it would have written.
+
+```toml
+[options]
+trim.on_write      = true    # the master switch
+trim.trailing      = true
+trim.first_line    = true
+trim.last_line     = false
+trim.final_newline = false
+```
+
+Markdown keeps its trailing spaces, because two of them are a hard line break
+there — a built-in `[filetype.markdown]` default rather than a blocklist, so
+markdown still gets everything that would not break it. The trim is its own
+undo step, so `u` after a `:w` puts the whitespace back and nothing else, and
+the cursor follows the text rather than the line number. See
+[docs/specs/trim.md](docs/specs/trim.md).
+
 #### `.editorconfig`
 
 Read, with no switch to turn it on and none to turn it off: a repository that
-has one means it. `root`, `indent_style`, `indent_size` and `tab_width` become
-options; `charset` and `end_of_line` are ignored because bi is always UTF-8 and
+has one means it. `root`, `indent_style`, `indent_size`, `tab_width`,
+`trim_trailing_whitespace` and `insert_final_newline` become options; `charset` and `end_of_line` are ignored because bi is always UTF-8 and
 always writes `\n`; the rest are for editors with features bi does not have
 yet. The nearest file to yours wins, `root = true` stops the walk, and the glob
 dialect is the format's own — `**`, `{a,b}`, `{1..9}` and all. Nothing is

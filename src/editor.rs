@@ -2449,6 +2449,12 @@ impl Editor {
         let mut written = 0;
         for id in &ids {
             let entry = self.entry_mut(*id);
+            let trim = entry.options.trim;
+            if trim.does_anything() {
+                let edits = entry.buffer.trim(&trim);
+                let across = |at: usize| edits.iter().fold(at, |at, edit| edit.map(at));
+                entry.last = entry.last.iter().map(|&(a, h)| (across(a), across(h))).collect();
+            }
             // No selections to record for a buffer nobody is looking at, and
             // the ones for a buffer in view have not moved.
             let pairs = entry.last.clone();
@@ -4505,6 +4511,7 @@ impl View<'_> {
 
     /// Returns whether the write succeeded.
     fn write(&mut self, path: &str) -> bool {
+        self.trim_for_write();
         let (before, after) = self.undo_bounds();
         let result = if path.is_empty() {
             self.buffer.save(before, after)
@@ -4527,6 +4534,38 @@ impl View<'_> {
                 false
             }
         }
+    }
+
+    /// Tidies the text before it goes to disk, and carries the cursors across
+    /// what it removed.
+    ///
+    /// Before the bytes go out rather than on the way past them, so that what
+    /// was written and what is in the buffer are the same text — which is the
+    /// property that keeps "modified" and the undo history honest. Mapped
+    /// rather than clamped, so a cursor on line 400 does not move because
+    /// three blank lines went from the top of the file; other windows on the
+    /// same buffer follow through `settle`, like every other edit.
+    ///
+    /// See `docs/specs/trim.md`.
+    fn trim_for_write(&mut self) {
+        if !self.options.trim.does_anything() {
+            return;
+        }
+        let edits = self.buffer.trim(&self.options.trim);
+        if edits.is_empty() {
+            return;
+        }
+        let across = |at: usize| edits.iter().fold(at, |at, edit| edit.map(at));
+        let mapped: Vec<Selection> = self
+            .selections
+            .all()
+            .iter()
+            .map(|selection| Selection {
+                anchor: self.buffer.clamped(Cursor::at(across(selection.anchor.at)), false),
+                head: self.buffer.clamped(Cursor::at(across(selection.head.at)), false),
+            })
+            .collect();
+        self.selections.set(mapped);
     }
 
     /// `:e` reloads this buffer from disk; `:e!` reloads discarding changes.
@@ -9307,5 +9346,107 @@ mod tests {
         ed.load_config(ConfigText(None));
 
         assert_eq!(ed.options().shiftwidth, 2, "nothing is cached, so nothing goes stale");
+    }
+
+    // ---- trimming on write --------------------------------------------------
+
+    #[test]
+    fn a_write_takes_the_trailing_whitespace_with_it() {
+        let f = Scratch::new("trim.rs", "alpha  \n\nbeta\t\n");
+        let mut ed = opened(&f);
+
+        ex(&mut ed, "w");
+
+        assert_eq!(f.read(), "alpha\n\nbeta\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), f.read(), "and the buffer agrees");
+    }
+
+    #[test]
+    fn a_trim_is_its_own_undo_step() {
+        let f = Scratch::new("trim-undo.rs", "alpha  \n");
+        let mut ed = opened(&f);
+        ex(&mut ed, "w");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "alpha\n");
+
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "alpha  \n",
+            "one `u` puts the whitespace back and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_cursor_follows_the_text_across_a_trim() {
+        let f = Scratch::new("trim-cursor.rs", "\n\nalpha\nbeta\n");
+        let mut ed = opened(&f);
+        // On the `b` of beta, which the two blank lines above are about to
+        // pull two rows up.
+        ed.apply(Command { count: 1, action: Action::Move(Motion::Line(4)) });
+        assert_eq!(ed.cursor_row(), Some(3));
+
+        ex(&mut ed, "w");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "alpha\nbeta\n");
+        assert_eq!(ed.cursor_row(), Some(1), "still on beta, rather than two rows past it");
+    }
+
+    #[test]
+    fn trim_on_write_off_means_none_of_it() {
+        let f = Scratch::new("trim-off.rs", "\nalpha  \n");
+        let mut ed = opened(&f);
+
+        ex(&mut ed, "set trim.on_write false");
+        ex(&mut ed, "w");
+
+        assert_eq!(f.read(), "\nalpha  \n");
+    }
+
+    #[test]
+    fn markdown_keeps_the_two_spaces_that_mean_a_line_break() {
+        let f = Scratch::new("notes.md", "\na line  \nand another\n");
+        let mut ed = opened(&f);
+
+        ex(&mut ed, "w");
+
+        assert_eq!(f.read(), "a line  \nand another\n", "the break survives");
+        assert!(!ed.options().trim.trailing);
+        assert!(ed.options().trim.first_line, "but the blank first line still went");
+    }
+
+    #[test]
+    fn a_filetype_section_can_disagree_with_bi_about_markdown() {
+        let f = Scratch::new("opinion.md", "a line  \n");
+        let mut ed = opened(&f);
+
+        ed.load_config(ConfigText(Some("[filetype.markdown]\ntrim.trailing = true\n")));
+        ex(&mut ed, "w");
+
+        assert_eq!(f.read(), "a line\n");
+    }
+
+    #[test]
+    fn a_project_can_ask_for_the_final_newline() {
+        let files = Files::new("trim-editorconfig");
+        files.file(".editorconfig", "root = true\n[*]\ninsert_final_newline = true\n");
+        let path = files.file("main.py", "x = 1");
+        let mut ed = Editor::open(&path).unwrap();
+
+        ex(&mut ed, "w");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x = 1\n");
+    }
+
+    #[test]
+    fn writing_every_buffer_trims_the_ones_nobody_is_looking_at() {
+        let f = Scratch::new("trim-all.rs", "alpha  \n");
+        let mut ed = opened(&f);
+        ed.apply(cmd(Action::InsertChar('x')));
+        ed.apply(cmd(Action::EnterNormal));
+
+        ex(&mut ed, "wa");
+
+        assert_eq!(f.read(), "xalpha\n");
     }
 }

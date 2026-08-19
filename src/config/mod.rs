@@ -114,6 +114,14 @@ pub struct Options {
     pub shiftwidth: usize,
     /// Whether a new line starts under the one above it.
     pub autoindent: bool,
+
+    /// What a write tidies up on its way out — see `docs/specs/trim.md`.
+    ///
+    /// A struct rather than five more fields because they are one feature with
+    /// a master switch, and because `Buffer` takes the bundle. The `:set`
+    /// names are dotted — `trim.trailing` — which is one namespace still, not
+    /// a second one.
+    pub trim: crate::trim::Trim,
 }
 
 impl Default for Options {
@@ -132,6 +140,7 @@ impl Default for Options {
             expandtab: indent.expandtab,
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
+            trim: crate::trim::Trim::default(),
         }
     }
 }
@@ -168,6 +177,16 @@ impl Options {
             ("expandtab", _) => return Err("expandtab takes true or false".into()),
             ("autoindent", OptionValue::Bool(on)) => self.autoindent = on,
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
+            ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
+            ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
+            ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
+            ("trim.last_line", OptionValue::Bool(on)) => self.trim.last_line = on,
+            ("trim.final_newline", OptionValue::Bool(on)) => self.trim.final_newline = on,
+            (
+                "trim.on_write" | "trim.trailing" | "trim.first_line" | "trim.last_line"
+                | "trim.final_newline",
+                _,
+            ) => return Err(format!("{name} takes true or false")),
             _ => return Err(format!("unknown option: {name}")),
         }
         Ok(())
@@ -192,6 +211,11 @@ impl Options {
             "shiftwidth" => OptionValue::Int(self.shiftwidth as i64),
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
+            "trim.on_write" => OptionValue::Bool(self.trim.on_write),
+            "trim.trailing" => OptionValue::Bool(self.trim.trailing),
+            "trim.first_line" => OptionValue::Bool(self.trim.first_line),
+            "trim.last_line" => OptionValue::Bool(self.trim.last_line),
+            "trim.final_newline" => OptionValue::Bool(self.trim.final_newline),
             _ => return None,
         })
     }
@@ -273,6 +297,9 @@ pub fn filetype_defaults(filetype: &str) -> OptionPatch {
         // Tabs, because gofmt writes them; the width stays yours, because
         // gofmt has nothing to say about how wide a tab looks.
         "go" => patch.set("expandtab", OptionValue::Bool(false)),
+        // Two trailing spaces are a hard line break in Markdown — actual
+        // syntax, in a format where whitespace is content.
+        "markdown" => patch.set("trim.trailing", OptionValue::Bool(false)),
         _ => {}
     }
     patch

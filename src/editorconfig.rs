@@ -397,6 +397,14 @@ fn to_patch(properties: &[(String, String)]) -> OptionPatch {
     };
 
     let mut patch = OptionPatch::default();
+    // The two properties that are bi's trim options by another name — see
+    // `docs/specs/trim.md`.
+    if let Some(value) = get("trim_trailing_whitespace") {
+        patch.set("trim.trailing", OptionValue::Bool(value == "true"));
+    }
+    if let Some(value) = get("insert_final_newline") {
+        patch.set("trim.final_newline", OptionValue::Bool(value == "true"));
+    }
     match get("indent_style") {
         Some("tab") => patch.set("expandtab", OptionValue::Bool(false)),
         Some("space") => patch.set("expandtab", OptionValue::Bool(true)),
@@ -579,6 +587,25 @@ mod tests {
     fn a_file_of_things_bi_does_not_know_changes_nothing() {
         let text = "[*]\ncharset = utf-8\nend_of_line = lf\nmax_line_length = 100\n";
         assert!(patch_of(text, "a.py").is_empty());
+    }
+
+    #[test]
+    fn the_two_whitespace_properties_are_bis_trim_options() {
+        let files = vec![(
+            PathBuf::from("/p"),
+            "[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n".to_string(),
+        )];
+        let patch = patch_from(&files, Path::new("/p/a.py"));
+        let mut options = crate::config::Options::default();
+        patch.apply_to(&mut options);
+        assert!(options.trim.trailing);
+        assert!(options.trim.final_newline);
+
+        let files =
+            vec![(PathBuf::from("/p"), "[*]\ntrim_trailing_whitespace = false\n".to_string())];
+        let patch = patch_from(&files, Path::new("/p/a.py"));
+        patch.apply_to(&mut options);
+        assert!(!options.trim.trailing, "and false reaches it too");
     }
 
     #[test]

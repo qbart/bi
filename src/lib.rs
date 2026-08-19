@@ -33,4 +33,5 @@ pub mod selection;
 pub mod syntax;
 pub mod theme;
 pub mod tree;
+pub mod trim;
 pub mod window;

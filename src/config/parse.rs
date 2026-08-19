@@ -45,13 +45,45 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
 }
 
 fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
-    for (key, item) in table.iter() {
-        let line = line_for(table, key, src);
-
-        if let Err(message) = config.options.set(key, option_value(item)) {
-            problems.push(Diagnostic { line, message });
+    for (name, value) in flatten(src, table, "") {
+        if let Err(message) = config.options.set(&name, value.1) {
+            problems.push(Diagnostic { line: value.0, message });
         }
     }
+}
+
+/// A table as flat `name` / `(line, value)` pairs, with dotted names for what
+/// was nested.
+///
+/// `trim.trailing = false`, `trim = { trailing = false }` and
+/// `[options.trim] trailing = false` are three TOML spellings of one setting,
+/// and `:set trim.trailing false` is a fourth. They arrive here as different
+/// shapes and leave as the same name, which is what keeps `[options]` a single
+/// namespace rather than a namespace and a set of exceptions.
+fn flatten(src: &str, table: &Table, prefix: &str) -> Vec<(String, (usize, OptionValue))> {
+    let mut out = Vec::new();
+    for (key, item) in table.iter() {
+        let line = line_for(table, key, src);
+        let name = match prefix.is_empty() {
+            true => key.to_string(),
+            false => format!("{prefix}.{key}"),
+        };
+        match item {
+            Item::Table(inner) => out.extend(flatten(src, inner, &name)),
+            Item::Value(Value::InlineTable(inner)) => {
+                // An inline table is the same thing said on one line. It has no
+                // `Table` to walk, so its entries are read here.
+                for (key, value) in inner.iter() {
+                    out.push((
+                        format!("{name}.{key}"),
+                        (line, option_value(&Item::Value(value.clone()))),
+                    ));
+                }
+            }
+            _ => out.push((name, (line, option_value(item)))),
+        }
+    }
+    out
 }
 
 /// `[filetype.<name>]` — one table per kind of file, each a patch over
@@ -72,10 +104,10 @@ fn read_filetypes(src: &str, table: &Table, config: &mut Config, problems: &mut 
             continue;
         };
         let patch = config.filetypes.entry(name.to_string()).or_default();
-        for (key, item) in inner.iter() {
-            let line = line_for(inner, key, src);
-            let value = option_value(item);
-            if let Err(message) = super::Options::default().set(key, value.clone()) {
+        // Flattened, so `trim.trailing = false` here means what it means in
+        // `[options]` — one namespace, whichever scope it is written in.
+        for (key, (line, value)) in flatten(src, inner, "") {
+            if let Err(message) = super::Options::default().set(&key, value.clone()) {
                 problems.push(Diagnostic { line, message });
                 continue;
             }
