@@ -586,6 +586,15 @@ Markdown list or a YAML file is exactly where people write them, and bi does
 not have a grammar for every file. `:set todo_comments false` turns it off. See
 [docs/specs/todo-comments.md](docs/specs/todo-comments.md).
 
+#### Colour swatches
+
+`#fb4934`, `#f94`, `rgb(251,73,52)`, `rgba(...)` and the shader spelling
+`rgb(0.5f,0.1f,0.1)` are drawn in the colour they name, with black or white
+text over them — whichever can actually be read, by WCAG luminance rather than
+a brightness average, which is the rule that gets saturated green right. `:set
+color_swatches false` turns it off. See
+[docs/specs/colors.md](docs/specs/colors.md).
+
 #### Trimming
 
 `:w` tidies the file on its way out: trailing whitespace goes, blank lines at

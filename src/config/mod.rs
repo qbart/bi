@@ -118,6 +118,8 @@ pub struct Options {
     pub indent_guides: bool,
     /// Whether `TODO:` and its friends are picked out of the text.
     pub todo_comments: bool,
+    /// Whether a colour literal is drawn in the colour it names.
+    pub color_swatches: bool,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -146,6 +148,7 @@ impl Default for Options {
             autoindent: indent.autoindent,
             indent_guides: true,
             todo_comments: true,
+            color_swatches: true,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -187,6 +190,8 @@ impl Options {
             ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
             ("todo_comments", OptionValue::Bool(on)) => self.todo_comments = on,
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
+            ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
+            ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
             ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
             ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
             ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
@@ -223,6 +228,7 @@ impl Options {
             "autoindent" => OptionValue::Bool(self.autoindent),
             "indent_guides" => OptionValue::Bool(self.indent_guides),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
+            "color_swatches" => OptionValue::Bool(self.color_swatches),
             "trim.on_write" => OptionValue::Bool(self.trim.on_write),
             "trim.trailing" => OptionValue::Bool(self.trim.trailing),
             "trim.first_line" => OptionValue::Bool(self.trim.first_line),

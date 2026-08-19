@@ -44,15 +44,6 @@ c - around brackents
 
 you should infer those from treesitter
 
-### color rendering
-
-colors are rendered based on patterns:
-#ffaacc so full 6 hex is colored as this code
-rgb(255,20,1)
-rgba(255,20,1)
-rgb(0.5f,0.1f,0.1) // float based as well so 1.0 is 255
-it's possbile that text color must be adjusted to display the color (black or white so background has engouth contrast)
-
 ### find on steroids
 
 when i press s (small s), whole syntax coloring should be dimmed and as i type it should find matching strings within viewport,

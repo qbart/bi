@@ -28,6 +28,11 @@ indent_guides = true
 # See docs/specs/todo-comments.md.
 todo_comments = true
 
+# #fb4934, rgb(251,73,52) and rgb(0.5f,0.1f,0.1) drawn in the colour they name,
+# with black or white text over them — whichever can be read.
+# See docs/specs/colors.md.
+color_swatches = true
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

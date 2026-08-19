@@ -849,6 +849,37 @@ fn todo_comments(
     }
 }
 
+/// Colour literals, drawn in the colour they name.
+///
+/// The style is an exact `Rgb` pair rather than anything a theme could have
+/// named, which is the case decorations carry a resolved style for.
+fn color_swatches(
+    buffer: &Buffer,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+    use crate::theme::{Color, Style};
+
+    for row in rows.start..rows.end.min(buffer.line_count()) {
+        let line = buffer.line(row);
+        let start = buffer.rope().line_to_char(row);
+        for swatch in crate::colors::swatches(&line) {
+            let (r, g, b) = swatch.rgb;
+            let (fr, fg_, fb) = crate::colors::readable_on(swatch.rgb);
+            out.push(Decoration::Repaint {
+                range: (start + swatch.range.start)..(start + swatch.range.end),
+                style: Style {
+                    fg: Some(Color::Rgb(fr, fg_, fb)),
+                    bg: Some(Color::Rgb(r, g, b)),
+                    ..Style::default()
+                },
+                layer: Layer::Under,
+            });
+        }
+    }
+}
+
 /// The character a guide is drawn with.
 ///
 /// Not an option yet, and it is the obvious next one if a font somewhere
@@ -1658,7 +1689,10 @@ impl Editor {
             indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
         }
         if options.todo_comments {
-            todo_comments(buffer, &self.theme, rows, &mut out);
+            todo_comments(buffer, &self.theme, rows.clone(), &mut out);
+        }
+        if options.color_swatches {
+            color_swatches(buffer, rows, &mut out);
         }
         out
     }
@@ -9671,6 +9705,32 @@ mod tests {
         let mut ed = editor("// TODO: rewrite\n");
         ex(&mut ed, "set todo_comments false");
         ex(&mut ed, "set indent_guides false");
+
+        assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    #[test]
+    fn a_colour_literal_is_drawn_in_the_colour_it_names() {
+        let mut ed = editor("bg = \"#fb4934\"\n");
+        ex(&mut ed, "set todo_comments false");
+        ex(&mut ed, "set indent_guides false");
+
+        let found = ed.decorations(ed.focus(), 0..1);
+
+        assert_eq!(found.len(), 1);
+        let Decoration::Repaint { range, style, layer } = &found[0] else { panic!("a repaint") };
+        assert_eq!(*range, 6..13, "the literal, not the quotes around it");
+        assert_eq!(style.bg, Some(crate::theme::Color::Rgb(0xfb, 0x49, 0x34)));
+        assert_eq!(style.fg, Some(crate::theme::Color::Rgb(0, 0, 0)), "readable on that red");
+        assert_eq!(*layer, Layer::Under);
+    }
+
+    #[test]
+    fn swatches_off_produce_nothing() {
+        let mut ed = editor("#fb4934\n");
+        ex(&mut ed, "set color_swatches false");
+        ex(&mut ed, "set indent_guides false");
+        ex(&mut ed, "set todo_comments false");
 
         assert!(ed.decorations(ed.focus(), 0..1).is_empty());
     }
