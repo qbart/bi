@@ -37,6 +37,15 @@ delimiter   = "#a89984"
 property             = "#83a598"                     # blue
 "string.special.key" = "#83a598"
 
+# A Ruby symbol is a key, not a string, and Ruby is dense with them. Without
+# these two leaves the fallback walk does its job correctly and lands both on
+# `string`: `:phases`, `class_name:` and `/\A[a-z_]+\z/` all come out the same
+# green as `'Time & Material'`, and a Ruby file reads as one green wall — the
+# failure docs/specs/tree-sitter.md names for JSON keys, at the other end of
+# the pipeline.
+"string.special.symbol" = "#83a598"                  # blue, as a key is
+"string.special.regex"  = "#fe8019"                  # orange, not a string literal
+
 # Markdown, whose captures are all text.*
 "text.title"     = { fg = "#b8bb26", bold = true }
 "text.literal"   = "#b8bb26"

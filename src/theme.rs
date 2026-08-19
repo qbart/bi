@@ -628,6 +628,37 @@ mod tests {
         assert_eq!(light.style("comment"), dark.style("comment"));
     }
 
+    /// The fallback walk lands `string.special.symbol` on `string` unless a
+    /// theme stops it, and Ruby is dense enough with symbols that letting it
+    /// happen turned 59% of a Ruby file into one green. That is the failure
+    /// tree-sitter.md names for JSON keys, arriving at the other end of the
+    /// pipeline: there the query had to be told two captures differ, here the
+    /// theme has to be told two colours do.
+    ///
+    /// `ansi` is deliberately exempt. It promises the colours bi had before it
+    /// had themes, and before it had themes these fell through to `string`.
+    #[test]
+    fn a_symbol_and_a_regex_are_not_just_strings() {
+        for name in [DEFAULT_THEME, "gruvbox-light"] {
+            let theme = parsed(name);
+            let string = theme.style("string");
+            for special in ["string.special.symbol", "string.special.regex"] {
+                assert_ne!(
+                    theme.style(special),
+                    string,
+                    "{name}: {special} fell through to the string colour"
+                );
+            }
+            // And they differ from each other — a symbol is a key, a regex is
+            // a pattern, and one colour for both is half a fix.
+            assert_ne!(
+                theme.style("string.special.symbol"),
+                theme.style("string.special.regex"),
+                "{name}: symbol and regex share a colour"
+            );
+        }
+    }
+
     #[test]
     fn a_builtin_with_no_user_file_resolves_to_itself() {
         let (theme, problems) = Theme::resolve("ansi", None);

@@ -83,6 +83,21 @@ stays in the frontend is one function from `theme::Color` to
 `ratatui::Color`, which is the whole of what a terminal knows that a GUI does
 not.
 
+**A theme has to stop the walk where two things genuinely differ.** The walk
+is what makes `function.method` free, and it is also what turns
+`string.special.symbol` into a string if nothing says otherwise. Ruby is dense
+with symbols — `:phases`, `class_name:`, `presence:` are on every other line —
+so leaving it to fall through put 59% of a Ruby file in one green, alongside
+the string literals, the regexes and the class names. That is exactly the
+failure `docs/specs/tree-sitter.md` names for JSON keys, arriving at the other
+end of the same pipeline: there the *query* had to be told the two captures
+differ, here the *theme* has to be told the two colours do. Both gruvbox
+themes therefore carry `string.special.symbol` and `string.special.regex`
+explicitly, and a test asserts neither equals `string`.
+
+`ansi` deliberately does not. It promises the colours bi had before it had
+themes, and before it had themes these fell through.
+
 Aliases are **explicit entries, not code**. Today `constructor` shares an arm
 with `function` and `number` with `constant`, welded together in a match. In a
 theme they are two keys that happen to hold the same value, and a theme that
