@@ -845,6 +845,11 @@ impl Input {
                 'e' => self.resolve(Motion::Word { big: false, forward: false, end: true }),
                 'E' => self.resolve(Motion::Word { big: true, forward: false, end: true }),
                 '_' => self.resolve(Motion::LastNonBlank),
+                // The other file — the test beside the implementation. `ga`
+                // in vim prints a character code, which nothing here does,
+                // and a leader binding can spell it `<leader>a` instead.
+                // See `docs/specs/alternate.md`.
+                'a' => self.plain(Action::Ex { line: "alt".into(), run: true }),
                 _ => {
                     self.reset();
                     None

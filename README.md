@@ -419,12 +419,22 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:{n}` | go to line *n* |
 | `:m 12` `:m 0` `:m $` | move this line, or the selection, after that line |
 | `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
+| `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:case <style>` | respell the selection, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
 | `:paste [<dir>]` | put what is marked into `<dir>`, or the selected directory |
 | `:paste-as <path>` | place the file a paste stopped on, and carry on |
+
+`:alt` is `ga`, and walks `[alternate]` in order: the first pattern that
+matches your path decides, then the first of its paths that exists is opened.
+`*` matches anything, separators included, and stands for the same text on the
+right. Go, C and C++ pairs are built in; a pattern you set replaces bi's.
+`<leader>a` is a line of config — `"<leader>a" = ":alt<CR>"` — rather than a
+default, because bi's leader has no built-in meaning and the first binding to
+claim one should be yours. See
+[docs/specs/alternate.md](docs/specs/alternate.md).
 
 `:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `kebab` or
 `constant` — `capital`, `screaming` and `dash` are the same three under other

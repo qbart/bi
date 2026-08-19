@@ -347,6 +347,12 @@ pub struct Config {
     /// Keyed by the name `crate::syntax::filetype` gives a file, which is the
     /// same name its grammar is chosen by.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
+    /// `[alternate]` — the other file, as a pattern and the paths to try.
+    ///
+    /// A `Vec` rather than a map because the *order* is the rule: the first
+    /// pattern that matches decides, so `*_test.go` has to be tried before
+    /// `*.go`. See `docs/specs/alternate.md`.
+    pub alternates: Vec<(String, Vec<String>)>,
 }
 
 impl Default for Config {
@@ -363,6 +369,7 @@ impl Default for Config {
                     options: Options::default(),
                     keys: Keymap::default(),
                     filetypes: Default::default(),
+                    alternates: Vec::new(),
                 };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })

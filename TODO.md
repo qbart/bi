@@ -4,36 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-###  Alternate mode
-
-i want to <leader>a to switch to alternate files thaat are defined as patterns in config:
-sample config from my old neovim:
-
-                mappings = {
-                    { '(.*).go', {
-                        { '[1]_test.go', 'Test' }
-                    } },
-                    { '(.*)_test.go', {
-                        { '[1].go', 'Implementation' }
-                    } },
-                    { '(.*).cpp', {
-                        { '[1].hpp', 'Header' }
-                    } },
-                    { '(.*).hpp', {
-                        { '[1].cpp', 'Implementation' }
-                    } },
-                    { '(.*).c', {
-                        { '[1].h', 'Header' }
-                    } },
-                    { '(.*).h', {
-                        { '[1].c', 'Implementation' }
-                    } },
-
-i should be alboe to defined ordered list how it looks for alternate file
-the one i mentioned above should be built-in but i clearly need configurability
-
-
-
 ### buffer switch list with fuzzy and default selected by MRU
 
 i should be able to invoke buffer switcher basd on names with fuzzy autocomplete

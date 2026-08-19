@@ -157,6 +157,7 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
 /// side of the boundary it lands on.
 const LIB_MODULES: &[&str] = &[
     "lib.rs",
+    "alternate.rs",
     "buffer.rs",
     "case.rs",
     "clipboard.rs",

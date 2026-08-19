@@ -37,6 +37,7 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
             "options" => read_options(src, table, &mut config, &mut problems),
             "keys" => read_keys(src, table, &mut config, &mut problems),
             "filetype" => read_filetypes(src, table, &mut config, &mut problems),
+            "alternate" => read_alternates(src, table, &mut config, &mut problems),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -112,6 +113,38 @@ fn read_filetypes(src: &str, table: &Table, config: &mut Config, problems: &mut 
                 continue;
             }
             patch.set(key, value);
+        }
+    }
+}
+
+/// `[alternate]` — one pattern per key, and the paths to try for it.
+///
+/// A rule the file already has is *replaced* rather than added beside, so a
+/// user who disagrees with bi about `*.go` says so once; anything else is
+/// appended, keeping the order it was written in — which is the rule, since
+/// the first pattern that matches decides.
+fn read_alternates(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    for (pattern, item) in table.iter() {
+        let line = line_for(table, pattern, src);
+        let Some(array) = item.as_value().and_then(Value::as_array) else {
+            problems.push(Diagnostic {
+                line,
+                message: format!("{pattern} takes a list of paths, like [\"*.go\"]"),
+            });
+            continue;
+        };
+        let targets: Vec<String> =
+            array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if targets.len() != array.len() {
+            problems.push(Diagnostic {
+                line,
+                message: format!("{pattern} takes a list of paths, like [\"*.go\"]"),
+            });
+            continue;
+        }
+        match config.alternates.iter_mut().find(|(key, _)| key == pattern) {
+            Some(rule) => rule.1 = targets,
+            None => config.alternates.push((pattern.to_string(), targets)),
         }
     }
 }

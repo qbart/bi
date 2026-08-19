@@ -1104,6 +1104,9 @@ enum ExLine {
     Move(MoveTo),
     /// `:case snake` — respell what is selected, or the word under the cursor.
     Case(crate::case::Style),
+    /// `:alt` — the other file: the test beside the implementation, the
+    /// header beside the source.
+    Alternate,
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -1230,6 +1233,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             Some(to) => ExLine::Move(to),
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
         },
+        "alt" | "alternate" => ExLine::Alternate,
         "case" => match crate::case::Style::parse(arg) {
             Some(style) => ExLine::Case(style),
             None => {
@@ -2520,6 +2524,32 @@ impl Editor {
         self.session.status = format!("\"{name}\" deleted");
     }
 
+    /// `:alt` — opens the other file, if one of them is there.
+    ///
+    /// The first rule whose pattern matches decides, and then the first of its
+    /// paths that exists is opened. A path that does not exist is not offered
+    /// and not created: `:alt` finds the other file, and making one is `:e`'s
+    /// job — with the name it just told you. See `docs/specs/alternate.md`.
+    fn open_alternate(&mut self) {
+        let Some(path) = self.buffer().and_then(|b| b.path.clone()) else {
+            self.session.status = "no file name".into();
+            return;
+        };
+        let name = path.to_string_lossy().to_string();
+        let candidates = crate::alternate::candidates(&self.config.alternates, &name);
+        if candidates.is_empty() {
+            self.session.status = format!("no alternate for {name}");
+            return;
+        }
+        match candidates.iter().find(|candidate| std::path::Path::new(candidate).exists()) {
+            Some(found) => {
+                let found = found.clone();
+                self.edit_path(&found)
+            }
+            None => self.session.status = format!("none of {} is there", candidates.join(", ")),
+        }
+    }
+
     /// `Ctrl-P` — the picker over every file under the session's root.
     fn open_file_picker(&mut self) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
@@ -3553,6 +3583,7 @@ impl Editor {
             ExLine::Case(style) => {
                 self.in_view(|view| view.recase(style));
             }
+            ExLine::Alternate => self.open_alternate(),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -11120,5 +11151,76 @@ mod tests {
 
         assert_eq!(ed.session.mode, Mode::Normal);
         assert!(ed.session.status.starts_with("no files under"), "{}", ed.session.status);
+    }
+
+    // ---- :alt ---------------------------------------------------------------
+
+    #[test]
+    fn alt_opens_the_test_beside_the_implementation_and_back() {
+        let files = Files::new("alt");
+        let source = files.file("thing.go", "package main\n");
+        files.file("thing_test.go", "package main\n");
+        let mut ed = Editor::open(&source).unwrap();
+
+        ex(&mut ed, "alt");
+        assert!(ed.name_of(ed.buffer_ids()[1]).ends_with("thing_test.go"));
+        assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("thing_test.go"));
+
+        ex(&mut ed, "alt");
+        assert!(
+            ed.buffer().unwrap().path.as_ref().unwrap().ends_with("thing.go"),
+            "and `*_test.go` is tried before `*.go`, or a test is its own alternate"
+        );
+    }
+
+    #[test]
+    fn alt_takes_the_first_of_its_paths_that_is_there() {
+        let files = Files::new("alt-order");
+        let source = files.file("main.cpp", "int main() {}\n");
+        // `*.hpp` is offered first and does not exist; `*.h` does.
+        files.file("main.h", "#pragma once\n");
+        let mut ed = Editor::open(&source).unwrap();
+
+        ex(&mut ed, "alt");
+
+        assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("main.h"));
+    }
+
+    #[test]
+    fn alt_with_nothing_to_open_says_which_names_it_looked_for() {
+        let files = Files::new("alt-missing");
+        let source = files.file("lonely.go", "package main\n");
+        let mut ed = Editor::open(&source).unwrap();
+
+        ex(&mut ed, "alt");
+
+        assert!(ed.session.status.starts_with("none of "), "{}", ed.session.status);
+        assert!(ed.session.status.contains("lonely_test.go"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn alt_on_a_file_no_rule_matches_says_so() {
+        let files = Files::new("alt-unmatched");
+        let source = files.file("notes.md", "# hi\n");
+        let mut ed = Editor::open(&source).unwrap();
+
+        ex(&mut ed, "alt");
+
+        assert!(ed.session.status.starts_with("no alternate for"), "{}", ed.session.status);
+    }
+
+    /// A rule you write replaces bi's for that pattern rather than sitting
+    /// beside it, so there is never a question of which one won.
+    #[test]
+    fn a_rule_in_the_config_replaces_the_built_in_one() {
+        let files = Files::new("alt-config");
+        let source = files.file("thing.go", "package main\n");
+        files.file("thing.pb.go", "// generated\n");
+        let mut ed = Editor::open(&source).unwrap();
+
+        ed.load_config(ConfigText(Some("[alternate]\n\"*.go\" = [\"*.pb.go\"]\n")));
+        ex(&mut ed, "alt");
+
+        assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("thing.pb.go"));
     }
 }

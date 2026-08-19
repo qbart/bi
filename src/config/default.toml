@@ -79,6 +79,23 @@ trim.final_newline = false
 # option uncommented where it stands would land in [options] and mean
 # something else.
 
+# The other file: `:alt` (and `ga`) walks these in order and opens the first
+# one that exists. `*` matches anything, separators included, and stands for
+# the same text on the right — so `*_test.go` reads `internal/thing_test.go` as
+# `internal/thing` and offers `internal/thing.go`. The first pattern that
+# matches decides, which is why `*_test.go` is written before `*.go`.
+# A pattern you set replaces bi's; anything else is added after it.
+# See docs/specs/alternate.md.
+[alternate]
+"*_test.go" = ["*.go"]
+"*.go" = ["*_test.go"]
+"*.c" = ["*.h"]
+"*.h" = ["*.c"]
+"*.cpp" = ["*.hpp", "*.h"]
+"*.hpp" = ["*.cpp", "*.cc"]
+"*.cc" = ["*.hh", "*.hpp", "*.h"]
+"*.hh" = ["*.cc", "*.cpp"]
+
 [keys]
 # The key <leader> stands for in a binding. Nothing uses it until you write a
 # binding that spells it — and the moment one does, this key stops meaning

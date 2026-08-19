@@ -16,6 +16,7 @@
 //! [`editor::Action`] table, plus [`editor::Editor::settle`], which drains
 //! the edit log for tree-sitter today and for LSP `didChange` later.
 
+pub mod alternate;
 pub mod buffer;
 pub mod case;
 pub mod clipboard;
