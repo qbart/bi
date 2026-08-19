@@ -322,6 +322,7 @@ impl Input {
             Mode::Search { .. } => Self::search_line(key),
             Mode::Pick => Self::pick(key),
             Mode::Label => Self::label(key),
+            Mode::Find => Self::find(key),
         }
     }
 
@@ -334,6 +335,18 @@ impl Input {
         let action = match key.code {
             KeyCode::Char(c) if !key.mods.ctrl => Action::LabelChar(c),
             _ => Action::LabelCancel,
+        };
+        Some(Command { count: 1, action })
+    }
+
+    /// `s` is aiming: a character either narrows what is matched or picks a
+    /// letter, and the editor decides which — it is the one that knows what
+    /// the letters are. See `docs/specs/find.md`.
+    fn find(key: Key) -> Option<Command> {
+        let action = match key.code {
+            KeyCode::Char(c) if !key.mods.ctrl => Action::FindChar(c),
+            KeyCode::Backspace => Action::FindBackspace,
+            _ => Action::FindCancel,
         };
         Some(Command { count: 1, action })
     }
@@ -973,7 +986,9 @@ impl Input {
             'D' => return self.resolve_as(Operator::Delete, Motion::LineEnd),
             'C' => return self.resolve_as(Operator::Change, Motion::LineEnd),
             'S' => return self.resolve_as(Operator::Change, Motion::CurrentLine),
-            's' => return self.resolve_as(Operator::Change, Motion::Right),
+            // Vim's `s` is `cl` spelled shorter, and `cl` still works. This
+            // is the better use of the key — see `docs/specs/find.md`.
+            's' => return self.plain(Action::EnterFind),
             'X' => return self.resolve_as(Operator::Delete, Motion::Left),
             'r' => {
                 self.replace_pending = true;
@@ -2537,9 +2552,11 @@ leader = \" \"
             ('D', Operator::Delete, Motion::LineEnd),
             ('C', Operator::Change, Motion::LineEnd),
             ('S', Operator::Change, Motion::CurrentLine),
-            ('s', Operator::Change, Motion::Right),
             ('X', Operator::Delete, Motion::Left),
         ];
+        // `s` was `cl` and is `s` now — see `docs/specs/find.md`. `cl` still
+        // spells what it spelled.
+        assert_eq!(typed("s").action, Action::EnterFind);
         for (c, op, motion) in cases {
             assert_eq!(
                 typed(&c.to_string()).action,

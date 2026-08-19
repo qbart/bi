@@ -58,6 +58,7 @@ search     = { bg = "color58" }
 cursor_alt = { bg = "magenta" }
 flash      = { bg = "color58" }
 label      = { fg = "black", bg = "yellow", bold = true }
+dim        = "darkgray"
 
 gutter         = "darkgray"
 gutter_current = "yellow"

@@ -141,6 +141,9 @@ pub struct Ui {
     /// A letter you are about to press to jump somewhere — see
     /// `docs/specs/labels.md`.
     pub label: Style,
+    /// Text that has been pushed into the background so something else can be
+    /// read — what `s` does to everything that did not match.
+    pub dim: Style,
 
     pub gutter: Style,
     pub gutter_current: Style,
@@ -196,6 +199,7 @@ impl Ui {
         "cursor_alt",
         "flash",
         "label",
+        "dim",
         "gutter",
         "gutter_current",
         "rule",
@@ -238,6 +242,7 @@ impl Ui {
             "cursor_alt" => self.cursor_alt = style,
             "flash" => self.flash = style,
             "label" => self.label = style,
+            "dim" => self.dim = style,
             "gutter" => self.gutter = style,
             "gutter_current" => self.gutter_current = style,
             "rule" => self.rule = style,

@@ -72,6 +72,7 @@ search     = { bg = "#665c54" }                      # bg3
 cursor_alt = { bg = "#b16286" }                      # purple, dim
 flash      = { bg = "#665c54" }
 label      = { fg = "#282828", bg = "#fe8019", bold = true }
+dim        = "#665c54"
 
 gutter         = "#7c6f64"                           # bg4
 gutter_current = "#fabd2f"

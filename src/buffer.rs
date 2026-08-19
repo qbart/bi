@@ -1828,6 +1828,11 @@ impl Buffer {
         self.object_range(at, TextObject::Word { big: false }, false)
     }
 
+    /// The character at `at`, or `None` past the end.
+    pub fn char_at(&self, at: usize) -> Option<char> {
+        (at < self.rope.len_chars()).then(|| self.rope.char(at))
+    }
+
     /// Text of a char range.
     pub fn slice(&self, start: usize, end: usize) -> String {
         let len = self.rope.len_chars();

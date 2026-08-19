@@ -67,6 +67,15 @@ the word, `dw` takes the word and the space after it.
 | `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
 | `X` | delete the char before the cursor — `dh` |
 
+**Jumping** — `s` dims the screen, then every match of what you type gets a
+letter after it; press the letter and you are on the first character of that
+match. The letters never include a character that could narrow the search
+further, so typing and jumping share the keyboard with no mode switch between
+them. Only the viewport is searched, `Esc` leaves, `Backspace` takes a
+character back, and a query that matches nothing leaves by itself. Vim's `s`
+was `cl` spelled shorter, and `cl` still works. See
+[docs/specs/find.md](docs/specs/find.md).
+
 **Surroundings** — add, remove and change what is around something.
 
 | Key | Does |

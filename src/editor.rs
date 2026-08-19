@@ -112,6 +112,9 @@ pub enum Mode {
     /// Letters are on screen and the next key picks one. The list lives in
     /// `Session::labels`, beside the picker's and for the same reason.
     Label,
+    /// `s` — typing narrows what is matched on screen and a letter jumps to
+    /// one. See `docs/specs/find.md`.
+    Find,
 }
 
 impl Mode {
@@ -127,6 +130,7 @@ impl Mode {
             Mode::Search { .. } => "SEARCH",
             Mode::Pick => "PICK",
             Mode::Label => "LABEL",
+            Mode::Find => "FIND",
         }
     }
 
@@ -177,6 +181,11 @@ pub enum Action {
     /// A key pressed while the labels are up.
     LabelChar(char),
     LabelCancel,
+    /// `s` — dim the screen and wait for something to look for.
+    EnterFind,
+    FindChar(char),
+    FindBackspace,
+    FindCancel,
     PickChar(char),
     PickBackspace,
     PickNext,
@@ -600,6 +609,9 @@ pub struct Session {
     /// The letters currently on screen, and what they stand for — see
     /// `docs/specs/labels.md`.
     pub labels: Option<Labels>,
+    /// What `s` has been given to look for, and what it found — see
+    /// `docs/specs/find.md`.
+    pub find: Option<Find>,
     pub overrides: OptionPatch,
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
@@ -719,6 +731,16 @@ impl Session {
     }
 }
 
+/// A jump being aimed: what has been typed, and every match of it on screen.
+///
+/// The matches are kept rather than recomputed at draw time, because the
+/// letters were assigned against *this* list and a list that had moved on
+/// would put them on the wrong words.
+pub struct Find {
+    pub query: String,
+    pub matches: Vec<(usize, usize)>,
+}
+
 /// The letters on screen and what they name.
 ///
 /// `typed` accumulates, so a two-character label is two presses with no
@@ -737,6 +759,8 @@ pub struct Labels {
 pub enum LabelTarget {
     /// `Ctrl-W f` — go to that window.
     Window(WindowId),
+    /// `s` — go to that char offset.
+    Position(usize),
 }
 
 impl Labels {
@@ -936,6 +960,57 @@ fn todo_comments(
                 layer: Layer::Under,
             });
         }
+    }
+}
+
+/// What `s` puts on screen: the dimming, the matches, and the letters.
+fn find_decorations(
+    buffer: &Buffer,
+    find: &Find,
+    labels: Option<&Labels>,
+    theme: &Theme,
+    options: &Options,
+    rows: &std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+
+    let rope = buffer.rope();
+    let last = rows.end.min(buffer.line_count());
+    let from = rope.line_to_char(rows.start.min(rope.len_lines().saturating_sub(1)));
+    let to = match last >= buffer.line_count() {
+        true => rope.len_chars(),
+        false => rope.line_to_char(last),
+    };
+    out.push(Decoration::Repaint { range: from..to, style: theme.ui.dim, layer: Layer::Under });
+    for &(start, end) in &find.matches {
+        out.push(Decoration::Repaint {
+            range: start..end,
+            style: theme.ui.search,
+            layer: Layer::Under,
+        });
+    }
+
+    let Some(labels) = labels else { return };
+    for (label, target) in &labels.targets {
+        let LabelTarget::Position(start) = target else { continue };
+        if !label.starts_with(&labels.typed) {
+            continue;
+        }
+        // Drawn *after* the match it belongs to, over whatever follows it —
+        // you aim at the word and land on its first character.
+        let Some(&(_, end)) = find.matches.iter().find(|(at, _)| at == start) else { continue };
+        let row = buffer.row_at(Cursor::at(end));
+        let line = buffer.line(row);
+        let col =
+            crate::indent::display_col(&line, end - rope.line_to_char(row), options.tab_width);
+        out.push(Decoration::Overlay {
+            row,
+            col,
+            text: label.clone(),
+            style: theme.ui.label,
+            layer: Layer::Over,
+        });
     }
 }
 
@@ -1790,6 +1865,114 @@ impl Editor {
         self.session.mode = Mode::Label;
     }
 
+    /// `s` — dims the screen and waits for something to look for.
+    fn enter_find(&mut self) {
+        self.session.find = Some(Find { query: String::new(), matches: Vec::new() });
+        self.session.labels = None;
+        self.session.mode = Mode::Find;
+    }
+
+    fn end_find(&mut self) {
+        self.session.find = None;
+        self.session.labels = None;
+        self.session.mode = Mode::Normal;
+    }
+
+    /// A key pressed while `s` is aiming.
+    ///
+    /// A label wins over a query character, and it can: the labels are chosen
+    /// so that no character which could extend a match is ever one. That one
+    /// rule is what lets typing and jumping share a keyboard with no mode
+    /// switch between them.
+    fn find_key(&mut self, c: char) {
+        let pending = self.session.labels.as_ref().is_some_and(|labels| {
+            !labels.typed.is_empty() || labels.targets.iter().any(|(label, _)| label.starts_with(c))
+        });
+        if pending {
+            return self.label_key(Some(c));
+        }
+        if let Some(find) = &mut self.session.find {
+            find.query.push(c);
+        }
+        self.refresh_find();
+    }
+
+    /// Backspace: take a character back, and leave when there is none.
+    fn find_backspace(&mut self) {
+        let Some(find) = &mut self.session.find else { return self.end_find() };
+        if find.query.pop().is_none() {
+            return self.end_find();
+        }
+        self.refresh_find();
+    }
+
+    /// Finds the query in the focused window's viewport and labels what it
+    /// found.
+    ///
+    /// The viewport and nothing else: this is a jump, not a search. Something
+    /// you cannot see is not somewhere you are aiming, and a letter on it
+    /// could not be drawn anyway.
+    fn refresh_find(&mut self) {
+        let Some(find) = &self.session.find else { return };
+        let query = find.query.clone();
+        if query.is_empty() {
+            if let Some(find) = &mut self.session.find {
+                find.matches.clear();
+            }
+            self.session.labels = None;
+            return;
+        }
+
+        let Some((from, to)) = self.visible_range() else { return self.end_find() };
+        let Some(buffer) = self.buffer() else { return self.end_find() };
+        let matches = buffer.matches_in(from, to, &query, false);
+        if matches.is_empty() {
+            // Nothing to press and nothing to narrow: the next key was going
+            // to be `Esc` either way.
+            return self.end_find();
+        }
+
+        // Every character that could extend *any* match on screen, in both
+        // cases — so which match you were looking at cannot change the answer.
+        let mut exclude: Vec<char> = Vec::new();
+        for &(_, end) in &matches {
+            let Some(next) = buffer.char_at(end) else { continue };
+            for c in next.to_lowercase().chain(next.to_uppercase()) {
+                if !exclude.contains(&c) {
+                    exclude.push(c);
+                }
+            }
+        }
+
+        // What you have typed, where every other half-typed command shows
+        // itself.
+        self.session.status = format!("s {query}");
+        let targets = crate::label::labels(matches.len(), &exclude)
+            .into_iter()
+            .zip(&matches)
+            .map(|(label, &(start, _))| (label, LabelTarget::Position(start)))
+            .collect();
+        self.session.labels = Some(Labels { typed: String::new(), targets });
+        if let Some(find) = &mut self.session.find {
+            find.matches = matches;
+        }
+    }
+
+    /// The char range the focused window is showing.
+    fn visible_range(&self) -> Option<(usize, usize)> {
+        let window = self.window_of(self.focus)?;
+        let text = window.text()?;
+        let buffer = self.buffer()?;
+        let rope = buffer.rope();
+        let last = (text.scroll + window.height).min(buffer.line_count());
+        let from = rope.line_to_char(text.scroll.min(rope.len_lines().saturating_sub(1)));
+        let to = match last >= buffer.line_count() {
+            true => rope.len_chars(),
+            false => rope.line_to_char(last),
+        };
+        Some((from, to))
+    }
+
     /// A key pressed while the letters are up.
     ///
     /// A key that cannot start any label cancels rather than being swallowed,
@@ -1808,13 +1991,19 @@ impl Editor {
                 self.end_labels();
                 match target {
                     LabelTarget::Window(id) => self.set_focus(id),
+                    // The start of the match, because you aimed at the word
+                    // and the letter was drawn after it.
+                    LabelTarget::Position(at) => self.set_cursor(Cursor::at(at)),
                 }
             }
         }
     }
 
+    /// Puts the letters away, and whatever was aiming with them: a jump that
+    /// has landed has no query left to narrow.
     fn end_labels(&mut self) {
         self.session.labels = None;
+        self.session.find = None;
         self.session.mode = Mode::Normal;
     }
 
@@ -1837,7 +2026,7 @@ impl Editor {
         // showing a tree, which has no buffer for the rest of this to read.
         if let Some(labels) = &self.session.labels {
             for (label, target) in &labels.targets {
-                let LabelTarget::Window(id) = target;
+                let LabelTarget::Window(id) = target else { continue };
                 if *id != window || !label.starts_with(&labels.typed) {
                     continue;
                 }
@@ -1853,6 +2042,24 @@ impl Editor {
             }
         }
         let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
+        // `s` is aiming: everything dims, what matched lights up, and each
+        // match wears the letter that goes to it. Only in the window it is
+        // aiming in. The order these are pushed in is the order they paint in,
+        // so the dim goes down first and the matches over it.
+        if window == self.focus
+            && let Some(find) = &self.session.find
+            && !find.matches.is_empty()
+        {
+            find_decorations(
+                buffer,
+                find,
+                self.session.labels.as_ref(),
+                &self.theme,
+                options,
+                &rows,
+                &mut out,
+            );
+        }
         if options.indent_guides {
             indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
         }
@@ -2681,6 +2888,10 @@ impl Editor {
             // fact about the session and not about any rope.
             Action::LabelChar(c) => self.label_key(Some(*c)),
             Action::LabelCancel => self.label_key(None),
+            Action::EnterFind => self.enter_find(),
+            Action::FindChar(c) => self.find_key(*c),
+            Action::FindBackspace => self.find_backspace(),
+            Action::FindCancel => self.end_find(),
 
             Action::PickChar(c) => {
                 if let Some(picker) = &mut self.session.picker {
@@ -4659,6 +4870,10 @@ impl View<'_> {
             | Action::PickAccept
             | Action::LabelChar(_)
             | Action::LabelCancel
+            | Action::EnterFind
+            | Action::FindChar(_)
+            | Action::FindBackspace
+            | Action::FindCancel
             | Action::Buffer(_)
             | Action::Window(_)
             | Action::Tree(_) => {}
@@ -10405,7 +10620,7 @@ mod tests {
 
         // And each one is drawn in its own window, at the top-left of it.
         for (label, target) in &labels.targets {
-            let LabelTarget::Window(id) = target;
+            let LabelTarget::Window(id) = target else { panic!("a window label") };
             let drawn = ed.decorations(*id, 0..1);
             assert!(
                 drawn.iter().any(|d| matches!(
@@ -10431,7 +10646,7 @@ mod tests {
             .unwrap()
             .targets
             .iter()
-            .find(|(_, LabelTarget::Window(id))| *id == elsewhere)
+            .find(|(_, target)| *target == LabelTarget::Window(elsewhere))
             .map(|(label, _)| label.clone())
             .expect("the other window has a letter");
 
@@ -10466,5 +10681,166 @@ mod tests {
 
         assert_eq!(ed.session.mode, Mode::Normal);
         assert_eq!(ed.session.status, "only one window");
+    }
+
+    // ---- `s`, find on screen ------------------------------------------------
+
+    /// An editor with a screen, because `s` searches the viewport and a
+    /// viewport needs a size.
+    fn aiming(text: &str) -> Editor {
+        let mut ed = editor(text);
+        sized(&mut ed);
+        // The frontend reports back how much of the pane is text; without it
+        // the window is nought rows tall and nothing is on screen to aim at.
+        let focus = ed.focus();
+        ed.size_window(focus, 80, 20);
+        ed.apply(cmd(Action::EnterFind));
+        ed
+    }
+
+    fn type_find(ed: &mut Editor, keys: &str) {
+        for c in keys.chars() {
+            ed.apply(cmd(Action::FindChar(c)));
+        }
+    }
+
+    fn label_of(ed: &Editor, at: usize) -> String {
+        ed.session
+            .labels
+            .as_ref()
+            .expect("letters are up")
+            .targets
+            .iter()
+            .find(|(_, target)| *target == LabelTarget::Position(at))
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| panic!("no letter on the match at {at}"))
+    }
+
+    #[test]
+    fn typing_narrows_what_is_matched() {
+        let mut ed = aiming("fun fur function\n");
+        type_find(&mut ed, "fu");
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 3);
+
+        type_find(&mut ed, "n");
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 2, "`fur` is out");
+    }
+
+    /// The one rule that lets typing and jumping share a keyboard.
+    #[test]
+    fn no_letter_is_a_character_that_could_narrow_the_search() {
+        let mut ed = aiming("fun function funny\n");
+        type_find(&mut ed, "fun");
+
+        let labels = ed.session.labels.as_ref().unwrap();
+        // ` `, `c` and `n` all continue a match on screen, so none of them can
+        // be a letter — pressing them has to mean "narrow".
+        for (label, _) in &labels.targets {
+            assert!(
+                !label.contains('c') && !label.contains('n') && !label.contains('C'),
+                "{label} would swallow a keystroke that means something else"
+            );
+        }
+    }
+
+    #[test]
+    fn pressing_a_letter_lands_on_the_first_character_of_that_match() {
+        let mut ed = aiming("alpha beta alpha\n");
+        type_find(&mut ed, "alpha");
+        let label = label_of(&ed, 11);
+
+        for c in label.chars() {
+            ed.apply(cmd(Action::FindChar(c)));
+        }
+
+        assert_eq!(ed.cursor().unwrap().at, 11, "the start of the second one");
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert!(ed.session.find.is_none(), "and the dimming is gone with it");
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_leaves_and_so_does_esc() {
+        let mut ed = aiming("alpha\n");
+        let here = ed.cursor().unwrap().at;
+        type_find(&mut ed, "zz");
+        assert_eq!(ed.session.mode, Mode::Normal, "nothing to press, nothing to narrow");
+        assert_eq!(ed.cursor().unwrap().at, here);
+
+        let mut ed = aiming("alpha\n");
+        type_find(&mut ed, "al");
+        ed.apply(cmd(Action::FindCancel));
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.cursor().unwrap().at, here, "and the cursor never moved");
+    }
+
+    #[test]
+    fn backspace_narrows_back_and_then_leaves() {
+        let mut ed = aiming("fun fur\n");
+        type_find(&mut ed, "fun");
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 1);
+
+        ed.apply(cmd(Action::FindBackspace));
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 2, "`fur` is back");
+
+        ed.apply(cmd(Action::FindBackspace));
+        ed.apply(cmd(Action::FindBackspace));
+        assert_eq!(ed.session.mode, Mode::Find, "an empty query still aims");
+        ed.apply(cmd(Action::FindBackspace));
+        assert_eq!(ed.session.mode, Mode::Normal, "and one more leaves");
+    }
+
+    /// A jump is aimed at what you can see. Something below the fold is not
+    /// somewhere you are aiming, and a letter on it could not be drawn.
+    #[test]
+    fn only_the_viewport_is_searched() {
+        let mut ed = editor(&format!("alpha\n{}alpha\n", "\n".repeat(80)));
+        sized(&mut ed);
+        let focus = ed.focus();
+        ed.size_window(focus, 80, 20);
+        ed.apply(cmd(Action::EnterFind));
+        type_find(&mut ed, "alpha");
+
+        let matches = &ed.session.find.as_ref().unwrap().matches;
+        assert_eq!(matches.len(), 1, "the one on screen");
+        assert_eq!(matches[0].0, 0);
+    }
+
+    #[test]
+    fn smartcase_is_the_same_rule_the_search_line_follows() {
+        let mut ed = aiming("Fn fn\n");
+        type_find(&mut ed, "fn");
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 2, "lowercase finds both");
+
+        let mut ed = aiming("Fn fn\n");
+        type_find(&mut ed, "Fn");
+        assert_eq!(ed.session.find.as_ref().unwrap().matches.len(), 1, "a capital means it");
+    }
+
+    #[test]
+    fn what_is_on_screen_while_aiming() {
+        let mut ed = aiming("alpha beta\n");
+        type_find(&mut ed, "beta");
+
+        let drawn = ed.decorations(ed.focus(), 0..1);
+        let ui = &ed.theme().ui;
+        assert!(
+            drawn
+                .iter()
+                .any(|d| matches!(d, Decoration::Repaint { style, .. } if *style == ui.dim)),
+            "everything else dims"
+        );
+        assert!(
+            drawn.iter().any(
+                |d| matches!(d, Decoration::Repaint { range, style, .. } if *range == (6..10) && *style == ui.search)
+            ),
+            "and the match lights up"
+        );
+        assert!(
+            drawn.iter().any(|d| matches!(
+                d,
+                Decoration::Overlay { row: 0, col: 10, layer: Layer::Over, .. }
+            )),
+            "with its letter after it"
+        );
     }
 }

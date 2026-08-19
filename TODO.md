@@ -30,22 +30,6 @@ c - around brackents
 
 you should infer those from treesitter
 
-### find on steroids
-
-when i press s (small s), whole syntax coloring should be dimmed and as i type it should find matching strings within viewport,
-and show higlihts there and after the hightlits it should show ideally with different color a unique assinged letter that if i press it will go that place - 
-at the beginning of that place. letters must be picked uqniuely in a way that still allow to type next letter if i need more precise matching so
-
-source file:
-
-function hello()
-
-my action:
-
-s -> fun -> it shold never assign c because "func" is a valid next more precised match.
-once no matches, just exit that mode  
-esc - exsts
-
 ### C-p fuzzy finder for files
 
 fuzzy serach files the files you want to jump to
