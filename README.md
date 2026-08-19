@@ -563,6 +563,18 @@ then the project's `.editorconfig`, then anything you `:set` this session — so
 a Makefile keeps its tabs however you like your spaces, and `:set` still wins
 when you mean it. See [docs/specs/options.md](docs/specs/options.md).
 
+#### Indent guides
+
+A vertical line down each level of indentation, at every step and never on the
+text itself. A blank line keeps the guides of the block it is inside and drops
+them where a block ends. `:set indent_guides false` turns them off; the colour
+is the theme's `indent_guide`.
+
+They are the first client of bi's decoration layer — the core answers "what is
+drawn here that is not buffer text" and the frontend paints it, which is what
+`TODO:` tags, colour swatches and jump labels will all arrive through. See
+[docs/specs/decorations.md](docs/specs/decorations.md).
+
 #### Trimming
 
 `:w` tidies the file on its way out: trailing whitespace goes, blank lines at

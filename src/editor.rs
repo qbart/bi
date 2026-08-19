@@ -758,6 +758,66 @@ fn resolve_options(
     options
 }
 
+/// A vertical line down each level of indentation, on every visible row.
+///
+/// A blank row shows the guides of the *smaller* of its nearest non-blank
+/// neighbours, which is what makes a blank line inside a block keep the block's
+/// guides while one between two blocks shows none. The scan for those
+/// neighbours stops at the first non-blank line in each direction, so it is
+/// bounded by how blank the file actually is.
+fn indent_guides(
+    buffer: &Buffer,
+    options: &Options,
+    theme: &Theme,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+
+    let indent = options.indent();
+    let step = indent.step();
+    let style = theme.ui.indent_guide;
+    let total = buffer.line_count();
+
+    for row in rows.start..rows.end.min(total) {
+        let width = match buffer.is_blank_row(row) {
+            false => buffer.indent_width(row, indent.tab_width),
+            true => {
+                let above = (0..row)
+                    .rev()
+                    .find(|&r| !buffer.is_blank_row(r))
+                    .map(|r| buffer.indent_width(r, indent.tab_width));
+                let below = (row + 1..total)
+                    .find(|&r| !buffer.is_blank_row(r))
+                    .map(|r| buffer.indent_width(r, indent.tab_width));
+                // The end of a block shows no guides rather than the guides of
+                // the block that ended: `min` is what says so, and a blank line
+                // with nothing on one side of it has no block to belong to.
+                match (above, below) {
+                    (Some(above), Some(below)) => above.min(below),
+                    _ => 0,
+                }
+            }
+        };
+        for col in crate::indent::guide_columns(width, step) {
+            out.push(Decoration::Overlay {
+                row,
+                col,
+                text: GUIDE.to_string(),
+                style,
+                layer: Layer::Under,
+            });
+        }
+    }
+}
+
+/// The character a guide is drawn with.
+///
+/// Not an option yet, and it is the obvious next one if a font somewhere
+/// cannot draw it — vim spells the same idea `listchars`, which is a whole
+/// grammar for a handful of characters and is not worth copying for one.
+const GUIDE: &str = "\u{2502}";
+
 /// The file type of a buffer, by the same whole-name-then-extension rule the
 /// grammar is chosen by.
 fn filetype_of(buffer: &Buffer) -> Option<&'static str> {
@@ -1538,6 +1598,28 @@ impl Editor {
     /// focused on.
     pub fn options_of(&self, id: BufferId) -> &Options {
         &self.entry(id).options
+    }
+
+    /// Everything to draw over `rows` of `window` that is not buffer text, in
+    /// paint order.
+    ///
+    /// One call per pane per frame, bounded by the rows on screen and never by
+    /// the size of the file — the same rule the highlight pass follows.
+    /// Nothing is cached: a decoration is derived from the buffer, the options
+    /// and the theme, and a cache over those would need invalidating on every
+    /// edit, every `:set` and every scroll, which is more work than the
+    /// derivation it would avoid. See `docs/specs/decorations.md`.
+    pub fn decorations(
+        &self,
+        window: WindowId,
+        rows: std::ops::Range<usize>,
+    ) -> Vec<crate::decoration::Decoration> {
+        let mut out = Vec::new();
+        let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
+        if options.indent_guides {
+            indent_guides(buffer, options, &self.theme, rows, &mut out);
+        }
+        out
     }
 
     /// The buffer a given window shows, if it shows one.
@@ -9448,5 +9530,74 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- decorations --------------------------------------------------------
+
+    use crate::decoration::{Decoration, Layer};
+
+    /// The guides on each row, as columns, for a whole-file query.
+    fn guides(ed: &Editor) -> Vec<(usize, Vec<usize>)> {
+        let rows = ed.buffer().unwrap().line_count();
+        let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+        for decoration in ed.decorations(ed.focus(), 0..rows) {
+            let Decoration::Overlay { row, col, layer, .. } = decoration else {
+                panic!("a guide is an overlay");
+            };
+            assert_eq!(layer, Layer::Under, "or a selected line stops looking selected");
+            match out.iter_mut().find(|(at, _)| *at == row) {
+                Some((_, cols)) => cols.push(col),
+                None => out.push((row, vec![col])),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_guide_goes_down_every_level_of_indentation() {
+        let ed = editor("fn main() {\n    let x = 1;\n        deep();\n}\n");
+
+        assert_eq!(guides(&ed), [(1, vec![0]), (2, vec![0, 4])]);
+    }
+
+    #[test]
+    fn a_blank_line_takes_the_smaller_of_its_neighbours() {
+        // Inside a block the guides carry on; where a block ends they stop,
+        // which is what `min` says and why it is not `max`.
+        let ed = editor("    a\n\n    b\n\nc\n");
+
+        assert_eq!(
+            guides(&ed),
+            [(0, vec![0]), (1, vec![0]), (2, vec![0])],
+            "row 3 sits between an indented line and an unindented one, so it \
+             belongs to no block and shows nothing"
+        );
+    }
+
+    #[test]
+    fn guides_count_columns_so_a_tab_is_as_wide_as_it_is_drawn() {
+        let mut ed = editor("\t\tdeep\n");
+        ex(&mut ed, "set expandtab false");
+        ex(&mut ed, "set tab_width 8");
+
+        assert_eq!(guides(&ed), [(0, vec![0, 8])], "two tabs at eight columns each");
+    }
+
+    #[test]
+    fn guides_are_bounded_by_the_rows_that_were_asked_for() {
+        let ed = editor("    a\n    b\n    c\n");
+
+        let visible = ed.decorations(ed.focus(), 1..2);
+
+        assert_eq!(visible.len(), 1, "one row asked for, one row's worth back");
+        assert!(matches!(visible[0], Decoration::Overlay { row: 1, col: 0, .. }));
+    }
+
+    #[test]
+    fn a_provider_that_is_off_produces_nothing() {
+        let mut ed = editor("    a\n");
+        ex(&mut ed, "set indent_guides false");
+
+        assert!(ed.decorations(ed.focus(), 0..1).is_empty());
     }
 }

@@ -118,6 +118,16 @@ pub fn leading(line: &str) -> &str {
     &line[..end]
 }
 
+/// The columns a line indented `width` gets vertical guides at: 0, one step
+/// in, two steps in, up to but not including the text itself.
+///
+/// Column 0 included, because the outermost level is a level. `width` itself
+/// excluded, because a guide there would sit on the first character of the
+/// line rather than in the whitespace before it.
+pub fn guide_columns(width: usize, step: usize) -> impl Iterator<Item = usize> {
+    (0..width).step_by(step.max(1))
+}
+
 /// Whether `line` has nothing on it but whitespace. An empty line qualifies.
 pub fn is_blank(line: &str) -> bool {
     line.chars().all(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n')
@@ -163,6 +173,14 @@ mod tests {
         assert_eq!(display_col("ab\tx", 3, 4), 4, "a tab after two chars still reaches 4");
         assert_eq!(display_col("abcd\tx", 5, 4), 8);
         assert_eq!(width_of("\t\t", 8), 16);
+    }
+
+    #[test]
+    fn guides_go_at_every_level_and_never_on_the_text() {
+        assert_eq!(guide_columns(8, 4).collect::<Vec<_>>(), [0, 4]);
+        assert_eq!(guide_columns(0, 4).collect::<Vec<_>>(), [], "nothing to guide");
+        assert_eq!(guide_columns(6, 4).collect::<Vec<_>>(), [0, 4], "a ragged indent still gets 4");
+        assert_eq!(guide_columns(3, 4).collect::<Vec<_>>(), [0]);
     }
 
     #[test]

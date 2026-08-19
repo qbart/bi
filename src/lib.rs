@@ -20,6 +20,7 @@ pub mod buffer;
 pub mod clipboard;
 pub mod cmd_history;
 pub mod config;
+pub mod decoration;
 pub mod editor;
 pub mod editorconfig;
 pub mod history;

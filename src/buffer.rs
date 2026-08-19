@@ -612,6 +612,20 @@ impl Buffer {
         self.backspace(at)
     }
 
+    /// How far `row` is indented, in columns.
+    ///
+    /// Columns rather than characters, because a tab is worth `tab_width` of
+    /// them and the answer is for something being drawn.
+    pub fn indent_width(&self, row: usize, tab_width: usize) -> usize {
+        let text = self.line_text(row);
+        indent::width_of(indent::leading(&text), tab_width)
+    }
+
+    /// Whether `row` has nothing but whitespace on it. An empty row qualifies.
+    pub fn is_blank_row(&self, row: usize) -> bool {
+        indent::is_blank(&self.line_text(row))
+    }
+
     // ---- trimming ----------------------------------------------------------
 
     /// Tidies the text on its way to disk, and hands back the edits it made so

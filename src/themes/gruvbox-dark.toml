@@ -75,6 +75,7 @@ gutter         = "#7c6f64"                           # bg4
 gutter_current = "#fabd2f"
 rule           = "#504945"
 filler         = "#504945"
+indent_guide   = "#3c3836"
 
 mode_normal = { fg = "#282828", bg = "#83a598", bold = true }
 mode_insert = { fg = "#282828", bg = "#b8bb26", bold = true }

@@ -19,6 +19,10 @@ shiftwidth = 0
 expandtab = true
 autoindent = true
 
+# A vertical line down each level of indentation. Its colour is the theme's
+# `indent_guide`. See docs/specs/indent.md.
+indent_guides = true
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bi::buffer::Cursor;
 use bi::config::Options;
+use bi::decoration::{Decoration, Layer};
 use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
 use bi::indent::{display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
@@ -137,6 +138,98 @@ fn paint_range(
         }
     }
     out
+}
+
+/// Splits a built line at a display column.
+///
+/// Pads the left half when the line is shorter than the column, which is how a
+/// decoration lands past the end of a line — an indent guide on a blank row is
+/// exactly that case.
+fn split_at_col(spans: Vec<Span<'static>>, col: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let mut at = 0usize;
+    for span in spans {
+        let text = span.content.to_string();
+        let width = text.chars().count();
+        if at + width <= col {
+            at += width;
+            left.push(span);
+        } else if at >= col {
+            at += width;
+            right.push(span);
+        } else {
+            let cut = col - at;
+            at += width;
+            left.push(Span::styled(text.chars().take(cut).collect::<String>(), span.style));
+            right.push(Span::styled(text.chars().skip(cut).collect::<String>(), span.style));
+        }
+    }
+    if at < col && right.is_empty() {
+        left.push(Span::raw(" ".repeat(col - at)));
+    }
+    (left, right)
+}
+
+/// Draws `text` over the cells at `col`, replacing as many as it is wide.
+///
+/// The line comes out the same length it went in, so nothing after the overlay
+/// shifts — which is the whole difference between an overlay and inserting.
+fn overlay(
+    spans: Vec<Span<'static>>,
+    col: usize,
+    text: &str,
+    style: ThemeStyle,
+) -> Vec<Span<'static>> {
+    let (mut out, rest) = split_at_col(spans, col);
+    let (_replaced, right) = split_at_col(rest, text.chars().count());
+    out.push(Span::styled(text.to_string(), tui(style)));
+    out.extend(right);
+    out
+}
+
+/// One row, as everything that paints over it needs to see it: which row it
+/// is, its text, where that text starts in the rope, and where its columns
+/// begin on screen.
+struct Row<'a> {
+    row: usize,
+    raw: &'a str,
+    /// Char offset of the start of the row, for the decorations anchored to
+    /// text rather than to columns.
+    start: usize,
+    gutter: usize,
+    tab: usize,
+}
+
+/// Everything a decoration does to one already-built line.
+fn decorate(
+    mut spans: Vec<Span<'static>>,
+    line: &Row,
+    decorations: &[Decoration],
+    layer: Layer,
+) -> Vec<Span<'static>> {
+    let Row { row, raw, start: line_start, gutter, tab } = *line;
+    for decoration in decorations.iter().filter(|d| d.layer() == layer) {
+        match decoration {
+            Decoration::Overlay { row: at, col, text, style, .. } if *at == row => {
+                spans = overlay(spans, col + gutter, text, *style);
+            }
+            Decoration::Eol { row: at, text, style } if *at == row => {
+                spans.push(Span::styled(text.clone(), tui(*style)));
+            }
+            Decoration::Repaint { range, style, .. } => {
+                let chars = raw.chars().count();
+                let (from, to) = (range.start, range.end);
+                if to <= line_start || from >= line_start + chars {
+                    continue;
+                }
+                let from = display_col(raw, from.saturating_sub(line_start), tab);
+                let to = display_col(raw, (to - line_start).min(chars), tab);
+                spans = paint_range(spans, (from + gutter)..(to + gutter), *style);
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 /// Paints `bg` behind a line and pads it to `width`, so the highlight reaches
@@ -460,6 +553,8 @@ fn render_window(
     // One query for the whole visible range, then partition per line. Bounded
     // by pane height, never by file size.
     let last_row = (scroll + text_area.height as usize).min(total);
+    // The same rule, for everything drawn that is not buffer text.
+    let decorations = ed.decorations(id, scroll..last_row);
     let highlights = syntax.map(|syntax| {
         let rope = buffer.rope();
         let from = rope.line_to_byte(scroll.min(rope.len_lines()));
@@ -501,6 +596,12 @@ fn render_window(
             }
             None => spans.push(Span::raw(expand_tabs(raw, tab))),
         }
+        // Under the selection: a guide or a swatch has to let a selected line
+        // still look selected.
+        let line_start_char = buffer.rope().line_to_char(row);
+        let line = Row { row, raw, start: line_start_char, gutter, tab };
+        spans = decorate(spans, &line, &decorations, Layer::Under);
+
         // Search matches, under the selection so a selected match still reads
         // as selected. Bounded by the row, like every other pass here.
         if options.hlsearch
@@ -574,6 +675,10 @@ fn render_window(
                 spans = paint_range(spans, col..col + 1, ed.theme().ui.cursor_alt);
             }
         }
+
+        // Over everything: a letter you are about to press has to be readable
+        // wherever it lands.
+        spans = decorate(spans, &line, &decorations, Layer::Over);
 
         // The cursor line is lit only in the focused window, as vim's
         // `'cursorline'` is. A dark bar in every pane reads as noise rather
@@ -1047,6 +1152,91 @@ mod tests {
             0,
             "the column is gone, not blank"
         );
+    }
+
+    /// The whole pipeline, on a real frame: core answers what to draw, this
+    /// file draws it.
+    ///
+    /// The unit tests above pin the column arithmetic; this pins that the
+    /// arithmetic is actually reached — a decoration produced and not painted
+    /// looks exactly like a decoration never produced.
+    #[test]
+    fn indent_guides_reach_the_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut()
+            .unwrap()
+            .insert_str(Cursor::at(0), "fn main() {\n    let x = 1;\n        deep();\n}\n");
+        ed.set_cursor(Cursor::at(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+
+        let rows: Vec<String> = (0..4)
+            .map(|y| {
+                (0..24)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        // The gutter comes too, because a guide's column is a column of the
+        // *text*, and getting that offset wrong is the other thing this test
+        // is here to catch.
+        assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
+    }
+
+    /// The whole of what a frontend does with a decoration, on one line.
+    ///
+    /// Width is the property worth guarding: an overlay replaces the cells it
+    /// covers rather than pushing them right, so the line it comes out of is
+    /// exactly as long as the line that went in — otherwise every column past
+    /// it, the cursor included, would be somewhere else.
+    #[test]
+    fn an_overlay_replaces_cells_rather_than_pushing_them() {
+        let spans = vec![Span::raw("    code".to_string())];
+        let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+
+        let out = overlay(spans, 4, "│", ThemeStyle::default());
+
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "    │ode");
+        assert_eq!(text.chars().count(), width, "the same length it went in");
+    }
+
+    /// A guide on a blank line is past the end of it, which is a line that has
+    /// to grow a little to hold one.
+    #[test]
+    fn an_overlay_past_the_end_of_a_line_pads_up_to_it() {
+        let out = overlay(vec![Span::raw(String::new())], 4, "│", ThemeStyle::default());
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "    │");
+    }
+
+    /// The case a char offset could not have expressed: column 4 of a
+    /// tab-indented line is *inside* the tab.
+    #[test]
+    fn an_overlay_lands_inside_a_tab_expansion() {
+        // One tab at width 8, so the line is eight columns of nothing.
+        let spans = vec![Span::raw(expand_tabs("\tcode", 8))];
+        let out = overlay(spans, 4, "│", ThemeStyle::default());
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "    │   code");
+    }
+
+    #[test]
+    fn split_at_col_keeps_both_halves_and_their_styles() {
+        let red = Style::default().fg(Color::Red);
+        let spans = vec![Span::styled("abcd".to_string(), red)];
+        let (left, right) = split_at_col(spans, 2);
+        assert_eq!(left.iter().map(|s| s.content.to_string()).collect::<String>(), "ab");
+        assert_eq!(right.iter().map(|s| s.content.to_string()).collect::<String>(), "cd");
+        assert_eq!(left[0].style, red, "and neither half loses its colour");
+        assert_eq!(right[0].style, red);
     }
 
     /// The renderer holds no width of its own any more — every column it

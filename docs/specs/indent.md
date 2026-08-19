@@ -180,6 +180,33 @@ thought better of leaves an invisible `    ` behind, and the diff shows it even
 though the screen never did. Gated on `autoindent`: with it off, nothing put
 that whitespace there but you, and the editor should not second-guess it.
 
+## Guides
+
+```
+indent_guides = true
+```
+
+A vertical line down each level of indentation, at columns 0, one step in, two
+steps in, and so on up to — but not including — the text. Column 0 is a level
+like any other; the text's own column is not, because a guide there would sit
+on the first character of the line rather than in the whitespace before it.
+
+They are drawn as *overlay decorations* (`docs/specs/decorations.md`), which is
+what lets one land at column 4 of a tab-indented line — a position that is
+inside a tab and has no char offset to be anchored to. The line comes out the
+same length it went in, so nothing after a guide moves.
+
+**A blank line shows the guides of the smaller of its nearest non-blank
+neighbours.** A blank line inside a block keeps the block's guides; one between
+a block and what follows it shows none, because it belongs to neither. `min`
+rather than `max` is the whole of that rule, and the scan stops at the first
+non-blank line in each direction.
+
+The character is `│`, and it is not an option yet. Vim spells the same idea
+`listchars`, which is a grammar for a handful of characters and is not worth
+copying for one; if a font somewhere cannot draw it, that is the day for
+`indent_guide = "|"`.
+
 ## Display columns
 
 ```rust
@@ -205,8 +232,7 @@ and a Python file in the same session cannot disagree. `.editorconfig` is the
 next spec and it is where the resolution chain — built-in filetype defaults,
 then config, then `.editorconfig`, then an explicit `:set` — is built.
 
-**Indent guides** need `width_of` and `Indent::step()`, both of which are now
-in the core, plus the decoration layer, which is not.
+**Indent guides** landed with the decoration layer — see the section above.
 
 ## Tests
 
@@ -232,6 +258,12 @@ in the core, plus the decoration layer, which is not.
 - `o` and `Enter` copy a tab indent as a tab even with `expandtab` on.
 - Leaving insert mode on a whitespace-only line clears it, and does not with
   `autoindent` off.
+- Guides at every level and never on the text; a ragged indent still gets the
+  level below it.
+- A blank line takes the smaller of its neighbours, and none at all where a
+  block ends.
+- A guide lands inside a tab's expansion, and the line it lands on is the same
+  length afterwards.
 - The renderer holds no width of its own: the same text laid out at two widths
   comes out two lengths, which is only possible because the number arrives from
   the options rather than from a constant beside the drawing code.

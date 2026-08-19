@@ -61,6 +61,7 @@ gutter         = "darkgray"
 gutter_current = "yellow"
 rule           = "darkgray"
 filler         = "darkgray"
+indent_guide   = "darkgray"
 
 mode_normal = { fg = "black", bg = "blue", bold = true }
 mode_insert = { fg = "black", bg = "green", bold = true }

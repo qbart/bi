@@ -114,6 +114,8 @@ pub struct Options {
     pub shiftwidth: usize,
     /// Whether a new line starts under the one above it.
     pub autoindent: bool,
+    /// Whether each level of indentation gets a vertical line down it.
+    pub indent_guides: bool,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -140,6 +142,7 @@ impl Default for Options {
             expandtab: indent.expandtab,
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
+            indent_guides: true,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -177,6 +180,8 @@ impl Options {
             ("expandtab", _) => return Err("expandtab takes true or false".into()),
             ("autoindent", OptionValue::Bool(on)) => self.autoindent = on,
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
+            ("indent_guides", OptionValue::Bool(on)) => self.indent_guides = on,
+            ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
             ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
             ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
             ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
@@ -211,6 +216,7 @@ impl Options {
             "shiftwidth" => OptionValue::Int(self.shiftwidth as i64),
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
+            "indent_guides" => OptionValue::Bool(self.indent_guides),
             "trim.on_write" => OptionValue::Bool(self.trim.on_write),
             "trim.trailing" => OptionValue::Bool(self.trim.trailing),
             "trim.first_line" => OptionValue::Bool(self.trim.first_line),

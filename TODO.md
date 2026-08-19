@@ -18,11 +18,6 @@ same for brackets etc.
 
 that takes selection and changes case converion, upper,lower,capital,pscal,snake etc.
                                                                                                                                                                            │  257 ▎   -- ys{motion}{char}, ds{char}, and cs{target}{replacement}
-### add support for virtual text rendering
-
-allow to render text that does not influence the source files.
-this is base for other future features like inline diagnostics
-
 ### treesitter markers
 
 S - capital s should be smart select based on treesitter boundries,
@@ -48,12 +43,6 @@ b - is around the string/inside brackents
 c - around brackents
 
 you should infer those from treesitter
-
-### show identation
-
-i want to dispaly indents as vertical lines (whether are space/tab based)
-
-needs .editorconfig support — done: docs/specs/indent.md, options.md, editorconfig.md
 
 ### TODO comments
 

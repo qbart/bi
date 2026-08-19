@@ -88,6 +88,7 @@ gutter         = "#5555ff"                           # light blue, dim on blue
 gutter_current = "#ffffff"
 rule           = "#00aaaa"
 filler         = "#5555ff"
+indent_guide   = "#00aaaa"
 
 # The status bar: black on light gray, which is the single most recognisable
 # thing about the whole IDE.

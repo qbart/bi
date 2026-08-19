@@ -140,6 +140,9 @@ pub struct Ui {
     pub gutter_current: Style,
     pub rule: Style,
     pub filler: Style,
+    /// The vertical line down each level of indentation. Furniture, like
+    /// `rule` — it marks structure rather than naming anything in the text.
+    pub indent_guide: Style,
 
     pub mode_normal: Style,
     pub mode_insert: Style,
@@ -179,6 +182,7 @@ impl Ui {
         "gutter_current",
         "rule",
         "filler",
+        "indent_guide",
         "mode_normal",
         "mode_insert",
         "mode_pick",
@@ -213,6 +217,7 @@ impl Ui {
             "gutter_current" => self.gutter_current = style,
             "rule" => self.rule = style,
             "filler" => self.filler = style,
+            "indent_guide" => self.indent_guide = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,
             "mode_pick" => self.mode_pick = style,
