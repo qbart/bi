@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bi::buffer::Cursor;
+use bi::config::Options;
 use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
 use bi::indent::{display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
@@ -227,8 +228,8 @@ fn styled_line(
 /// Fixed across modes on purpose — sizing it to the largest *relative* label
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
-fn gutter_width(ed: &Editor, buffer: &bi::buffer::Buffer) -> usize {
-    match ed.session.options.number {
+fn gutter_width(options: &Options, buffer: &bi::buffer::Buffer) -> usize {
+    match options.number {
         LineNumbers::Off => 0,
         _ => format!("{}", buffer.line_count()).len() + 1,
     }
@@ -271,6 +272,8 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     // Copied out once: `Ui` is `Copy`, and the picker below borrows the
     // editor mutably, which a `&Theme` held across it could not survive.
     let ui = ed.theme().ui;
+    // The session's, not a buffer's: the overlay is showing registers and
+    // command lines, which belong to no file.
     let tab = ed.session.options.tab_width;
     // The theme's own background, under everything, before anything draws. A
     // theme that named none leaves the terminal's showing through — which is
@@ -427,8 +430,8 @@ fn render_window(
     text_area: Rect,
     focused: bool,
 ) -> Option<(u16, u16)> {
-    let (text, buffer, syntax) = match ed.pane(id)? {
-        Pane::Text { text, buffer, syntax, .. } => (text, buffer, syntax),
+    let (text, buffer, syntax, options) = match ed.pane(id)? {
+        Pane::Text { text, buffer, syntax, options, .. } => (text, buffer, syntax, options),
         Pane::Tree { tree, .. } => {
             return render_tree(
                 frame,
@@ -442,11 +445,12 @@ fn render_window(
     };
     let (scroll, selections) = (text.scroll, &text.selections);
 
-    // The one number the core owns and the renderer used to guess. Everything
-    // below counts columns with it.
-    let tab = ed.session.options.tab_width;
+    // The one number the core owns and the renderer used to guess — and this
+    // buffer's, not the session's, so a Makefile and the file beside it can
+    // disagree about how wide a tab is.
+    let tab = options.tab_width;
     let total = buffer.line_count();
-    let gutter = gutter_width(ed, buffer);
+    let gutter = gutter_width(options, buffer);
     let cursor = selections.cursor();
     let cursor_row = buffer.row_at(cursor);
 
@@ -472,7 +476,7 @@ fn render_window(
         }
 
         // A blank cell where a number is not due, so the text stays put.
-        let mut spans = match ed.session.options.number.label_for(row, cursor_row) {
+        let mut spans = match options.number.label_for(row, cursor_row) {
             _ if gutter == 0 => Vec::new(),
             Some(n) => vec![Span::styled(
                 format!("{n:>width$} ", width = gutter - 1),
@@ -499,7 +503,7 @@ fn render_window(
         }
         // Search matches, under the selection so a selected match still reads
         // as selected. Bounded by the row, like every other pass here.
-        if ed.session.options.hlsearch
+        if options.hlsearch
             && let Some(search) = &ed.session.last_search
         {
             let line_start = buffer.rope().line_to_char(row);
@@ -1024,20 +1028,25 @@ mod tests {
     fn the_gutter_keeps_its_width_in_every_mode_but_off() {
         let mut ed = Editor::empty();
         ed.buffer_mut().unwrap().insert_str(Cursor::at(0), &"x\n".repeat(120));
-        let numbered = gutter_width(&ed, ed.buffer().unwrap());
+        let mut options = ed.session.options.clone();
+        let numbered = gutter_width(&options, ed.buffer().unwrap());
         assert_eq!(numbered, 4, "121 lines, so three digits and a space");
 
-        ed.session.options.number = LineNumbers::Relative;
+        options.number = LineNumbers::Relative;
         assert_eq!(
-            gutter_width(&ed, ed.buffer().unwrap()),
+            gutter_width(&options, ed.buffer().unwrap()),
             numbered,
             "or the file slides sideways as you move"
         );
-        ed.session.options.number = LineNumbers::Every(10);
-        assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), numbered);
+        options.number = LineNumbers::Every(10);
+        assert_eq!(gutter_width(&options, ed.buffer().unwrap()), numbered);
 
-        ed.session.options.number = LineNumbers::Off;
-        assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), 0, "the column is gone, not blank");
+        options.number = LineNumbers::Off;
+        assert_eq!(
+            gutter_width(&options, ed.buffer().unwrap()),
+            0,
+            "the column is gone, not blank"
+        );
     }
 
     /// The renderer holds no width of its own any more — every column it

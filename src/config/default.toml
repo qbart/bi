@@ -36,6 +36,18 @@ theme = "gruvbox-dark"
 # Set it to the same as `theme` to turn the distinction off.
 ssh_theme = "gruvbox-light"
 
+# A [filetype.<name>] section holds options for one kind of file, laid over
+# [options] above — a [filetype.go] section setting tab_width to 4, say. The
+# name is the one bi gives the file (rust, make, markdown, csharp), which is
+# the same name its grammar is chosen by. bi has a built-in table of its own
+# for what a language *requires*: a Makefile gets tabs eight columns wide, and
+# Go gets tabs. A section here overrides that. See docs/specs/options.md.
+#
+# No example is written out below, unlike every other setting here: the lines
+# in this file are meant to be uncommented where they stand, and a filetype
+# option uncommented where it stands would land in [options] and mean
+# something else.
+
 [keys]
 # The key <leader> stands for in a binding. Nothing uses it until you write a
 # binding that spells it — and the moment one does, this key stops meaning

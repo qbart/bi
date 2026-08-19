@@ -11,7 +11,7 @@ use anyhow::Result;
 use crate::buffer::{Buffer, BufferId, Cursor};
 use crate::clipboard::SystemClipboard;
 use crate::cmd_history::History;
-use crate::config::{Config, ConfigSource, Diagnostic, OptionValue, Options};
+use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
@@ -555,6 +555,14 @@ pub struct Session {
     /// session state for the same reason: it is not a fact about any buffer,
     /// and it outlives every one of them. See `docs/specs/cmdline-history.md`.
     pub cmd_history: History,
+    /// The options `:set` has been given this session, as a layer rather than
+    /// as values: they have to be re-applied on top of whatever a file's type
+    /// and project ask for, or `:set tab_width 8` would silently do nothing in
+    /// the repositories that have an `.editorconfig`. See
+    /// `docs/specs/options.md`.
+    pub overrides: OptionPatch,
+    /// `[filetype.<name>]` from the config, kept beside the options it patches.
+    pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
     pub mode: Mode,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
@@ -682,6 +690,16 @@ struct BufferEntry {
     /// whoever drains it destroys it for the others. Putting the tree on
     /// `Buffer` would move the drain inside the buffer and break that.
     syntax: Option<Syntax>,
+    /// What kind of file this is — `rust`, `make` — or `None` when nothing
+    /// claims the name. The key the option layers and the grammar are both
+    /// chosen by; see `crate::syntax::filetype`.
+    filetype: Option<&'static str>,
+    /// The options in force here: the session's, with whatever this file's
+    /// type and project ask for laid over them.
+    ///
+    /// Recomputed rather than patched in place whenever a layer under it moves
+    /// — see `docs/specs/options.md`.
+    options: Options,
     /// Where the last window to leave this buffer was looking.
     ///
     /// Without it, cycling forward and back through three files loses your
@@ -690,6 +708,50 @@ struct BufferEntry {
     /// remembers — there is no better answer, and it costs nothing to say
     /// which one wins.
     last: Cursors,
+}
+
+impl BufferEntry {
+    /// Options are left at the defaults here and resolved by
+    /// `Editor::resolve_options`, which is the only thing that can see the
+    /// layers under them.
+    fn new(id: BufferId, buffer: Buffer) -> Self {
+        Self {
+            id,
+            filetype: filetype_of(&buffer),
+            syntax: syntax_for(&buffer),
+            buffer,
+            options: Options::default(),
+            last: Vec::new(),
+        }
+    }
+}
+
+/// The options in force for a file of this type: the session's, with the
+/// layers a file gets on top of them.
+///
+/// A free function because it is asked once per open buffer while the buffer
+/// list is borrowed mutably, and because it is the whole of the resolution
+/// order in one place — bi's defaults and your config are already inside
+/// `session.options`, and what follows is the file's own.
+fn resolve_options(session: &Session, filetype: Option<&'static str>) -> Options {
+    let mut options = session.options.clone();
+    if let Some(filetype) = filetype {
+        crate::config::filetype_defaults(filetype).apply_to(&mut options);
+        if let Some(patch) = session.filetypes.get(filetype) {
+            patch.apply_to(&mut options);
+        }
+    }
+    // Last, so what you typed this session outranks what the file's type asked
+    // for. `.editorconfig` will land between the two.
+    session.overrides.apply_to(&mut options);
+    options
+}
+
+/// The file type of a buffer, by the same whole-name-then-extension rule the
+/// grammar is chosen by.
+fn filetype_of(buffer: &Buffer) -> Option<&'static str> {
+    let path = buffer.path.as_ref()?;
+    crate::syntax::filetype(path.file_name()?.to_str()?)
 }
 
 /// A parsed `:` line.
@@ -1007,8 +1069,20 @@ pub struct Editor {
 
 /// One window and what it shows, borrowed to be drawn.
 pub enum Pane<'a> {
-    Text { window: &'a Window, text: &'a Text, buffer: &'a Buffer, syntax: Option<&'a Syntax> },
-    Tree { window: &'a Window, tree: &'a Tree },
+    Text {
+        window: &'a Window,
+        text: &'a Text,
+        buffer: &'a Buffer,
+        syntax: Option<&'a Syntax>,
+        /// This buffer's options, not the session's: a frontend draws a tab in
+        /// a Makefile eight columns wide and the one in the file beside it
+        /// four. See `docs/specs/options.md`.
+        options: &'a Options,
+    },
+    Tree {
+        window: &'a Window,
+        tree: &'a Tree,
+    },
 }
 
 /// One buffer, one window, and the session, borrowed together for the length
@@ -1022,6 +1096,12 @@ pub struct View<'a> {
     pub id: BufferId,
     pub buffer: &'a mut Buffer,
     pub syntax: &'a mut Option<Syntax>,
+    /// The options in force for this buffer — what every editing command here
+    /// reads, in place of the session's. Mutable because a command can change
+    /// the path under it, and a file that becomes a Makefile takes a
+    /// Makefile's options with it.
+    pub options: &'a mut Options,
+    pub filetype: &'a mut Option<&'static str>,
     pub selections: &'a mut Selections,
     pub scroll: &'a mut usize,
     /// Which window this is, for the commands that name one.
@@ -1203,9 +1283,27 @@ impl Editor {
         source: Option<&dyn ConfigSource>,
     ) -> Vec<Diagnostic> {
         self.session.options = config.options.clone();
+        self.session.filetypes = config.filetypes.clone();
+        // Whatever `:set` said this session is re-applied over the new file,
+        // here and in every buffer below: a reload is a new config, not a new
+        // session, and it must not undo what you typed.
+        self.session.overrides.clone().apply_to(&mut self.session.options);
         self.config = config;
         self.config_epoch += 1;
+        self.resolve_options();
         self.resolve_theme(source)
+    }
+
+    /// Recomputes every open buffer's options from the layers under them.
+    ///
+    /// Whole rather than incremental, and on every move of any layer — a
+    /// config load, a `:set`, a buffer opening, a path changing. Working out
+    /// which buffers a change could have reached costs more than redoing a
+    /// handful of clones, and cannot be got wrong. See `docs/specs/options.md`.
+    fn resolve_options(&mut self) {
+        for entry in &mut self.buffers {
+            entry.options = resolve_options(&self.session, entry.filetype);
+        }
     }
 
     /// Turns the *name* in `options.theme` into a palette.
@@ -1301,13 +1399,8 @@ impl Editor {
 
     fn with_buffer(buffer: Buffer) -> Self {
         let (buffer_id, window_id) = (BufferId(0), WindowId(0));
-        Self {
-            buffers: vec![BufferEntry {
-                id: buffer_id,
-                syntax: syntax_for(&buffer),
-                buffer,
-                last: Vec::new(),
-            }],
+        let mut editor = Self {
+            buffers: vec![BufferEntry::new(buffer_id, buffer)],
             windows: vec![Window::new(window_id, buffer_id)],
             layout: Layout::new(window_id),
             focus: window_id,
@@ -1322,7 +1415,9 @@ impl Editor {
             remote: false,
             config_source: None,
             config_epoch: 0,
-        }
+        };
+        editor.resolve_options();
+        editor
     }
 
     // ---- what the focused view is -------------------------------------------
@@ -1402,9 +1497,34 @@ impl Editor {
             Content::Tree(tree) => Pane::Tree { window, tree },
             Content::Text(text) => {
                 let entry = self.entry(text.buffer);
-                Pane::Text { window, text, buffer: &entry.buffer, syntax: entry.syntax.as_ref() }
+                Pane::Text {
+                    window,
+                    text,
+                    buffer: &entry.buffer,
+                    syntax: entry.syntax.as_ref(),
+                    options: &entry.options,
+                }
             }
         })
+    }
+
+    /// The options in force where the cursor is.
+    ///
+    /// The focused buffer's, not the session's — an embedder asking how wide a
+    /// tab is means *here*, and the answer differs per file. A tree pane shows
+    /// no buffer and gets the session's, which is the only honest answer for a
+    /// pane that is not a file.
+    pub fn options(&self) -> &Options {
+        match self.window_of(self.focus).and_then(Window::buffer) {
+            Some(id) => &self.entry(id).options,
+            None => &self.session.options,
+        }
+    }
+
+    /// One buffer's options, for a frontend that is drawing a window it is not
+    /// focused on.
+    pub fn options_of(&self, id: BufferId) -> &Options {
+        &self.entry(id).options
     }
 
     /// The buffer a given window shows, if it shows one.
@@ -1461,6 +1581,8 @@ impl Editor {
             id: entry.id,
             buffer: &mut entry.buffer,
             syntax: &mut entry.syntax,
+            options: &mut entry.options,
+            filetype: &mut entry.filetype,
             selections: &mut text.selections,
             scroll: &mut text.scroll,
             window: window_id,
@@ -1517,12 +1639,8 @@ impl Editor {
         }
         let buffer = Buffer::open(path)?;
         let id = self.fresh_buffer_id();
-        self.buffers.push(BufferEntry {
-            id,
-            syntax: syntax_for(&buffer),
-            buffer,
-            last: Vec::new(),
-        });
+        self.buffers.push(BufferEntry::new(id, buffer));
+        self.resolve_options();
         Ok(id)
     }
 
@@ -1925,12 +2043,8 @@ impl Editor {
     fn fresh_scratch(&mut self) -> BufferId {
         let buffer = Buffer::empty();
         let id = self.fresh_buffer_id();
-        self.buffers.push(BufferEntry {
-            id,
-            syntax: syntax_for(&buffer),
-            buffer,
-            last: Vec::new(),
-        });
+        self.buffers.push(BufferEntry::new(id, buffer));
+        self.resolve_options();
         id
     }
 
@@ -2797,7 +2911,7 @@ impl Editor {
         };
 
         let was = self.session.options.active_theme(self.remote).to_string();
-        if let Err(message) = self.session.options.set(name, parsed) {
+        if let Err(message) = self.session.options.set(name, parsed.clone()) {
             // A real option given a bad value gets the value echoed — you
             // want to see what you fat-fingered. An unknown option does not:
             // its message already names the thing that was wrong.
@@ -2807,6 +2921,12 @@ impl Editor {
             };
             return;
         }
+
+        // Remembered as a layer, not only as a value: it has to be re-applied
+        // over whatever the next file's type and project ask for, or `:set`
+        // would be the one layer a `.editorconfig` could silently overrule.
+        self.session.overrides.set(name, parsed);
+        self.resolve_options();
 
         // A name is not a palette. `:set theme ansi` that left `self.theme`
         // alone would report success and change nothing on screen.
@@ -3028,6 +3148,10 @@ impl View<'_> {
     /// no longer exists, and a new path can change the language outright.
     fn reload_syntax(&mut self) {
         *self.syntax = syntax_for(self.buffer);
+        // A new path is a new file type, and a new file type is new options:
+        // `:w Makefile` has to bring a Makefile's tabs with it.
+        *self.filetype = filetype_of(self.buffer);
+        *self.options = resolve_options(self.session, *self.filetype);
     }
 
     /// Everything that needs the rope. What does not — the window tree, the
@@ -3581,7 +3705,7 @@ impl View<'_> {
             Action::Operate { op: Operator::Indent { right }, target, count, .. } => {
                 let Some(target) = self.resolve_find_target(*target) else { return };
                 let (right, count) = (*right, *count);
-                let indent = self.session.options.indent();
+                let indent = self.options.indent();
                 self.for_each_selection(|ed, sel| {
                     let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
                         return sel;
@@ -3654,7 +3778,7 @@ impl View<'_> {
                 // autoindent put there is invisible on screen and perfectly
                 // visible in the diff. Only when autoindent is on: with it off,
                 // nothing but the user put that whitespace there.
-                let clearing = stepping_back && self.session.options.autoindent;
+                let clearing = stepping_back && self.options.autoindent;
                 self.session.mode = Mode::Normal;
                 self.session.replaced.clear();
                 self.selections.collapse_each();
@@ -3674,7 +3798,7 @@ impl View<'_> {
             }
             Action::OpenLineBelow | Action::OpenLineAbove => {
                 let below = matches!(action, Action::OpenLineBelow);
-                let indent = self.session.options.indent();
+                let indent = self.options.indent();
                 self.session.mode = Mode::Insert;
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.open_line(sel.head, below, &indent))
@@ -3742,19 +3866,19 @@ impl View<'_> {
                 });
             }
             Action::InsertNewline => {
-                let indent = self.session.options.indent();
+                let indent = self.options.indent();
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.insert_newline(sel.head, &indent))
                 });
             }
             Action::Backspace => {
-                let indent = self.session.options.indent();
+                let indent = self.options.indent();
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(ed.buffer.backspace_indent(sel.head, &indent))
                 });
             }
             Action::InsertIndent { right } => {
-                let (right, indent) = (*right, self.session.options.indent());
+                let (right, indent) = (*right, self.options.indent());
                 self.for_each_selection(|ed, sel| {
                     Selection::collapsed(match right {
                         true => ed.buffer.insert_indent(sel.head, &indent),
@@ -3827,7 +3951,7 @@ impl View<'_> {
             // for free: three steps is the command run three times, and it can
             // only run three times if there is still a selection.
             Action::OperateSelection { op: Operator::Indent { right }, .. } => {
-                let (right, indent) = (*right, self.session.options.indent());
+                let (right, indent) = (*right, self.options.indent());
                 self.for_each_selection(|ed, sel| {
                     let (lo, hi) = sel.range();
                     let first = ed.buffer.row_at(Cursor::at(lo));
@@ -8983,12 +9107,139 @@ mod tests {
     #[test]
     fn autoindent_off_leaves_both_halves_of_that_alone() {
         let mut ed = editor("    alpha\n");
-        ed.session.options.autoindent = false;
+        // Through `:set` rather than by poking the session: options resolve
+        // per buffer now, and a field written behind the resolver's back would
+        // not reach the buffer that is already open.
+        ex(&mut ed, "set autoindent false");
 
         ed.apply(cmd(Action::OpenLineBelow));
         type_str(&mut ed, "  ");
         ed.apply(cmd(Action::EnterNormal));
 
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "    alpha\n  \n");
+    }
+
+    // ---- options, per file --------------------------------------------------
+    //
+    // See `docs/specs/options.md`. A file type is a *name*, so these need real
+    // ones on disk — `Scratch` prefixes what it is given, and a Makefile is
+    // only a Makefile if it is called one.
+
+    /// A directory of files with the names they were asked for.
+    struct Files(std::path::PathBuf);
+
+    impl Files {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("bi-options-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str, text: &str) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_makefile_gets_tabs_whatever_the_config_says() {
+        let files = Files::new("make");
+        let mut ed = Editor::open(files.file("Makefile", "all:\n\techo hi\n")).unwrap();
+        assert!(!ed.options().expandtab, "out of the box");
+        assert_eq!(ed.options().tab_width, 8);
+
+        ed.load_config(ConfigText(Some("[options]\nexpandtab = true\n")));
+
+        assert!(ed.session.options.expandtab, "the session wanted spaces");
+        assert!(!ed.options().expandtab, "and a Makefile still does not get them");
+    }
+
+    #[test]
+    fn a_filetype_section_beats_the_built_in_table() {
+        let files = Files::new("ftsection");
+        let mut ed = Editor::open(files.file("Makefile", "all:\n")).unwrap();
+
+        ed.load_config(ConfigText(Some("[filetype.make]\ntab_width = 2\n")));
+
+        assert_eq!(ed.options().tab_width, 2, "yours, over bi's own 8");
+        assert!(!ed.options().expandtab, "and the rest of the built-in still stands");
+    }
+
+    #[test]
+    fn set_beats_every_layer_under_it_and_reaches_open_buffers() {
+        let files = Files::new("setwins");
+        let mut ed = Editor::open(files.file("Makefile", "all:\n")).unwrap();
+        ed.load_config(ConfigText(Some("[filetype.make]\ntab_width = 2\n")));
+
+        ex(&mut ed, "set tab_width 5");
+
+        assert_eq!(ed.options().tab_width, 5, "on the file that was already open");
+    }
+
+    #[test]
+    fn two_kinds_of_file_open_at_once_resolve_differently() {
+        let files = Files::new("both");
+        let makefile = files.file("Makefile", "all:\n");
+        let script = files.file("run.py", "print(1)\n");
+
+        let mut ed = Editor::open(&makefile).unwrap();
+        let python = ed.open_path(&script).unwrap();
+
+        assert!(!ed.options().expandtab, "the Makefile keeps its tabs");
+        assert!(ed.options_of(python).expandtab, "and the Python file does not get them");
+    }
+
+    #[test]
+    fn a_file_nothing_claims_gets_the_session_options() {
+        let files = Files::new("plain");
+        let mut ed = Editor::open(files.file("notes.unknownext", "hi\n")).unwrap();
+        ed.load_config(ConfigText(Some("[options]\ntab_width = 3\n")));
+
+        assert_eq!(ed.options().tab_width, 3);
+    }
+
+    #[test]
+    fn reload_re_resolves_every_open_buffer() {
+        let files = Files::new("reload");
+        let mut ed = Editor::open(files.file("Makefile", "all:\n")).unwrap();
+        let source = std::rc::Rc::new(Mutable::new("[filetype.make]\ntab_width = 2\n"));
+        ed.load_config(std::rc::Rc::clone(&source));
+        assert_eq!(ed.options().tab_width, 2);
+
+        *source.0.borrow_mut() = Some(String::new());
+        ex(&mut ed, "reload");
+
+        assert_eq!(ed.options().tab_width, 8, "back to what a Makefile asks for");
+    }
+
+    #[test]
+    fn writing_a_buffer_under_a_new_name_re_resolves_it() {
+        let files = Files::new("rename");
+        let mut ed = Editor::open(files.file("notes.txt", "hi\n")).unwrap();
+        assert!(ed.options().expandtab);
+
+        ex(&mut ed, &format!("w {}", files.0.join("Makefile").display()));
+
+        assert!(!ed.options().expandtab, "it is a Makefile now, and Makefiles take tabs");
+    }
+
+    #[test]
+    fn a_bad_value_in_a_filetype_section_is_reported_rather_than_fatal() {
+        let files = Files::new("badvalue");
+        let mut ed = Editor::open(files.file("Makefile", "all:\n")).unwrap();
+
+        let problems = ed.load_config(ConfigText(Some("[filetype.make]\ntab_width = \"wide\"\n")));
+
+        assert_eq!(problems.len(), 1, "reported, with the line it is on");
+        assert_eq!(problems[0].line, 2);
+        assert_eq!(ed.options().tab_width, 8, "and the bad line changed nothing");
     }
 }

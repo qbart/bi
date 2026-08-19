@@ -25,7 +25,14 @@ pub struct Span {
     pub capture: u32,
 }
 
-/// Grammar for a file, or `None` for plain text.
+/// The file type a name implies — `rust`, `make`, `markdown` — or `None` when
+/// nothing here claims it.
+///
+/// This is the one place a file name becomes a language, and it answers with a
+/// *name* rather than a grammar because more than the grammar is scoped by it:
+/// `[filetype.go]` in a config file is, and so are the built-in defaults that
+/// give a Makefile its tabs. A second table asking the same question of the
+/// same string is a second answer waiting to disagree.
 ///
 /// `file` is a file *name* — `Cargo.toml`, `CMakeLists.txt` — or a bare
 /// extension, which is the same string with no dot in it. Whole names are
@@ -36,15 +43,13 @@ pub struct Span {
 /// The whole-name arm matches the name entire, never a prefix of it, which is
 /// what keeps `Gemfile` on Ruby while `Gemfile.lock` — a different format
 /// wearing the same first word — falls through to an extension nobody claims.
-fn language_for(file: &str) -> Option<(Language, &'static str)> {
+pub fn filetype(file: &str) -> Option<&'static str> {
     let named = match file {
-        "CMakeLists.txt" => Some(cmake()),
+        "CMakeLists.txt" => Some("cmake"),
         // Build files are named rather than suffixed, which is the whole
         // reason this arm exists. `*.mk` still resolves below.
-        "Makefile" | "makefile" | "GNUmakefile" => Some(make()),
-        "Dockerfile" => {
-            Some((arborium_dockerfile::language().into(), arborium_dockerfile::HIGHLIGHTS_QUERY))
-        }
+        "Makefile" | "makefile" | "GNUmakefile" => Some("make"),
+        "Dockerfile" => Some("dockerfile"),
         // Every dotfile the two shells read on the way in or out. None of them
         // has an extension and all of them are shell, so the whole-name arm is
         // the only thing that can reach them — and picking off `.bashrc` alone
@@ -55,108 +60,148 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
         // `.bash_aliases` is a convention rather than a file bash looks for
         // itself, which changes nothing about what is inside it.
         ".bashrc" | ".bash_profile" | ".bash_login" | ".bash_logout" | ".bash_aliases"
-        | ".profile" | ".zshenv" | ".zprofile" | ".zshrc" | ".zlogin" | ".zlogout" => Some(bash()),
+        | ".profile" | ".zshenv" | ".zprofile" | ".zshrc" | ".zlogin" | ".zlogout" => Some("bash"),
         // TOML, and `lock` is not a format: `yarn.lock` is bespoke,
         // `flake.lock` is JSON, `Gemfile.lock` is neither. The whole name is
         // the only honest key.
-        "Cargo.lock" => Some(toml()),
+        "Cargo.lock" => Some("toml"),
         // Ruby's build files are named, extensionless Ruby — the `Makefile`
         // case again. `.rake` was already an extension while `Rakefile`, where
         // the tasks actually live, was not.
-        "Gemfile" | "Rakefile" => Some(ruby()),
+        "Gemfile" | "Rakefile" => Some("ruby"),
         _ => None,
     };
     if named.is_some() {
         return named;
     }
 
-    match file.rsplit('.').next().unwrap_or(file) {
-        "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
-        "toml" => Some(toml()),
-        "yaml" | "yml" => {
-            Some((tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY))
-        }
-        "json" => Some((tree_sitter_json::LANGUAGE.into(), tree_sitter_json::HIGHLIGHTS_QUERY)),
-        "ini" => Some((tree_sitter_ini::LANGUAGE.into(), tree_sitter_ini::HIGHLIGHTS_QUERY)),
-        // The block grammar only. Markdown's inline syntax — emphasis, links,
-        // code spans — is a *second* parser reached through an injection, and
-        // injections are still deferred. Block structure is most of what you
-        // look at anyway: headings, fences, list markers, quotes.
-        "md" | "markdown" => {
-            Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
-        }
-        "cmake" => Some(cmake()),
-        "mk" | "mak" => Some(make()),
-        "go" => Some((tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY)),
-        "c3" | "c3i" => Some((tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY)),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
-            Some((tree_sitter_cpp::LANGUAGE.into(), &CPP_HIGHLIGHTS))
-        }
+    Some(match file.rsplit('.').next().unwrap_or(file) {
+        "rs" => "rust",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "json" => "json",
+        "ini" => "ini",
+        "md" | "markdown" => "markdown",
+        "cmake" => "cmake",
+        "mk" | "mak" => "make",
+        "go" => "go",
+        "c3" | "c3i" => "c3",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
         // `.h` is ambiguous and always will be. C, because a C++ project that
         // uses it gets a grammar that reads most of the file anyway, while a C
         // project handed the C++ grammar gets nothing better.
-        "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
-        "lua" => Some((tree_sitter_lua::LANGUAGE.into(), tree_sitter_lua::HIGHLIGHTS_QUERY)),
-        "sh" | "bash" | "zsh" => Some(bash()),
-        // Terraform is HCL. The query is bi's own — see `src/queries/hcl.scm`.
-        "tf" | "tfvars" | "hcl" => Some((tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS)),
-        "css" => Some((tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY)),
-        // Slang and HLSL are C-family forks whose crates ship their highlight
-        // queries commented out, so both borrow C's. Not C++'s: Slang rejects
-        // it outright (no `auto` node) and HLSL accepts it but then matches
-        // nothing at all, which is the worse failure of the two because it
-        // looks like a working grammar. Both are pinned by tests below.
-        "slang" => Some((tree_sitter_slang::LANGUAGE_SLANG.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
-        "glsl" | "vert" | "frag" | "comp" => {
-            Some((tree_sitter_glsl::LANGUAGE_GLSL.into(), tree_sitter_glsl::HIGHLIGHTS_QUERY))
-        }
-        "hlsl" => Some((tree_sitter_hlsl::LANGUAGE_HLSL.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
-        "py" | "pyi" => {
-            Some((tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY))
-        }
-        "rb" | "rake" | "gemspec" => Some(ruby()),
-        "html" | "htm" => {
-            Some((tree_sitter_html::LANGUAGE.into(), tree_sitter_html::HIGHLIGHTS_QUERY))
-        }
+        "c" | "h" => "c",
+        "lua" => "lua",
+        "sh" | "bash" | "zsh" => "bash",
+        // Terraform is HCL.
+        "tf" | "tfvars" | "hcl" => "hcl",
+        "css" => "css",
+        "slang" => "slang",
+        "glsl" | "vert" | "frag" | "comp" => "glsl",
+        "hlsl" => "hlsl",
+        "py" | "pyi" => "python",
+        "rb" | "rake" | "gemspec" => "ruby",
+        "html" | "htm" => "html",
         // XML is a syntax, not a file type, and the languages already here drag
         // most of these in: `.csproj`/`.props`/`.targets` come with C#,
         // `.vcxproj` with C++, `.xaml` with a .NET UI. The grammar does not
         // care which, so each one costs a word here and costs a plain-looking
         // file if left out.
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" | "csproj" | "vcxproj" | "props"
-        | "targets" | "xaml" => {
-            Some((tree_sitter_xml::LANGUAGE_XML.into(), tree_sitter_xml::XML_HIGHLIGHT_QUERY))
+        | "targets" | "xaml" => "xml",
+        "dtd" => "dtd",
+        "scss" => "scss",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        // Its own name rather than TypeScript's: the grammar differs, and a
+        // filetype is what someone writes `[filetype.tsx]` against.
+        "tsx" => "tsx",
+        "swift" => "swift",
+        "java" => "java",
+        // Capital `.R` is as common as lowercase, and this is given the name as
+        // typed.
+        "r" | "R" => "r",
+        "jl" => "julia",
+        "cs" => "csharp",
+        "cr" => "crystal",
+        "templ" => "templ",
+        _ => return None,
+    })
+}
+
+/// Grammar for a file type, or `None` when bi names the type but ships no
+/// parser for it.
+fn grammar(filetype: &str) -> Option<(Language, &'static str)> {
+    Some(match filetype {
+        "rust" => (tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY),
+        "toml" => toml(),
+        "yaml" => (tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY),
+        "json" => (tree_sitter_json::LANGUAGE.into(), tree_sitter_json::HIGHLIGHTS_QUERY),
+        "ini" => (tree_sitter_ini::LANGUAGE.into(), tree_sitter_ini::HIGHLIGHTS_QUERY),
+        // The block grammar only. Markdown's inline syntax — emphasis, links,
+        // code spans — is a *second* parser reached through an injection, and
+        // injections are still deferred. Block structure is most of what you
+        // look at anyway: headings, fences, list markers, quotes.
+        "markdown" => (tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK),
+        "cmake" => cmake(),
+        "make" => make(),
+        "dockerfile" => {
+            (arborium_dockerfile::language().into(), arborium_dockerfile::HIGHLIGHTS_QUERY)
         }
+        "go" => (tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY),
+        "c3" => (tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY),
+        "cpp" => (tree_sitter_cpp::LANGUAGE.into(), &CPP_HIGHLIGHTS),
+        "c" => (tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY),
+        "lua" => (tree_sitter_lua::LANGUAGE.into(), tree_sitter_lua::HIGHLIGHTS_QUERY),
+        "bash" => bash(),
+        // The query is bi's own — see `src/queries/hcl.scm`.
+        "hcl" => (tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS),
+        "css" => (tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY),
+        // Slang and HLSL are C-family forks whose crates ship their highlight
+        // queries commented out, so both borrow C's. Not C++'s: Slang rejects
+        // it outright (no `auto` node) and HLSL accepts it but then matches
+        // nothing at all, which is the worse failure of the two because it
+        // looks like a working grammar. Both are pinned by tests below.
+        "slang" => (tree_sitter_slang::LANGUAGE_SLANG.into(), tree_sitter_c::HIGHLIGHT_QUERY),
+        "glsl" => (tree_sitter_glsl::LANGUAGE_GLSL.into(), tree_sitter_glsl::HIGHLIGHTS_QUERY),
+        "hlsl" => (tree_sitter_hlsl::LANGUAGE_HLSL.into(), tree_sitter_c::HIGHLIGHT_QUERY),
+        "python" => (tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY),
+        "ruby" => ruby(),
+        "html" => (tree_sitter_html::LANGUAGE.into(), tree_sitter_html::HIGHLIGHTS_QUERY),
+        "xml" => (tree_sitter_xml::LANGUAGE_XML.into(), tree_sitter_xml::XML_HIGHLIGHT_QUERY),
         // The same crate's second grammar, and its parser is compiled either
         // way — see `Cargo.toml`. A `.dtd` open beside the document it
         // constrains is the whole use.
-        "dtd" => Some((tree_sitter_xml::LANGUAGE_DTD.into(), tree_sitter_xml::DTD_HIGHLIGHT_QUERY)),
+        "dtd" => (tree_sitter_xml::LANGUAGE_DTD.into(), tree_sitter_xml::DTD_HIGHLIGHT_QUERY),
         // `language()` is a function here rather than a `LANGUAGE` const —
         // this crate predates that convention.
-        "scss" => Some((tree_sitter_scss::language(), &SCSS_HIGHLIGHTS)),
+        "scss" => (tree_sitter_scss::language(), &SCSS_HIGHLIGHTS),
         // `HIGHLIGHT_QUERY`, singular, and a second query for JSX which needs
         // an injection to reach. `.jsx` gets the plain one until then.
-        "js" | "jsx" | "mjs" | "cjs" => {
-            Some((tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY))
+        "javascript" => {
+            (tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY)
         }
-        "ts" | "mts" | "cts" => {
-            Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &TYPESCRIPT_HIGHLIGHTS))
+        "typescript" => {
+            (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &TYPESCRIPT_HIGHLIGHTS)
         }
-        "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), &TYPESCRIPT_HIGHLIGHTS)),
-        "swift" => Some((tree_sitter_swift::LANGUAGE.into(), tree_sitter_swift::HIGHLIGHTS_QUERY)),
-        "java" => Some((tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY)),
-        // Capital `.R` is as common as lowercase, and `language_for` is given
-        // the name as typed.
-        "r" | "R" => Some((tree_sitter_r::LANGUAGE.into(), tree_sitter_r::HIGHLIGHTS_QUERY)),
+        "tsx" => (tree_sitter_typescript::LANGUAGE_TSX.into(), &TYPESCRIPT_HIGHLIGHTS),
+        "swift" => (tree_sitter_swift::LANGUAGE.into(), tree_sitter_swift::HIGHLIGHTS_QUERY),
+        "java" => (tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY),
+        "r" => (tree_sitter_r::LANGUAGE.into(), tree_sitter_r::HIGHLIGHTS_QUERY),
         // The query is vendored — see `src/queries/julia.scm`.
-        "jl" => Some((tree_sitter_julia::LANGUAGE.into(), JULIA_HIGHLIGHTS)),
-        "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), tree_sitter_c_sharp::HIGHLIGHTS_QUERY)),
+        "julia" => (tree_sitter_julia::LANGUAGE.into(), JULIA_HIGHLIGHTS),
+        "csharp" => (tree_sitter_c_sharp::LANGUAGE.into(), tree_sitter_c_sharp::HIGHLIGHTS_QUERY),
         // The query is vendored — see `src/queries/crystal.scm`.
-        "cr" => Some((tree_sitter_crystal::LANGUAGE.into(), CRYSTAL_HIGHLIGHTS)),
+        "crystal" => (tree_sitter_crystal::LANGUAGE.into(), CRYSTAL_HIGHLIGHTS),
         // Go's query, then templ's own vendored half.
-        "templ" => Some((tree_sitter_templ::LANGUAGE.into(), &TEMPL_HIGHLIGHTS)),
-        _ => None,
-    }
+        "templ" => (tree_sitter_templ::LANGUAGE.into(), &TEMPL_HIGHLIGHTS),
+        _ => return None,
+    })
+}
+
+/// Grammar for a file, or `None` for plain text.
+fn language_for(file: &str) -> Option<(Language, &'static str)> {
+    grammar(filetype(file)?)
 }
 
 /// HCL's highlights, which the grammar crate does not ship. See the file.

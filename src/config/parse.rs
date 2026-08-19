@@ -36,6 +36,7 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
         match key {
             "options" => read_options(src, table, &mut config, &mut problems),
             "keys" => read_keys(src, table, &mut config, &mut problems),
+            "filetype" => read_filetypes(src, table, &mut config, &mut problems),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -49,6 +50,36 @@ fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
 
         if let Err(message) = config.options.set(key, option_value(item)) {
             problems.push(Diagnostic { line, message });
+        }
+    }
+}
+
+/// `[filetype.<name>]` — one table per kind of file, each a patch over
+/// `[options]`.
+///
+/// A value is checked here even though it is applied later: a patch carries
+/// no line numbers, and `config.toml:7: expandtab takes true or false` is the
+/// whole difference between a diagnostic and a shrug. So each value is tried
+/// against a scratch `Options` — the same `Options::set` `[options]` goes
+/// through — and one that will never apply is reported and dropped rather
+/// than kept to fail silently at every resolution.
+fn read_filetypes(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    for (name, item) in table.iter() {
+        let line = line_for(table, name, src);
+        let Some(inner) = item.as_table() else {
+            problems
+                .push(Diagnostic { line, message: format!("[filetype.{name}] is not a section") });
+            continue;
+        };
+        let patch = config.filetypes.entry(name.to_string()).or_default();
+        for (key, item) in inner.iter() {
+            let line = line_for(inner, key, src);
+            let value = option_value(item);
+            if let Err(message) = super::Options::default().set(key, value.clone()) {
+                problems.push(Diagnostic { line, message });
+                continue;
+            }
+            patch.set(key, value);
         }
     }
 }

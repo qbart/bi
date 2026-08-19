@@ -652,6 +652,34 @@ for a config layer — becomes a lookup into the same options table the file
 parses into, so a new option is one entry rather than one arm plus one parse
 rule.
 
+### `[filetype.<name>]`
+
+A second *scope*, which is not the same thing as a second settings section:
+the keys are the same keys, `[options]`'s, and what changes is which files they
+reach.
+
+```toml
+[filetype.go]
+tab_width = 4
+
+[filetype.markdown]
+expandtab = true
+```
+
+The name is the one `src/syntax.rs` gives a file — `rust`, `make`, `markdown`,
+`csharp` — which is the same name its grammar is chosen by, because two tables
+answering "what kind of file is this" would eventually disagree.
+
+A section here is a *patch*: it names what it has an opinion about and says
+nothing else. It is applied over `[options]`, over bi's own built-in table for
+that type (which is what gives a Makefile its tabs whatever your `expandtab`
+says), and under a `.editorconfig` and an explicit `:set`. The whole order,
+and why it is that order, is `docs/specs/options.md`.
+
+A value that no option would accept is reported against its own line and
+dropped, exactly as it is in `[options]` — the check happens here, at parse
+time, because a patch carries no line numbers to complain with later.
+
 ## The boundary
 
 The library owns the config **types and the parser**. The frontend owns **where

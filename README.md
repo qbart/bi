@@ -547,10 +547,21 @@ expandtab  = true   # write an indent as spaces
 autoindent = true   # a new line starts under the one above it
 ```
 
-`expandtab` defaults to spaces, which is not vim's default and is deliberate.
-The exception it costs is a `Makefile`, which needs tabs and needs `:set
-expandtab false` until per-file options land — see
-[docs/specs/indent.md](docs/specs/indent.md).
+Options resolve **per file**, not per session. `[options]` is what you want in
+general; bi has a small built-in table of what a language *requires* — a
+Makefile gets tabs, Go gets tabs — and `[filetype.<name>]` is where you
+override either:
+
+```toml
+[filetype.go]
+tab_width = 4      # gofmt writes tabs; how wide they look is yours
+```
+
+The name is the one bi gives the file, which is the same name its grammar is
+chosen by. The order is: bi's defaults, then `[options]`, then the file's type,
+then the project's `.editorconfig`, then anything you `:set` this session — so
+a Makefile keeps its tabs however you like your spaces, and `:set` still wins
+when you mean it. See [docs/specs/options.md](docs/specs/options.md).
 
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown

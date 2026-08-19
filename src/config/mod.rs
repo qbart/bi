@@ -210,6 +210,74 @@ impl Options {
     }
 }
 
+/// A sparse set of option values: a *layer*, not a configuration.
+///
+/// It names the options it has an opinion about and says nothing about the
+/// rest, which is what lets bi's defaults, your config, the file's type, its
+/// project and your last `:set` be five statements of different scope rather
+/// than five whole configurations fighting over one.
+///
+/// A list of name/value pairs rather than a mirror of [`Options`] with an
+/// `Option` on every field: applying it goes through `Options::set`, the one
+/// place a name becomes a field, so a patch cannot hold an option `:set`
+/// cannot, and an option added later works in every layer the day it exists.
+/// Ordered, so a patch that says a thing twice ends on the second.
+///
+/// See `docs/specs/options.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OptionPatch(Vec<(String, OptionValue)>);
+
+impl OptionPatch {
+    pub fn set(&mut self, name: impl Into<String>, value: OptionValue) {
+        self.0.push((name.into(), value));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether this layer has an opinion about `name`.
+    pub fn holds(&self, name: &str) -> bool {
+        self.0.iter().any(|(key, _)| key == name)
+    }
+
+    /// Lays this layer over `options`, and reports what it could not apply.
+    ///
+    /// A bad value drops that one entry rather than the layer, the same rule
+    /// the config file follows: an option you cannot set is a message, not a
+    /// reason to throw away the four that were fine.
+    pub fn apply_to(&self, options: &mut Options) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (name, value) in &self.0 {
+            if let Err(message) = options.set(name, value.clone()) {
+                problems.push(message);
+            }
+        }
+        problems
+    }
+}
+
+/// What a language needs whatever your config says.
+///
+/// Deliberately tiny, and only for what a language *requires* or has
+/// *universally settled* — a Makefile with spaces does not run, and gofmt
+/// writes tabs whether or not you like them. Taste belongs in
+/// `[filetype.<name>]`, which is applied after this and can undo it.
+pub fn filetype_defaults(filetype: &str) -> OptionPatch {
+    let mut patch = OptionPatch::default();
+    match filetype {
+        "make" => {
+            patch.set("expandtab", OptionValue::Bool(false));
+            patch.set("tab_width", OptionValue::Int(8));
+        }
+        // Tabs, because gofmt writes them; the width stays yours, because
+        // gofmt has nothing to say about how wide a tab looks.
+        "go" => patch.set("expandtab", OptionValue::Bool(false)),
+        _ => {}
+    }
+    patch
+}
+
 /// Everything a config file can say. The theme is named here and resolved by
 /// [`crate::theme::Theme::resolve`], because a name is config and a palette is
 /// a second file — see `docs/specs/theme.md`.
@@ -219,6 +287,12 @@ pub struct Config {
     /// Rewrites of bi's own keys, per mode. Empty is the default and means
     /// every key keeps its built-in meaning.
     pub keys: Keymap,
+    /// `[filetype.<name>]` — options for one kind of file, laid over
+    /// `[options]` and over bi's own built-in table for that type.
+    ///
+    /// Keyed by the name `crate::syntax::filetype` gives a file, which is the
+    /// same name its grammar is chosen by.
+    pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
 }
 
 impl Default for Config {
@@ -231,7 +305,11 @@ impl Default for Config {
         static DEFAULT: OnceLock<Config> = OnceLock::new();
         DEFAULT
             .get_or_init(|| {
-                let bare = Config { options: Options::default(), keys: Keymap::default() };
+                let bare = Config {
+                    options: Options::default(),
+                    keys: Keymap::default(),
+                    filetypes: Default::default(),
+                };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })
             .clone()
