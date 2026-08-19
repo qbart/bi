@@ -1190,6 +1190,87 @@ mod tests {
         assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
     }
 
+    fn line_of(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    /// The two anchors, on a line with a tab in it — the conversion from
+    /// characters to columns is the part that can be wrong, and only a range
+    /// anchored to text can be wrong that way.
+    #[test]
+    fn a_repaint_covers_the_columns_its_char_range_occupies() {
+        let spans = vec![Span::raw(expand_tabs("\tab", 4))];
+        let marked = ThemeStyle { bg: Some(ThemeColor::Indexed(1)), ..ThemeStyle::default() };
+        // Chars 1..2 — the `a`, which a tab has pushed out to column 4.
+        let line = Row { row: 0, raw: "\tab", start: 0, gutter: 0, tab: 4 };
+        let decorations = [Decoration::Repaint { range: 1..2, style: marked, layer: Layer::Under }];
+
+        let out = decorate(spans, &line, &decorations, Layer::Under);
+
+        assert_eq!(line_of(&out), "    ab", "the text is untouched");
+        let painted: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Indexed(1)))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(painted, "a", "and exactly one column changed colour");
+    }
+
+    #[test]
+    fn an_eol_decoration_lands_past_the_end_and_pads_nothing() {
+        let line = Row { row: 0, raw: "code", start: 0, gutter: 0, tab: 4 };
+        let decorations = [Decoration::Eol {
+            row: 0,
+            text: "  ← here".to_string(),
+            style: ThemeStyle::default(),
+        }];
+
+        let out = decorate(vec![Span::raw("code".to_string())], &line, &decorations, Layer::Over);
+
+        assert_eq!(line_of(&out), "code  ← here");
+    }
+
+    /// The whole of what `Layer` is for: a guide has to let a selected line
+    /// still look selected, and a jump label has to be readable wherever it
+    /// lands.
+    #[test]
+    fn the_selection_paints_over_one_layer_and_under_the_other() {
+        let line = Row { row: 0, raw: "code", start: 0, gutter: 0, tab: 4 };
+        let ink = ThemeStyle { bg: Some(ThemeColor::Indexed(1)), ..ThemeStyle::default() };
+        let selection = ThemeStyle { bg: Some(ThemeColor::Indexed(2)), ..ThemeStyle::default() };
+        let under = [Decoration::Overlay {
+            row: 0,
+            col: 0,
+            text: "│".to_string(),
+            style: ink,
+            layer: Layer::Under,
+        }];
+        let over = [Decoration::Overlay {
+            row: 0,
+            col: 3,
+            text: "x".to_string(),
+            style: ink,
+            layer: Layer::Over,
+        }];
+
+        // The order render_window paints in: under, selection, over.
+        let mut spans = vec![Span::raw("code".to_string())];
+        spans = decorate(spans, &line, &under, Layer::Under);
+        spans = paint_range(spans, 0..4, selection);
+        spans = decorate(spans, &line, &over, Layer::Over);
+
+        assert_eq!(line_of(&spans), "│odx");
+        let bg = |col: usize| {
+            spans
+                .iter()
+                .flat_map(|s| std::iter::repeat_n(s.style.bg, s.content.chars().count()))
+                .nth(col)
+                .flatten()
+        };
+        assert_eq!(bg(0), Some(Color::Indexed(2)), "the selection is over the guide");
+        assert_eq!(bg(3), Some(Color::Indexed(1)), "and under the label");
+    }
+
     /// The whole of what a frontend does with a decoration, on one line.
     ///
     /// Width is the property worth guarding: an overlay replaces the cells it
