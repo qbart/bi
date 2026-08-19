@@ -16,6 +16,7 @@ function    = { fg = "#79740e", bold = true }        # green, bold
 constructor = { fg = "#79740e", bold = true }
 type        = "#b57614"                              # yellow
 module      = "#b57614"
+tag         = "#b57614"                              # an element names a type
 string      = "#79740e"
 escape      = "#79740e"
 character   = "#79740e"

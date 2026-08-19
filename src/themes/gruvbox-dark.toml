@@ -10,6 +10,13 @@ function    = { fg = "#b8bb26", bold = true }        # green, bold
 constructor = { fg = "#b8bb26", bold = true }
 type        = "#fabd2f"                              # yellow
 module      = "#fabd2f"
+
+# An element name names a kind of node, which is what a type is — XML's own
+# vocabulary calls them element types. Without this every `<div>` in an HTML
+# file was captured and then painted plain foreground, which is the failure
+# named below for operators, one rung further out: not a role given the wrong
+# colour, but a role no theme gave one at all.
+tag         = "#fabd2f"
 string      = "#b8bb26"
 escape      = "#b8bb26"
 character   = "#b8bb26"

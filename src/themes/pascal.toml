@@ -34,6 +34,7 @@ constructor = "#ffff55"
 
 type        = "#55ffff"                              # light cyan
 module      = "#55ffff"
+tag         = "#55ffff"                              # an element names a type
 
 string      = "#55ff55"                              # light green
 character   = "#55ff55"

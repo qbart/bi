@@ -258,7 +258,7 @@ The default. From the palette in
 |---|---|
 | keyword | red `#fb4934` |
 | function, constructor | green `#b8bb26` bold |
-| type, module | yellow `#fabd2f` |
+| type, module, tag | yellow `#fabd2f` |
 | string, escape, character | green `#b8bb26` |
 | comment | gray `#928374` italic |
 | constant, number, float, boolean | purple `#d3869b` |
@@ -276,6 +276,24 @@ of nothing is a capture that did not happen" — `&x` and `x` are different
 programs, and a palette that paints the `&` the colour of the text around it
 is one where the capture may as well not have fired. Orange is gruvbox's own
 and unused elsewhere in the table.
+
+**Tags take the type colour, and before they took none.** `@tag` is what the
+HTML and XML grammars call an element name, and no theme here had an entry for
+it — so every `<div>` in an HTML file was parsed, captured and then painted the
+same colour as the text around it. That is the operator bug again, one rung
+further out: not a role given the wrong colour, but a role nobody remembered to
+give one. It went unnoticed because HTML is mostly not tags; XML is *almost
+entirely* tags, and a document that renders plain is hard to miss.
+
+Yellow rather than a colour of its own, because an element name names a kind of
+node — `<note>` and `<from>` are the same thing to a document that `struct` and
+`enum` are to a program, and XML's own vocabulary calls them element *types*.
+It also keeps the three parts of a tag distinct, which is what a reader is
+actually separating: yellow name, aqua or blue attribute, green value. Sharing
+a colour across roles is normal here — `constructor` is `function`'s, `module`
+is `type`'s — and the aliases are written out per theme rather than welded
+together in code, so a theme that wants tags in their own colour writes one
+line.
 
 ### `gruvbox-light`
 
@@ -338,6 +356,12 @@ It sets no `background`.
   is allowed to decline, and `ansi` declines both.
 - the `ansi` built-in round-trips to the styles `render.rs` uses today. This
   is the one that says the door swings both ways.
+- every built-in styles the roles that *carry* a file — `keyword`, `string`,
+  `comment`, `type`, `property`, `tag` — because a capture with no entry falls
+  off the end of the dotted walk and renders as plain foreground, which looks
+  exactly like a grammar that never matched. `tag` is in that list by
+  experience: it was missing from all four themes and took every HTML element
+  name down with it.
 - all three colour spellings parse, and a fourth thing does not
 - the dotted walk: `function.method` finds `function`, `string.special.key`
   does *not* find `string`, an unknown name finds nothing

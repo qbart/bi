@@ -32,6 +32,10 @@ pub struct Span {
 /// tried first, because a build file is often named rather than suffixed;
 /// otherwise the text after the last dot decides. One arm per language either
 /// way, so adding one stays a line.
+///
+/// The whole-name arm matches the name entire, never a prefix of it, which is
+/// what keeps `Gemfile` on Ruby while `Gemfile.lock` — a different format
+/// wearing the same first word — falls through to an extension nobody claims.
 fn language_for(file: &str) -> Option<(Language, &'static str)> {
     let named = match file {
         "CMakeLists.txt" => Some(cmake()),
@@ -41,9 +45,25 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
         "Dockerfile" => {
             Some((arborium_dockerfile::language().into(), arborium_dockerfile::HIGHLIGHTS_QUERY))
         }
+        // Every dotfile the two shells read on the way in or out. None of them
+        // has an extension and all of them are shell, so the whole-name arm is
+        // the only thing that can reach them — and picking off `.bashrc` alone
+        // is how the list ends up arbitrary.
+        //
         // zsh is not bash, but the bash grammar reads all but the exotic parts
         // of a normal rc file, and there is no zsh grammar to prefer to it.
-        ".bashrc" | ".zshrc" => Some(bash()),
+        // `.bash_aliases` is a convention rather than a file bash looks for
+        // itself, which changes nothing about what is inside it.
+        ".bashrc" | ".bash_profile" | ".bash_login" | ".bash_logout" | ".bash_aliases"
+        | ".profile" | ".zshenv" | ".zprofile" | ".zshrc" | ".zlogin" | ".zlogout" => Some(bash()),
+        // TOML, and `lock` is not a format: `yarn.lock` is bespoke,
+        // `flake.lock` is JSON, `Gemfile.lock` is neither. The whole name is
+        // the only honest key.
+        "Cargo.lock" => Some(toml()),
+        // Ruby's build files are named, extensionless Ruby — the `Makefile`
+        // case again. `.rake` was already an extension while `Rakefile`, where
+        // the tasks actually live, was not.
+        "Gemfile" | "Rakefile" => Some(ruby()),
         _ => None,
     };
     if named.is_some() {
@@ -52,9 +72,7 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
 
     match file.rsplit('.').next().unwrap_or(file) {
         "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
-        "toml" => {
-            Some((tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY))
-        }
+        "toml" => Some(toml()),
         "yaml" | "yml" => {
             Some((tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY))
         }
@@ -96,12 +114,23 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
         "py" | "pyi" => {
             Some((tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY))
         }
-        "rb" | "rake" | "gemspec" => {
-            Some((tree_sitter_ruby::LANGUAGE.into(), tree_sitter_ruby::HIGHLIGHTS_QUERY))
-        }
+        "rb" | "rake" | "gemspec" => Some(ruby()),
         "html" | "htm" => {
             Some((tree_sitter_html::LANGUAGE.into(), tree_sitter_html::HIGHLIGHTS_QUERY))
         }
+        // XML is a syntax, not a file type, and the languages already here drag
+        // most of these in: `.csproj`/`.props`/`.targets` come with C#,
+        // `.vcxproj` with C++, `.xaml` with a .NET UI. The grammar does not
+        // care which, so each one costs a word here and costs a plain-looking
+        // file if left out.
+        "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" | "csproj" | "vcxproj" | "props"
+        | "targets" | "xaml" => {
+            Some((tree_sitter_xml::LANGUAGE_XML.into(), tree_sitter_xml::XML_HIGHLIGHT_QUERY))
+        }
+        // The same crate's second grammar, and its parser is compiled either
+        // way — see `Cargo.toml`. A `.dtd` open beside the document it
+        // constrains is the whole use.
+        "dtd" => Some((tree_sitter_xml::LANGUAGE_DTD.into(), tree_sitter_xml::DTD_HIGHLIGHT_QUERY)),
         // `language()` is a function here rather than a `LANGUAGE` const —
         // this crate predates that convention.
         "scss" => Some((tree_sitter_scss::language(), &SCSS_HIGHLIGHTS)),
@@ -209,6 +238,14 @@ fn make() -> (Language, &'static str) {
 
 fn bash() -> (Language, &'static str) {
     (tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY)
+}
+
+fn toml() -> (Language, &'static str) {
+    (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY)
+}
+
+fn ruby() -> (Language, &'static str) {
+    (tree_sitter_ruby::LANGUAGE.into(), tree_sitter_ruby::HIGHLIGHTS_QUERY)
 }
 
 /// Lets tree-sitter read predicate text straight out of the rope instead of
@@ -494,7 +531,16 @@ mod tests {
         "bash",
         "zsh",
         ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".bash_aliases",
+        ".profile",
+        ".zshenv",
+        ".zprofile",
         ".zshrc",
+        ".zlogin",
+        ".zlogout",
         "Dockerfile",
         "tf",
         "tfvars",
@@ -516,8 +562,23 @@ mod tests {
         "rb",
         "rake",
         "gemspec",
+        "Gemfile",
+        "Rakefile",
+        "Cargo.lock",
         "html",
         "htm",
+        "xml",
+        "xsd",
+        "xsl",
+        "xslt",
+        "svg",
+        "plist",
+        "csproj",
+        "vcxproj",
+        "props",
+        "targets",
+        "xaml",
+        "dtd",
         "scss",
         "js",
         "jsx",
@@ -758,6 +819,23 @@ mod tests {
                 "\"hi\"",
             ),
             ("cr", "# note\ndef f\n  s = \"hi\"\nend\n", "# note", "def", "\"hi\""),
+            // XML's keyword and its literal both live in the declaration —
+            // `<note>` is a tag, not a keyword, and the text between tags is
+            // `@markup` rather than a string.
+            (
+                "xml",
+                "<?xml version=\"1.0\"?>\n<!-- note -->\n<note to=\"x\">hi</note>\n",
+                "<!-- note -->",
+                "xml",
+                "1.0",
+            ),
+            (
+                "dtd",
+                "<?xml version=\"1.0\"?>\n<!-- note -->\n<!ELEMENT note (#PCDATA)>\n",
+                "<!-- note -->",
+                "ELEMENT",
+                "1.0",
+            ),
         ];
 
         for (file, text, comment, keyword, literal) in cases {
@@ -951,6 +1029,47 @@ mod tests {
         covers(&found, "keyword", "def");
         covers(&found, "string", "\"0.1.0\"");
         covers(&found, "type", "Int32");
+    }
+
+    /// An XML document is almost entirely tags, so `@tag` is the capture that
+    /// decides whether the grammar was worth adding. The three parts of a tag
+    /// have to come back as three different names, or the file reads as one
+    /// colour — the failure this file already knows from JSON keys.
+    #[test]
+    fn xml_separates_a_tag_from_its_attribute_and_its_value() {
+        let found = captures("xml", "<note to=\"x\">hi</note>\n");
+        covers(&found, "tag", "note");
+        covers(&found, "property", "to");
+        covers(&found, "string", "x");
+
+        // Both the open and the close tag, since a closing name is a separate
+        // node and a query can easily capture only the first.
+        assert_eq!(
+            found.iter().filter(|(n, t)| n == "tag" && t == "note").count(),
+            2,
+            "only one of the two tag names came back: {found:?}"
+        );
+    }
+
+    /// A file whose *name* carries the language, for the three cases where the
+    /// suffix could never have found it. `Cargo.lock` is the one that bites:
+    /// `lock` is not a format — `yarn.lock` is bespoke and `flake.lock` is
+    /// JSON — so the key has to be the whole name.
+    #[test]
+    fn a_named_file_reaches_a_grammar_its_suffix_could_not() {
+        let lock = captures("Cargo.lock", "[[package]]\nname = \"bi\"\n");
+        covers(&lock, "type", "name");
+        covers(&lock, "string", "\"bi\"");
+
+        for name in ["Gemfile", "Rakefile"] {
+            let found = captures(name, "# note\nsource \"https://rubygems.org\"\n");
+            covers(&found, "comment", "# note");
+            covers(&found, "string", "\"https://rubygems.org\"");
+        }
+
+        // And the whole name is matched whole. `Gemfile.lock` starts with a key
+        // in the table and is not that format — nor any other one here.
+        assert!(Syntax::new("Gemfile.lock", &Rope::from_str("GEM\n")).is_none());
     }
 
     #[test]

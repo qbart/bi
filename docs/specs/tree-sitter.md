@@ -5,7 +5,7 @@ user actually *sees*, and the reason `Buffer::Edit` has existed since step 1.
 
 ## Status
 
-**Built**, for thirty-three languages — see the table below. Markdown is block-level
+**Built**, for thirty-five languages — see the table below. Markdown is block-level
 only until injections land. Injections, indent queries and background parsing
 remain deferred — see the end of this file.
 
@@ -110,6 +110,19 @@ The general form of this is worth stating, because a query test cannot catch
 it: the syntax tests assert *capture names*, and the whole point of the
 capture-name boundary is that they cannot know what colour a frontend picks.
 So the theme needs its own assertion that a style is not the default one.
+
+**And a capture no theme has heard of is the same failure**, arriving from the
+other side. `@tag` had no entry in any of the four themes, so HTML element
+names — `<a>`, `<div>`, the most-repeated token in the file — rendered in plain
+foreground, parsed and captured and then thrown away. XML is what made it
+impossible to ignore: an XML document is *almost entirely* tags, so the grammar
+would have gone in, compiled, matched, passed its snippet test and produced a
+screen indistinguishable from having no grammar at all. Tags now take the
+`type` colour in all four themes — an element name names a kind of node, which
+is what a type is — and `docs/specs/theme.md` carries the reasoning. The rule
+this leaves behind: **adding a grammar means reading its query for capture
+names the themes do not have**, and the ones that carry a file are the ones to
+check first.
 
 **Query only the visible byte range.** `QueryCursor::set_byte_range` restricted
 to the rows being drawn. Frame cost stays bounded by terminal height, which is
@@ -320,7 +333,7 @@ The table, by the key that reaches it:
 | Go | `go` |
 | Python | `py` `pyi` |
 | Lua | `lua` |
-| Bash | `sh` `bash` `zsh` · `.bashrc` `.zshrc` |
+| Bash | `sh` `bash` `zsh` · `.bashrc` `.bash_profile` `.bash_login` `.bash_logout` `.bash_aliases` `.profile` `.zshenv` `.zprofile` `.zshrc` `.zlogin` `.zlogout` |
 | CSS | `css` |
 | GLSL | `glsl` `vert` `frag` `comp` |
 | HLSL | `hlsl` |
@@ -328,15 +341,17 @@ The table, by the key that reaches it:
 | HCL / Terraform | `tf` `tfvars` `hcl` |
 | Dockerfile | `Dockerfile` |
 | CMake | `cmake` · `CMakeLists.txt` |
-| TOML | `toml` |
+| TOML | `toml` · `Cargo.lock` |
 | YAML | `yaml` `yml` |
 | JSON | `json` |
 | INI | `ini` |
 | Markdown | `md` `markdown` |
 | Make | `mk` `mak` · `Makefile` `makefile` `GNUmakefile` |
-| Ruby | `rb` `rake` `gemspec` |
+| Ruby | `rb` `rake` `gemspec` · `Gemfile` `Rakefile` |
 | Crystal | `cr` |
 | HTML | `html` `htm` |
+| XML | `xml` `xsd` `xsl` `xslt` `svg` `plist` `csproj` `vcxproj` `props` `targets` `xaml` |
+| DTD | `dtd` |
 | SCSS | `scss` |
 | JavaScript | `js` `jsx` `mjs` `cjs` |
 | TypeScript | `ts` `mts` `cts` `tsx` |
@@ -356,8 +371,49 @@ other spellings `make` itself looks for; `*.mk` still resolves as an extension.
 project whose headers are `.h` gets a grammar that reads most of the file; a C
 project handed the C++ grammar gets nothing better in exchange.
 
-**`.zshrc` goes to the bash grammar.** zsh is not bash, but there is no zsh
-grammar to prefer, and bash reads all but the exotic parts of a normal rc file.
+**Bash takes every startup file, not a favourite one.** A shell dotfile has no
+extension by construction, so the whole-name arm is the only thing that can
+reach it — and `.bashrc` alone was an arbitrary list of one. The rule is now
+statable: every dotfile bash or zsh reads on the way in or out, which is the
+eleven above. `.bash_aliases` is the one bash does not look for itself; it is
+a convention `.bashrc` sources, which changes nothing about what is in it.
+
+**And they all go to the bash grammar**, `.zsh*` included. zsh is not bash, but
+there is no zsh grammar to prefer, and bash reads all but the exotic parts of a
+normal rc file. `.profile` is sh rather than bash and arrives at the same place
+for the same reason, from the other direction.
+
+**`Gemfile` and `Rakefile` are Ruby**, and are the same case as `Makefile`
+one row up: Ruby's ecosystem writes its build files as named, extensionless
+Ruby, and `.rake` was already in the table while the file rake tasks actually
+live in was not. A `Gemfile` is a Ruby DSL — `source`, `gem`, `group do` — and
+was rendering plain. `Gemfile.lock` is *not* Ruby and gets no arm; see below.
+
+**`Cargo.lock` is TOML, and `lock` is not a format.** The lockfile is the
+second-most-opened file in a Rust checkout after the manifest beside it, and it
+was rendering as plain text because its name ends in a suffix that means
+nothing. So it is a whole-name key, not an extension one, and that is not a
+shortcut: `yarn.lock` is its own bespoke format, `flake.lock` and
+`package-lock.json` are JSON, and `Gemfile.lock` is none of the three — not
+even Ruby, which is exactly why the arm above has to match `Gemfile` whole
+rather than as a prefix. Mapping `lock` would be wrong for more files than it
+is right for. `poetry.lock` and `uv.lock` *are* TOML and can have the same line
+the day someone wants them.
+
+**XML covers eleven suffixes because XML is a syntax, not a file type.** The
+languages already here drag most of them in: a C# checkout has `.csproj`,
+`.props` and `.targets`, a C++ one has `.vcxproj`, a .NET UI has `.xaml`, and
+`.svg`, `.xsd`, `.xsl`/`.xslt` and `.plist` are XML that nobody calls XML. The
+grammar does not care which, so the only cost of each is a line in the table
+and the only cost of *omitting* one is a file that renders plain for no reason
+the user can see.
+
+**DTD is a second grammar and comes with the first.** `tree-sitter-xml` ships
+both, and its `build.rs` compiles both parsers whether or not either is
+referenced — so the compile time is already paid the moment XML is added, and
+the only question left is whether the linker pulls the second symbol in. A
+`.dtd` open next to the `.xml` it constrains is the whole use, one arm reaches
+it, and the crate exports a query for it.
 
 The original argument here was "Rust only": every grammar is a C library that
 costs compile time and binary size, and the editor is written in Rust so Rust
@@ -370,7 +426,8 @@ is what gets dogfooded.
 | Rust only | 4.75 MB |
 | + TOML, YAML, JSON, INI, Markdown, CMake | 5.42 MB |
 | + the other thirteen | 23.60 MB |
-| + the thirteen after that | **49.84 MB** |
+| + the thirteen after that | 49.84 MB |
+| + XML and DTD | **49.97 MB** |
 
 Thirty-three grammars is a **10× binary**, and the second thirteen cost more
 than the first twenty put together. The jump is not evenly spread — the C-family
@@ -381,6 +438,15 @@ The single worst offender is Crystal at 44 MB of generated C — more than twice
 Swift, which was the previous record — and Ruby, Swift, C++ and TypeScript are
 each in the same order. A release build on a Raspberry Pi is now about six
 minutes.
+
+**And XML is the counter-example that makes the shape of this clear: two
+grammars for 132 KB**, a thousandth of what Crystal cost, on a relink that took
+under three minutes. The price of a grammar is the size of the language it
+parses, not the fact of having one — XML has a dozen productions and Crystal
+has a macro system. So "thirty-five grammars" is not a number to budget
+against, and a small language should never have to argue for its place here.
+The 50 MB is owed by about six of these, which is also why the fix below is
+Cargo features rather than a shorter table.
 
 Nothing here is wrong, but it changes which deferred item matters most, and
 "matters most" has become "is overdue". `Editor::syntax` is already
@@ -426,14 +492,19 @@ tree-sitter-hlsl = "0.2"     # query commented out upstream; borrows C's
 tree-sitter-slang = "0.3"    # ditto
 arborium-dockerfile = "2.18" # tree-sitter-dockerfile is stuck on tree-sitter 0.20
 tree-sitter-c3 = { git = "https://github.com/c3lang/tree-sitter-c3" }  # no crates.io release
+tree-sitter-xml = "0.7"      # two grammars; XML_HIGHLIGHT_QUERY / DTD_HIGHLIGHT_QUERY
 ```
 
 Most expose `LANGUAGE` and `HIGHLIGHTS_QUERY`, so a new grammar is one arm.
 The exceptions are worth knowing before adding the next one: C, C++ and Bash
 spell it `HIGHLIGHT_QUERY`; GLSL, HLSL and Slang name the language
 `LANGUAGE_GLSL` and so on; markdown has two grammars and calls its query
-`HIGHLIGHT_QUERY_BLOCK`; and `arborium-dockerfile` exposes `language()` as a
-function.
+`HIGHLIGHT_QUERY_BLOCK`; `arborium-dockerfile` exposes `language()` as a
+function; and `tree-sitter-xml` is two grammars in one crate, naming them
+`LANGUAGE_XML` / `LANGUAGE_DTD` and their queries `XML_HIGHLIGHT_QUERY` /
+`DTD_HIGHLIGHT_QUERY` — a fifth spelling of the same constant. Both of its
+queries are whole rather than an `; inherits:` delta, which after four in a row
+is worth saying out loud.
 
 These are the **first non-pure-Rust dependencies**. Grammars are C compiled by
 `cc`, which means a C toolchain becomes a build requirement and
@@ -476,7 +547,10 @@ Per grammar, because a grammar fails *quietly*:
   have.
 - a key and a value in each of TOML, YAML, JSON and INI get *different*
   captures — the tie-break above, from the side that shows
-- `CMakeLists.txt` resolves by name, not extension
+- `CMakeLists.txt` resolves by name, not extension — and so do `Cargo.lock`,
+  `Gemfile` and `Rakefile`, each of which has to reach a grammar its suffix
+  could never have found. `Gemfile.lock` is the negative case in the same test:
+  a whole-name key must not leak to a name that merely starts with it.
 - no `@spell` or `@nospell` ever reaches the frontend
 
 ## Deferred

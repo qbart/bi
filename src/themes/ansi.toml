@@ -17,6 +17,15 @@ function    = "blue"
 constructor = "blue"
 type        = "cyan"
 module      = "cyan"
+
+# `tag` is here and `string.special.symbol` deliberately is not, which is not
+# an inconsistency. A symbol with no entry falls through to `string` and gets a
+# colour — the one it got before themes existed, which is this file's whole
+# promise. `tag` falls through to *nothing* and renders as plain foreground, and
+# an XML document is almost entirely tags. There is also nothing to be faithful
+# to: render.rs never had a `tag` arm, because HTML and XML both arrived after
+# it stopped being the place colours lived.
+tag         = "cyan"
 string      = "green"
 escape      = "green"
 character   = "green"

@@ -630,6 +630,26 @@ mod tests {
         assert_eq!(light.style("comment"), dark.style("comment"));
     }
 
+    /// A capture with no entry falls off the end of the dotted walk and paints
+    /// in plain foreground, which on screen is indistinguishable from a grammar
+    /// that never matched. So the roles that *carry* a file have to be filled
+    /// by every built-in, `ansi` included.
+    ///
+    /// `tag` is on this list by experience rather than by principle: it was in
+    /// none of the four, so every HTML element name was parsed, captured,
+    /// ranked and then thrown away. HTML is mostly not tags and it went
+    /// unnoticed; XML is almost entirely tags and would have shipped a grammar
+    /// whose files render blank.
+    #[test]
+    fn every_builtin_fills_the_roles_that_carry_a_file() {
+        for name in ["gruvbox-dark", "gruvbox-light", "pascal", "ansi"] {
+            let theme = parsed(name);
+            for role in ["keyword", "string", "comment", "type", "property", "tag"] {
+                assert!(theme.style(role).is_some(), "{name} leaves {role} unpainted");
+            }
+        }
+    }
+
     /// The fallback walk lands `string.special.symbol` on `string` unless a
     /// theme stops it, and Ruby is dense enough with symbols that letting it
     /// happen turned 59% of a Ruby file into one green. That is the failure
