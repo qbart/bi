@@ -973,6 +973,8 @@ enum ExLine {
     PasteAs(String),
     /// `:m +3`, `:m -2`, `:m 0`, `:m $`, `:m 12`.
     Move(MoveTo),
+    /// `:case snake` — respell what is selected, or the word under the cursor.
+    Case(crate::case::Style),
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -1098,6 +1100,12 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "m" | "move" => match parse_move(arg) {
             Some(to) => ExLine::Move(to),
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
+        },
+        "case" => match crate::case::Style::parse(arg) {
+            Some(style) => ExLine::Case(style),
+            None => {
+                ExLine::Error(format!("case what? one of {}", crate::case::Style::NAMES.join(", ")))
+            }
         },
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         "reload" => ExLine::ReloadConfig,
@@ -3086,6 +3094,9 @@ impl Editor {
             ExLine::Move(to) => {
                 self.in_view(|view| view.move_to(to));
             }
+            ExLine::Case(style) => {
+                self.in_view(|view| view.recase(style));
+            }
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -4801,6 +4812,46 @@ impl View<'_> {
         }
         let row = self.after_line(address as usize, first, last);
         self.move_lines(first, last, row);
+    }
+
+    /// `:case {style}` — respells what is selected, or the word under the
+    /// cursor when nothing is.
+    ///
+    /// The word is the fallback because renaming one is what this is for, and
+    /// selecting it first is a keystroke that says nothing new. Every
+    /// selection gets it, so a column of cursors respells a column of names.
+    fn recase(&mut self, style: crate::case::Style) {
+        let mut missed = false;
+        self.for_each_selection(|ed, sel| {
+            let len = ed.buffer.rope().len_chars();
+            let (start, end) = match sel.is_collapsed() {
+                false => sel.inclusive_range(len),
+                // `iw` on whitespace is the run of whitespace, which is
+                // right for `diw` and is not a word to respell.
+                true => match ed
+                    .buffer
+                    .word_at(sel.head)
+                    .filter(|&(a, b)| ed.buffer.slice(a, b).chars().any(char::is_alphanumeric))
+                {
+                    Some(range) => range,
+                    None => {
+                        missed = true;
+                        return sel;
+                    }
+                },
+            };
+            let text = crate::case::convert(&ed.buffer.slice(start, end), style);
+            ed.buffer.replace_range(start, end, &text);
+            // On the first character of what was respelled: the text under the
+            // old position is a different length now, and the start is the one
+            // place that means the same thing either way.
+            Selection::collapsed(ed.buffer.clamped(Cursor::at(start), false))
+        });
+        if missed {
+            self.session.status = "no word under the cursor".into();
+        }
+        // A selection that has been rewritten is not a selection any more.
+        self.session.mode = Mode::Normal;
     }
 
     /// Where a block starts once it is put *after* one-based line `address` —
@@ -10131,5 +10182,75 @@ mod tests {
 
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "\"hello\" there");
         assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    // ---- :case --------------------------------------------------------------
+
+    #[test]
+    fn case_respells_the_word_under_the_cursor() {
+        let mut ed = editor("let hello_world = 1;\n");
+        ed.set_cursor(Cursor::at(6));
+
+        ex(&mut ed, "case camel");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "let helloWorld = 1;\n");
+        assert_eq!(ed.cursor().unwrap().at, 4, "on the first character of the name");
+    }
+
+    #[test]
+    fn case_respells_a_selection_and_leaves_visual_mode() {
+        let mut ed = editor("one_two three_four\n");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        for _ in 0..6 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "case pascal");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "OneTwo three_four\n");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn case_is_one_undo_step() {
+        let mut ed = editor("hello_world\n");
+        ex(&mut ed, "case constant");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "HELLO_WORLD\n");
+
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello_world\n");
+    }
+
+    #[test]
+    fn case_with_no_style_or_a_bad_one_says_what_it_takes() {
+        let mut ed = editor("hello_world\n");
+        ex(&mut ed, "case sideways");
+
+        assert!(
+            ed.session.status.starts_with("case what? one of upper, lower"),
+            "{}",
+            ed.session.status
+        );
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello_world\n", "and nothing changed");
+    }
+
+    #[test]
+    fn case_on_nothing_says_so() {
+        let mut ed = editor("   \n");
+        ed.set_cursor(Cursor::at(1));
+        ex(&mut ed, "case snake");
+        assert_eq!(ed.session.status, "no word under the cursor");
+    }
+
+    /// Every cursor gets it, which is what makes `Ctrl-N` and `:case` a rename.
+    #[test]
+    fn case_reaches_every_cursor() {
+        let mut ed = editor("foo_bar\nfoo_bar\n");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+
+        ex(&mut ed, "case camel");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "fooBar\nfooBar\n");
     }
 }

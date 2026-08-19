@@ -17,6 +17,7 @@
 //! the edit log for tree-sitter today and for LSP `didChange` later.
 
 pub mod buffer;
+pub mod case;
 pub mod clipboard;
 pub mod cmd_history;
 pub mod colors;

@@ -392,11 +392,19 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:{n}` | go to line *n* |
 | `:m 12` `:m 0` `:m $` | move this line, or the selection, after that line |
 | `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
+| `:case <style>` | respell the selection, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
 | `:paste [<dir>]` | put what is marked into `<dir>`, or the selected directory |
 | `:paste-as <path>` | place the file a paste stopped on, and carry on |
+
+`:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `kebab` or
+`constant` — `capital`, `screaming` and `dash` are the same three under other
+names. It respells every *identifier* in range and leaves what is between them
+alone, so `foo_bar baz_qux` in camel is `fooBar bazQux`. With nothing selected
+it takes the word under the cursor, which is what renaming one usually is. See
+[docs/specs/case.md](docs/specs/case.md).
 
 ### Windows and buffers
 

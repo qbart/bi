@@ -158,6 +158,7 @@ fn an_embedder_can_split_switch_and_edit_in_both_windows() {
 const LIB_MODULES: &[&str] = &[
     "lib.rs",
     "buffer.rs",
+    "case.rs",
     "clipboard.rs",
     "cmd_history.rs",
     "colors.rs",

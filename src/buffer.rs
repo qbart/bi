@@ -440,6 +440,13 @@ impl Buffer {
         Ok(Cursor::at(self.rope.line_to_char(row) + col))
     }
 
+    /// Replaces a char range with `text`. What `:case` needs and what nothing
+    /// else did: every other rewrite here is an operator with a rule of its
+    /// own about where the cursor lands.
+    pub fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        self.apply_edit(start, end, text);
+    }
+
     // ---- surroundings ------------------------------------------------------
 
     /// The char range a target covers, without touching it.

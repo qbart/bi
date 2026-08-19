@@ -4,12 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-### new case command
-
-:case ....
-
-that takes selection and changes case converion, upper,lower,capital,pscal,snake etc.
-                                                                                                                                                                           │  257 ▎   -- ys{motion}{char}, ds{char}, and cs{target}{replacement}
 ### treesitter markers
 
 S - capital s should be smart select based on treesitter boundries,
