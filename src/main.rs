@@ -297,6 +297,17 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
 
         term.draw(|frame| tui::render::render(frame, ed, &input.pending_display()))?;
 
+        // Something on screen may go away on its own — the flash a yank left.
+        // Waiting is the frontend's job and the clock is the editor's, so the
+        // loop asks how long it may block for and draws when that runs out
+        // whether or not a key arrived. `None` is the usual case: nothing is
+        // pending, so `read` below blocks as it always did.
+        if let Some(until) = ed.redraw_in()
+            && !event::poll(until)?
+        {
+            continue;
+        }
+
         // Everything that has already arrived is applied before the next draw.
         // A frame the user never sees is a frame not worth rendering, and this
         // is what makes a burst — a paste into a terminal that does not support

@@ -1169,19 +1169,25 @@ impl Buffer {
         (hi > lo).then_some((lo, hi))
     }
 
-    /// Applies `op` over `motion`, returning the text it took.
+    /// Applies `op` over `motion`, returning the text it took, where the
+    /// cursor lands, and the char range it covered *in the text as it was*.
     ///
-    /// The caller decides where that goes — the buffer knows nothing about
+    /// The caller decides where the text goes — the buffer knows nothing about
     /// registers, which is what makes `"_` a policy at the call site rather
     /// than a flag threaded through here. `None` means the motion covered
     /// nothing and the buffer is untouched.
+    ///
+    /// The range is what the yank flash lights up. It was already computed in
+    /// here — it is what `take` copies or cuts — and handing it back beats the
+    /// caller guessing it out of the entry, whose text for a linewise yank is
+    /// not the same length as what was on screen.
     pub fn operate(
         &mut self,
         at: Cursor,
         op: Operator,
         target: Target,
         count: usize,
-    ) -> Option<(Entry, Cursor)> {
+    ) -> Option<(Entry, Cursor, std::ops::Range<usize>)> {
         let (start, end) = self.operator_range(at, op, target, count)?;
         let linewise = target.kind() == Kind::Linewise;
 
@@ -1226,7 +1232,7 @@ impl Buffer {
         start: usize,
         end: usize,
         linewise: bool,
-    ) -> Option<(Entry, Cursor)> {
+    ) -> Option<(Entry, Cursor, std::ops::Range<usize>)> {
         if end <= start {
             return None;
         }
@@ -1249,7 +1255,7 @@ impl Buffer {
         end: usize,
         text: String,
         linewise: bool,
-    ) -> (Entry, Cursor) {
+    ) -> (Entry, Cursor, std::ops::Range<usize>) {
         let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
 
         let landed = if op == Operator::Yank {
@@ -1262,7 +1268,7 @@ impl Buffer {
             // text was, which for `d$` or `cc` is one past what's left.
             self.clamped(Cursor::at(start), op == Operator::Change)
         };
-        (Entry { text, kind }, landed)
+        (Entry { text, kind }, landed, start..end)
     }
 
     /// Moves rows `first..=last` so the block starts at `to`.
@@ -2403,7 +2409,7 @@ mod tests {
         }
         fn operate(&mut self, op: Operator, target: Target, count: usize) -> Option<Entry> {
             self.mark();
-            let (entry, landed) = self.inner.operate(self.cursor, op, target, count)?;
+            let (entry, landed, _) = self.inner.operate(self.cursor, op, target, count)?;
             self.cursor = landed;
             Some(entry)
         }

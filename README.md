@@ -586,6 +586,15 @@ Markdown list or a YAML file is exactly where people write them, and bi does
 not have a grammar for every file. `:set todo_comments false` turns it off. See
 [docs/specs/todo-comments.md](docs/specs/todo-comments.md).
 
+#### A flash on what was yanked
+
+`yy` prints nothing, changes nothing and moves nothing — it is the one command
+whose whole effect is invisible. So what it read lights up for `yank_flash`
+milliseconds (150 by default, `0` turns it off), in the theme's `flash`.
+Charwise, linewise, blockwise — a rectangle lights one span per row rather than
+its bounding box. Nothing else flashes: a delete or a paste is already visible
+in the text. See [docs/specs/flash.md](docs/specs/flash.md).
+
 #### Colour swatches
 
 `#fb4934`, `#f94`, `rgb(251,73,52)`, `rgba(...)` and the shader spelling

@@ -120,6 +120,9 @@ pub struct Options {
     pub todo_comments: bool,
     /// Whether a colour literal is drawn in the colour it names.
     pub color_swatches: bool,
+    /// How long a yank stays lit, in milliseconds. 0 is a flash of no time at
+    /// all, which is the honest spelling of off.
+    pub yank_flash: usize,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -149,6 +152,7 @@ impl Default for Options {
             indent_guides: true,
             todo_comments: true,
             color_swatches: true,
+            yank_flash: 150,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -192,6 +196,10 @@ impl Options {
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
             ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
+            ("yank_flash", OptionValue::Int(n)) if n >= 0 => self.yank_flash = n as usize,
+            ("yank_flash", _) => {
+                return Err("yank_flash takes milliseconds, or 0 to turn it off".into());
+            }
             ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
             ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
             ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
@@ -229,6 +237,7 @@ impl Options {
             "indent_guides" => OptionValue::Bool(self.indent_guides),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
+            "yank_flash" => OptionValue::Int(self.yank_flash as i64),
             "trim.on_write" => OptionValue::Bool(self.trim.on_write),
             "trim.trailing" => OptionValue::Bool(self.trim.trailing),
             "trim.first_line" => OptionValue::Bool(self.trim.first_line),

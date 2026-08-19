@@ -560,6 +560,8 @@ pub struct Session {
     /// and project ask for, or `:set tab_width 8` would silently do nothing in
     /// the repositories that have an `.editorconfig`. See
     /// `docs/specs/options.md`.
+    /// What the last yank read, and until when — see `docs/specs/flash.md`.
+    pub flash: Option<Flash>,
     pub overrides: OptionPatch,
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
@@ -677,6 +679,16 @@ impl Session {
         let kind = if text.ends_with('\n') { EntryKind::Linewise } else { EntryKind::Charwise };
         Some(Entry { text, kind })
     }
+}
+
+/// What a yank lit up, and the moment the light goes out.
+///
+/// One buffer, because a yank happened in one; several ranges, because a
+/// command can yank at several cursors and a rectangle is one span per row.
+pub struct Flash {
+    pub buffer: BufferId,
+    pub ranges: Vec<std::ops::Range<usize>>,
+    pub until: std::time::Instant,
 }
 
 /// An open buffer, and what belongs to it rather than to a window.
@@ -1694,7 +1706,37 @@ impl Editor {
         if options.color_swatches {
             color_swatches(buffer, rows, &mut out);
         }
+        if let Some(flash) = &self.session.flash
+            && self.window_of(window).and_then(Window::buffer) == Some(flash.buffer)
+            && std::time::Instant::now() < flash.until
+        {
+            for range in &flash.ranges {
+                out.push(crate::decoration::Decoration::Repaint {
+                    range: range.clone(),
+                    style: self.theme.ui.flash,
+                    layer: crate::decoration::Layer::Under,
+                });
+            }
+        }
         out
+    }
+
+    /// How long until something on screen changes on its own, if anything
+    /// will.
+    ///
+    /// The whole of what the yank flash asks of a frontend: a loop that
+    /// blocked on the next key now waits for the next key *or* for this,
+    /// whichever comes first, and draws either way. Clears a flash that has
+    /// already expired, which is what stops "expired zero seconds ago" from
+    /// being a timeout to spin on.
+    pub fn redraw_in(&mut self) -> Option<std::time::Duration> {
+        let flash = self.session.flash.as_ref()?;
+        let left = flash.until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            self.session.flash = None;
+            return None;
+        }
+        Some(left)
     }
 
     /// The buffer a given window shows, if it shows one.
@@ -3339,6 +3381,9 @@ impl View<'_> {
             self.repeat_change(count);
             return;
         }
+        // Whatever was lit by the last yank goes out when you do the next
+        // thing; the deadline is only for when you do nothing at all.
+        self.session.flash = None;
         if self.session.undo_from.is_empty() {
             self.session.undo_from = self.selections.as_pairs();
         }
@@ -3491,6 +3536,14 @@ impl View<'_> {
             // One entry, not one per row: what was taken is a rectangle, and
             // pasting it back has to know that.
             self.session.capture(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise }, sink);
+        }
+
+        if op == Operator::Yank {
+            for &(start, end) in &spans {
+                if end > start {
+                    self.flash(start..end);
+                }
+            }
         }
 
         let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
@@ -3897,8 +3950,11 @@ impl View<'_> {
                 let (op, count, sink) = (*op, *count, *sink);
                 self.for_each_selection(|ed, sel| {
                     match ed.buffer.operate(sel.head, op, target, count) {
-                        Some((entry, landed)) => {
+                        Some((entry, landed, range)) => {
                             ed.session.capture(entry, sink);
+                            if op == Operator::Yank {
+                                ed.flash(range);
+                            }
                             Selection::collapsed(landed)
                         }
                         None => sel,
@@ -4167,8 +4223,11 @@ impl View<'_> {
                         sel.inclusive_range(len)
                     };
                     match ed.buffer.operate_range(sel.head, op, start, end, linewise) {
-                        Some((entry, landed)) => {
+                        Some((entry, landed, range)) => {
                             ed.session.capture(entry, sink);
+                            if op == Operator::Yank {
+                                ed.flash(range);
+                            }
                             Selection::collapsed(landed)
                         }
                         None => Selection::collapsed(sel.head),
@@ -4690,6 +4749,27 @@ impl View<'_> {
                 self.session.status = format!("error: {e:#}");
                 false
             }
+        }
+    }
+
+    /// Lights up what a yank just read, until the moment named by
+    /// `yank_flash`.
+    ///
+    /// Appends rather than replaces: one command can yank at several cursors,
+    /// and a rectangle is one span per row. What clears the last flash is the
+    /// *next command*, in `apply` — see `docs/specs/flash.md`.
+    fn flash(&mut self, range: std::ops::Range<usize>) {
+        let ms = self.options.yank_flash;
+        if ms == 0 || range.is_empty() {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        match &mut self.session.flash {
+            Some(flash) if flash.buffer == self.id => {
+                flash.ranges.push(range);
+                flash.until = until;
+            }
+            slot => *slot = Some(Flash { buffer: self.id, ranges: vec![range], until }),
         }
     }
 
@@ -9733,5 +9813,113 @@ mod tests {
         ex(&mut ed, "set todo_comments false");
 
         assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    // ---- the yank flash -----------------------------------------------------
+
+    /// The ranges lit up right now, whatever produced them.
+    fn lit(ed: &Editor) -> Vec<std::ops::Range<usize>> {
+        let rows = ed.buffer().unwrap().line_count();
+        let flash = ed.theme().ui.flash;
+        ed.decorations(ed.focus(), 0..rows)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Repaint { range, style, .. } if style == flash => Some(range),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_yank_lights_up_what_it_read() {
+        let mut ed = editor("alpha beta\n");
+        ed.apply(Command {
+            count: 1,
+            action: Action::Operate {
+                op: Operator::Yank,
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                count: 1,
+                sink: Sink::Ring,
+            },
+        });
+
+        assert_eq!(lit(&ed), vec![0..6], "the word and the space `yw` took");
+    }
+
+    #[test]
+    fn a_linewise_yank_lights_the_line_and_a_block_lights_each_row() {
+        let mut ed = editor("alpha\nbeta\n");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(lit(&ed), vec![0..6], "the row, terminator and all");
+
+        let mut ed = editor("alpha\nbeta\n");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Block)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
+
+        assert_eq!(lit(&ed).len(), 2, "a rectangle is one span per row, not a bounding box");
+    }
+
+    #[test]
+    fn nothing_else_flashes_and_the_next_command_puts_it_out() {
+        let mut ed = editor("alpha beta\n");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert!(lit(&ed).is_empty(), "a delete is visible in the text already");
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::LineEnd),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert!(!lit(&ed).is_empty());
+
+        ed.apply(cmd(Action::Move(Motion::Left)));
+        assert!(lit(&ed).is_empty(), "the next thing you do puts it out");
+    }
+
+    #[test]
+    fn a_flash_of_no_time_at_all_is_the_spelling_of_off() {
+        let mut ed = editor("alpha\n");
+        ex(&mut ed, "set yank_flash 0");
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+
+        assert!(lit(&ed).is_empty());
+        assert_eq!(ed.redraw_in(), None, "and nothing to wake up for");
+    }
+
+    #[test]
+    fn an_expired_flash_draws_nothing_and_asks_for_no_more_frames() {
+        let mut ed = editor("alpha\n");
+        ex(&mut ed, "set yank_flash 1");
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert!(ed.redraw_in().is_some(), "a frame is owed while it is lit");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(lit(&ed).is_empty());
+        assert_eq!(ed.redraw_in(), None, "and the loop goes back to blocking");
     }
 }

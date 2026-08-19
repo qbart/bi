@@ -33,6 +33,10 @@ todo_comments = true
 # See docs/specs/colors.md.
 color_swatches = true
 
+# How long a yank stays lit, in milliseconds — 0 turns it off. `yy` is the one
+# command whose whole effect is invisible. See docs/specs/flash.md.
+yank_flash = 150
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

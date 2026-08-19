@@ -135,6 +135,9 @@ pub struct Ui {
     pub selection: Style,
     pub search: Style,
     pub cursor_alt: Style,
+    /// What a yank lit up, for as long as it is lit — see
+    /// `docs/specs/flash.md`.
+    pub flash: Style,
 
     pub gutter: Style,
     pub gutter_current: Style,
@@ -188,6 +191,7 @@ impl Ui {
         "selection",
         "search",
         "cursor_alt",
+        "flash",
         "gutter",
         "gutter_current",
         "rule",
@@ -228,6 +232,7 @@ impl Ui {
             "selection" => self.selection = style,
             "search" => self.search = style,
             "cursor_alt" => self.cursor_alt = style,
+            "flash" => self.flash = style,
             "gutter" => self.gutter = style,
             "gutter_current" => self.gutter_current = style,
             "rule" => self.rule = style,

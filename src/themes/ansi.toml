@@ -56,6 +56,7 @@ cursorline = { bg = "color236" }
 selection  = { bg = "color239" }
 search     = { bg = "color58" }
 cursor_alt = { bg = "magenta" }
+flash      = { bg = "color58" }
 
 gutter         = "darkgray"
 gutter_current = "yellow"

@@ -106,10 +106,6 @@ the one i mentioned above should be built-in but i clearly need configurability
 i should be able to invoke buffer switcher basd on names with fuzzy autocomplete
 prefer C-Tab
 
-### highlit on action
-
-when yanking would be nice to see some visual feedback that what was copied, so maybe quick selection coloration before it disappears
-
 
 ## DO NOT DO IT NOW
 
