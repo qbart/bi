@@ -640,8 +640,10 @@ compiling and gets the built-ins. See `### ConfigSource` below.
 
 ```toml
 [options]
-number   = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
-hlsearch = false
+number    = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
+hlsearch  = false
+theme     = "gruvbox-dark"
+ssh_theme = "gruvbox-light"   # used instead when SSH_CONNECTION is set
 ```
 
 Both already exist as `Session::line_numbers` and `Session::highlight_search`.

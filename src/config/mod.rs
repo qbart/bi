@@ -91,6 +91,15 @@ pub struct Options {
     /// `:set number 5` and `number = 5` are. That is a feature *removed*
     /// rather than added: there is no second command to design.
     pub theme: String,
+    /// The theme to use instead when the session is remote — see
+    /// [`crate::editor::Editor::set_remote`].
+    ///
+    /// A second name rather than a modifier on the first, because the point is
+    /// to tell the two apart at a glance: a window that is editing files on
+    /// another machine should not look identical to one that is not. The
+    /// default is the light theme, which no local session gets by default, so
+    /// the distinction is visible out of the box.
+    pub ssh_theme: String,
     /// Off unless asked for: vim does not light the buffer up on a plain
     /// `/`, and the status line's `[3/17]` says how many matches there are
     /// without painting them.
@@ -107,6 +116,7 @@ impl Default for Options {
             number: LineNumbers::default(),
             hlsearch: false,
             theme: crate::theme::DEFAULT_THEME.to_string(),
+            ssh_theme: "gruvbox-light".to_string(),
         }
     }
 }
@@ -126,9 +136,21 @@ impl Options {
             ("hlsearch", _) => return Err("hlsearch takes true or false".into()),
             ("theme", OptionValue::Str(name)) => self.theme = name,
             ("theme", _) => return Err("theme takes the name of a theme, in quotes".into()),
+            ("ssh_theme", OptionValue::Str(name)) => self.ssh_theme = name,
+            ("ssh_theme", _) => {
+                return Err("ssh_theme takes the name of a theme, in quotes".into());
+            }
             _ => return Err(format!("unknown option: {name}")),
         }
         Ok(())
+    }
+
+    /// The theme name actually in force.
+    ///
+    /// One place decides, so `:set`, the config reader and the resolver cannot
+    /// disagree about which of the two names is live.
+    pub fn active_theme(&self, remote: bool) -> &str {
+        if remote { &self.ssh_theme } else { &self.theme }
     }
 
     /// What `:set <option>` reports when given no value.
@@ -137,6 +159,7 @@ impl Options {
             "number" => OptionValue::Int(self.number.setting()),
             "hlsearch" => OptionValue::Bool(self.hlsearch),
             "theme" => OptionValue::Str(self.theme.clone()),
+            "ssh_theme" => OptionValue::Str(self.ssh_theme.clone()),
             _ => return None,
         })
     }

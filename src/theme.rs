@@ -250,6 +250,7 @@ pub const DEFAULT_THEME: &str = "gruvbox-dark";
 
 const GRUVBOX_DARK: &str = include_str!("themes/gruvbox-dark.toml");
 const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
+const PASCAL: &str = include_str!("themes/pascal.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
 
 impl Default for Theme {
@@ -274,6 +275,7 @@ impl Theme {
         match name {
             DEFAULT_THEME => Some(GRUVBOX_DARK),
             "gruvbox-light" => Some(GRUVBOX_LIGHT),
+            "pascal" => Some(PASCAL),
             "ansi" => Some(ANSI),
             _ => None,
         }
@@ -657,6 +659,70 @@ mod tests {
                 "{name}: symbol and regex share a colour"
             );
         }
+    }
+
+    /// Sixteen colours is the theme, so the test is that it stayed inside
+    /// them. A single off-palette value would be the whole point missed.
+    #[test]
+    fn pascal_uses_nothing_but_the_ega_palette() {
+        // The sixteen, as the hardware produced them — plus the one shade of
+        // blue the cursor line needs, which the IDE had no equivalent of.
+        const EGA: &[(u8, u8, u8)] = &[
+            (0x00, 0x00, 0x00),
+            (0x00, 0x00, 0xa8),
+            (0x00, 0xaa, 0x00),
+            (0x00, 0xaa, 0xaa),
+            (0xaa, 0x00, 0x00),
+            (0xaa, 0x00, 0xaa),
+            (0xaa, 0x55, 0x00),
+            (0xaa, 0xaa, 0xaa),
+            (0x55, 0x55, 0x55),
+            (0x55, 0x55, 0xff),
+            (0x55, 0xff, 0x55),
+            (0x55, 0xff, 0xff),
+            (0xff, 0x55, 0x55),
+            (0xff, 0x55, 0xff),
+            (0xff, 0xff, 0x55),
+            (0xff, 0xff, 0xff),
+            (0x00, 0x00, 0x80), // the cursor line, a shade of the same blue
+        ];
+        let src = Theme::builtin("pascal").expect("pascal is built in");
+        for (line, text) in src.lines().enumerate() {
+            // Only the values, never the palette table in the header comment.
+            let Some(code) = text.split('#').nth(1) else { continue };
+            if text.trim_start().starts_with('#') || code.len() < 6 {
+                continue;
+            }
+            let hex = &code[..6];
+            let Ok(colour) = Color::parse(&format!("#{hex}")) else { continue };
+            let Color::Rgb(r, g, b) = colour else { continue };
+            assert!(
+                EGA.contains(&(r, g, b)),
+                "pascal.toml:{}: #{hex} is not an EGA colour",
+                line + 1
+            );
+        }
+    }
+
+    /// The theme is only worth having if it looks like the thing, and the two
+    /// halves of that are the blue and the inverted keyword/call pair.
+    #[test]
+    fn pascal_is_blue_and_keeps_its_keywords_brighter_than_its_calls() {
+        let pascal = parsed("pascal");
+        assert_eq!(pascal.ui.background, Some(Color::Rgb(0x00, 0x00, 0xa8)));
+
+        // White and bold for `procedure`/`begin`/`end`, yellow for the thing
+        // being called — the reverse of every theme written since, and what
+        // the screen actually did.
+        let keyword = pascal.style("keyword").unwrap();
+        assert_eq!(keyword.fg, Some(Color::Rgb(0xff, 0xff, 0xff)));
+        assert!(keyword.bold);
+        assert_eq!(pascal.style("function").unwrap().fg, Some(Color::Rgb(0xff, 0xff, 0x55)));
+
+        // And the status bar is black on light gray, which is the single most
+        // recognisable thing about the IDE.
+        assert_eq!(pascal.ui.statusline.fg, Some(Color::Rgb(0, 0, 0)));
+        assert_eq!(pascal.ui.statusline.bg, Some(Color::Rgb(0xaa, 0xaa, 0xaa)));
     }
 
     #[test]

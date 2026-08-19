@@ -48,6 +48,12 @@ fn main() -> Result<()> {
         None => Editor::empty(),
     };
 
+    // Before the config, so the theme resolves once rather than twice — but
+    // `set_remote` re-resolves either way, so the order is a nicety and not a
+    // requirement. Reading the environment is the frontend's job: it is
+    // process-wide state, and an embedder that is not a terminal has no
+    // SSH_CONNECTION to consult.
+    editor.set_remote(std::env::var_os("SSH_CONNECTION").is_some());
     let problems = editor.load_config(XdgConfig { dir: config_dir() });
     // `"+y` and `"+p`. The library holds the trait; the terminal is what knows
     // how to reach a clipboard from inside one.

@@ -18,6 +18,13 @@ hlsearch = false
 # See docs/specs/theme.md.
 theme = "gruvbox-dark"
 
+# The theme for a session that is editing from somewhere else — bi uses this
+# instead of `theme` when SSH_CONNECTION is set. A second name rather than a
+# switch, because the point is to tell the two apart at a glance: a window
+# editing files on another machine should not look like one that is not.
+# Set it to the same as `theme` to turn the distinction off.
+ssh_theme = "gruvbox-light"
+
 [keys]
 # The key <leader> stands for in a binding. Nothing uses it until you write a
 # binding that spells it — and the moment one does, this key stops meaning

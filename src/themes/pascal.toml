@@ -1,0 +1,114 @@
+# Borland Turbo Pascal 7, as an editor looked in 1992.
+#
+# Every colour here is one of the sixteen EGA/VGA text-mode colours, written as
+# the RGB the hardware actually produced. That constraint is the theme: the
+# look does not come from the particular blue, it comes from there having been
+# only sixteen of anything, and from a palette where "bright" literally meant
+# one bit. Picking a nicer blue would make it a blue theme rather than that
+# blue.
+#
+# The role assignment follows the IDE rather than modern convention, and the
+# one place it will surprise you is that KEYWORDS ARE WHITE AND CALLS ARE
+# YELLOW — the reverse of every theme written since. That is what the screen
+# looked like, and inverting it to suit habit would be missing the point.
+#
+#   0 #000000 black          8 #555555 dark gray
+#   1 #0000a8 blue           9 #5555ff light blue
+#   2 #00aa00 green         10 #55ff55 light green
+#   3 #00aaaa cyan          11 #55ffff light cyan
+#   4 #aa0000 red           12 #ff5555 light red
+#   5 #aa00aa magenta       13 #ff55ff light magenta
+#   6 #aa5500 brown         14 #ffff55 yellow
+#   7 #aaaaaa light gray    15 #ffffff white
+#
+# See docs/specs/theme.md.
+
+[syntax]
+# White and bright, the way `procedure`, `function`, `begin` and `end` stood
+# out from the body of a unit.
+keyword     = { fg = "#ffffff", bold = true }        # white
+
+# Yellow, which in the IDE marked the thing being called.
+function    = "#ffff55"
+constructor = "#ffff55"
+
+type        = "#55ffff"                              # light cyan
+module      = "#55ffff"
+
+string      = "#55ff55"                              # light green
+character   = "#55ff55"
+escape      = "#ff55ff"                              # light magenta
+
+# Dimmer than the code, which is the one modern instinct worth keeping — and
+# cyan was the dim colour available on blue.
+comment     = "#00aaaa"                              # cyan
+
+# `$00`, `$03`, `1`. Green with the strings, deliberately: a sixteen-colour
+# palette did not spend two of them separating one kind of literal from
+# another, and the two are rarely adjacent enough to confuse.
+constant    = "#55ff55"
+number      = "#55ff55"
+float       = "#55ff55"
+boolean     = "#55ff55"
+
+attribute   = "#ff55ff"
+label       = "#ff55ff"
+
+operator    = "#ffffff"                              # white
+punctuation = "#aaaaaa"                              # light gray
+delimiter   = "#aaaaaa"
+
+property                = "#55ffff"
+"string.special.key"    = "#55ffff"
+"string.special.symbol" = "#55ffff"
+"string.special.regex"  = "#ff55ff"
+
+"text.title"     = { fg = "#ffffff", bold = true }
+"text.literal"   = "#55ff55"
+"text.uri"       = { fg = "#55ffff", underline = true }
+"text.reference" = "#ff55ff"
+
+[ui]
+# The editor window: light gray on blue. This theme claims the background for
+# the obvious reason — a Turbo Pascal that is not blue is not Turbo Pascal.
+background = "#0000a8"                               # blue
+foreground = "#aaaaaa"                               # light gray
+
+# Turbo Vision selected text was black on cyan, and that is exactly what a
+# selection is here. The cursor line is a shade of the same blue rather than
+# an EGA colour: the IDE had no cursor line to copy, and light blue — the only
+# other blue in the palette — is far too loud to sit under text.
+cursorline = { bg = "#000080" }
+selection  = { fg = "#000000", bg = "#00aaaa" }
+search     = { fg = "#000000", bg = "#aa5500" }      # brown
+cursor_alt = { bg = "#aa00aa" }                      # magenta
+
+gutter         = "#5555ff"                           # light blue, dim on blue
+gutter_current = "#ffffff"
+rule           = "#00aaaa"
+filler         = "#5555ff"
+
+# The status bar: black on light gray, which is the single most recognisable
+# thing about the whole IDE.
+mode_normal = { fg = "#000000", bg = "#aaaaaa", bold = true }
+mode_insert = { fg = "#000000", bg = "#55ff55", bold = true }
+mode_pick   = { fg = "#000000", bg = "#55ffff", bold = true }
+
+status          = "#ffff55"
+status_muted    = "#00aaaa"
+status_inactive = "#5555ff"
+statusline      = { fg = "#000000", bg = "#aaaaaa" }
+
+tree_dir  = "#ffff55"
+tree_link = "#55ffff"
+mark_copy = "#55ff55"
+mark_cut  = "#ff5555"
+
+# A Turbo Vision dialog was a gray box with a white frame, and the highlighted
+# row in a list was the same black-on-cyan a selection is.
+picker_border   = "#ffffff"
+picker_prompt   = "#ffff55"
+picker_selected = { fg = "#000000", bg = "#00aaaa", bold = true }
+picker_badge    = "#00aaaa"
+picker_divider  = "#00aaaa"
+picker_preview  = "#aaaaaa"

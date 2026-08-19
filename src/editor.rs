@@ -962,6 +962,9 @@ pub struct Editor {
     /// The palette named by `config.options.theme`, already resolved. Held
     /// rather than resolved per frame, because resolving reads a file.
     theme: Theme,
+    /// Whether this session is editing from somewhere else — see
+    /// [`Editor::set_remote`]. Selects `ssh_theme` over `theme`.
+    remote: bool,
     /// Kept so `:reload` can ask again. `None` until a frontend supplies one —
     /// an embedder that wants no config never calls `load_config`, and
     /// `:reload` then has nothing to re-read and says so.
@@ -1174,7 +1177,7 @@ impl Editor {
     /// name can change without a config being loaded, and a theme the editor
     /// never re-resolved is a `:set` that silently did nothing.
     fn resolve_theme(&mut self, source: Option<&dyn ConfigSource>) -> Vec<Diagnostic> {
-        let name = self.session.options.theme.clone();
+        let name = self.session.options.active_theme(self.remote).to_string();
         // A source that cannot be read is not fatal here: a missing themes/
         // directory is the normal case, and a built-in of that name is very
         // likely what was wanted anyway.
@@ -1188,6 +1191,35 @@ impl Editor {
     /// whatever it draws with; the core never names a terminal colour.
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    /// Says this session is editing from somewhere else, which swaps `theme`
+    /// for `ssh_theme`.
+    ///
+    /// **The frontend decides, and the library is told.** Detecting a remote
+    /// session means reading the environment — `SSH_CONNECTION` for the
+    /// terminal — and the environment is process-wide, which makes it exactly
+    /// the thing this codebase already refuses to reach for from a testable
+    /// path: `main.rs` passes `$BI_CONFIG` and `$HOME` into `dir_from` for the
+    /// same reason, so that two tests running at once cannot fight over them.
+    /// An embedder that is a GUI, or a browser, has no `SSH_CONNECTION` to
+    /// read and gets to answer the question itself.
+    ///
+    /// Order-independent: this re-resolves immediately if a config is already
+    /// loaded, so a frontend may call it before or after `load_config`.
+    pub fn set_remote(&mut self, remote: bool) {
+        if self.remote == remote {
+            return;
+        }
+        self.remote = remote;
+        let source = self.config_source.take();
+        self.resolve_theme(source.as_deref());
+        self.config_source = source;
+    }
+
+    /// Whether `ssh_theme` is the one in force.
+    pub fn is_remote(&self) -> bool {
+        self.remote
     }
 
     /// Bumped every time a config is applied, so a frontend can tell that the
@@ -1250,6 +1282,7 @@ impl Editor {
             session: Session::default(),
             config: Config::default(),
             theme: Theme::default(),
+            remote: false,
             config_source: None,
             config_epoch: 0,
         }
@@ -2658,7 +2691,7 @@ impl Editor {
             },
         };
 
-        let was = self.session.options.theme.clone();
+        let was = self.session.options.active_theme(self.remote).to_string();
         if let Err(message) = self.session.options.set(name, parsed) {
             // A real option given a bad value gets the value echoed — you
             // want to see what you fat-fingered. An unknown option does not:
@@ -2672,13 +2705,13 @@ impl Editor {
 
         // A name is not a palette. `:set theme ansi` that left `self.theme`
         // alone would report success and change nothing on screen.
-        if self.session.options.theme != was {
+        if self.session.options.active_theme(self.remote) != was {
             let source = self.config_source.take();
             let problems = self.resolve_theme(source.as_deref());
             self.config_source = source;
             self.session.status = match problems.first() {
                 Some(problem) => problem.message.clone(),
-                None => format!("theme={}", self.session.options.theme),
+                None => format!("{name}={}", self.session.options.active_theme(self.remote)),
             };
         }
     }
@@ -4932,6 +4965,60 @@ mod tests {
 
         ex(&mut ed, "set theme gruvbox-dark");
         assert_eq!(ed.theme(), &before, "and back again");
+    }
+
+    /// The whole point is that a window editing files on another machine does
+    /// not look like one that is not, so the two must actually differ.
+    #[test]
+    fn a_remote_session_takes_the_ssh_theme() {
+        let mut ed = Editor::empty();
+        assert!(!ed.is_remote());
+        let local = ed.theme().clone();
+
+        ed.set_remote(true);
+        assert!(ed.is_remote());
+        assert_ne!(ed.theme(), &local, "a remote session looked identical");
+        // The default pairing: dark locally, light over the wire.
+        assert_eq!(ed.session.options.ssh_theme, "gruvbox-light");
+        assert_eq!(ed.theme().ui.background, Some(crate::theme::Color::Rgb(0xfb, 0xf1, 0xc7)));
+
+        ed.set_remote(false);
+        assert_eq!(ed.theme(), &local, "and back again");
+    }
+
+    /// `set_remote` re-resolves, so a frontend may call it before or after
+    /// `load_config` — which matters because `main.rs` has to pick one.
+    #[test]
+    fn the_ssh_theme_lands_whichever_order_the_frontend_uses() {
+        let config = "[options]\nssh_theme = \"pascal\"\n";
+
+        let mut before = Editor::empty();
+        before.set_remote(true);
+        before.load_config(ConfigText(Some(config)));
+
+        let mut after = Editor::empty();
+        after.load_config(ConfigText(Some(config)));
+        after.set_remote(true);
+
+        assert_eq!(before.theme(), after.theme());
+        assert_eq!(before.theme().ui.background, Some(crate::theme::Color::Rgb(0, 0, 0xa8)));
+    }
+
+    /// Over SSH the name in force is `ssh_theme`, so that is the one `:set`
+    /// has to move — changing `theme` there would report success and leave the
+    /// screen alone.
+    #[test]
+    fn set_moves_whichever_theme_name_is_in_force() {
+        let mut ed = Editor::empty();
+        ed.set_remote(true);
+        let light = ed.theme().clone();
+
+        ex(&mut ed, "set theme ansi");
+        assert_eq!(ed.theme(), &light, "the local theme is not the live one here");
+
+        ex(&mut ed, "set ssh_theme pascal");
+        assert_eq!(ed.session.status, "ssh_theme=pascal");
+        assert_eq!(ed.theme().ui.background, Some(crate::theme::Color::Rgb(0, 0, 0xa8)));
     }
 
     #[test]

@@ -166,9 +166,42 @@ theme says which it is rather than a flag elsewhere deciding for it.
 
 `ansi` omits it. `gruvbox-dark` sets `#282828`.
 
+## Two names, and which one is live
+
+`theme` names the palette; `ssh_theme` names the one used instead when the
+session is remote, and defaults to `gruvbox-light`.
+
+A second *name* rather than a modifier on the first, because the point is to
+tell the two apart at a glance — a window editing files on another machine
+should not look identical to one that is not, and the failure being designed
+against is typing into the wrong one. The default pairing is dark locally and
+light over the wire, which no local session gets by default, so the
+distinction is visible without configuring anything. Setting `ssh_theme` to
+the same value as `theme` turns it off.
+
+`Options::active_theme(remote)` is the single place that chooses, so `:set`,
+the config reader and the resolver cannot disagree about which name is live.
+Over SSH that means `:set ssh_theme` is the one that moves the screen and
+`:set theme` is the one that quietly does not — correct, and the reason the
+status line echoes back the name it actually changed.
+
+**The frontend decides whether a session is remote, and the library is told.**
+`Editor::set_remote(bool)`; `main.rs` passes
+`std::env::var_os("SSH_CONNECTION").is_some()`. Detecting it means reading the
+environment, the environment is process-wide, and that is exactly what this
+codebase already refuses to reach for from a testable path — `dir_from` takes
+`$BI_CONFIG` and `$HOME` as arguments so that two tests running at once cannot
+fight over them, and this is the same rule. An embedder that is a GUI or a
+browser has no `SSH_CONNECTION` to consult and gets to answer for itself.
+
+`set_remote` re-resolves if a config is already loaded, so it works before or
+after `load_config`. That is not tidiness: `main.rs` has to pick an order, and
+a rule that only works one way round is a bug waiting for the day someone
+reorders two lines.
+
 ## Resolution
 
-The `theme` option names a theme. In order:
+The theme name in force — `theme`, or `ssh_theme` when remote. In order:
 
 1. `<config dir>/themes/<name>.toml`
 2. a built-in of the same name
@@ -212,7 +245,7 @@ without changing the type.
 
 ## The built-ins
 
-Three, compiled in with `include_str!`, and parsed through the same parser a
+Four, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
@@ -261,6 +294,30 @@ rather than one. bi has no way to ask the terminal whether it is light —
 there is no portable query for it, and guessing wrong is worse than not
 guessing — so the light theme is one `:set theme gruvbox-light` away and the
 dark one stays the thing you get.
+
+### `pascal`
+
+Borland Turbo Pascal 7, as an editor looked in 1992: light gray on `#0000a8`
+blue, with a black-on-light-gray status bar and black-on-cyan selection.
+
+**Every colour is one of the sixteen EGA/VGA text-mode colours**, and that
+constraint *is* the theme. The look does not come from the particular blue; it
+comes from there having been only sixteen of anything, and from a palette where
+"bright" meant one bit. A nicer blue would make it a blue theme rather than
+that blue, so a test walks the file and fails on any value that is not an EGA
+colour — with one documented exception, `#000080` for the cursor line, which
+the IDE had no equivalent of and which light blue is far too loud to serve.
+
+**Keywords are white and calls are yellow**, which is the reverse of every
+theme written since. That is what the screen did — `procedure`, `function`,
+`begin` and `end` stood out bright from the body of a unit while the thing
+being called was yellow — and flipping it to suit modern habit would be
+missing the point. Strings and numbers share a green for the same reason: a
+sixteen-colour palette did not spend two of them separating one kind of
+literal from another.
+
+It sets a background, obviously. A Turbo Pascal that is not blue is not Turbo
+Pascal.
 
 ### `ansi`
 
