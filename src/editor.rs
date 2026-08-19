@@ -181,6 +181,8 @@ pub enum Action {
     /// A key pressed while the labels are up.
     LabelChar(char),
     LabelCancel,
+    /// `S` — a letter at both ends of every scope around the cursor.
+    ShowScopes,
     /// `s` — dim the screen and wait for something to look for.
     EnterFind,
     FindChar(char),
@@ -761,6 +763,8 @@ pub enum LabelTarget {
     Window(WindowId),
     /// `s` — go to that char offset.
     Position(usize),
+    /// `S` — select that char range.
+    Scope(usize, usize),
 }
 
 impl Labels {
@@ -1865,6 +1869,41 @@ impl Editor {
         self.session.mode = Mode::Label;
     }
 
+    /// `S` — a letter at both ends of every scope around the cursor.
+    ///
+    /// The chain of tree-sitter nodes containing the cursor, innermost first,
+    /// lettered `a`, `b`, `c` — the alphabet rather than the home row, because
+    /// here the letters mean an *order* and `a` inside `b` inside `c` says so
+    /// at a glance. See `docs/specs/scopes.md`.
+    fn show_scopes(&mut self) {
+        let Some(view) = self.focused() else { return };
+        let at = view.selections.cursor().at;
+        let Some(syntax) = view.syntax.as_ref() else {
+            self.session.status = "no parse tree for this file".into();
+            return;
+        };
+        let rope = view.buffer.rope();
+        let byte = rope.char_to_byte(at.min(rope.len_chars()));
+        let scopes: Vec<(usize, usize)> = syntax
+            .scopes_at(byte)
+            .into_iter()
+            .map(|range| (rope.byte_to_char(range.start), rope.byte_to_char(range.end)))
+            .filter(|(start, end)| end > start)
+            .collect();
+
+        if scopes.is_empty() {
+            self.session.status = "nothing around the cursor".into();
+            return;
+        }
+        let targets = crate::label::labels_from(scopes.len(), crate::label::ALPHABET, &[])
+            .into_iter()
+            .zip(scopes)
+            .map(|(label, (start, end))| (label, LabelTarget::Scope(start, end)))
+            .collect();
+        self.session.labels = Some(Labels { typed: String::new(), targets });
+        self.session.mode = Mode::Label;
+    }
+
     /// `s` — dims the screen and waits for something to look for.
     fn enter_find(&mut self) {
         self.session.find = Some(Find { query: String::new(), matches: Vec::new() });
@@ -1994,6 +2033,18 @@ impl Editor {
                     // The start of the match, because you aimed at the word
                     // and the letter was drawn after it.
                     LabelTarget::Position(at) => self.set_cursor(Cursor::at(at)),
+                    LabelTarget::Scope(start, end) => {
+                        if let Some(view) = self.focused() {
+                            // Charwise visual is inclusive of the head, so the
+                            // head sits *on* the last character rather than
+                            // past it — the same rule `viw` follows.
+                            view.selections.set(vec![Selection {
+                                anchor: Cursor::at(start),
+                                head: Cursor::at(end.saturating_sub(1).max(start)),
+                            }]);
+                        }
+                        self.session.mode = Mode::Visual(VisualKind::Char);
+                    }
                 }
             }
         }
@@ -2024,6 +2075,39 @@ impl Editor {
         let mut out = Vec::new();
         // Before the text pane below, because a window wearing a letter may be
         // showing a tree, which has no buffer for the rest of this to read.
+        if let Some(labels) = &self.session.labels
+            && window == self.focus
+            && let Some(Pane::Text { buffer, options, .. }) = self.pane(window)
+        {
+            // Outermost first, so where two scopes share an edge the tighter
+            // one's letter is the one left showing — it is the one you are
+            // more likely to want, and the outer still shows at its other end.
+            for (label, target) in labels.targets.iter().rev() {
+                let LabelTarget::Scope(start, end) = target else { continue };
+                if !label.starts_with(&labels.typed) {
+                    continue;
+                }
+                for at in [*start, end.saturating_sub(1)] {
+                    let row = buffer.row_at(Cursor::at(at));
+                    if !rows.contains(&row) {
+                        continue;
+                    }
+                    let line = buffer.line(row);
+                    let col = crate::indent::display_col(
+                        &line,
+                        at - buffer.rope().line_to_char(row),
+                        options.tab_width,
+                    );
+                    out.push(crate::decoration::Decoration::Overlay {
+                        row,
+                        col,
+                        text: label.clone(),
+                        style: self.theme.ui.label,
+                        layer: crate::decoration::Layer::Over,
+                    });
+                }
+            }
+        }
         if let Some(labels) = &self.session.labels {
             for (label, target) in &labels.targets {
                 let LabelTarget::Window(id) = target else { continue };
@@ -2888,6 +2972,7 @@ impl Editor {
             // fact about the session and not about any rope.
             Action::LabelChar(c) => self.label_key(Some(*c)),
             Action::LabelCancel => self.label_key(None),
+            Action::ShowScopes => self.show_scopes(),
             Action::EnterFind => self.enter_find(),
             Action::FindChar(c) => self.find_key(*c),
             Action::FindBackspace => self.find_backspace(),
@@ -4870,6 +4955,7 @@ impl View<'_> {
             | Action::PickAccept
             | Action::LabelChar(_)
             | Action::LabelCancel
+            | Action::ShowScopes
             | Action::EnterFind
             | Action::FindChar(_)
             | Action::FindBackspace
@@ -10842,5 +10928,114 @@ mod tests {
             )),
             "with its letter after it"
         );
+    }
+
+    // ---- `S`, select by structure -------------------------------------------
+
+    /// A buffer with a real grammar behind it, which `S` needs and
+    /// `Editor::empty()` has no path to get.
+    fn parsed(name: &str, text: &str) -> (Scratch, Editor) {
+        let f = Scratch::new(name, text);
+        let mut ed = opened(&f);
+        sized(&mut ed);
+        let focus = ed.focus();
+        ed.size_window(focus, 80, 20);
+        (f, ed)
+    }
+
+    fn scopes(ed: &Editor) -> Vec<(String, (usize, usize))> {
+        ed.session
+            .labels
+            .as_ref()
+            .expect("letters are up")
+            .targets
+            .iter()
+            .filter_map(|(label, target)| match target {
+                LabelTarget::Scope(start, end) => Some((label.clone(), (*start, *end))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// TODO.md's own example, in the language it was written in.
+    ///
+    /// `{ "hello/plugin" },` with the cursor inside the string wants three
+    /// scopes: the contents, the string, the table. Which is exactly the chain
+    /// of nodes the Lua grammar puts there — no special case for strings or
+    /// brackets anywhere.
+    #[test]
+    fn the_scopes_around_a_string_are_its_contents_then_it_then_the_table() {
+        let (_f, mut ed) = parsed("scopes.lua", "return { \"hello/plugin\" },\n");
+        ed.set_cursor(Cursor::at(12)); // inside `hello/plugin`
+
+        ed.apply(cmd(Action::ShowScopes));
+
+        let found = scopes(&ed);
+        let text = |(start, end): (usize, usize)| ed.buffer().unwrap().slice(start, end);
+        assert_eq!(found[0].0, "a");
+        assert_eq!(text(found[0].1), "hello/plugin", "the contents, tightest first");
+        assert_eq!(found[1].0, "b");
+        assert_eq!(text(found[1].1), "\"hello/plugin\"", "the string, quotes and all");
+        assert_eq!(found[2].0, "c");
+        assert_eq!(text(found[2].1), "{ \"hello/plugin\" }", "the table");
+    }
+
+    #[test]
+    fn both_ends_of_every_scope_carry_the_same_letter() {
+        let (_f, mut ed) = parsed("ends.lua", "return { \"hi\" },\n");
+        ed.set_cursor(Cursor::at(10));
+        ed.apply(cmd(Action::ShowScopes));
+
+        let (label, (start, end)) = scopes(&ed)[0].clone();
+        let drawn: Vec<usize> = ed
+            .decorations(ed.focus(), 0..1)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { col, text, .. } if text == label => Some(col),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(drawn.len(), 2, "one letter, both ends");
+        assert!(drawn.contains(&start), "the first character of the scope");
+        assert!(drawn.contains(&(end - 1)), "and its last one");
+    }
+
+    #[test]
+    fn pressing_a_letter_selects_that_scope() {
+        let (_f, mut ed) = parsed("select.lua", "return { \"hi\" },\n");
+        ed.set_cursor(Cursor::at(10));
+        ed.apply(cmd(Action::ShowScopes));
+        let (label, (start, end)) = scopes(&ed)[1].clone();
+
+        ed.apply(cmd(Action::LabelChar(label.chars().next().unwrap())));
+
+        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
+        let selection = ed.selections().unwrap().primary();
+        assert_eq!(selection.anchor.at, start);
+        assert_eq!(selection.head.at, end - 1, "charwise visual sits *on* the last character");
+    }
+
+    #[test]
+    fn a_file_with_no_grammar_has_no_structure_to_offer() {
+        let (_f, mut ed) = parsed("plain.unknownext", "some words here\n");
+
+        ed.apply(cmd(Action::ShowScopes));
+
+        assert_eq!(ed.session.status, "no parse tree for this file");
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert!(ed.session.labels.is_none());
+    }
+
+    #[test]
+    fn a_key_that_is_no_scope_cancels_and_leaves_the_cursor_alone() {
+        let (_f, mut ed) = parsed("cancel.lua", "return { \"hi\" },\n");
+        ed.set_cursor(Cursor::at(10));
+        ed.apply(cmd(Action::ShowScopes));
+
+        ed.apply(cmd(Action::LabelChar('9')));
+
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.cursor().unwrap().at, 10);
     }
 }

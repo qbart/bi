@@ -985,7 +985,10 @@ impl Input {
             // the key implies rather than one the user typed.
             'D' => return self.resolve_as(Operator::Delete, Motion::LineEnd),
             'C' => return self.resolve_as(Operator::Change, Motion::LineEnd),
-            'S' => return self.resolve_as(Operator::Change, Motion::CurrentLine),
+            // Vim's `S` is `cc` spelled shorter, and `cc` still spells it.
+            // In visual mode `S` stays vim-surround's, which is a different
+            // key in a different mode. See `docs/specs/scopes.md`.
+            'S' => return self.plain(Action::ShowScopes),
             // Vim's `s` is `cl` spelled shorter, and `cl` still works. This
             // is the better use of the key — see `docs/specs/find.md`.
             's' => return self.plain(Action::EnterFind),
@@ -2551,7 +2554,6 @@ leader = \" \"
         let cases = [
             ('D', Operator::Delete, Motion::LineEnd),
             ('C', Operator::Change, Motion::LineEnd),
-            ('S', Operator::Change, Motion::CurrentLine),
             ('X', Operator::Delete, Motion::Left),
         ];
         // `s` was `cl` and is `s` now — see `docs/specs/find.md`. `cl` still
@@ -2570,8 +2572,10 @@ leader = \" \"
     fn d_and_c_shorthands_are_exactly_their_long_forms() {
         assert_eq!(typed("D").action, typed("d$").action);
         assert_eq!(typed("C").action, typed("c$").action);
-        assert_eq!(typed("S").action, typed("cc").action);
         assert_eq!(typed("X").action, typed("dh").action);
+        // `S` was `cc` and is the scope picker now — see
+        // `docs/specs/scopes.md`. `cc` still spells what it spelled.
+        assert_eq!(typed("S").action, Action::ShowScopes);
     }
 
     #[test]

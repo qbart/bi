@@ -13,18 +13,14 @@
 /// is about the hand and not about the alphabet.
 pub const KEYS: &str = "fjdkslaghrueiwotyvnmcxzqpb";
 
-/// `count` labels, avoiding every character in `exclude`.
-///
-/// Single characters while they last; past that, enough of the *worst* keys
-/// become prefixes for two-character labels and the good keys stay single — so
-/// what comes first keeps the one-key labels and nothing is typed twice until
-/// there is no other way.
-///
-/// Fewer than `count` labels come back when two characters cannot name them
-/// all, which takes 677 targets on one screen. The caller labels what it can
-/// and leaves the rest unlabelled rather than pretending.
-pub fn labels(count: usize, exclude: &[char]) -> Vec<String> {
-    let keys: Vec<char> = KEYS.chars().filter(|c| !exclude.contains(c)).collect();
+/// The alphabet, for the one client whose labels mean an *order* rather than
+/// a finger: `S` offers scopes from the tightest out, and `a` inside `b`
+/// inside `c` says so at a glance.
+pub const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
+
+/// `count` labels from `keys`, avoiding every character in `exclude`.
+pub fn labels_from(count: usize, keys: &str, exclude: &[char]) -> Vec<String> {
+    let keys: Vec<char> = keys.chars().filter(|c| !exclude.contains(c)).collect();
     let n = keys.len();
     if n == 0 || count == 0 {
         return Vec::new();
@@ -50,6 +46,20 @@ pub fn labels(count: usize, exclude: &[char]) -> Vec<String> {
         }
     }
     out
+}
+
+/// `count` labels, avoiding every character in `exclude`.
+///
+/// Single characters while they last; past that, enough of the *worst* keys
+/// become prefixes for two-character labels and the good keys stay single — so
+/// what comes first keeps the one-key labels and nothing is typed twice until
+/// there is no other way.
+///
+/// Fewer than `count` labels come back when two characters cannot name them
+/// all, which takes 677 targets on one screen. The caller labels what it can
+/// and leaves the rest unlabelled rather than pretending.
+pub fn labels(count: usize, exclude: &[char]) -> Vec<String> {
+    labels_from(count, KEYS, exclude)
 }
 
 #[cfg(test)]

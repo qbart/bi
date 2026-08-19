@@ -4,32 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-### treesitter markers
-
-S - capital s should be smart select based on treesitter boundries,
-so when i press S it should show all unique markers as alphabet letters (rendered virtual text overlay with clear background and color),
-so i can create selection, example:
-i press S, it shows markers near curly braces, function params etc. when i use that letter it selects within thta boundry.
-so mathcing start,end postioin is the same combination to know where it ends
-
-start with a, b, c, ... where a is the closest scope, 
-example in lua:
-
-{ "hello/plugin" },
-
-so when i press s inside the double quotes it should
-
-show:
-
-c{ b"ahello/plugina"b }c,
-
-so:
-a - is the closest inside the string
-b - is around the string/inside brackents
-c - around brackents
-
-you should infer those from treesitter
-
 ### C-p fuzzy finder for files
 
 fuzzy serach files the files you want to jump to

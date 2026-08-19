@@ -403,6 +403,31 @@ impl Syntax {
         }
     }
 
+    /// The byte ranges of the nodes containing `byte`, innermost first.
+    ///
+    /// What `S` offers to select — see `docs/specs/scopes.md`. Consecutive
+    /// duplicates are dropped: a node whose only child covers exactly what it
+    /// covers is one boundary wearing two hats, and offering it twice would
+    /// waste a letter and blur the nesting.
+    pub fn scopes_at(&self, byte: usize) -> Vec<Range<usize>> {
+        let mut node = match self.tree.root_node().descendant_for_byte_range(byte, byte) {
+            Some(node) => node,
+            None => return Vec::new(),
+        };
+        let mut out: Vec<Range<usize>> = Vec::new();
+        loop {
+            let range = node.byte_range();
+            if !range.is_empty() && out.last() != Some(&range) {
+                out.push(range);
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Non-overlapping highlight spans covering `range`, in order.
     ///
     /// Only the visible byte range is queried, so frame cost stays bounded by

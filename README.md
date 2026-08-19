@@ -76,6 +76,15 @@ character back, and a query that matches nothing leaves by itself. Vim's `s`
 was `cl` spelled shorter, and `cl` still works. See
 [docs/specs/find.md](docs/specs/find.md).
 
+**Selecting by structure** — `S` puts a letter at *both ends* of every scope
+around the cursor, tightest first: `a` inside `b` inside `c`, so one letter
+tells you where a scope starts and where it ends before you commit to it.
+Press one and it becomes the selection. The list is the chain of tree-sitter
+nodes containing the cursor, so `{ "hello/plugin" }` in Lua offers the string's
+contents, the string, and the table with no special case for any of them. Vim's
+`S` was `cc` spelled shorter, and `cc` still works. See
+[docs/specs/scopes.md](docs/specs/scopes.md).
+
 **Surroundings** — add, remove and change what is around something.
 
 | Key | Does |
