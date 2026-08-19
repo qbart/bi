@@ -5,7 +5,7 @@ user actually *sees*, and the reason `Buffer::Edit` has existed since step 1.
 
 ## Status
 
-**Built**, for twenty languages — see the table below. Markdown is block-level
+**Built**, for thirty-three languages — see the table below. Markdown is block-level
 only until injections land. Injections, indent queries and background parsing
 remain deferred — see the end of this file.
 
@@ -189,6 +189,15 @@ turns a missing or incompatible query into plain text with no message.
   `include_str!` cannot reach into a dependency, so bi ships its own —
   `src/queries/hcl.scm`, written against that crate's `node-types.json`. It is
   the only query here bi authors.
+- **Julia, templ and Crystal ship the file and do not export it.** The
+  `.scm` is right there in the package; the crate has `LANGUAGE` and
+  `NODE_TYPES` and either no `HIGHLIGHTS_QUERY` or one commented out. Since
+  `include_str!` cannot reach into a dependency, all three are **vendored
+  verbatim** into `src/queries/`, with the upstream and revision named in a
+  header. All three are MIT. This is copying, not authoring, and the
+  distinction is worth keeping: `hcl.scm` is bi's and can be wrong on bi's
+  terms, while these three are somebody else's and should be re-copied rather
+  than edited.
 - **Slang and HLSL.** Both crates ship their `HIGHLIGHTS_QUERY` commented out.
   Both borrow C's. Not C++'s: Slang rejects it outright (no `auto` node), and
   HLSL *accepts* it and then matches nothing at all — the worse of the two
@@ -199,7 +208,7 @@ That last case is why `the_queries_bi_did_not_get_from_a_crate_produce_captures`
 asserts a snippet comes back with captures in it, rather than asserting the
 query merely compiles.
 
-### And one ships only half of one
+### And four ship only half of one
 
 **C++'s query is a delta on C's, not a query.** Upstream `queries/cpp/highlights.scm`
 opens with `; inherits: c`, and the crate ships only the C++ half — the
@@ -218,6 +227,20 @@ So `cpp` gets C's query concatenated in front of C++'s, which is exactly what
 the same range fall through to the later pattern, so C's own
 `(call_expression function: (identifier) @function)` has to keep beating its
 own `(identifier) @variable`, and C++'s overrides have to land after both.
+
+**And it is not one crate being careless.** Adding thirteen more grammars
+turned up three more of the identical shape, which makes this the normal case
+rather than the exception:
+
+| grammar | inherits | alone it captures |
+|---|---|---|
+| C++ | `c` | `auto`, the C++-only keywords, raw strings |
+| TypeScript | `ecma` | types. Thirty-five lines, no comment, no string, no keyword |
+| SCSS | `css` | `@mixin`, `@include`, `@each`. No comment, no property, no number |
+| templ | `go` | the templ tags. None of the Go the file is mostly made of |
+
+All four get the base query concatenated in front of their own, which is what
+`; inherits:` means, and all four are pinned by a snippet test.
 
 The general lesson is that a crate shipping `HIGHLIGHTS_QUERY` is not evidence
 that the query is whole. Only a snippet with captures in it is, which is why
@@ -255,6 +278,21 @@ change.
 tree-sitter cannot coexist in one binary — both declare `links = "tree-sitter"`,
 so cargo refuses to resolve rather than letting a duplicate native runtime
 link. Any future grammar has to be on 0.26 or it cannot be used at all.
+
+**Crystal is a git dependency, and the crates.io crate is a trap.**
+`tree-sitter-crystal 0.1.0` exists, resolves, compiles and exports a
+`LANGUAGE`, and is a toy: a 229 KB parser against the real grammar's 44 MB,
+with `puts`, `pp` and `p` as dedicated node types. Twenty-five lines of
+ordinary Crystal — `module`, `require`, `struct`, a block, an interpolated
+string, a macro — put **twelve `ERROR` nodes** through it. It ships no query
+either, so nothing would have highlighted regardless.
+
+The real one is `crystal-lang-tools/tree-sitter-crystal`, which nvim uses, and
+it is git-only. Worth stating plainly because it is the third distinct way a
+grammar fails quietly, after "no query" and "half a query": **the grammar
+itself can be a stub**, and it announces that with neither an error nor a
+missing symbol. The check that caught it was parsing real code and counting
+`ERROR` nodes, which is now what any future grammar should have to survive.
 
 **C3 is a git dependency**, `c3lang/tree-sitter-c3` — there is no crates.io
 release. `cargo publish` refuses a crate with a git dependency, because a
@@ -295,6 +333,24 @@ The table, by the key that reaches it:
 | JSON | `json` |
 | INI | `ini` |
 | Markdown | `md` `markdown` |
+| Make | `mk` `mak` · `Makefile` `makefile` `GNUmakefile` |
+| Ruby | `rb` `rake` `gemspec` |
+| Crystal | `cr` |
+| HTML | `html` `htm` |
+| SCSS | `scss` |
+| JavaScript | `js` `jsx` `mjs` `cjs` |
+| TypeScript | `ts` `mts` `cts` `tsx` |
+| Swift | `swift` |
+| Java | `java` |
+| C# | `cs` |
+| R | `r` `R` |
+| Julia | `jl` |
+| templ | `templ` |
+
+**`Makefile` is a name, not an extension**, and it was the case the "key on
+the file name" decision was written for — the spec called it out by name three
+steps before the grammar existed. `makefile` and `GNUmakefile` are the two
+other spellings `make` itself looks for; `*.mk` still resolves as an extension.
 
 **`.h` goes to C**, which is a coin-flip that has to land somewhere. A C++
 project whose headers are `.h` gets a grammar that reads most of the file; a C
@@ -313,17 +369,25 @@ is what gets dogfooded.
 |---|---|
 | Rust only | 4.75 MB |
 | + TOML, YAML, JSON, INI, Markdown, CMake | 5.42 MB |
-| + the other thirteen | **23.60 MB** |
+| + the other thirteen | 23.60 MB |
+| + the thirteen after that | **49.84 MB** |
 
-Twenty grammars is a 5× binary. The jump is not evenly spread — the C-family
+Thirty-three grammars is a **10× binary**, and the second thirteen cost more
+than the first twenty put together. The jump is not evenly spread — the C-family
 grammars dominate it, and C++, HLSL and Slang are each a large generated
 parser table. A release build on a Raspberry Pi gained about three minutes.
 
-Nothing here is wrong, but it changes which deferred item matters most.
-`Editor::syntax` is already `Option<Syntax>` and an unknown name already
-renders as plain text, so **the no-syntax path exists and works** — putting
-grammars behind Cargo features is a mechanical change, and it is now the
-cheapest way to get the binary back. The README already lists the C-toolchain
+The single worst offender is Crystal at 44 MB of generated C — more than twice
+Swift, which was the previous record — and Ruby, Swift, C++ and TypeScript are
+each in the same order. A release build on a Raspberry Pi is now about six
+minutes.
+
+Nothing here is wrong, but it changes which deferred item matters most, and
+"matters most" has become "is overdue". `Editor::syntax` is already
+`Option<Syntax>` and an unknown name already renders as plain text, so **the
+no-syntax path exists and works** — putting grammars behind Cargo features is a
+mechanical change, and it is now the cheapest way to get the binary back. At
+50 MB it should be the next thing done to this file, ahead of injections. The README already lists the C-toolchain
 version of this argument under "cheaper to fix now than later".
 
 What bought the 18 MB is that these are the formats an editor sits in front

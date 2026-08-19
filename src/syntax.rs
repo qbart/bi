@@ -35,6 +35,9 @@ pub struct Span {
 fn language_for(file: &str) -> Option<(Language, &'static str)> {
     let named = match file {
         "CMakeLists.txt" => Some(cmake()),
+        // Build files are named rather than suffixed, which is the whole
+        // reason this arm exists. `*.mk` still resolves below.
+        "Makefile" | "makefile" | "GNUmakefile" => Some(make()),
         "Dockerfile" => {
             Some((arborium_dockerfile::language().into(), arborium_dockerfile::HIGHLIGHTS_QUERY))
         }
@@ -65,6 +68,7 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
             Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
         }
         "cmake" => Some(cmake()),
+        "mk" | "mak" => Some(make()),
         "go" => Some((tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY)),
         "c3" | "c3i" => Some((tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY)),
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
@@ -92,12 +96,51 @@ fn language_for(file: &str) -> Option<(Language, &'static str)> {
         "py" | "pyi" => {
             Some((tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY))
         }
+        "rb" | "rake" | "gemspec" => {
+            Some((tree_sitter_ruby::LANGUAGE.into(), tree_sitter_ruby::HIGHLIGHTS_QUERY))
+        }
+        "html" | "htm" => {
+            Some((tree_sitter_html::LANGUAGE.into(), tree_sitter_html::HIGHLIGHTS_QUERY))
+        }
+        // `language()` is a function here rather than a `LANGUAGE` const —
+        // this crate predates that convention.
+        "scss" => Some((tree_sitter_scss::language(), &SCSS_HIGHLIGHTS)),
+        // `HIGHLIGHT_QUERY`, singular, and a second query for JSX which needs
+        // an injection to reach. `.jsx` gets the plain one until then.
+        "js" | "jsx" | "mjs" | "cjs" => {
+            Some((tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY))
+        }
+        "ts" | "mts" | "cts" => {
+            Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &TYPESCRIPT_HIGHLIGHTS))
+        }
+        "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), &TYPESCRIPT_HIGHLIGHTS)),
+        "swift" => Some((tree_sitter_swift::LANGUAGE.into(), tree_sitter_swift::HIGHLIGHTS_QUERY)),
+        "java" => Some((tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY)),
+        // Capital `.R` is as common as lowercase, and `language_for` is given
+        // the name as typed.
+        "r" | "R" => Some((tree_sitter_r::LANGUAGE.into(), tree_sitter_r::HIGHLIGHTS_QUERY)),
+        // The query is vendored — see `src/queries/julia.scm`.
+        "jl" => Some((tree_sitter_julia::LANGUAGE.into(), JULIA_HIGHLIGHTS)),
+        "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), tree_sitter_c_sharp::HIGHLIGHTS_QUERY)),
+        // The query is vendored — see `src/queries/crystal.scm`.
+        "cr" => Some((tree_sitter_crystal::LANGUAGE.into(), CRYSTAL_HIGHLIGHTS)),
+        // Go's query, then templ's own vendored half.
+        "templ" => Some((tree_sitter_templ::LANGUAGE.into(), &TEMPL_HIGHLIGHTS)),
         _ => None,
     }
 }
 
 /// HCL's highlights, which the grammar crate does not ship. See the file.
 const HCL_HIGHLIGHTS: &str = include_str!("queries/hcl.scm");
+
+/// Julia's, which the crate ships in its package and does not export.
+const JULIA_HIGHLIGHTS: &str = include_str!("queries/julia.scm");
+
+/// Crystal's, which the grammar ships with its constant commented out.
+const CRYSTAL_HIGHLIGHTS: &str = include_str!("queries/crystal.scm");
+
+/// templ's own half, which the crate ships with its constant commented out.
+const TEMPL_HIGHLIGHTS_OWN: &str = include_str!("queries/templ.scm");
 
 /// C++'s highlights are C's, then C++'s own.
 ///
@@ -117,12 +160,51 @@ static CPP_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
     format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY)
 });
 
+/// TypeScript's highlights are JavaScript's, then TypeScript's own.
+///
+/// The same shape as C++: 35 lines that upstream opens `; inherits: ecma`,
+/// which on its own captures types and little else — no comment, no string, no
+/// keyword, no function. The concatenation *is* what the inherits line means,
+/// and the order matters for the same reason it does there.
+///
+/// TSX shares it. The two grammars differ, the query does not.
+static TYPESCRIPT_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\n{}",
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    )
+});
+
+/// SCSS's highlights are CSS's, then SCSS's own.
+///
+/// Sixty-nine lines of `@mixin`, `@include` and `@each` and nothing else — no
+/// comment, no property, no number. SCSS is a superset of CSS and its grammar
+/// is a fork of CSS's, so the base query compiles against it; upstream writes
+/// `; inherits: css` and means exactly this.
+static SCSS_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{}", tree_sitter_css::HIGHLIGHTS_QUERY, tree_sitter_scss::HIGHLIGHTS_QUERY)
+});
+
+/// templ's highlights are Go's, then templ's own — `; inherits: go`.
+///
+/// templ is Go with HTML in it, so the Go half is most of the file. The HTML
+/// half needs an injection and is still deferred; what the vendored query adds
+/// is the templ-specific scaffolding around it.
+static TEMPL_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{}", tree_sitter_go::HIGHLIGHTS_QUERY, TEMPL_HIGHLIGHTS_OWN)
+});
+
 fn is_spell(capture: &str) -> bool {
     matches!(capture, "spell" | "nospell")
 }
 
 fn cmake() -> (Language, &'static str) {
     (tree_sitter_cmake::LANGUAGE.into(), tree_sitter_cmake::HIGHLIGHTS_QUERY)
+}
+
+fn make() -> (Language, &'static str) {
+    (tree_sitter_make::LANGUAGE.into(), tree_sitter_make::HIGHLIGHTS_QUERY)
 }
 
 fn bash() -> (Language, &'static str) {
@@ -426,6 +508,33 @@ mod tests {
         "hlsl",
         "py",
         "pyi",
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "mk",
+        "mak",
+        "rb",
+        "rake",
+        "gemspec",
+        "html",
+        "htm",
+        "scss",
+        "js",
+        "jsx",
+        "mjs",
+        "cjs",
+        "ts",
+        "mts",
+        "cts",
+        "tsx",
+        "swift",
+        "java",
+        "r",
+        "R",
+        "jl",
+        "cs",
+        "templ",
+        "cr",
     ];
 
     /// The capture names for `text`, in order, with the text they cover.
@@ -600,6 +709,55 @@ mod tests {
                 "resource",
                 "\"hi\"",
             ),
+            // A Makefile has no literals to speak of; the variable reference is
+            // the nearest thing, and it arrives split into four captures.
+            ("Makefile", "# note\nall: dep\n\tcp a $(B)\n", "# note", "all", "B"),
+            ("rb", "# note\ndef f\n  s = \"hi\"\nend\n", "# note", "def", "\"hi\""),
+            // HTML captures the attribute value without its quotes.
+            ("html", "<!-- note -->\n<a href=\"x\">t</a>\n", "<!-- note -->", "a", "x"),
+            ("scss", "// note\n.a { color: red; width: 0 }\n", "// note", "color", "0"),
+            ("js", "// note\nfunction f() { return \"hi\"; }\n", "// note", "return", "\"hi\""),
+            // The regression this file already knows by heart: TypeScript's
+            // own query is thirty-five lines of types and nothing else.
+            (
+                "ts",
+                "// note\nfunction f(): string { return \"hi\"; }\n",
+                "// note",
+                "return",
+                "\"hi\"",
+            ),
+            (
+                "tsx",
+                "// note\nfunction f(): string { return \"hi\"; }\n",
+                "// note",
+                "return",
+                "\"hi\"",
+            ),
+            (
+                "swift",
+                "// note\nfunc f() -> String { return \"hi\" }\n",
+                "// note",
+                "func",
+                "\"hi\"",
+            ),
+            ("java", "// note\nclass C { int f() { return 1; } }\n", "// note", "class", "1"),
+            ("r", "# note\nf <- function(x) { return(\"hi\") }\n", "# note", "function", "\"hi\""),
+            (
+                "jl",
+                "# note\nfunction f(x)\n    return \"hi\"\nend\n",
+                "# note",
+                "function",
+                "\"hi\"",
+            ),
+            ("cs", "// note\nclass C { int F() { return 1; } }\n", "// note", "class", "1"),
+            (
+                "templ",
+                "// note\npackage a\n\nfunc f() string { return \"hi\" }\n",
+                "// note",
+                "func",
+                "\"hi\"",
+            ),
+            ("cr", "# note\ndef f\n  s = \"hi\"\nend\n", "# note", "def", "\"hi\""),
         ];
 
         for (file, text, comment, keyword, literal) in cases {
@@ -753,6 +911,46 @@ mod tests {
             !found.iter().any(|(n, _)| n == "spell" || n == "nospell"),
             "a spell marker reached the frontend: {found:?}"
         );
+    }
+
+    /// A grammar can be a stub, and it says so with neither an error nor a
+    /// missing symbol — the crates.io `tree-sitter-crystal` exports a
+    /// `LANGUAGE`, compiles, and puts twelve `ERROR` nodes through this. The
+    /// check is parsing real code and counting the wreckage, and it is what
+    /// any future grammar should have to survive.
+    #[test]
+    fn crystal_parses_real_crystal_rather_than_a_subset_of_it() {
+        let real = concat!(
+            "require \"http/client\"\n\n",
+            "module Greeter\n",
+            "  VERSION = \"0.1.0\"\n\n",
+            "  struct Point\n",
+            "    property x : Int32\n",
+            "  end\n\n",
+            "  def self.run(names : Array(String)) : Hash(String, Int32)\n",
+            "    counts = {} of String => Int32\n",
+            "    names.each do |name|\n",
+            "      counts[name] = name.size\n",
+            "      puts \"hello, #{name}!\"\n",
+            "    end\n",
+            "    counts\n",
+            "  end\n",
+            "end\n",
+        );
+        let rope = Rope::from_str(real);
+        let syntax = Syntax::new("cr", &rope).expect("crystal grammar");
+        let sexp = syntax.sexp();
+        assert!(
+            !sexp.contains("ERROR") && !sexp.contains("MISSING"),
+            "the crystal grammar could not read ordinary crystal: {sexp}"
+        );
+
+        // And the vendored query has to actually fire on it.
+        let found = names(&syntax, &rope, 0..real.len());
+        covers(&found, "keyword", "module");
+        covers(&found, "keyword", "def");
+        covers(&found, "string", "\"0.1.0\"");
+        covers(&found, "type", "Int32");
     }
 
     #[test]
