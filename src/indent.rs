@@ -1,0 +1,181 @@
+//! What an indent is, and how wide a line is when it is drawn.
+//!
+//! The width of a tab decides where the cursor is drawn, where an indent guide
+//! goes, and how far `>` moves a line. Two of those are editor semantics, so
+//! the number lives here rather than in a frontend that would have to guess it
+//! — it used to be a `const` in `src/tui/render.rs`, which is exactly the
+//! guess this module exists to stop.
+//!
+//! Nothing here touches a rope: it takes a `&str` and a width and answers
+//! questions about columns. The edits are [`crate::buffer::Buffer`]'s.
+//!
+//! See `docs/specs/indent.md`.
+
+/// The settings that decide what indentation looks like.
+///
+/// Copied out of [`crate::config::Options`] and handed down, rather than being
+/// reached for: `Buffer` knows nothing about config, and when options become
+/// per-file this is the value that will be resolved per buffer instead of per
+/// session — the call sites will not have to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Indent {
+    pub tab_width: usize,
+    pub expandtab: bool,
+    /// 0 means "whatever `tab_width` says" — see [`Indent::step`].
+    pub shiftwidth: usize,
+    pub autoindent: bool,
+}
+
+impl Default for Indent {
+    fn default() -> Self {
+        Self { tab_width: 4, expandtab: true, shiftwidth: 0, autoindent: true }
+    }
+}
+
+impl Indent {
+    /// How far one `>` moves, in columns.
+    ///
+    /// Vim's `shiftwidth = 0` rule: almost nobody wants the shift to differ
+    /// from the tab stop, so one knob controls both until someone deliberately
+    /// wants two. Never returns 0 — a step of nothing would make `>` a no-op
+    /// and `Tab` an infinite loop.
+    pub fn step(&self) -> usize {
+        match self.shiftwidth {
+            0 => self.tab_width.max(1),
+            n => n,
+        }
+    }
+
+    /// `width` columns of indentation, written the way the options ask for.
+    ///
+    /// The whole of the tabs-versus-spaces policy, in the one place `>`, `Tab`
+    /// and autoindent all reach for it, so they cannot disagree.
+    ///
+    /// The remainder is spaces because there is no such thing as most of a
+    /// tab. It only appears when the step does not divide the tab width, which
+    /// someone has to ask for; when they do, the file still lines up on
+    /// screen, which is the only promise indentation makes.
+    pub fn render(&self, width: usize) -> String {
+        if self.expandtab {
+            return " ".repeat(width);
+        }
+        let tabs = width / self.tab_width.max(1);
+        let spaces = width % self.tab_width.max(1);
+        let mut out = String::with_capacity(tabs + spaces);
+        out.extend(std::iter::repeat_n('\t', tabs));
+        out.extend(std::iter::repeat_n(' ', spaces));
+        out
+    }
+}
+
+/// Screen column of char offset `char_col` within `line`.
+pub fn display_col(line: &str, char_col: usize, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut col = 0;
+    for ch in line.chars().take(char_col) {
+        col += if ch == '\t' { tab_width - (col % tab_width) } else { 1 };
+    }
+    col
+}
+
+/// How many columns `text` occupies, starting from column zero.
+pub fn width_of(text: &str, tab_width: usize) -> usize {
+    display_col(text, text.chars().count(), tab_width)
+}
+
+/// Expands tabs for display.
+///
+/// Width is counted in chars, so wide (CJK) and combining chars will be off.
+/// Fixing that means a `unicode-width` dependency and a real grapheme walk —
+/// worth doing before this is usable on non-Latin text.
+pub fn expand_tabs(line: &str, tab_width: usize) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let tab_width = tab_width.max(1);
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let n = tab_width - (col % tab_width);
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    out
+}
+
+/// The leading whitespace of `line`, as it is written.
+///
+/// Returned as a slice rather than a width because autoindent copies the
+/// characters: a tab-indented file stays tab-indented even under `expandtab`,
+/// which is what makes a new line match its neighbour.
+pub fn leading(line: &str) -> &str {
+    let end = line.find(|c: char| c != ' ' && c != '\t').unwrap_or(line.len());
+    &line[..end]
+}
+
+/// Whether `line` has nothing on it but whitespace. An empty line qualifies.
+pub fn is_blank(line: &str) -> bool {
+    line.chars().all(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spaces() -> Indent {
+        Indent::default()
+    }
+
+    fn tabs() -> Indent {
+        Indent { expandtab: false, ..Indent::default() }
+    }
+
+    #[test]
+    fn step_follows_tab_width_until_shiftwidth_says_otherwise() {
+        assert_eq!(spaces().step(), 4);
+        assert_eq!(Indent { tab_width: 8, ..spaces() }.step(), 8);
+        assert_eq!(Indent { shiftwidth: 2, tab_width: 8, ..spaces() }.step(), 2);
+        assert_eq!(
+            Indent { tab_width: 0, ..spaces() }.step(),
+            1,
+            "a step of nothing is not a step"
+        );
+    }
+
+    #[test]
+    fn render_writes_what_the_options_ask_for() {
+        assert_eq!(spaces().render(6), "      ");
+        assert_eq!(tabs().render(8), "\t\t");
+        // The step need not divide the tab width, and when it does not the
+        // remainder is spaces — there is no most of a tab.
+        assert_eq!(Indent { shiftwidth: 2, ..tabs() }.render(6), "\t  ");
+        assert_eq!(spaces().render(0), "");
+    }
+
+    #[test]
+    fn display_col_counts_a_tab_to_the_next_stop() {
+        assert_eq!(display_col("\tx", 1, 4), 4);
+        assert_eq!(display_col("ab\tx", 3, 4), 4, "a tab after two chars still reaches 4");
+        assert_eq!(display_col("abcd\tx", 5, 4), 8);
+        assert_eq!(width_of("\t\t", 8), 16);
+    }
+
+    #[test]
+    fn leading_stops_at_the_first_real_character() {
+        assert_eq!(leading("  \tfoo  "), "  \t");
+        assert_eq!(leading("foo"), "");
+        assert_eq!(leading("   "), "   ", "a blank line is all indent");
+    }
+
+    #[test]
+    fn expand_tabs_leaves_a_line_without_any_alone() {
+        assert_eq!(expand_tabs("plain", 4), "plain");
+        assert_eq!(expand_tabs("\tx", 4), "    x");
+        assert_eq!(expand_tabs("ab\tx", 4), "ab  x");
+    }
+}

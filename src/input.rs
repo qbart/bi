@@ -321,6 +321,7 @@ impl Input {
             Some(Operator::Delete) => s.push('d'),
             Some(Operator::Change) => s.push('c'),
             Some(Operator::Yank) => s.push('y'),
+            Some(Operator::Indent { right }) => s.push(if right { '>' } else { '<' }),
             None => {}
         }
         if let Some(n) = self.motion_count {
@@ -756,7 +757,11 @@ impl Input {
         if let Some(op) = self.operator {
             let doubled = matches!(
                 (op, c),
-                (Operator::Delete, 'd') | (Operator::Change, 'c') | (Operator::Yank, 'y')
+                (Operator::Delete, 'd')
+                    | (Operator::Change, 'c')
+                    | (Operator::Yank, 'y')
+                    | (Operator::Indent { right: true }, '>')
+                    | (Operator::Indent { right: false }, '<')
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
@@ -903,6 +908,10 @@ impl Input {
                 self.operator = Some(Operator::Yank);
                 return None;
             }
+            '>' | '<' => {
+                self.operator = Some(Operator::Indent { right: c == '>' });
+                return None;
+            }
             '"' => {
                 self.quote_pending = true;
                 return None;
@@ -1006,12 +1015,20 @@ impl Input {
             'd' | 'x' => Some(Operator::Delete),
             'c' | 's' => Some(Operator::Change),
             'y' => Some(Operator::Yank),
+            '>' | '<' => Some(Operator::Indent { right: c == '>' }),
             _ => None,
         };
         if let Some(op) = op {
             let sink = self.sink;
+            // The count is steps here, not rows — the selection already says
+            // which rows — so it stays on the command rather than being folded
+            // into a range. `3>` is the command three times.
+            let count = match op {
+                Operator::Indent { .. } => self.fold_count(),
+                _ => 1,
+            };
             self.reset();
-            return Some(Command { count: 1, action: Action::OperateSelection { op, sink } });
+            return Some(Command { count, action: Action::OperateSelection { op, sink } });
         }
 
         // `p` here replaces the selection rather than inserting beside it, so
@@ -1088,7 +1105,10 @@ impl Input {
             KeyCode::Char(c) => Action::InsertChar(c),
             KeyCode::Enter => Action::InsertNewline,
             KeyCode::Backspace => Action::Backspace,
-            KeyCode::Tab => Action::InsertChar('\t'),
+            // Not an `InsertChar('\t')`: where the next stop is depends on
+            // where on the line the cursor already is, and with `expandtab`
+            // there is no tab to insert. Shift-Tab is the way back.
+            KeyCode::Tab => Action::InsertIndent { right: !key.mods.shift },
             KeyCode::Left => Action::Move(Motion::Left),
             KeyCode::Right => Action::Move(Motion::Right),
             KeyCode::Down => Action::Move(Motion::Down),
@@ -1826,6 +1846,72 @@ leader = \" \"
                 count: 1,
                 sink: Sink::Ring
             }
+        );
+    }
+
+    #[test]
+    fn indent_is_an_operator_like_any_other() {
+        assert_eq!(
+            typed(">j").action,
+            Action::Operate {
+                op: Operator::Indent { right: true },
+                target: Target::Motion(Motion::Down),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        assert_eq!(
+            typed("<<").action,
+            Action::Operate {
+                op: Operator::Indent { right: false },
+                target: Target::Motion(Motion::CurrentLine),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        // The count folds into the range, as it does for `3dd`.
+        assert_eq!(
+            typed("3>>").action,
+            Action::Operate {
+                op: Operator::Indent { right: true },
+                target: Target::Motion(Motion::CurrentLine),
+                count: 3,
+                sink: Sink::Ring
+            }
+        );
+    }
+
+    /// In visual mode the count is steps, not rows — the selection already
+    /// says which rows — so it stays on the command.
+    #[test]
+    fn a_visual_indent_counts_steps() {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in "3>".chars() {
+            last = input.on_key(key(c), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+        }
+        let cmd = last.expect("indented");
+        assert_eq!(
+            cmd.action,
+            Action::OperateSelection { op: Operator::Indent { right: true }, sink: Sink::Ring }
+        );
+        assert_eq!(cmd.count, 3);
+    }
+
+    #[test]
+    fn tab_in_insert_mode_is_an_indent_rather_than_a_character() {
+        let mut input = Input::default();
+        let tab = |shift| Key {
+            code: KeyCode::Tab,
+            mods: crate::key::Mods { shift, ..Default::default() },
+        };
+        assert_eq!(
+            input.on_key(tab(false), &Mode::Insert, ContentKind::Text).unwrap().action,
+            Action::InsertIndent { right: true }
+        );
+        assert_eq!(
+            input.on_key(tab(true), &Mode::Insert, ContentKind::Text).unwrap().action,
+            Action::InsertIndent { right: false }
         );
     }
 

@@ -165,6 +165,7 @@ const LIB_MODULES: &[&str] = &[
     "config/parse.rs",
     "editor.rs",
     "history.rs",
+    "indent.rs",
     "input.rs",
     "key.rs",
     "motion.rs",

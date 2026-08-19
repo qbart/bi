@@ -8,6 +8,17 @@
 number = 1
 hlsearch = false
 
+# Indentation. `tab_width` is how wide a \t is drawn, `shiftwidth` is how far
+# `>` moves — 0 means "the same as tab_width", so one number usually does.
+# `expandtab` writes indentation as spaces, which is not vim's default and is
+# deliberate; a Makefile needs `:set expandtab false` until .editorconfig lands.
+# `autoindent` starts a new line under the one above it.
+# See docs/specs/indent.md.
+tab_width = 4
+shiftwidth = 0
+expandtab = true
+autoindent = true
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

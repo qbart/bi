@@ -128,6 +128,18 @@ pub enum Operator {
     Change,
     /// Copies without removing. The only operator that leaves the text alone.
     Yank,
+    /// `>` and `<`. An operator in the full sense — it takes a motion, it
+    /// doubles, it takes a count, `.` repeats it — which is the only reason
+    /// `>j` needs no machinery of its own beside the machinery `dj` already
+    /// has.
+    ///
+    /// The one that captures nothing: there is no register in an indent, so
+    /// the `sink` an `Operate` carries alongside it is ignored. It is also
+    /// always linewise, whatever its motion says, since half a line cannot be
+    /// indented. See `docs/specs/indent.md`.
+    Indent {
+        right: bool,
+    },
 }
 
 /// How a motion's endpoints turn into a range.

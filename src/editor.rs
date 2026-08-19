@@ -293,6 +293,12 @@ pub enum Action {
     InsertText(String),
     InsertNewline,
     Backspace,
+    /// `Tab` / `Shift-Tab` in insert mode — to the next indent stop, or back
+    /// to the previous one. Not an `InsertChar('\t')`, because where the stop
+    /// is depends on where on the line the cursor already is.
+    InsertIndent {
+        right: bool,
+    },
 
     EnterCommandMode,
     /// A `:` line from a binding, rather than one that was typed.
@@ -335,6 +341,13 @@ impl Action {
         }
         // A move repeats one row at a time, so `3 Shift-Down` clamps at the
         // bottom the same way three presses would.
+        //
+        // Visual `>` is here because its count is steps rather than rows — the
+        // selection already says which rows — and three steps is the command
+        // three times. It works only because it keeps the selection.
+        if let Action::OperateSelection { op: Operator::Indent { .. }, .. } = self {
+            return true;
+        }
         matches!(
             self,
             Action::InsertChar(_) | Action::Undo | Action::Redo | Action::MoveLines { .. }
@@ -3562,6 +3575,23 @@ impl View<'_> {
                     }
                 });
             }
+            // `>` before the general form: it captures nothing, so none of the
+            // register machinery below applies to it, and it is always
+            // linewise however its motion is classified.
+            Action::Operate { op: Operator::Indent { right }, target, count, .. } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                let (right, count) = (*right, *count);
+                let indent = self.session.options.indent();
+                self.for_each_selection(|ed, sel| {
+                    let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
+                        return sel;
+                    };
+                    match ed.buffer.indent_rows(first, last, right, 1, &indent) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => sel,
+                    }
+                });
+            }
             Action::Operate { op, target, count, sink } => {
                 let Some(target) = self.resolve_find_target(*target) else { return };
                 let (op, count, sink) = (*op, *count, *sink);
@@ -3619,9 +3649,20 @@ impl View<'_> {
                 // column. Vim does this, and it is what makes `iAB<Esc>.`
                 // insert at the right place. Leaving visual mode does not.
                 let stepping_back = matches!(self.session.mode, Mode::Insert | Mode::Replace);
+                // A line that ended up as nothing but whitespace was almost
+                // certainly opened and thought better of, and the indent
+                // autoindent put there is invisible on screen and perfectly
+                // visible in the diff. Only when autoindent is on: with it off,
+                // nothing but the user put that whitespace there.
+                let clearing = stepping_back && self.session.options.autoindent;
                 self.session.mode = Mode::Normal;
                 self.session.replaced.clear();
                 self.selections.collapse_each();
+                if clearing {
+                    self.for_each_selection(|ed, sel| {
+                        Selection::collapsed(ed.buffer.clear_blank_line(sel.head))
+                    });
+                }
                 self.for_each_selection(|ed, sel| {
                     let head = if stepping_back && ed.buffer.col_at(sel.head) > 0 {
                         Cursor::at(sel.head.at - 1)
@@ -3633,9 +3674,10 @@ impl View<'_> {
             }
             Action::OpenLineBelow | Action::OpenLineAbove => {
                 let below = matches!(action, Action::OpenLineBelow);
+                let indent = self.session.options.indent();
                 self.session.mode = Mode::Insert;
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.open_line(sel.head, below))
+                    Selection::collapsed(ed.buffer.open_line(sel.head, below, &indent))
                 });
             }
 
@@ -3700,13 +3742,24 @@ impl View<'_> {
                 });
             }
             Action::InsertNewline => {
+                let indent = self.session.options.indent();
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.insert_char(sel.head, '\n'))
+                    Selection::collapsed(ed.buffer.insert_newline(sel.head, &indent))
                 });
             }
             Action::Backspace => {
+                let indent = self.session.options.indent();
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.backspace(sel.head))
+                    Selection::collapsed(ed.buffer.backspace_indent(sel.head, &indent))
+                });
+            }
+            Action::InsertIndent { right } => {
+                let (right, indent) = (*right, self.session.options.indent());
+                self.for_each_selection(|ed, sel| {
+                    Selection::collapsed(match right {
+                        true => ed.buffer.insert_indent(sel.head, &indent),
+                        false => ed.buffer.remove_indent(sel.head, &indent),
+                    })
                 });
             }
 
@@ -3765,6 +3818,34 @@ impl View<'_> {
                     Selection::collapsed(ed.buffer.clamped(Cursor::at(sel.range().0), false))
                 });
                 self.session.mode = Mode::Normal;
+            }
+            // Whole rows whatever the shape of the selection — a block `>`
+            // shifts the lines it touches, as vim's does.
+            //
+            // The selection survives, which vim drops and every vimrc puts
+            // back with `vnoremap > >gv`. It is also what makes `3>` fall out
+            // for free: three steps is the command run three times, and it can
+            // only run three times if there is still a selection.
+            Action::OperateSelection { op: Operator::Indent { right }, .. } => {
+                let (right, indent) = (*right, self.session.options.indent());
+                self.for_each_selection(|ed, sel| {
+                    let (lo, hi) = sel.range();
+                    let first = ed.buffer.row_at(Cursor::at(lo));
+                    let last = ed.buffer.row_at(Cursor::at(hi));
+                    if ed.buffer.indent_rows(first, last, right, 1, &indent).is_none() {
+                        return sel;
+                    }
+                    // The rows it touched, whole: the text moved out from under
+                    // the old columns, so keeping them would slide the
+                    // selection sideways under a repeated `>`.
+                    let backwards = sel.head.at < sel.anchor.at;
+                    let start = ed.buffer.at_row(first, false);
+                    let end = ed.buffer.line_end(ed.buffer.at_row(last, false), false);
+                    match backwards {
+                        true => Selection { anchor: end, head: start },
+                        false => Selection { anchor: start, head: end },
+                    }
+                });
             }
             Action::OperateSelection { op, sink }
                 if self.session.mode.visual() == Some(VisualKind::Block) =>
@@ -8787,5 +8868,127 @@ mod tests {
         let mut ed = tall(3);
         ed.apply(cmd(Action::ScrollHalfPage { down: true }));
         assert_eq!(ed.scroll(), 0);
+    }
+
+    // ---- indentation --------------------------------------------------------
+    //
+    // The buffer's own tests say what an indent *is*; these say that the
+    // commands reach it, that the cursor and the selection end up where they
+    // should, and that one `>` is one undo step.
+
+    fn indent(target: Target, count: usize, right: bool) -> Command {
+        cmd(Action::Operate { op: Operator::Indent { right }, target, count, sink: Sink::Ring })
+    }
+
+    #[test]
+    fn shift_right_moves_the_line_and_lands_on_its_first_non_blank() {
+        let mut ed = editor("alpha\nbeta\n");
+
+        ed.apply(indent(Target::Motion(Motion::CurrentLine), 1, true));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "    alpha\nbeta\n");
+        assert_eq!(ed.cursor_col(), Some(4));
+    }
+
+    #[test]
+    fn a_count_is_lines_in_normal_mode() {
+        let mut ed = editor("a\nb\nc\nd\n");
+
+        ed.apply(indent(Target::Motion(Motion::CurrentLine), 3, true));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "    a\n    b\n    c\nd\n");
+    }
+
+    #[test]
+    fn indent_takes_a_text_object() {
+        let mut ed = editor("a\nb\n\nc\n");
+
+        ed.apply(indent(Target::Object { object: TextObject::Paragraph, around: false }, 1, true));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "    a\n    b\n\nc\n");
+    }
+
+    #[test]
+    fn indent_is_one_undo_step_however_many_lines_it_touched() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.apply(indent(Target::Motion(Motion::CurrentLine), 3, true));
+
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn dot_repeats_an_indent() {
+        let mut ed = editor("alpha\n");
+        ed.apply(indent(Target::Motion(Motion::CurrentLine), 1, true));
+
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "        alpha\n");
+    }
+
+    /// The count is steps here, and the selection survives — which is what
+    /// lets three steps be the command three times.
+    #[test]
+    fn a_visual_indent_takes_steps_and_keeps_the_selection() {
+        let mut ed = editor("alpha\nbeta\n");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ed.apply(Command {
+            count: 3,
+            action: Action::OperateSelection {
+                op: Operator::Indent { right: true },
+                sink: Sink::Ring,
+            },
+        });
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "            alpha\n            beta\n"
+        );
+        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Line), "still selecting");
+        let selection = ed.selections().unwrap().primary();
+        let buffer = ed.buffer().unwrap();
+        assert_eq!(buffer.row_at(Cursor::at(selection.range().0)), 0);
+        assert_eq!(buffer.row_at(Cursor::at(selection.range().1)), 1, "both rows, still");
+    }
+
+    #[test]
+    fn tab_in_insert_mode_reaches_the_next_stop() {
+        let mut ed = editor("ab\n");
+        ed.apply(cmd(Action::EnterInsertLineEnd));
+
+        ed.apply(cmd(Action::InsertIndent { right: true }));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ab  \n", "two columns, not four");
+    }
+
+    #[test]
+    fn opening_a_line_carries_the_indent_and_esc_takes_back_an_unused_one() {
+        let mut ed = editor("    alpha\n");
+        ed.apply(cmd(Action::OpenLineBelow));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "    alpha\n    \n");
+
+        ed.apply(cmd(Action::EnterNormal));
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "    alpha\n\n",
+            "an indent nothing was typed into is not left behind"
+        );
+    }
+
+    #[test]
+    fn autoindent_off_leaves_both_halves_of_that_alone() {
+        let mut ed = editor("    alpha\n");
+        ed.session.options.autoindent = false;
+
+        ed.apply(cmd(Action::OpenLineBelow));
+        type_str(&mut ed, "  ");
+        ed.apply(cmd(Action::EnterNormal));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "    alpha\n  \n");
     }
 }

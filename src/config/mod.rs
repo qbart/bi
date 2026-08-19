@@ -104,6 +104,16 @@ pub struct Options {
     /// `/`, and the status line's `[3/17]` says how many matches there are
     /// without painting them.
     pub hlsearch: bool,
+
+    /// How wide a `\t` is drawn.
+    pub tab_width: usize,
+    /// Whether an indent is written as spaces. True by default, which is not
+    /// vim's default and is deliberate — see `docs/specs/indent.md`.
+    pub expandtab: bool,
+    /// How far `>` moves, in columns. 0 means "whatever `tab_width` says".
+    pub shiftwidth: usize,
+    /// Whether a new line starts under the one above it.
+    pub autoindent: bool,
 }
 
 impl Default for Options {
@@ -112,11 +122,16 @@ impl Default for Options {
     /// gets. `shipped_defaults_agree_with_the_rust_fallback` keeps this and
     /// `default.toml` saying the same thing.
     fn default() -> Self {
+        let indent = crate::indent::Indent::default();
         Options {
             number: LineNumbers::default(),
             hlsearch: false,
             theme: crate::theme::DEFAULT_THEME.to_string(),
             ssh_theme: "gruvbox-light".to_string(),
+            tab_width: indent.tab_width,
+            expandtab: indent.expandtab,
+            shiftwidth: indent.shiftwidth,
+            autoindent: indent.autoindent,
         }
     }
 }
@@ -140,6 +155,19 @@ impl Options {
             ("ssh_theme", _) => {
                 return Err("ssh_theme takes the name of a theme, in quotes".into());
             }
+            // A tab of no width would put every column on top of the last one,
+            // so the floor is 1 rather than 0. `shiftwidth` *may* be 0: that is
+            // how it says "follow tab_width".
+            ("tab_width", OptionValue::Int(n)) if n >= 1 => self.tab_width = n as usize,
+            ("tab_width", _) => return Err("tab_width takes a count of 1 or more".into()),
+            ("shiftwidth", OptionValue::Int(n)) if n >= 0 => self.shiftwidth = n as usize,
+            ("shiftwidth", _) => {
+                return Err("shiftwidth takes a count, or 0 to follow tab_width".into());
+            }
+            ("expandtab", OptionValue::Bool(on)) => self.expandtab = on,
+            ("expandtab", _) => return Err("expandtab takes true or false".into()),
+            ("autoindent", OptionValue::Bool(on)) => self.autoindent = on,
+            ("autoindent", _) => return Err("autoindent takes true or false".into()),
             _ => return Err(format!("unknown option: {name}")),
         }
         Ok(())
@@ -160,8 +188,25 @@ impl Options {
             "hlsearch" => OptionValue::Bool(self.hlsearch),
             "theme" => OptionValue::Str(self.theme.clone()),
             "ssh_theme" => OptionValue::Str(self.ssh_theme.clone()),
+            "tab_width" => OptionValue::Int(self.tab_width as i64),
+            "shiftwidth" => OptionValue::Int(self.shiftwidth as i64),
+            "expandtab" => OptionValue::Bool(self.expandtab),
+            "autoindent" => OptionValue::Bool(self.autoindent),
             _ => return None,
         })
+    }
+
+    /// The indentation settings, bundled for the code that edits text.
+    ///
+    /// `Buffer` takes one of these rather than reaching for `Options`, which is
+    /// what will let these four become per-file without the call sites moving.
+    pub fn indent(&self) -> crate::indent::Indent {
+        crate::indent::Indent {
+            tab_width: self.tab_width,
+            expandtab: self.expandtab,
+            shiftwidth: self.shiftwidth,
+            autoindent: self.autoindent,
+        }
     }
 }
 
@@ -247,6 +292,39 @@ mod tests {
         assert_eq!(options.set("hlsearch", OptionValue::Bool(true)), Ok(()));
         assert!(options.hlsearch);
         assert_eq!(options.get("hlsearch"), Some(OptionValue::Bool(true)));
+
+        assert_eq!(options.set("tab_width", OptionValue::Int(8)), Ok(()));
+        assert_eq!(options.get("tab_width"), Some(OptionValue::Int(8)));
+        assert_eq!(options.set("shiftwidth", OptionValue::Int(2)), Ok(()));
+        assert_eq!(options.get("shiftwidth"), Some(OptionValue::Int(2)));
+        assert_eq!(options.set("expandtab", OptionValue::Bool(false)), Ok(()));
+        assert_eq!(options.get("expandtab"), Some(OptionValue::Bool(false)));
+        assert_eq!(options.set("autoindent", OptionValue::Bool(false)), Ok(()));
+        assert_eq!(options.get("autoindent"), Some(OptionValue::Bool(false)));
+
+        assert_eq!(
+            options.indent(),
+            crate::indent::Indent {
+                tab_width: 8,
+                shiftwidth: 2,
+                expandtab: false,
+                autoindent: false,
+            }
+        );
+    }
+
+    /// `shiftwidth` may be 0 — that is how it says "follow tab_width" — and
+    /// `tab_width` may not, because a tab of no width puts every column on top
+    /// of the last one.
+    #[test]
+    fn the_widths_refuse_what_they_cannot_mean() {
+        let mut options = Options::default();
+
+        assert!(options.set("shiftwidth", OptionValue::Int(0)).is_ok());
+        assert!(options.set("tab_width", OptionValue::Int(0)).is_err());
+        assert!(options.set("tab_width", OptionValue::Int(-3)).is_err());
+        assert_eq!(options.tab_width, 4, "a rejected set changes nothing");
+        assert!(options.set("expandtab", OptionValue::Int(1)).is_err());
     }
 
     #[test]

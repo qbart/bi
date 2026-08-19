@@ -22,6 +22,7 @@ pub mod cmd_history;
 pub mod config;
 pub mod editor;
 pub mod history;
+pub mod indent;
 pub mod input;
 pub mod key;
 pub mod motion;

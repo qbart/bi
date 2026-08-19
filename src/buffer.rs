@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use ropey::Rope;
 
 use crate::history::{Change, Cursors, History};
+use crate::indent::{self, Indent};
 use crate::motion::{Kind, Motion, Operator, Target, TextObject};
 use crate::registers::{Entry, EntryKind};
 
@@ -438,16 +439,194 @@ impl Buffer {
         Ok(Cursor::at(self.rope.line_to_char(row) + col))
     }
 
-    /// `o` / `O`.
-    pub fn open_line(&mut self, at: Cursor, below: bool) -> Cursor {
+    /// The text of `row`, without its terminator.
+    fn line_text(&self, row: usize) -> String {
+        if row >= self.rope.len_lines() {
+            return String::new();
+        }
+        let start = self.rope.line_to_char(row);
+        self.rope.slice(start..start + self.line_len(row)).to_string()
+    }
+
+    /// The leading whitespace of `row`, as it is written — tabs stay tabs.
+    ///
+    /// Autoindent copies characters rather than a width, which is what keeps a
+    /// tab-indented file tab-indented under `expandtab`: the new line matches
+    /// its neighbour, and only `>` or `Tab` change the indent character.
+    fn copied_indent(&self, row: usize, indent: &Indent) -> String {
+        if !indent.autoindent {
+            return String::new();
+        }
+        indent::leading(&self.line_text(row)).to_string()
+    }
+
+    /// `o` / `O`, with the indent of the line it opened from.
+    pub fn open_line(&mut self, at: Cursor, below: bool, indent: &Indent) -> Cursor {
         let row = self.row_at(at);
+        let lead = self.copied_indent(row, indent);
         let start = if below {
             self.rope.line_to_char(row) + self.line_len(row)
         } else {
             self.rope.line_to_char(row)
         };
-        self.apply_edit(start, start, "\n");
-        Cursor::at(if below { start + 1 } else { start })
+        // Above, the newline goes *after* the indent: the text being pushed
+        // down is the old line, and the indent belongs to the new one.
+        let text = if below { format!("\n{lead}") } else { format!("{lead}\n") };
+        self.apply_edit(start, start, &text);
+        Cursor::at(start + if below { 1 + lead.chars().count() } else { lead.chars().count() })
+    }
+
+    /// `Enter` in insert mode: splits the line and indents what comes after it
+    /// to match what came before.
+    pub fn insert_newline(&mut self, at: Cursor, indent: &Indent) -> Cursor {
+        let lead = self.copied_indent(self.row_at(at), indent);
+        self.insert_str(at, &format!("\n{lead}"))
+    }
+
+    // ---- indentation -------------------------------------------------------
+    //
+    // Widths are columns, never characters: a line indented with a tab and a
+    // space is 5 columns wide at `tab_width = 4`, and `<` takes it to 0 rather
+    // than to "one character less". See `docs/specs/indent.md`.
+
+    /// The rows `target` touches, for the operators that are always linewise.
+    ///
+    /// `None` when the target names nothing — a `f` that misses, an object the
+    /// cursor is not inside — so `>f;` on a line without a `;` leaves the file
+    /// alone rather than indenting the line the cursor happens to be on.
+    pub fn target_rows(&self, at: Cursor, target: Target, count: usize) -> Option<(usize, usize)> {
+        let count = count.max(1);
+        match target {
+            Target::Motion(Motion::FindChar { ch, forward, till, repeat }) => {
+                let to = self.find_char(at, ch, forward, till, repeat, count)?;
+                let (a, b) = (self.row_of(at.at), self.row_of(to.at));
+                Some((a.min(b), a.max(b)))
+            }
+            Target::Motion(motion) => Some(self.linewise_rows(at, motion, count)),
+            Target::Object { object, around } => {
+                let (start, end) = self.object_range(at, object, around)?;
+                Some((self.row_of(start), self.row_of(end.saturating_sub(1).max(start))))
+            }
+        }
+    }
+
+    /// Moves rows `first..=last` by `steps` indent steps, and says where the
+    /// cursor goes: the first non-blank of the first row, as vim does, so a
+    /// repeated `>>` keeps pushing the line it is looking at.
+    ///
+    /// `None` when nothing moved — a `<` on a file already at column zero puts
+    /// no no-op on the undo stack.
+    ///
+    /// A line with nothing but whitespace on it is not indented: pushing an
+    /// empty line right buys nothing and fills the diff with `    `. `<` still
+    /// empties one, which is the way to get rid of it.
+    pub fn indent_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        right: bool,
+        steps: usize,
+        indent: &Indent,
+    ) -> Option<Cursor> {
+        let by = indent.step() * steps.max(1);
+        let last = last.min(self.line_count().saturating_sub(1));
+        let mut changed = false;
+
+        // Bottom-up, so an edit on one row cannot move the rows still to come.
+        for row in (first..=last).rev() {
+            let text = self.line_text(row);
+            let lead = indent::leading(&text);
+            if right && lead.len() == text.len() {
+                continue;
+            }
+            let width = indent::width_of(lead, indent.tab_width);
+            let width = if right { width + by } else { width.saturating_sub(by) };
+            let new = indent.render(width);
+            if new == lead {
+                continue;
+            }
+            let start = self.rope.line_to_char(row);
+            self.apply_edit(start, start + lead.chars().count(), &new);
+            changed = true;
+        }
+
+        changed.then(|| self.first_non_blank(self.clamped(self.at_row(first, false), false)))
+    }
+
+    /// `Tab` in insert mode: forward to the next indent stop.
+    ///
+    /// Aligns rather than inserting a fixed width, which is what a tab has
+    /// always meant on a terminal — at column 6 with a step of 4 it moves two
+    /// columns, so the line below lines up with the one above it.
+    ///
+    /// A literal tab only when the file is written with tabs *and* one lands
+    /// exactly on the stop: at `tab_width = 8` with `shiftwidth = 4` a tab
+    /// would overshoot by four columns, so spaces it is.
+    pub fn insert_indent(&mut self, at: Cursor, indent: &Indent) -> Cursor {
+        let text = self.line_text(self.row_at(at));
+        let col = indent::display_col(&text, self.col_at(at), indent.tab_width);
+        let step = indent.step();
+        let width = step - (col % step);
+        let tab = indent.tab_width.max(1);
+        let one_tab = !indent.expandtab && tab - (col % tab) == width;
+        let text = if one_tab { "\t".to_string() } else { " ".repeat(width) };
+        self.insert_str(at, &text)
+    }
+
+    /// `Shift-Tab` in insert mode: back one indent stop.
+    ///
+    /// Only through whitespace. With anything else behind the cursor it does
+    /// nothing at all rather than deleting a character that was typed.
+    pub fn remove_indent(&mut self, at: Cursor, indent: &Indent) -> Cursor {
+        let row = self.row_at(at);
+        let col = self.col_at(at);
+        let before: String = self.line_text(row).chars().take(col).collect();
+        if before.is_empty() || !indent::is_blank(&before) {
+            return at;
+        }
+        let step = indent.step();
+        // The previous stop, and strictly before where we are: from column 4
+        // with a step of 4 that is 0, not 4.
+        let width = indent::width_of(&before, indent.tab_width);
+        let width = (width.saturating_sub(1) / step) * step;
+        let new = indent.render(width);
+        let start = self.rope.line_to_char(row);
+        self.apply_edit(start, start + col, &new);
+        Cursor::at(start + new.chars().count())
+    }
+
+    /// `Backspace` in insert mode, which takes a whole indent when there is
+    /// nothing but whitespace to the left of it on the line.
+    ///
+    /// With `expandtab` that is the difference between one press and four.
+    /// Anywhere else on the line it is the plain backspace it always was.
+    pub fn backspace_indent(&mut self, at: Cursor, indent: &Indent) -> Cursor {
+        let col = self.col_at(at);
+        if col > 0 {
+            let before: String = self.line_text(self.row_at(at)).chars().take(col).collect();
+            if indent::is_blank(&before) {
+                return self.remove_indent(at, indent);
+            }
+        }
+        self.backspace(at)
+    }
+
+    /// Clears a line that is nothing but whitespace, on the way out of insert
+    /// mode.
+    ///
+    /// Without this, every line you opened and thought better of leaves an
+    /// invisible indent behind — invisible on screen and perfectly visible in
+    /// the diff. Returns where the cursor goes; unchanged when there was
+    /// nothing to clear.
+    pub fn clear_blank_line(&mut self, at: Cursor) -> Cursor {
+        let row = self.row_at(at);
+        let text = self.line_text(row);
+        if text.is_empty() || !indent::is_blank(&text) {
+            return at;
+        }
+        let start = self.rope.line_to_char(row);
+        self.apply_edit(start, start + text.chars().count(), "");
+        Cursor::at(start)
     }
 
     // ---- motions -----------------------------------------------------------
@@ -1783,6 +1962,202 @@ mod tests {
         assert_eq!(shown(&buffer), "gamma\nalpha\nbeta");
     }
 
+    // ---- indentation --------------------------------------------------------
+
+    fn spaces() -> Indent {
+        Indent::default()
+    }
+
+    fn tabs() -> Indent {
+        Indent { expandtab: false, ..Indent::default() }
+    }
+
+    #[test]
+    fn indent_moves_a_line_one_step_each_way() {
+        let mut buffer = rows("alpha\nbeta\n");
+
+        buffer.indent_rows(0, 0, true, 1, &spaces()).expect("indented");
+        assert_eq!(shown(&buffer), "    alpha\nbeta\n");
+
+        buffer.indent_rows(0, 0, false, 1, &spaces()).expect("outdented");
+        assert_eq!(shown(&buffer), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn indent_writes_the_character_the_options_ask_for() {
+        let mut buffer = rows("alpha\n");
+        buffer.indent_rows(0, 0, true, 1, &tabs()).expect("indented");
+        assert_eq!(shown(&buffer), "\talpha\n");
+
+        // And converts what is already there, because the width is what is
+        // being changed and the options say how a width is written.
+        buffer.indent_rows(0, 0, true, 1, &spaces()).expect("indented");
+        assert_eq!(shown(&buffer), "        alpha\n");
+    }
+
+    #[test]
+    fn outdent_subtracts_a_step_rather_than_rounding_to_one() {
+        let mut buffer = rows("      alpha\n");
+
+        buffer.indent_rows(0, 0, false, 1, &spaces()).expect("outdented");
+
+        assert_eq!(shown(&buffer), "  alpha\n", "6 columns, step 4, lands on 2 — not on 4");
+    }
+
+    #[test]
+    fn outdent_clamps_at_column_zero_rather_than_eating_text() {
+        let mut buffer = rows("  alpha\n");
+
+        buffer.indent_rows(0, 0, false, 1, &spaces()).expect("outdented");
+        assert_eq!(shown(&buffer), "alpha\n");
+        assert!(buffer.indent_rows(0, 0, false, 1, &spaces()).is_none(), "nothing left to take");
+    }
+
+    #[test]
+    fn a_step_counts_columns_not_characters() {
+        // One tab and one space is five columns at tab_width 4, so one step
+        // right is nine and one step left is one.
+        let mut buffer = rows("\t alpha\n");
+
+        buffer.indent_rows(0, 0, false, 1, &spaces()).expect("outdented");
+
+        assert_eq!(shown(&buffer), " alpha\n");
+    }
+
+    #[test]
+    fn a_blank_line_is_not_indented_but_is_emptied() {
+        let mut buffer = rows("alpha\n\n   \nbeta\n");
+
+        buffer.indent_rows(0, 3, true, 1, &spaces()).expect("indented");
+        assert_eq!(shown(&buffer), "    alpha\n\n   \n    beta\n", "no indent goes onto nothing");
+
+        buffer.indent_rows(0, 3, false, 1, &spaces()).expect("outdented");
+        assert_eq!(shown(&buffer), "alpha\n\n\nbeta\n", "but `<` clears one out");
+    }
+
+    #[test]
+    fn indent_lands_on_the_first_non_blank_of_the_first_row() {
+        let mut buffer = rows("alpha\nbeta\n");
+
+        let landed = buffer.indent_rows(0, 1, true, 1, &spaces()).expect("indented");
+
+        assert_eq!(buffer.row_at(landed), 0);
+        assert_eq!(buffer.col_at(landed), 4, "on the `a`, not in the whitespace");
+    }
+
+    #[test]
+    fn several_steps_at_once() {
+        let mut buffer = rows("alpha\n");
+
+        buffer.indent_rows(0, 0, true, 3, &spaces()).expect("indented");
+
+        assert_eq!(shown(&buffer), "            alpha\n");
+    }
+
+    #[test]
+    fn tab_in_insert_mode_aligns_to_the_next_stop() {
+        let mut buffer = rows("ab\n");
+
+        // Two characters in, so the next stop is two columns away — not four.
+        let landed = buffer.insert_indent(Cursor::at(2), &spaces());
+
+        assert_eq!(shown(&buffer), "ab  \n");
+        assert_eq!(landed.at, 4);
+    }
+
+    #[test]
+    fn tab_writes_a_tab_only_when_one_lands_on_the_stop() {
+        let mut buffer = rows("\n");
+        buffer.insert_indent(Cursor::at(0), &tabs());
+        assert_eq!(shown(&buffer), "\t\n");
+
+        // A step of 4 under a tab width of 8: a tab would overshoot by four
+        // columns, so spaces it is.
+        let mut buffer = rows("\n");
+        buffer.insert_indent(Cursor::at(0), &Indent { tab_width: 8, shiftwidth: 4, ..tabs() });
+        assert_eq!(shown(&buffer), "    \n");
+    }
+
+    #[test]
+    fn shift_tab_goes_back_a_stop_and_never_eats_text() {
+        let mut buffer = rows("      alpha\n");
+        let landed = buffer.remove_indent(Cursor::at(6), &spaces());
+        assert_eq!(shown(&buffer), "    alpha\n");
+        assert_eq!(landed.at, 4);
+
+        // Behind text it does nothing at all.
+        let mut buffer = rows("alpha\n");
+        assert_eq!(buffer.remove_indent(Cursor::at(3), &spaces()).at, 3);
+        assert_eq!(shown(&buffer), "alpha\n");
+    }
+
+    #[test]
+    fn backspace_takes_a_whole_indent_and_then_a_character() {
+        let mut buffer = rows("        alpha\n");
+
+        let at = buffer.backspace_indent(Cursor::at(8), &spaces());
+        assert_eq!(shown(&buffer), "    alpha\n");
+
+        // Past the indent it is the backspace it always was.
+        let at = buffer.backspace_indent(Cursor::at(at.at + 5), &spaces());
+        assert_eq!(shown(&buffer), "    alph\n");
+        assert_eq!(at.at, 8);
+    }
+
+    #[test]
+    fn opening_a_line_copies_the_indent_as_it_is_written() {
+        let mut buffer = rows("\talpha\n");
+
+        let landed = buffer.open_line(Cursor::at(3), true, &tabs());
+
+        assert_eq!(shown(&buffer), "\talpha\n\t\n", "a tab file stays a tab file");
+        assert_eq!(buffer.row_at(landed), 1);
+        assert_eq!(buffer.col_at(landed), 1);
+    }
+
+    #[test]
+    fn opening_a_line_above_puts_the_indent_on_the_new_line() {
+        let mut buffer = rows("    alpha\n");
+
+        let landed = buffer.open_line(Cursor::at(4), false, &spaces());
+
+        assert_eq!(shown(&buffer), "    \n    alpha\n");
+        assert_eq!(buffer.row_at(landed), 0);
+        assert_eq!(buffer.col_at(landed), 4);
+    }
+
+    #[test]
+    fn autoindent_off_opens_at_column_zero() {
+        let mut buffer = rows("    alpha\n");
+
+        buffer.open_line(Cursor::at(4), true, &Indent { autoindent: false, ..spaces() });
+
+        assert_eq!(shown(&buffer), "    alpha\n\n");
+    }
+
+    #[test]
+    fn newline_indents_what_it_pushed_down() {
+        let mut buffer = rows("    alpha beta\n");
+
+        buffer.insert_newline(Cursor::at(10), &spaces());
+
+        assert_eq!(shown(&buffer), "    alpha \n    beta\n");
+    }
+
+    #[test]
+    fn a_whitespace_only_line_is_cleared_and_nothing_else_is() {
+        let mut buffer = rows("alpha\n    \nbeta\n");
+
+        let landed = buffer.clear_blank_line(Cursor::at(10));
+        assert_eq!(shown(&buffer), "alpha\n\nbeta\n");
+        assert_eq!(landed.at, 6);
+
+        // A line with something on it is left alone, trailing space and all.
+        let mut buffer = rows("alpha   \n");
+        assert_eq!(buffer.clear_blank_line(Cursor::at(8)).at, 8);
+        assert_eq!(shown(&buffer), "alpha   \n");
+    }
+
     /// A buffer with a cursor attached.
     ///
     /// The cursor lives on `Editor` now, as a selection. These cases are about
@@ -1834,7 +2209,10 @@ mod tests {
         }
         fn open_line(&mut self, below: bool) {
             self.mark();
-            self.cursor = self.inner.open_line(self.cursor, below);
+            // No autoindent: these tests are about where the line lands, and
+            // the indent tests below say what the indent does.
+            let plain = Indent { autoindent: false, ..Indent::default() };
+            self.cursor = self.inner.open_line(self.cursor, below, &plain);
         }
         /// Single-cursor, so each "set" is one pair. Multi-cursor undo is
         /// covered in `editor.rs`.

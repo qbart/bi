@@ -11,14 +11,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bi::buffer::Cursor;
 use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
+use bi::indent::{display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
 use bi::selection::Selections;
 use bi::syntax::{Span as HlSpan, Syntax};
 use bi::theme::{Ansi, Color as ThemeColor, Style as ThemeStyle, Theme, Ui};
 use bi::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
 use bi::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
-
-const TAB_WIDTH: usize = 4;
 
 /// A theme colour, in the one spelling a terminal understands.
 ///
@@ -169,43 +168,6 @@ fn fill_line(spans: Vec<Span<'static>>, bg: Option<ThemeColor>, width: usize) ->
     Line::from(spans)
 }
 
-/// Expands tabs for display.
-///
-/// Width is counted in chars, so wide (CJK) and combining chars will be off.
-/// Fixing that means a `unicode-width` dependency and a real grapheme walk —
-/// worth doing before this is usable on non-Latin text.
-fn expand_tabs(line: &str) -> String {
-    if !line.contains('\t') {
-        return line.to_string();
-    }
-    let mut out = String::with_capacity(line.len());
-    let mut col = 0;
-    for ch in line.chars() {
-        if ch == '\t' {
-            let n = TAB_WIDTH - (col % TAB_WIDTH);
-            out.extend(std::iter::repeat_n(' ', n));
-            col += n;
-        } else {
-            out.push(ch);
-            col += 1;
-        }
-    }
-    out
-}
-
-/// Screen column of char offset `char_col` within `line`.
-fn display_col(line: &str, char_col: usize) -> usize {
-    let mut col = 0;
-    for ch in line.chars().take(char_col) {
-        if ch == '\t' {
-            col += TAB_WIDTH - (col % TAB_WIDTH);
-        } else {
-            col += 1;
-        }
-    }
-    col
-}
-
 /// Splits one line into styled pieces, expanding tabs as it goes.
 ///
 /// Tab expansion has to happen *inside* the split: expanding first would shift
@@ -216,6 +178,7 @@ fn styled_line(
     spans: &[HlSpan],
     syntax: &Syntax,
     theme: &Theme,
+    tab_width: usize,
 ) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
@@ -228,7 +191,7 @@ fn styled_line(
         let mut expanded = String::with_capacity(text.len());
         for ch in text.chars() {
             if ch == '\t' {
-                let n = TAB_WIDTH - (*col % TAB_WIDTH);
+                let n = tab_width - (*col % tab_width);
                 expanded.extend(std::iter::repeat_n(' ', n));
                 *col += n;
             } else {
@@ -308,6 +271,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     // Copied out once: `Ui` is `Copy`, and the picker below borrows the
     // editor mutably, which a `&Theme` held across it could not survive.
     let ui = ed.theme().ui;
+    let tab = ed.session.options.tab_width;
     // The theme's own background, under everything, before anything draws. A
     // theme that named none leaves the terminal's showing through — which is
     // what bi did before it had themes, and what `ansi` still does.
@@ -350,7 +314,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     if matches!(ed.session.mode, Mode::Pick)
         && let Some(picker) = ed.session.picker.as_mut()
     {
-        render_picker(frame, picker, body, &ui);
+        render_picker(frame, picker, body, &ui, tab);
         return;
     }
 
@@ -478,6 +442,9 @@ fn render_window(
     };
     let (scroll, selections) = (text.scroll, &text.selections);
 
+    // The one number the core owns and the renderer used to guess. Everything
+    // below counts columns with it.
+    let tab = ed.session.options.tab_width;
     let total = buffer.line_count();
     let gutter = gutter_width(ed, buffer);
     let cursor = selections.cursor();
@@ -501,7 +468,7 @@ fn render_window(
         let raw = raw.trim_end_matches(['\n', '\r']);
 
         if row == cursor_row {
-            cursor_screen_col = display_col(raw, buffer.col_at(cursor));
+            cursor_screen_col = display_col(raw, buffer.col_at(cursor), tab);
         }
 
         // A blank cell where a number is not due, so the text stays put.
@@ -526,9 +493,9 @@ fn render_window(
                     .copied()
                     .filter(|s| s.end_byte > line_start && s.start_byte < line_end)
                     .collect();
-                spans.extend(styled_line(raw, line_start, &mine, syntax, ed.theme()));
+                spans.extend(styled_line(raw, line_start, &mine, syntax, ed.theme(), tab));
             }
-            None => spans.push(Span::raw(expand_tabs(raw))),
+            None => spans.push(Span::raw(expand_tabs(raw, tab))),
         }
         // Search matches, under the selection so a selected match still reads
         // as selected. Bounded by the row, like every other pass here.
@@ -540,8 +507,8 @@ fn render_window(
             for (start, end) in
                 buffer.matches_in(line_start, line_end, &search.pattern, search.whole_word)
             {
-                let from = display_col(raw, start.saturating_sub(line_start));
-                let to = display_col(raw, (end - line_start).min(raw.chars().count()));
+                let from = display_col(raw, start.saturating_sub(line_start), tab);
+                let to = display_col(raw, (end - line_start).min(raw.chars().count()), tab);
                 spans = paint_range(spans, (from + gutter)..(to + gutter), ed.theme().ui.search);
             }
         }
@@ -569,7 +536,8 @@ fn render_window(
                     let line_start = buffer.rope().line_to_char(row);
                     let (start, end) = ed.block_span_in(id, row);
                     let (from, to) = (start - line_start, end - line_start);
-                    display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
+                    display_col(raw, from, tab)
+                        ..display_col(raw, to, tab).max(display_col(raw, from, tab) + 1)
                 }
                 _ => {
                     let line_start = buffer.rope().line_to_char(row);
@@ -579,7 +547,8 @@ fn render_window(
                     } else {
                         (hi - line_start + 1).min(raw.chars().count())
                     };
-                    display_col(raw, from)..display_col(raw, to).max(display_col(raw, from) + 1)
+                    display_col(raw, from, tab)
+                        ..display_col(raw, to, tab).max(display_col(raw, from, tab) + 1)
                 }
             };
             let cols = (cols.start + gutter)..(cols.end + gutter);
@@ -597,7 +566,7 @@ fn render_window(
                 if buffer.row_at(head) != row {
                     continue;
                 }
-                let col = display_col(raw, buffer.col_at(head)) + gutter;
+                let col = display_col(raw, buffer.col_at(head), tab) + gutter;
                 spans = paint_range(spans, col..col + 1, ed.theme().ui.cursor_alt);
             }
         }
@@ -700,9 +669,9 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
 }
 
 /// The entry's first line, tab-expanded and elided to fit one row.
-fn row_label(text: &str, width: usize) -> String {
+fn row_label(text: &str, width: usize, tab_width: usize) -> String {
     let first = text.lines().next().unwrap_or("");
-    let expanded = expand_tabs(first);
+    let expanded = expand_tabs(first, tab_width);
     if expanded.chars().count() <= width {
         return expanded;
     }
@@ -713,7 +682,7 @@ fn row_label(text: &str, width: usize) -> String {
 ///
 /// Viewport-bounded like the main pass — only visible rows are formatted, no
 /// matter how deep the ring is.
-fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
+fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, tab_width: usize) {
     let w = (area.width * 3 / 5).clamp(24, area.width.saturating_sub(2).max(24));
     let h = (area.height * 3 / 5).clamp(6, area.height.saturating_sub(2).max(6));
     let rect = Rect {
@@ -778,7 +747,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
             // `¶` says the entry is linewise, so you can tell before pasting
             // whether it will open a line or splice inline.
             let badge = item.badge.unwrap_or(' ');
-            let label = row_label(&item.text, width.saturating_sub(4));
+            let label = row_label(&item.text, width.saturating_sub(4), tab_width);
             let style = if selected { tui(ui.picker_selected) } else { Style::default() };
             Line::from(vec![
                 Span::styled(format!("{marker} "), style),
@@ -805,7 +774,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
             .preview()
             .lines()
             .take(preview_inner.height as usize)
-            .map(|l| Line::from(expand_tabs(l)))
+            .map(|l| Line::from(expand_tabs(l, tab_width)))
             .collect();
         frame.render_widget(Paragraph::new(body).style(tui(ui.picker_preview)), preview_inner);
     }
@@ -1069,6 +1038,15 @@ mod tests {
 
         ed.session.options.number = LineNumbers::Off;
         assert_eq!(gutter_width(&ed, ed.buffer().unwrap()), 0, "the column is gone, not blank");
+    }
+
+    /// The renderer holds no width of its own any more — every column it
+    /// counts comes from `options.tab_width`, through `bi::indent`. `row_label`
+    /// is the smallest place that shows it: the same text, two widths.
+    #[test]
+    fn a_tab_is_as_wide_as_the_options_say() {
+        assert_eq!(row_label("a\tb", 20, 4), "a   b");
+        assert_eq!(row_label("a\tb", 20, 8), "a       b");
     }
 
     #[test]

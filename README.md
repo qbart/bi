@@ -58,7 +58,9 @@ the word, `dw` takes the word and the space after it.
 | `d{motion}` | delete over the motion: `dw` `d$` `d0` `db` `dj` `dgg` `dG` |
 | `c{motion}` | change — delete, then enter insert mode |
 | `y{motion}` | yank |
+| `>{motion}` `<{motion}` | indent / outdent the lines it covers |
 | `dd` `cc` `yy` | the whole line, `{n}` of them when counted |
+| `>>` `<<` | the whole line, `{n}` of them when counted |
 | `D` `C` | `d$` / `c$` — to the end of the line |
 | `S` | `cc` |
 | `Y` | `yy` |
@@ -231,6 +233,7 @@ expect.
 | `y` | yank it |
 | `p` `P` | replace it with the register |
 | `r{char}` | overwrite every selected character |
+| `>` `<` | indent / outdent the selected lines, `{n}` steps |
 | `o` | swap the ends, to adjust the other one |
 | `iw` `i(` … | make that text object the selection |
 
@@ -297,9 +300,18 @@ rather than eating the newline. The whole session is one undo step.
 
 ### Insert mode
 
-Printable keys insert themselves. `Enter`, `Backspace` and `Tab` do the obvious
-thing, arrows and `Home`/`End` move, and `Esc` or `Ctrl-C` returns to normal
-mode with the cursor pulled back onto a character.
+Printable keys insert themselves, arrows and `Home`/`End` move, and `Esc` or
+`Ctrl-C` returns to normal mode with the cursor pulled back onto a character.
+
+`Tab` moves to the next indent stop rather than inserting a fixed width, so a
+line lines up with the one above it whatever column you started from;
+`Shift-Tab` goes back one, and never eats a character you typed. `Backspace`
+takes a whole indent when there is nothing but whitespace to its left, and one
+character everywhere else. `Enter` starts the new line under the old one, with
+the same indent characters — a tab-indented file stays tab-indented. A line you
+opened and thought better of loses its indent again on `Esc`, rather than
+leaving whitespace nothing can see. See
+[docs/specs/indent.md](docs/specs/indent.md).
 
 ### Picker
 
@@ -527,9 +539,18 @@ whatever a later version adds. `[options]` **is** the `:set` namespace — one k
 
 ```toml
 [options]
-number   = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
-hlsearch = false
+number     = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
+hlsearch   = false
+tab_width  = 4      # how wide a \t is drawn
+shiftwidth = 0      # how far `>` moves; 0 means "the same as tab_width"
+expandtab  = true   # write an indent as spaces
+autoindent = true   # a new line starts under the one above it
 ```
+
+`expandtab` defaults to spaces, which is not vim's default and is deliberate.
+The exception it costs is a `Makefile`, which needs tabs and needs `:set
+expandtab false` until per-file options land — see
+[docs/specs/indent.md](docs/specs/indent.md).
 
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown
@@ -718,8 +739,9 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 - No tree-sitter injections, so a code fence in markdown highlights as a fence
   and its contents stay plain — and markdown's own inline syntax (`**bold**`,
   links, code spans) is a second grammar reached the same way, so it is
-  unhighlighted too. No indent queries, so no auto-indent. See
-  `docs/specs/tree-sitter.md`.
+  unhighlighted too. No indent queries either, so `o` and `Enter` copy the
+  indent of the line above rather than working out what the language wants,
+  and there is no `=`. See `docs/specs/tree-sitter.md`.
 - No regular expressions in search, and no `:s`. See
   [docs/specs/search.md](docs/specs/search.md).
 - No marks (`m{a}`, `` `{a} ``), and no `gn`.

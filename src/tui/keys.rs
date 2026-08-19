@@ -21,6 +21,10 @@ pub fn translate(ev: KeyEvent) -> Option<Key> {
         CtCode::Enter => KeyCode::Enter,
         CtCode::Backspace => KeyCode::Backspace,
         CtCode::Tab => KeyCode::Tab,
+        // Shift-Tab arrives as a code of its own rather than as a modifier, so
+        // it is put back together here. The core has one Tab and reads the
+        // shift, which is what the key is.
+        CtCode::BackTab => KeyCode::Tab,
         CtCode::Left => KeyCode::Left,
         CtCode::Right => KeyCode::Right,
         CtCode::Up => KeyCode::Up,
@@ -35,7 +39,7 @@ pub fn translate(ev: KeyEvent) -> Option<Key> {
         mods: Mods {
             ctrl: ev.modifiers.contains(KeyModifiers::CONTROL),
             alt: ev.modifiers.contains(KeyModifiers::ALT),
-            shift: ev.modifiers.contains(KeyModifiers::SHIFT),
+            shift: ev.modifiers.contains(KeyModifiers::SHIFT) || matches!(ev.code, CtCode::BackTab),
         },
     })
 }
@@ -85,6 +89,16 @@ mod tests {
         for (from, to) in pairs {
             assert_eq!(translate(ev(from, KeyModifiers::NONE)).unwrap().code, to);
         }
+    }
+
+    /// Shift-Tab arrives as a code of its own rather than as Tab with a
+    /// modifier, and the core has one Tab and reads the shift — so the two
+    /// halves are put back together here or `Shift-Tab` unindents nothing.
+    #[test]
+    fn back_tab_is_a_shifted_tab() {
+        let key = translate(ev(CtCode::BackTab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(key.code, KeyCode::Tab);
+        assert!(key.mods.shift);
     }
 
     #[test]
