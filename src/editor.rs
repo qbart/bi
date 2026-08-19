@@ -614,6 +614,9 @@ pub struct Session {
     /// What `s` has been given to look for, and what it found — see
     /// `docs/specs/find.md`.
     pub find: Option<Find>,
+    /// Every buffer, most recently shown first — what `C-Tab` lists and what
+    /// decides which one it opens on. See `docs/specs/buffers.md`.
+    mru: Vec<BufferId>,
     pub overrides: OptionPatch,
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
@@ -2315,6 +2318,8 @@ impl Editor {
         if from == Some(to) {
             return;
         }
+        self.touch(to);
+        let Some(current) = self.window_of(window) else { return };
 
         // Leaving a buffer writes where this window was into the entry, whether
         // what replaces it is another buffer or a tree.
@@ -2421,7 +2426,9 @@ impl Editor {
                     None
                 }
             },
-            BufferCmd::Chosen(i) => ids.get(i).copied(),
+            // Into the most-recent-first list, which is the order the picker
+            // built its rows from and cannot change while it holds every key.
+            BufferCmd::Chosen(i) => self.mru_ids().get(i).copied(),
             BufferCmd::Named(ref partial) => {
                 let hits: Vec<BufferId> = ids
                     .iter()
@@ -2550,6 +2557,30 @@ impl Editor {
         }
     }
 
+    /// Moves `id` to the front of the most-recently-shown list.
+    ///
+    /// Shown rather than focused: a buffer you put in a split beside you is
+    /// one you are working with, and the list is about what you are working
+    /// with rather than about where the cursor happens to be.
+    fn touch(&mut self, id: BufferId) {
+        self.session.mru.retain(|&seen| seen != id);
+        self.session.mru.insert(0, id);
+    }
+
+    /// Every open buffer, most recently shown first.
+    ///
+    /// Anything the list has not heard of goes on the end in the order it was
+    /// opened, so a buffer that arrived without being shown — `:badd` has no
+    /// spelling here yet, but `:wa` walks them all — is still reachable.
+    fn mru_ids(&self) -> Vec<BufferId> {
+        let open = self.buffer_ids();
+        let mut out: Vec<BufferId> =
+            self.session.mru.iter().copied().filter(|id| open.contains(id)).collect();
+        let missing: Vec<BufferId> = open.into_iter().filter(|id| !out.contains(id)).collect();
+        out.extend(missing);
+        out
+    }
+
     /// `Ctrl-P` — the picker over every file under the session's root.
     fn open_file_picker(&mut self) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
@@ -2573,14 +2604,19 @@ impl Editor {
     }
 
     fn open_buffer_picker(&mut self) {
-        let items = self
-            .buffer_ids()
-            .into_iter()
-            .map(|id| Item { text: self.name_of(id), badge: self.is_modified(id).then_some('+') })
+        let ids = self.mru_ids();
+        let items = ids
+            .iter()
+            .map(|&id| Item { text: self.name_of(id), badge: self.is_modified(id).then_some('+') })
             .collect();
         // No length floor: a file named `a` is a file, and hiding it behind
         // `Ctrl-A` is the register ring's problem, not this list's.
-        self.session.picker = Some(Picker::new(PickerKind::Buffer, items, 0));
+        let mut picker = Picker::new(PickerKind::Buffer, items, 0);
+        // On the one you were in *before* this one, so a switcher opened and
+        // taken is a switch — the same thing `Ctrl-^` does, reached the way
+        // you reach everything else.
+        picker.open_on(1.min(ids.len().saturating_sub(1)));
+        self.session.picker = Some(picker);
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
     }
 
@@ -11222,5 +11258,74 @@ mod tests {
         ex(&mut ed, "alt");
 
         assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("thing.pb.go"));
+    }
+
+    // ---- the buffer switcher ------------------------------------------------
+
+    fn names(ed: &Editor) -> Vec<String> {
+        ed.session
+            .picker
+            .as_ref()
+            .expect("the list is up")
+            .items()
+            .iter()
+            .map(|i| {
+                std::path::Path::new(&i.text)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| i.text.clone())
+            })
+            .collect()
+    }
+
+    /// Three files, opened in order, so the list has something to sort.
+    fn three(tag: &str) -> (Files, Editor) {
+        let files = Files::new(tag);
+        let a = files.file("a.txt", "a\n");
+        let mut ed = Editor::open(&a).unwrap();
+        for name in ["b.txt", "c.txt"] {
+            let path = files.file(name, "x\n");
+            ex(&mut ed, &format!("e {path}"));
+        }
+        (files, ed)
+    }
+
+    #[test]
+    fn the_switcher_lists_the_most_recently_shown_first() {
+        let (_files, mut ed) = three("mru");
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+
+        assert_eq!(names(&ed), ["c.txt", "b.txt", "a.txt"]);
+    }
+
+    /// Opened *and taken* is a switch: the row it starts on is the buffer you
+    /// were in before this one.
+    #[test]
+    fn the_switcher_opens_on_the_previous_buffer() {
+        let (_files, mut ed) = three("mru-open");
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("b.txt"));
+
+        // And again, which is what makes it a toggle.
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+        ed.apply(cmd(Action::PickAccept));
+        assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("c.txt"));
+    }
+
+    #[test]
+    fn typing_leaves_the_default_row_and_matches_a_subsequence() {
+        let (_files, mut ed) = three("mru-typing");
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+
+        ed.apply(cmd(Action::PickChar('a')));
+        ed.apply(cmd(Action::PickChar('t')));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert!(
+            ed.name_of(ed.window().buffer().unwrap()).ends_with("a.txt"),
+            "`at` is a subsequence of a.txt and of nothing else here"
+        );
     }
 }

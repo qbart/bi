@@ -68,7 +68,7 @@ impl PickerKind {
     /// prose — which is what a register holds — "these letters appear in
     /// order" matches nearly everything, which is why it is not the default.
     fn subsequence(&self) -> bool {
-        matches!(self, PickerKind::File)
+        matches!(self, PickerKind::File | PickerKind::Buffer)
     }
 }
 
@@ -89,6 +89,12 @@ pub struct Picker {
     /// wants — see [`REGISTER_MIN_LEN`].
     min_len: usize,
     show_short: bool,
+    /// Where the selection sits while nothing has been typed.
+    ///
+    /// One for the buffer list, which opens on the buffer you were in *last*
+    /// so that one Enter goes back to it; zero for everything else, where the
+    /// front of the list is the answer.
+    default_row: usize,
 }
 
 /// Case-insensitive, every whitespace-separated term must appear somewhere.
@@ -129,9 +135,20 @@ impl Picker {
             scroll: 0,
             min_len,
             show_short: false,
+            default_row: 0,
         };
         picker.refilter();
         picker
+    }
+
+    /// Opens on a row other than the first.
+    ///
+    /// Typing moves off it — the row you meant while the list was whole says
+    /// nothing about the list once it is filtered — and backspacing back to an
+    /// empty query returns to it.
+    pub fn open_on(&mut self, row: usize) {
+        self.default_row = row;
+        self.selected = row.min(self.matches.len().saturating_sub(1));
     }
 
     /// Opens with the query already typed.
@@ -194,8 +211,16 @@ impl Picker {
     }
 
     pub fn push_char(&mut self, c: char) {
+        let was_whole = self.query.is_empty();
         self.query.push(c);
         self.refilter();
+        // The first character leaves the *default* row behind: it was a fact
+        // about the whole list, and this is no longer the whole list. A row
+        // you moved to yourself is not a default and is clamped like any
+        // other, which is what every picker but the buffer list does.
+        if was_whole && self.default_row != 0 && self.selected == self.default_row {
+            self.selected = 0;
+        }
     }
 
     /// Returns false when there was nothing left to delete, which cancels —
@@ -205,6 +230,9 @@ impl Picker {
             return false;
         }
         self.refilter();
+        if self.query.is_empty() {
+            self.selected = self.default_row.min(self.matches.len().saturating_sub(1));
+        }
         true
     }
 

@@ -356,13 +356,20 @@ whitespace-separated term must appear somewhere, in any order,
 case-insensitively. Matches keep the order they were given, so the most recent
 is first.
 
-The file list is the exception: it matches a *subsequence*, so `sfr` finds
+The file and buffer lists are the exception: they match a *subsequence*, so
+`sfr` finds
 `src/find/render.rs`. Over prose that rule would match everything, which is why
 it is not the default; over paths it is the only useful one. The walk skips
 hidden entries and the usual build directories (`target`, `node_modules`, …)
 and stops at 20,000 files, saying so when it does. `.gitignore` is not read
 yet — that needs a matcher of its own and the git support bi does not have.
 See [docs/specs/files.md](docs/specs/files.md).
+
+The buffer list is ordered by when each buffer was last *shown* and opens on
+the second row — the one you were in before this one — so `Ctrl-Tab` `Enter`
+switches back and doing it twice returns you. Where a terminal cannot tell
+`Ctrl-Tab` from `Tab` you simply get buffer-next, which is what that key always
+did. See [docs/specs/buffers.md](docs/specs/buffers.md).
 
 | Key | Does |
 |---|---|
@@ -412,7 +419,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:close` `:only` | close this window / every other one |
 | `:bn` `:bp` | cycle the buffer list, wrapping |
 | `:b <partial>` `:b#` | switch by path substring / to the alternate buffer |
-| `:ls` `:buffers` | pick from the open buffers |
+| `:ls` `:buffers` | the buffer switcher — same list, every terminal |
 | `:bd` `:bd!` | delete this buffer and close the windows showing it, refusing unsaved changes unless forced |
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
@@ -461,6 +468,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W =` | equalise every pane |
 | `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
 | `Ctrl-I` `Ctrl-O` | cycle the buffer list forwards / backwards. `Ctrl-I` is `Tab`, byte for byte |
+| `Ctrl-Tab` | the buffer switcher: newest first, opening on the one you were in before |
 
 Two windows may show one buffer, with their own cursor and their own scroll.
 An edit in one moves the other's cursor *with the text* rather than clamping it

@@ -756,6 +756,12 @@ impl Input {
             // `Tab` is listed because it *is* Ctrl-I, byte for byte.
             KeyCode::Char('i') if ctrl => self.plain(Action::Buffer(BufferCmd::Next)),
             KeyCode::Char('o') if ctrl => self.plain(Action::Buffer(BufferCmd::Prev)),
+            // `Ctrl-Tab` for the buffer switcher, where the terminal sends
+            // one — kitty and alacritty do, with the protocol that tells
+            // `Ctrl-I` and `Ctrl-Tab` apart. Where it does not, this arm never
+            // fires and the plain `Tab` below is what arrives, which is
+            // exactly what it always did. See `docs/specs/buffers.md`.
+            KeyCode::Tab if ctrl => self.plain(Action::Buffer(BufferCmd::List)),
             KeyCode::Tab => self.plain(Action::Buffer(BufferCmd::Next)),
             // The start of a key, not a key. Any count already typed stays,
             // because it belongs to the resize forms.

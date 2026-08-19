@@ -4,11 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-### buffer switch list with fuzzy and default selected by MRU
-
-i should be able to invoke buffer switcher basd on names with fuzzy autocomplete
-prefer C-Tab
-
 
 ## DO NOT DO IT NOW
 
