@@ -563,6 +563,17 @@ then the project's `.editorconfig`, then anything you `:set` this session — so
 a Makefile keeps its tabs however you like your spaces, and `:set` still wins
 when you mean it. See [docs/specs/options.md](docs/specs/options.md).
 
+#### `.editorconfig`
+
+Read, with no switch to turn it on and none to turn it off: a repository that
+has one means it. `root`, `indent_style`, `indent_size` and `tab_width` become
+options; `charset` and `end_of_line` are ignored because bi is always UTF-8 and
+always writes `\n`; the rest are for editors with features bi does not have
+yet. The nearest file to yours wins, `root = true` stops the walk, and the glob
+dialect is the format's own — `**`, `{a,b}`, `{1..9}` and all. Nothing is
+cached, so `:reload` picks up an edit to it. See
+[docs/specs/editorconfig.md](docs/specs/editorconfig.md).
+
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown
 option: nmber` on the status line, not stderr, which the alternate screen

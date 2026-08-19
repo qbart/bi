@@ -49,21 +49,11 @@ c - around brackents
 
 you should infer those from treesitter
 
-### .editorconfig support
-
-Add support and respect .editorconfig standard
-:reload should also reloadA if config changed
-
-if you feel like some options to bi must be added like expandtab, shiftwidth etc. let me know
-
-also default file encoding is always utf8
-
-
 ### show identation
 
 i want to dispaly indents as vertical lines (whether are space/tab based)
 
-needs .editorconfig support
+needs .editorconfig support — done: docs/specs/indent.md, options.md, editorconfig.md
 
 ### TODO comments
 

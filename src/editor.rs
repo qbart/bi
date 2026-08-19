@@ -733,7 +733,11 @@ impl BufferEntry {
 /// list is borrowed mutably, and because it is the whole of the resolution
 /// order in one place — bi's defaults and your config are already inside
 /// `session.options`, and what follows is the file's own.
-fn resolve_options(session: &Session, filetype: Option<&'static str>) -> Options {
+fn resolve_options(
+    session: &Session,
+    filetype: Option<&'static str>,
+    path: Option<&std::path::Path>,
+) -> Options {
     let mut options = session.options.clone();
     if let Some(filetype) = filetype {
         crate::config::filetype_defaults(filetype).apply_to(&mut options);
@@ -741,8 +745,15 @@ fn resolve_options(session: &Session, filetype: Option<&'static str>) -> Options
             patch.apply_to(&mut options);
         }
     }
-    // Last, so what you typed this session outranks what the file's type asked
-    // for. `.editorconfig` will land between the two.
+    // What the project has already agreed, over what the language asks for: a
+    // repository with an `.editorconfig` means it. See
+    // `docs/specs/editorconfig.md`.
+    if let Some(path) = path {
+        crate::editorconfig::patch_for(path).apply_to(&mut options);
+    }
+    // Last, so what you typed this session outranks all of it — an option that
+    // silently did nothing in exactly the repositories that have their act
+    // together would be worse than no option at all.
     session.overrides.apply_to(&mut options);
     options
 }
@@ -1302,7 +1313,9 @@ impl Editor {
     /// handful of clones, and cannot be got wrong. See `docs/specs/options.md`.
     fn resolve_options(&mut self) {
         for entry in &mut self.buffers {
-            entry.options = resolve_options(&self.session, entry.filetype);
+            let options =
+                resolve_options(&self.session, entry.filetype, entry.buffer.path.as_deref());
+            entry.options = options;
         }
     }
 
@@ -3151,7 +3164,7 @@ impl View<'_> {
         // A new path is a new file type, and a new file type is new options:
         // `:w Makefile` has to bring a Makefile's tabs with it.
         *self.filetype = filetype_of(self.buffer);
-        *self.options = resolve_options(self.session, *self.filetype);
+        *self.options = resolve_options(self.session, *self.filetype, self.buffer.path.as_deref());
     }
 
     /// Everything that needs the rope. What does not — the window tree, the
@@ -9136,6 +9149,12 @@ mod tests {
             Self(dir)
         }
 
+        fn dir(&self, name: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
         fn file(&self, name: &str, text: &str) -> String {
             let path = self.0.join(name);
             std::fs::write(&path, text).unwrap();
@@ -9241,5 +9260,52 @@ mod tests {
         assert_eq!(problems.len(), 1, "reported, with the line it is on");
         assert_eq!(problems[0].line, 2);
         assert_eq!(ed.options().tab_width, 8, "and the bad line changed nothing");
+    }
+
+    #[test]
+    fn a_project_that_says_how_it_is_indented_is_believed() {
+        let files = Files::new("editorconfig");
+        // `root = true` so the walk stops here rather than wandering up into
+        // whatever /tmp's parents have to say.
+        files.file(".editorconfig", "root = true\n[*.py]\nindent_style = tab\nindent_size = 3\n");
+        let mut ed = Editor::open(files.file("main.py", "x = 1\n")).unwrap();
+
+        assert!(!ed.options().expandtab, "the project asked for tabs");
+        assert_eq!(ed.options().shiftwidth, 3);
+        assert_eq!(ed.options().tab_width, 3, "indent_size sets the width too");
+
+        // Above the config's own [filetype.python]...
+        ed.load_config(ConfigText(Some("[filetype.python]\nshiftwidth = 7\n")));
+        assert_eq!(ed.options().shiftwidth, 3, "the project outranks your preference");
+
+        // ...and below what you say out loud.
+        ex(&mut ed, "set shiftwidth 5");
+        assert_eq!(ed.options().shiftwidth, 5);
+    }
+
+    #[test]
+    fn the_editorconfig_beside_the_file_beats_the_one_above_it() {
+        let files = Files::new("editorconfig-nested");
+        files.file(".editorconfig", "root = true\n[*]\nindent_size = 8\n");
+        let inner = files.dir("src");
+        std::fs::write(inner.join(".editorconfig"), "[*]\nindent_size = 2\n").unwrap();
+        std::fs::write(inner.join("main.py"), "x = 1\n").unwrap();
+
+        let ed = Editor::open(inner.join("main.py").to_str().unwrap()).unwrap();
+
+        assert_eq!(ed.options().shiftwidth, 2);
+    }
+
+    #[test]
+    fn reload_picks_up_an_edited_editorconfig() {
+        let files = Files::new("editorconfig-reload");
+        files.file(".editorconfig", "root = true\n[*]\nindent_size = 8\n");
+        let mut ed = Editor::open(files.file("main.py", "x = 1\n")).unwrap();
+        assert_eq!(ed.options().shiftwidth, 8);
+
+        files.file(".editorconfig", "root = true\n[*]\nindent_size = 2\n");
+        ed.load_config(ConfigText(None));
+
+        assert_eq!(ed.options().shiftwidth, 2, "nothing is cached, so nothing goes stale");
     }
 }
