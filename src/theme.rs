@@ -249,6 +249,7 @@ pub struct Theme {
 pub const DEFAULT_THEME: &str = "gruvbox-dark";
 
 const GRUVBOX_DARK: &str = include_str!("themes/gruvbox-dark.toml");
+const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
 
 impl Default for Theme {
@@ -272,13 +273,18 @@ impl Theme {
     pub fn builtin(name: &str) -> Option<&'static str> {
         match name {
             DEFAULT_THEME => Some(GRUVBOX_DARK),
+            "gruvbox-light" => Some(GRUVBOX_LIGHT),
             "ansi" => Some(ANSI),
             _ => None,
         }
     }
 
     /// The names of every built-in, for `:set theme` to complain with.
-    pub const BUILTINS: &'static [&'static str] = &[DEFAULT_THEME, "ansi"];
+    ///
+    /// `gruvbox-light` is here and is not the default, because bi has no way
+    /// to ask the terminal whether it is light. Shipping it and defaulting to
+    /// it are different decisions, and only the first one is available.
+    pub const BUILTINS: &'static [&'static str] = &[DEFAULT_THEME, "gruvbox-light", "ansi"];
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -592,6 +598,34 @@ mod tests {
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("nosuch"), "{:?}", problems[0].message);
         assert!(problems[0].message.contains(DEFAULT_THEME), "{:?}", problems[0].message);
+    }
+
+    /// The light theme is the dark one's roles in the light palette, so the
+    /// thing worth pinning is that it is genuinely inverted rather than a copy
+    /// with a different background bolted on.
+    #[test]
+    fn gruvbox_light_is_light_and_still_gruvbox() {
+        let light = parsed("gruvbox-light");
+        let dark = Theme::default();
+
+        assert_eq!(light.ui.background, Some(Color::Rgb(0xfb, 0xf1, 0xc7)));
+        assert_eq!(light.ui.foreground, Some(Color::Rgb(0x3c, 0x38, 0x36)));
+        // The dark theme's background is the light theme's foreground, near
+        // enough — they are the two ends of one palette.
+        assert_eq!(dark.ui.background, Some(Color::Rgb(0x28, 0x28, 0x28)));
+
+        // Every syntax role the dark theme fills, the light one fills too, and
+        // with a different colour — a role that came back identical would mean
+        // a key was copied rather than translated.
+        for role in ["keyword", "function", "type", "string", "operator", "property"] {
+            let (l, d) = (light.style(role), dark.style(role));
+            assert!(l.is_some(), "gruvbox-light has no {role}");
+            assert_ne!(l, d, "{role} was not translated into the light palette");
+        }
+
+        // Comments are the one deliberate exception: gruvbox uses the same
+        // neutral gray at both ends.
+        assert_eq!(light.style("comment"), dark.style("comment"));
     }
 
     #[test]

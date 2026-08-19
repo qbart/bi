@@ -9,8 +9,10 @@ number = 1
 hlsearch = false
 
 # The palette. A name in themes/ beside this file wins, then a built-in of the
-# same name, then this one. Built in: gruvbox-dark, ansi.
+# same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #
+# `gruvbox-light` is the same theme at the other end of the palette; it is not
+# the default because bi cannot ask the terminal whether it is light.
 # `ansi` is bi's pre-theme colours in the sixteen ANSI names, so it uses YOUR
 # terminal palette and its background rather than bringing its own.
 # See docs/specs/theme.md.

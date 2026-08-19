@@ -197,7 +197,7 @@ without changing the type.
 
 ## The built-ins
 
-Two, compiled in with `include_str!`, and parsed through the same parser a
+Three, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
@@ -228,6 +228,24 @@ of nothing is a capture that did not happen" — `&x` and `x` are different
 programs, and a palette that paints the `&` the colour of the text around it
 is one where the capture may as well not have fired. Orange is gruvbox's own
 and unused elsewhere in the table.
+
+### `gruvbox-light`
+
+The same roles at the other end of the same palette, in gruvbox's *faded*
+column: red `#9d0006` where the dark theme has `#fb4934`, green `#79740e`,
+yellow `#b57614`, blue `#076678`, purple `#8f3f71`, aqua `#427b58`, orange
+`#af3a03`, on `#fbf1c7`. The bright accents that carry a dark theme have
+nothing to be bright against on a light background, which is why this is a
+translation rather than a copy with the background swapped — and a test
+asserts exactly that, by requiring each role to differ from its dark
+counterpart. Comments are the one deliberate exception: gruvbox uses the same
+neutral `#928374` at both ends.
+
+**It is shipped and it is not the default**, which were always two decisions
+rather than one. bi has no way to ask the terminal whether it is light —
+there is no portable query for it, and guessing wrong is worse than not
+guessing — so the light theme is one `:set theme gruvbox-light` away and the
+dark one stays the thing you get.
 
 ### `ansi`
 
@@ -267,9 +285,11 @@ It sets no `background`.
 
 ## Deferred
 
-**Light themes.** Nothing here is dark-specific — `gruvbox-light` is a file,
-not a feature — but shipping one means having an opinion about which is the
-default on a light terminal, and bi cannot detect that.
+**Detecting a light terminal.** `gruvbox-light` ships, so the remaining half
+of that question is whether bi could *choose* it. OSC 11 asks the terminal for
+its background colour and many terminals answer, but it is a query with a
+timeout in the middle of startup and a wrong guess is worse than no guess.
+Deferred rather than rejected.
 
 **`:set theme` live-reload of an already-drawn frame** is free, because the
 theme is read at draw time rather than baked into widgets. Noted because it

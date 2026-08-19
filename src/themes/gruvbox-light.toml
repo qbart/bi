@@ -1,0 +1,79 @@
+# gruvbox light, medium contrast.
+#
+# Palette from github.com/morhetz/gruvbox. The same roles as gruvbox-dark, in
+# the light palette's *faded* column — on a light background the bright accents
+# that carry a dark theme have nothing to be bright against, so red is #9d0006
+# here where it is #fb4934 there. Compiled into the binary; a file at
+# <config dir>/themes/gruvbox-light.toml is a PATCH over this one.
+#
+# Not the default, and it cannot be: bi has no way to ask the terminal whether
+# it is light. `:set theme gruvbox-light`, or `theme = "gruvbox-light"` in
+# config.toml. See docs/specs/theme.md.
+
+[syntax]
+keyword     = "#9d0006"                              # red
+function    = { fg = "#79740e", bold = true }        # green, bold
+constructor = { fg = "#79740e", bold = true }
+type        = "#b57614"                              # yellow
+module      = "#b57614"
+string      = "#79740e"
+escape      = "#79740e"
+character   = "#79740e"
+comment     = { fg = "#928374", italic = true }      # gray — shared with dark
+constant    = "#8f3f71"                              # purple
+number      = "#8f3f71"
+float       = "#8f3f71"
+boolean     = "#8f3f71"
+attribute   = "#427b58"                              # aqua
+label       = "#427b58"
+
+# Orange, for the same reason it is orange in the dark theme: `&x` and `x` are
+# different programs, and an operator painted the colour of the text around it
+# is a capture that may as well not have fired.
+operator    = "#af3a03"
+
+punctuation = "#7c6f64"                              # fg4
+delimiter   = "#7c6f64"
+
+property             = "#076678"                     # blue
+"string.special.key" = "#076678"
+
+"text.title"     = { fg = "#79740e", bold = true }
+"text.literal"   = "#79740e"
+"text.uri"       = { fg = "#076678", underline = true }
+"text.reference" = "#427b58"
+
+[ui]
+background = "#fbf1c7"                               # bg0
+foreground = "#3c3836"                               # fg1
+
+cursorline = { bg = "#f2e5bc" }                      # bg0_s
+selection  = { bg = "#d5c4a1" }                      # bg2
+search     = { bg = "#bdae93" }                      # bg3
+cursor_alt = { bg = "#8f3f71" }                      # purple
+
+gutter         = "#a89984"                           # bg4
+gutter_current = "#b57614"
+rule           = "#d5c4a1"
+filler         = "#d5c4a1"
+
+mode_normal = { fg = "#fbf1c7", bg = "#076678", bold = true }
+mode_insert = { fg = "#fbf1c7", bg = "#79740e", bold = true }
+mode_pick   = { fg = "#fbf1c7", bg = "#8f3f71", bold = true }
+
+status          = "#427b58"
+status_muted    = "#7c6f64"
+status_inactive = "#bdae93"
+statusline      = { fg = "#3c3836", bg = "#ebdbb2" }  # bg1
+
+tree_dir  = "#076678"
+tree_link = "#427b58"
+mark_copy = "#b57614"
+mark_cut  = "#9d0006"
+
+picker_border   = "#af3a03"
+picker_prompt   = "#af3a03"
+picker_selected = { fg = "#b57614", bold = true }
+picker_badge    = "#7c6f64"
+picker_divider  = "#d5c4a1"
+picker_preview  = "#665c54"                          # fg3
