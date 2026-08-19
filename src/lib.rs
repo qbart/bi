@@ -29,6 +29,7 @@ pub mod history;
 pub mod indent;
 pub mod input;
 pub mod key;
+pub mod label;
 pub mod motion;
 pub mod picker;
 pub mod registers;

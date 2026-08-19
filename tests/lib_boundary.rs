@@ -172,6 +172,7 @@ const LIB_MODULES: &[&str] = &[
     "indent.rs",
     "input.rs",
     "key.rs",
+    "label.rs",
     "motion.rs",
     "picker.rs",
     "registers.rs",

@@ -321,7 +321,21 @@ impl Input {
             Mode::Command(_) => Self::command_line(key),
             Mode::Search { .. } => Self::search_line(key),
             Mode::Pick => Self::pick(key),
+            Mode::Label => Self::label(key),
         }
+    }
+
+    /// Letters are on screen and the next key picks one.
+    ///
+    /// Every key means one thing here, which is why labels are a mode: a
+    /// character goes to the resolver, and anything else — `Esc` included —
+    /// puts the letters away. See `docs/specs/labels.md`.
+    fn label(key: Key) -> Option<Command> {
+        let action = match key.code {
+            KeyCode::Char(c) if !key.mods.ctrl => Action::LabelChar(c),
+            _ => Action::LabelCancel,
+        };
+        Some(Command { count: 1, action })
     }
 
     /// What's been typed but not yet resolved, for the status line.
@@ -520,6 +534,10 @@ impl Input {
             // prefix because it makes a window, which is where every other key
             // that makes one lives.
             KeyCode::Char('e') => WindowCmd::Tree,
+            // `f` for focus: a letter on every window, and the next key goes
+            // there. Not `<Tab>`, which is `Ctrl-I` byte for byte and would
+            // take buffer-next with it — see `docs/specs/labels.md`.
+            KeyCode::Char('f') => WindowCmd::Pick,
             KeyCode::Char('+') => WindowCmd::Resize { axis: Dir::Horizontal, cells },
             KeyCode::Char('-') => WindowCmd::Resize { axis: Dir::Horizontal, cells: -cells },
             KeyCode::Char('>') => WindowCmd::Resize { axis: Dir::Vertical, cells },

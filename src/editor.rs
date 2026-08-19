@@ -109,6 +109,9 @@ pub enum Mode {
     /// The picker overlay is up. Its state lives in `Editor::picker` — a
     /// `Picker` is far too large to sit inside this enum.
     Pick,
+    /// Letters are on screen and the next key picks one. The list lives in
+    /// `Session::labels`, beside the picker's and for the same reason.
+    Label,
 }
 
 impl Mode {
@@ -123,6 +126,7 @@ impl Mode {
             Mode::Command(_) => "COMMAND",
             Mode::Search { .. } => "SEARCH",
             Mode::Pick => "PICK",
+            Mode::Label => "LABEL",
         }
     }
 
@@ -170,6 +174,9 @@ pub enum Action {
     },
 
     OpenPicker(PickerKind),
+    /// A key pressed while the labels are up.
+    LabelChar(char),
+    LabelCancel,
     PickChar(char),
     PickBackspace,
     PickNext,
@@ -590,6 +597,9 @@ pub struct Session {
     /// `docs/specs/options.md`.
     /// What the last yank read, and until when — see `docs/specs/flash.md`.
     pub flash: Option<Flash>,
+    /// The letters currently on screen, and what they stand for — see
+    /// `docs/specs/labels.md`.
+    pub labels: Option<Labels>,
     pub overrides: OptionPatch,
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
@@ -707,6 +717,46 @@ impl Session {
         let kind = if text.ends_with('\n') { EntryKind::Linewise } else { EntryKind::Charwise };
         Some(Entry { text, kind })
     }
+}
+
+/// The letters on screen and what they name.
+///
+/// `typed` accumulates, so a two-character label is two presses with no
+/// timeout anywhere — the same rule the keymap's sequences follow.
+pub struct Labels {
+    pub typed: String,
+    pub targets: Vec<(String, LabelTarget)>,
+}
+
+/// What pressing a label does.
+///
+/// An enum rather than a closure, because the editor has to be able to say
+/// what a label means without having been the thing that made it — and because
+/// `s` and `S` will each add an arm here rather than a mode of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelTarget {
+    /// `Ctrl-W f` — go to that window.
+    Window(WindowId),
+}
+
+impl Labels {
+    /// What the typed prefix has reached: a target, or nothing yet, or the
+    /// knowledge that nothing can match.
+    fn resolve(&self) -> Resolution {
+        if let Some((_, target)) = self.targets.iter().find(|(label, _)| *label == self.typed) {
+            return Resolution::Hit(*target);
+        }
+        match self.targets.iter().any(|(label, _)| label.starts_with(&self.typed)) {
+            true => Resolution::Pending,
+            false => Resolution::Miss,
+        }
+    }
+}
+
+enum Resolution {
+    Hit(LabelTarget),
+    Pending,
+    Miss,
 }
 
 /// What a yank lit up, and the moment the light goes out.
@@ -1133,6 +1183,8 @@ pub enum WindowCmd {
     /// `Ctrl-W e` — a tree beside this window, rooted at the file it is
     /// showing, with that file selected.
     Tree,
+    /// `Ctrl-W f` — a letter on every window, and the next key goes there.
+    Pick,
     Focus(Side),
     Cycle {
         back: bool,
@@ -1717,6 +1769,55 @@ impl Editor {
         &self.entry(id).options
     }
 
+    /// `Ctrl-W f` — puts a letter on every window and waits for one.
+    ///
+    /// Every window, the focused one included: jumping to where you already
+    /// are is a no-op, and leaving it out would move the letters around
+    /// depending on where you were, which is what a label is supposed not to
+    /// do. One window is not worth a mode, so it says so and stays put.
+    fn pick_window(&mut self) {
+        let ids: Vec<WindowId> = self.windows.iter().map(|w| w.id).collect();
+        if ids.len() < 2 {
+            self.session.status = "only one window".into();
+            return;
+        }
+        let targets = crate::label::labels(ids.len(), &[])
+            .into_iter()
+            .zip(ids)
+            .map(|(label, id)| (label, LabelTarget::Window(id)))
+            .collect();
+        self.session.labels = Some(Labels { typed: String::new(), targets });
+        self.session.mode = Mode::Label;
+    }
+
+    /// A key pressed while the letters are up.
+    ///
+    /// A key that cannot start any label cancels rather than being swallowed,
+    /// which is what makes a mistyped label cost one press instead of two.
+    fn label_key(&mut self, c: Option<char>) {
+        let Some(labels) = &mut self.session.labels else {
+            self.session.mode = Mode::Normal;
+            return;
+        };
+        let Some(c) = c else { return self.end_labels() };
+        labels.typed.push(c);
+        match labels.resolve() {
+            Resolution::Pending => {}
+            Resolution::Miss => self.end_labels(),
+            Resolution::Hit(target) => {
+                self.end_labels();
+                match target {
+                    LabelTarget::Window(id) => self.set_focus(id),
+                }
+            }
+        }
+    }
+
+    fn end_labels(&mut self) {
+        self.session.labels = None;
+        self.session.mode = Mode::Normal;
+    }
+
     /// Everything to draw over `rows` of `window` that is not buffer text, in
     /// paint order.
     ///
@@ -1732,6 +1833,25 @@ impl Editor {
         rows: std::ops::Range<usize>,
     ) -> Vec<crate::decoration::Decoration> {
         let mut out = Vec::new();
+        // Before the text pane below, because a window wearing a letter may be
+        // showing a tree, which has no buffer for the rest of this to read.
+        if let Some(labels) = &self.session.labels {
+            for (label, target) in &labels.targets {
+                let LabelTarget::Window(id) = target;
+                if *id != window || !label.starts_with(&labels.typed) {
+                    continue;
+                }
+                out.push(crate::decoration::Decoration::Overlay {
+                    row: rows.start,
+                    col: 0,
+                    text: label.clone(),
+                    style: self.theme.ui.label,
+                    // Over everything: a letter you are about to press has to
+                    // be readable wherever it lands.
+                    layer: crate::decoration::Layer::Over,
+                });
+            }
+        }
         let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
         if options.indent_guides {
             indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
@@ -2377,6 +2497,8 @@ impl Editor {
                 self.show(target, id);
             }
 
+            WindowCmd::Pick => self.pick_window(),
+
             WindowCmd::Tree => {
                 // One tree, so the key that opened it is the key that puts it
                 // away. Two trees are two of the same thing, and the second is
@@ -2553,6 +2675,12 @@ impl Editor {
             // from: both have to work in a window holding a tree, where there
             // is no rope to run anything against.
             Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
+
+            // The same reason again: a letter can be sitting on a tree pane,
+            // and pressing it changes which window is focused — which is a
+            // fact about the session and not about any rope.
+            Action::LabelChar(c) => self.label_key(Some(*c)),
+            Action::LabelCancel => self.label_key(None),
 
             Action::PickChar(c) => {
                 if let Some(picker) = &mut self.session.picker {
@@ -4529,6 +4657,8 @@ impl View<'_> {
             | Action::PickToggleShort
             | Action::PickCancel
             | Action::PickAccept
+            | Action::LabelChar(_)
+            | Action::LabelCancel
             | Action::Buffer(_)
             | Action::Window(_)
             | Action::Tree(_) => {}
@@ -10252,5 +10382,89 @@ mod tests {
         ex(&mut ed, "case camel");
 
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "fooBar\nfooBar\n");
+    }
+
+    // ---- labels -------------------------------------------------------------
+
+    /// Two windows, so there is something to pick between.
+    fn two_windows(text: &str) -> Editor {
+        let mut ed = editor(text);
+        split(&mut ed, Dir::Vertical);
+        ed
+    }
+
+    #[test]
+    fn ctrl_w_f_puts_a_letter_on_every_window_including_this_one() {
+        let mut ed = two_windows("alpha\n");
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+
+        assert_eq!(ed.session.mode, Mode::Label);
+        let labels = ed.session.labels.as_ref().expect("letters are up");
+        assert_eq!(labels.targets.len(), 2, "the focused window gets one too");
+        assert_eq!(labels.targets[0].0, "f", "the hand, not the alphabet");
+
+        // And each one is drawn in its own window, at the top-left of it.
+        for (label, target) in &labels.targets {
+            let LabelTarget::Window(id) = target;
+            let drawn = ed.decorations(*id, 0..1);
+            assert!(
+                drawn.iter().any(|d| matches!(
+                    d,
+                    Decoration::Overlay { row: 0, col: 0, text, layer: Layer::Over, .. }
+                        if text == label
+                )),
+                "{label} is not on its own window"
+            );
+        }
+    }
+
+    #[test]
+    fn pressing_a_letter_goes_to_that_window() {
+        let mut ed = two_windows("alpha\n");
+        let here = ed.focus();
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+        let elsewhere = other(&ed);
+        let label = ed
+            .session
+            .labels
+            .as_ref()
+            .unwrap()
+            .targets
+            .iter()
+            .find(|(_, LabelTarget::Window(id))| *id == elsewhere)
+            .map(|(label, _)| label.clone())
+            .expect("the other window has a letter");
+
+        ed.apply(cmd(Action::LabelChar(label.chars().next().unwrap())));
+
+        assert_eq!(ed.focus(), elsewhere);
+        assert_ne!(ed.focus(), here, "and it was the other one");
+        assert_eq!(ed.session.mode, Mode::Normal, "the letters are gone");
+        assert!(ed.session.labels.is_none());
+    }
+
+    #[test]
+    fn a_key_that_is_no_label_cancels_and_so_does_esc() {
+        let mut ed = two_windows("alpha\n");
+        let here = ed.focus();
+
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+        ed.apply(cmd(Action::LabelChar('z')));
+        assert_eq!(ed.session.mode, Mode::Normal, "a mistyped label costs one press");
+        assert_eq!(ed.focus(), here);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+        ed.apply(cmd(Action::LabelCancel));
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.focus(), here);
+    }
+
+    #[test]
+    fn one_window_is_not_worth_a_mode() {
+        let mut ed = editor("alpha\n");
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.session.status, "only one window");
     }
 }

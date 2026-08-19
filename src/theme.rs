@@ -138,6 +138,9 @@ pub struct Ui {
     /// What a yank lit up, for as long as it is lit — see
     /// `docs/specs/flash.md`.
     pub flash: Style,
+    /// A letter you are about to press to jump somewhere — see
+    /// `docs/specs/labels.md`.
+    pub label: Style,
 
     pub gutter: Style,
     pub gutter_current: Style,
@@ -192,6 +195,7 @@ impl Ui {
         "search",
         "cursor_alt",
         "flash",
+        "label",
         "gutter",
         "gutter_current",
         "rule",
@@ -233,6 +237,7 @@ impl Ui {
             "search" => self.search = style,
             "cursor_alt" => self.cursor_alt = style,
             "flash" => self.flash = style,
+            "label" => self.label = style,
             "gutter" => self.gutter = style,
             "gutter_current" => self.gutter_current = style,
             "rule" => self.rule = style,

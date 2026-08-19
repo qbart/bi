@@ -84,6 +84,7 @@ selection  = { fg = "#000000", bg = "#00aaaa" }
 search     = { fg = "#000000", bg = "#aa5500" }      # brown
 cursor_alt = { bg = "#aa00aa" }                      # magenta
 flash      = { fg = "#000000", bg = "#aaaaaa" }
+label      = { fg = "#000000", bg = "#ffff55", bold = true }
 
 gutter         = "#5555ff"                           # light blue, dim on blue
 gutter_current = "#ffffff"

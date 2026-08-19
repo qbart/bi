@@ -46,13 +46,6 @@ s -> fun -> it shold never assign c because "func" is a valid next more precised
 once no matches, just exit that mode  
 esc - exsts
 
-### pick window by letter
-
-i want to select window by view - try <Tab>
-so when i press <tab> it assigns each visible window a uqniue letter that i press and go to thaht window,
-
-prefer keybaord middle row first so f and j 
-
 ### C-p fuzzy finder for files
 
 fuzzy serach files the files you want to jump to

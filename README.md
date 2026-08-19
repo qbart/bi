@@ -416,6 +416,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
 | `Ctrl-W e` | show or hide the tree beside this file, rooted where the session is with the file revealed |
 | `Ctrl-W h j k l` | focus the window in that direction |
+| `Ctrl-W f` | a letter on every window — press one to go there |
 | `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
 | `Ctrl-W c` `Ctrl-W q` | close this window |
 | `Ctrl-W o` | close every other window |
@@ -473,6 +474,12 @@ A split opens on the far side — below for `:sp`, right for `:vs` — and focus
 goes there, so you can see that you moved. Vim's default is the other way
 round, which made focus look broken: the new pane took the space the old one
 occupied. The tree sidebar is the exception and still opens on the left.
+
+`Ctrl-W f` puts a letter at the top-left of every window — home row first, `f`
+and `j` before the rest — and the next key goes there. It is the first client
+of bi's label machinery, which `s` and `S` will reuse; see
+[docs/specs/labels.md](docs/specs/labels.md). Not `<Tab>`, which is `Ctrl-I`
+byte for byte in a terminal and would have taken buffer-next with it.
 
 `Ctrl-W e` is the shortcut for that layout: it opens the tree beside the file
 you are reading, rooted at its directory with the file already selected, and

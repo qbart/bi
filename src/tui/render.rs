@@ -713,7 +713,9 @@ fn render_window(
 fn mode_style(mode: &Mode, ui: &Ui) -> Style {
     tui(match mode {
         Mode::Insert => ui.mode_insert,
-        Mode::Pick => ui.mode_pick,
+        // Both are overlays waiting for one key, so both read as the same
+        // kind of moment.
+        Mode::Pick | Mode::Label => ui.mode_pick,
         _ => ui.mode_normal,
     })
 }

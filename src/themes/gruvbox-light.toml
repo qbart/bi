@@ -62,6 +62,7 @@ selection  = { bg = "#d5c4a1" }                      # bg2
 search     = { bg = "#bdae93" }                      # bg3
 cursor_alt = { bg = "#8f3f71" }                      # purple
 flash      = { bg = "#bdae93" }
+label      = { fg = "#fbf1c7", bg = "#af3a03", bold = true }
 
 gutter         = "#a89984"                           # bg4
 gutter_current = "#b57614"
