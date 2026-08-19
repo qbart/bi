@@ -63,6 +63,13 @@ rule           = "darkgray"
 filler         = "darkgray"
 indent_guide   = "darkgray"
 
+# TODO: and friends, in your terminal's own sixteen.
+todo_fix   = { fg = "black", bg = "red", bold = true }
+todo_todo  = { fg = "black", bg = "blue", bold = true }
+todo_warn  = { fg = "black", bg = "yellow", bold = true }
+todo_perf  = { fg = "black", bg = "magenta", bold = true }
+todo_note  = { fg = "black", bg = "green", bold = true }
+
 mode_normal = { fg = "black", bg = "blue", bold = true }
 mode_insert = { fg = "black", bg = "green", bold = true }
 mode_pick   = { fg = "black", bg = "magenta", bold = true }

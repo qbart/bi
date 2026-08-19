@@ -77,6 +77,14 @@ rule           = "#504945"
 filler         = "#504945"
 indent_guide   = "#3c3836"
 
+# TODO: and friends. Loud on purpose — the point is that they stop reading as
+# ordinary comment-grey. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#282828", bg = "#fb4934", bold = true }
+todo_todo  = { fg = "#282828", bg = "#83a598", bold = true }
+todo_warn  = { fg = "#282828", bg = "#fabd2f", bold = true }
+todo_perf  = { fg = "#282828", bg = "#d3869b", bold = true }
+todo_note  = { fg = "#282828", bg = "#b8bb26", bold = true }
+
 mode_normal = { fg = "#282828", bg = "#83a598", bold = true }
 mode_insert = { fg = "#282828", bg = "#b8bb26", bold = true }
 mode_pick   = { fg = "#282828", bg = "#d3869b", bold = true }

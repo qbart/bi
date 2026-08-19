@@ -90,6 +90,13 @@ rule           = "#00aaaa"
 filler         = "#5555ff"
 indent_guide   = "#00aaaa"
 
+# TODO: and friends, in the EGA sixteen. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#000000", bg = "#ff5555", bold = true }
+todo_todo  = { fg = "#000000", bg = "#55ffff", bold = true }
+todo_warn  = { fg = "#000000", bg = "#ffff55", bold = true }
+todo_perf  = { fg = "#000000", bg = "#ff55ff", bold = true }
+todo_note  = { fg = "#000000", bg = "#55ff55", bold = true }
+
 # The status bar: black on light gray, which is the single most recognisable
 # thing about the whole IDE.
 mode_normal = { fg = "#000000", bg = "#aaaaaa", bold = true }

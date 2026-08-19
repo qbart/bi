@@ -33,6 +33,7 @@ pub mod registers;
 pub mod selection;
 pub mod syntax;
 pub mod theme;
+pub mod todo;
 pub mod tree;
 pub mod trim;
 pub mod window;

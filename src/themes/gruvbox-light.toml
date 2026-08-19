@@ -68,6 +68,13 @@ rule           = "#d5c4a1"
 filler         = "#d5c4a1"
 indent_guide   = "#d5c4a1"
 
+# TODO: and friends. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#fbf1c7", bg = "#9d0006", bold = true }
+todo_todo  = { fg = "#fbf1c7", bg = "#076678", bold = true }
+todo_warn  = { fg = "#fbf1c7", bg = "#b57614", bold = true }
+todo_perf  = { fg = "#fbf1c7", bg = "#8f3f71", bold = true }
+todo_note  = { fg = "#fbf1c7", bg = "#79740e", bold = true }
+
 mode_normal = { fg = "#fbf1c7", bg = "#076678", bold = true }
 mode_insert = { fg = "#fbf1c7", bg = "#79740e", bold = true }
 mode_pick   = { fg = "#fbf1c7", bg = "#8f3f71", bold = true }

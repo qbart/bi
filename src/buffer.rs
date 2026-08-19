@@ -612,6 +612,15 @@ impl Buffer {
         self.backspace(at)
     }
 
+    /// The text of `row`, without its terminator.
+    ///
+    /// Public for the decoration providers, which read lines and produce
+    /// nothing that can change one — the rope stays private and every mutation
+    /// still goes through `apply_edit`.
+    pub fn line(&self, row: usize) -> String {
+        self.line_text(row)
+    }
+
     /// How far `row` is indented, in columns.
     ///
     /// Columns rather than characters, because a tab is worth `tab_width` of

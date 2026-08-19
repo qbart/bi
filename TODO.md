@@ -44,19 +44,6 @@ c - around brackents
 
 you should infer those from treesitter
 
-### TODO comments
-
-add suppport fot todo comment patterns:
-TODO:
-HACK:
-WARN:
-PERF:
-NOTE:
-TEST:
-FIX:
-
-and apply coloring that can be customized with theme
-
 ### color rendering
 
 colors are rendered based on patterns:

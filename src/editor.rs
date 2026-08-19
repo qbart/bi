@@ -811,6 +811,44 @@ fn indent_guides(
     }
 }
 
+/// `TODO:` and its friends, wherever they appear.
+///
+/// Not restricted to comments, and that is a decision rather than an omission:
+/// bi has the parse tree and could check, at the cost of a `TODO:` in a
+/// Markdown list, a YAML file or any file whose grammar bi does not ship
+/// going quiet — which is exactly where people write them. See
+/// `docs/specs/todo-comments.md`.
+fn todo_comments(
+    buffer: &Buffer,
+    theme: &Theme,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+    use crate::todo::Tag;
+
+    let ui = &theme.ui;
+    for row in rows.start..rows.end.min(buffer.line_count()) {
+        let line = buffer.line(row);
+        let start = buffer.rope().line_to_char(row);
+        for (range, tag) in crate::todo::tags(&line) {
+            let style = match tag {
+                Tag::Fix => ui.todo_fix,
+                Tag::Todo => ui.todo_todo,
+                Tag::Warn => ui.todo_warn,
+                Tag::Perf => ui.todo_perf,
+                Tag::Note => ui.todo_note,
+            };
+            out.push(Decoration::Repaint {
+                range: (start + range.start)..(start + range.end),
+                style,
+                // Under, so a selected line still reads as selected.
+                layer: Layer::Under,
+            });
+        }
+    }
+}
+
 /// The character a guide is drawn with.
 ///
 /// Not an option yet, and it is the obvious next one if a font somewhere
@@ -1617,7 +1655,10 @@ impl Editor {
         let mut out = Vec::new();
         let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
         if options.indent_guides {
-            indent_guides(buffer, options, &self.theme, rows, &mut out);
+            indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
+        }
+        if options.todo_comments {
+            todo_comments(buffer, &self.theme, rows, &mut out);
         }
         out
     }
@@ -9535,6 +9576,7 @@ mod tests {
     // ---- decorations --------------------------------------------------------
 
     use crate::decoration::{Decoration, Layer};
+    use crate::theme::Style;
 
     /// The guides on each row, as columns, for a whole-file query.
     fn guides(ed: &Editor) -> Vec<(usize, Vec<usize>)> {
@@ -9596,6 +9638,38 @@ mod tests {
     #[test]
     fn a_provider_that_is_off_produces_nothing() {
         let mut ed = editor("    a\n");
+        ex(&mut ed, "set indent_guides false");
+
+        assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    #[test]
+    fn a_marker_is_painted_where_it_stands() {
+        let ed = editor("// TODO: rewrite\nlet x = 1;\n// FIX: this\n");
+
+        let found: Vec<(std::ops::Range<usize>, Style)> = ed
+            .decorations(ed.focus(), 0..3)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Repaint { range, style, layer } => {
+                    assert_eq!(layer, Layer::Under);
+                    Some((range, style))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let ui = &ed.theme().ui;
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, 3..8, "`TODO:` and not the space after it");
+        assert_eq!(found[0].1, ui.todo_todo);
+        assert_eq!(found[1].1, ui.todo_fix, "and the second line's marker is its own colour");
+    }
+
+    #[test]
+    fn markers_off_produce_nothing() {
+        let mut ed = editor("// TODO: rewrite\n");
+        ex(&mut ed, "set todo_comments false");
         ex(&mut ed, "set indent_guides false");
 
         assert!(ed.decorations(ed.focus(), 0..1).is_empty());

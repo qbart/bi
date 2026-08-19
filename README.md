@@ -575,6 +575,17 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### `TODO:` and friends
+
+`TODO:`, `FIX:`, `HACK:`, `WARN:`, `PERF:`, `NOTE:` and `TEST:` are picked out
+of the text in five colours the theme names — `FIXME`, `BUG`, `XXX`, `OPTIM`
+and the rest are aliases of those five, because the same thought has more than
+one spelling. Uppercase, on a word boundary, colon required, `TODO(name):`
+included. Anywhere in the file rather than in comments only: a `TODO:` in a
+Markdown list or a YAML file is exactly where people write them, and bi does
+not have a grammar for every file. `:set todo_comments false` turns it off. See
+[docs/specs/todo-comments.md](docs/specs/todo-comments.md).
+
 #### Trimming
 
 `:w` tidies the file on its way out: trailing whitespace goes, blank lines at

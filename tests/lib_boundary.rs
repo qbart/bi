@@ -176,6 +176,7 @@ const LIB_MODULES: &[&str] = &[
     "selection.rs",
     "syntax.rs",
     "theme.rs",
+    "todo.rs",
     "tree.rs",
     "trim.rs",
     "window.rs",

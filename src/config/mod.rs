@@ -116,6 +116,8 @@ pub struct Options {
     pub autoindent: bool,
     /// Whether each level of indentation gets a vertical line down it.
     pub indent_guides: bool,
+    /// Whether `TODO:` and its friends are picked out of the text.
+    pub todo_comments: bool,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -143,6 +145,7 @@ impl Default for Options {
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
             indent_guides: true,
+            todo_comments: true,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -182,6 +185,8 @@ impl Options {
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
             ("indent_guides", OptionValue::Bool(on)) => self.indent_guides = on,
             ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
+            ("todo_comments", OptionValue::Bool(on)) => self.todo_comments = on,
+            ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
             ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
             ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
@@ -217,6 +222,7 @@ impl Options {
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
             "indent_guides" => OptionValue::Bool(self.indent_guides),
+            "todo_comments" => OptionValue::Bool(self.todo_comments),
             "trim.on_write" => OptionValue::Bool(self.trim.on_write),
             "trim.trailing" => OptionValue::Bool(self.trim.trailing),
             "trim.first_line" => OptionValue::Bool(self.trim.first_line),

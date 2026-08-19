@@ -23,6 +23,11 @@ autoindent = true
 # `indent_guide`. See docs/specs/indent.md.
 indent_guides = true
 
+# TODO:, FIX:, HACK:, WARN:, PERF:, NOTE: and TEST: picked out of the text,
+# wherever they appear — the colours are the theme's `todo_*` keys.
+# See docs/specs/todo-comments.md.
+todo_comments = true
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

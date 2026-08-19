@@ -144,6 +144,16 @@ pub struct Ui {
     /// `rule` — it marks structure rather than naming anything in the text.
     pub indent_guide: Style,
 
+    /// `FIX:`, `TODO:` and the rest — five meanings rather than one per
+    /// keyword, because the same thought has more than one spelling and two
+    /// colours for one meaning is a palette nobody can read. See
+    /// `docs/specs/todo-comments.md`.
+    pub todo_fix: Style,
+    pub todo_todo: Style,
+    pub todo_warn: Style,
+    pub todo_perf: Style,
+    pub todo_note: Style,
+
     pub mode_normal: Style,
     pub mode_insert: Style,
     pub mode_pick: Style,
@@ -183,6 +193,11 @@ impl Ui {
         "rule",
         "filler",
         "indent_guide",
+        "todo_fix",
+        "todo_todo",
+        "todo_warn",
+        "todo_perf",
+        "todo_note",
         "mode_normal",
         "mode_insert",
         "mode_pick",
@@ -218,6 +233,11 @@ impl Ui {
             "rule" => self.rule = style,
             "filler" => self.filler = style,
             "indent_guide" => self.indent_guide = style,
+            "todo_fix" => self.todo_fix = style,
+            "todo_todo" => self.todo_todo = style,
+            "todo_warn" => self.todo_warn = style,
+            "todo_perf" => self.todo_perf = style,
+            "todo_note" => self.todo_note = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,
             "mode_pick" => self.mode_pick = style,
