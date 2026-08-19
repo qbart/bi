@@ -4,32 +4,43 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directories that are files nobody opens by name, and any one of which can
-/// be larger than everything else put together.
-///
-/// Not a substitute for `.gitignore`, which is the right answer and needs a
-/// matcher of its own — see the spec.
-const SKIP: &[&str] = &["target", "node_modules", "dist", "build", "vendor", "__pycache__"];
+use crate::gitignore::Rules;
 
 /// A picker over a home directory is a hang, and a hang is worse than a
 /// truncated list.
 pub const LIMIT: usize = 20_000;
 
-/// Every file under `root`, as paths relative to it, directories first and
-/// then alphabetically — the order the tree walks in.
+/// Every file under `root`, as paths relative to it, in sorted order.
 ///
 /// Hidden entries are skipped, the same rule the tree follows and for the same
 /// reason: `.git` alone would double the list.
-pub fn walk(root: &Path, limit: usize) -> Vec<String> {
+///
+/// With `gitignore`, the project's own answer to "which files are not my
+/// files" is read as the walk goes — including the `.gitignore` files *above*
+/// `root`, so opening bi on a subdirectory still respects the repository's.
+/// An ignored directory is pruned rather than filtered, which is where the
+/// speed comes from and is also git's own behaviour. See
+/// `docs/specs/gitignore.md`.
+pub fn walk(root: &Path, limit: usize, gitignore: bool) -> Vec<String> {
+    let mut rules = match gitignore {
+        true => inherited(root),
+        false => Rules::default(),
+    };
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
+        // Before its own entries are judged, and after everything above it:
+        // the last match wins, so a deeper file beats a shallower one by
+        // arriving later.
+        if gitignore && let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) {
+            rules.push(&dir, &text);
+        }
+
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut here: Vec<(bool, PathBuf)> = entries
             .flatten()
             .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-            .filter(|entry| !SKIP.contains(&entry.file_name().to_string_lossy().as_ref()))
             .map(|entry| {
                 // `symlink_metadata`, so a link to a directory is not walked
                 // into — the tree makes the same call for the same reason, and
@@ -39,6 +50,7 @@ pub fn walk(root: &Path, limit: usize) -> Vec<String> {
                     .unwrap_or(false);
                 (is_dir, entry.path())
             })
+            .filter(|(is_dir, path)| !rules.ignored(path, *is_dir))
             .collect();
         here.sort_by(|a, b| a.1.cmp(&b.1));
 
@@ -57,6 +69,53 @@ pub fn walk(root: &Path, limit: usize) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// The ignore files that apply to `root` from above it.
+///
+/// Up to the repository — the first directory with a `.git` in it — and no
+/// further, because a `.gitignore` in a directory that happens to be an
+/// ancestor of one repository is not a rule about another. Outermost first, so
+/// that the nearer file wins.
+///
+/// `core.excludesFile`, the global one, is not read: it lives behind `git
+/// config`, which means parsing git's config file and its includes, and it is
+/// the one of the four that nearly nobody sets for anything but editor backup
+/// files.
+fn inherited(root: &Path) -> Rules {
+    let mut rules = Rules::default();
+    // The repository `root` sits in — the first ancestor with a `.git`, root
+    // itself included. `.git` may be a file rather than a directory, which is
+    // what a worktree and a submodule have, so this asks whether it is there
+    // rather than what it is.
+    let Some(repo) = root.ancestors().find(|dir| dir.join(".git").exists()) else {
+        // Nothing above an ordinary directory is a rule about it.
+        return rules;
+    };
+
+    // Outside the project's own file, and below it in precedence.
+    if let Ok(text) = std::fs::read_to_string(repo.join(".git/info/exclude")) {
+        rules.push(repo, &text);
+    }
+
+    // Every directory from the repository down to — but not including —
+    // `root`, whose own `.gitignore` the walk reads in its turn. Outermost
+    // first, so that the nearer file wins.
+    let mut above: Vec<&Path> = Vec::new();
+    if repo != root {
+        for dir in root.ancestors().skip(1) {
+            above.push(dir);
+            if dir == repo {
+                break;
+            }
+        }
+    }
+    for dir in above.iter().rev() {
+        if let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) {
+            rules.push(*dir, &text);
+        }
+    }
+    rules
 }
 
 #[cfg(test)]
@@ -79,6 +138,16 @@ mod tests {
             std::fs::write(path, "x").unwrap();
             self
         }
+
+        /// Makes this a repository, as far as the walk is concerned.
+        fn repo(&self) -> &Self {
+            std::fs::create_dir_all(self.0.join(".git")).unwrap();
+            self
+        }
+
+        fn walk(&self) -> Vec<String> {
+            walk(&self.0, LIMIT, true)
+        }
     }
 
     impl Drop for Dir {
@@ -92,19 +161,84 @@ mod tests {
         let dir = Dir::new("walk");
         dir.file("main.rs").file("src/lib.rs").file("src/deep/mod.rs");
 
-        assert_eq!(walk(&dir.0, LIMIT), ["main.rs", "src/deep/mod.rs", "src/lib.rs"]);
+        assert_eq!(dir.walk(), ["main.rs", "src/deep/mod.rs", "src/lib.rs"]);
     }
 
     #[test]
-    fn hidden_entries_and_build_directories_are_not_walked() {
-        let dir = Dir::new("skip");
-        dir.file("keep.rs")
-            .file(".git/objects/abc")
-            .file(".hidden")
-            .file("target/debug/thing")
-            .file("node_modules/pkg/index.js");
+    fn hidden_entries_are_not_walked() {
+        let dir = Dir::new("hidden");
+        dir.file("keep.rs").file(".git/objects/abc").file(".hidden");
 
-        assert_eq!(walk(&dir.0, LIMIT), ["keep.rs"]);
+        assert_eq!(dir.walk(), ["keep.rs"]);
+    }
+
+    /// The project's own answer, in place of the list of likely directory
+    /// names bi used to guess with.
+    #[test]
+    fn what_the_project_ignores_is_not_listed() {
+        let dir = Dir::new("ignored");
+        dir.repo()
+            .file(".gitignore")
+            .file("keep.rs")
+            .file("debug.log")
+            .file("target/debug/thing")
+            .file("build/script.sh");
+        std::fs::write(dir.0.join(".gitignore"), "*.log\ntarget/\n").unwrap();
+
+        assert_eq!(
+            dir.walk(),
+            ["build/script.sh", "keep.rs"],
+            "and `build` is listed, because this project checks it in"
+        );
+    }
+
+    #[test]
+    fn a_nested_gitignore_applies_to_its_own_subtree_and_beats_the_one_above() {
+        let dir = Dir::new("nested");
+        dir.repo().file("a.log").file("sub/b.log").file("sub/keep.rs");
+        std::fs::write(dir.0.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.0.join("sub/.gitignore"), "!*.log\n").unwrap();
+
+        assert_eq!(dir.walk(), ["sub/b.log", "sub/keep.rs"]);
+    }
+
+    /// Git never looks inside an ignored directory, which is where the speed
+    /// comes from and is also why a `!` cannot reach in there.
+    #[test]
+    fn an_ignored_directory_is_pruned_rather_than_filtered() {
+        let dir = Dir::new("pruned");
+        dir.repo().file("keep.rs").file("out/thing.rs").file("out/keep.rs");
+        std::fs::write(dir.0.join(".gitignore"), "out/\n!out/keep.rs\n").unwrap();
+
+        assert_eq!(dir.walk(), ["keep.rs"], "nothing looked inside `out` to re-include anything");
+    }
+
+    #[test]
+    fn a_repository_above_the_root_still_has_its_say() {
+        let dir = Dir::new("above");
+        dir.repo().file("sub/a.log").file("sub/keep.rs");
+        std::fs::write(dir.0.join(".gitignore"), "*.log\n").unwrap();
+
+        assert_eq!(walk(&dir.0.join("sub"), LIMIT, true), ["keep.rs"]);
+    }
+
+    #[test]
+    fn the_repositorys_own_exclude_file_is_read_too() {
+        let dir = Dir::new("exclude");
+        dir.repo().file("keep.rs").file("secret.txt");
+        std::fs::create_dir_all(dir.0.join(".git/info")).unwrap();
+        std::fs::write(dir.0.join(".git/info/exclude"), "secret.txt\n").unwrap();
+
+        assert_eq!(dir.walk(), ["keep.rs"]);
+    }
+
+    #[test]
+    fn off_lists_everything_again() {
+        let dir = Dir::new("off");
+        dir.repo().file("keep.rs").file("debug.log");
+        std::fs::write(dir.0.join(".gitignore"), "*.log\n").unwrap();
+
+        assert_eq!(walk(&dir.0, LIMIT, false), ["debug.log", "keep.rs"]);
     }
 
     #[test]
@@ -113,11 +247,11 @@ mod tests {
         for i in 0..10 {
             dir.file(&format!("f{i}.txt"));
         }
-        assert_eq!(walk(&dir.0, 4).len(), 4);
+        assert_eq!(walk(&dir.0, 4, true).len(), 4);
     }
 
     #[test]
     fn an_unreadable_or_missing_directory_yields_nothing_rather_than_failing() {
-        assert!(walk(Path::new("/definitely/not/here"), LIMIT).is_empty());
+        assert!(walk(Path::new("/definitely/not/here"), LIMIT, true).is_empty());
     }
 }

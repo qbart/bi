@@ -41,19 +41,22 @@ of the file bi was opened on.
 **Hidden entries are skipped**, the same rule the tree follows for the same
 reason: `.git` alone would double the list.
 
-**A built-in list of build directories is skipped** — `target`, `node_modules`,
-`.git`, `dist`, `build`, `vendor`, `__pycache__`. Not because they are not
-files, but because they are files nobody opens by name, and one of them can be
-larger than everything else put together.
+**What the project ignores is skipped** — `.gitignore`, the repository's
+`.git/info/exclude`, and every `.gitignore` from the repository root down,
+with an ignored directory pruned rather than filtered. `docs/specs/`
+`gitignore.md` is the whole of that, including which of the format's corners
+are honoured and which two are not.
+
+An earlier draft had a built-in list of likely directory names instead —
+`target`, `node_modules`, `dist`, `build`. It is gone. It was a guess about
+your project, and it was wrong in both directions: it missed whatever your
+build tool is called this year, and it hid a checked-in `build/` full of
+scripts you wanted to open. One mechanism, and it is the project's own.
 
 **The walk stops at 20,000 files.** A picker over a home directory is a hang,
-and a hang is worse than a truncated list that says it was truncated.
-
-`.gitignore` is *not* read, and that is the one thing here worth flagging: it
-is the right answer and it needs a gitignore matcher (its own dialect,
-negations, directory-only patterns, one file per directory) plus the git
-support bi does not have yet. The built-in list covers the cases that actually
-bite until then.
+and a hang is worse than a truncated list that says it was truncated. That is
+a backstop rather than a policy about files, which is why it survived the list
+that was one.
 
 ## Opening
 
@@ -65,7 +68,8 @@ copy of it.
 
 - A subsequence finds a path: `sfr` matches `src/find/render.rs`.
 - Terms still rule the register picker, so prose does not match everything.
-- Hidden entries and build directories are absent from the walk.
+- Hidden entries are absent from the walk, and so is everything the project's
+  `.gitignore` names.
 - The cap holds, and what is over it is dropped rather than hung on.
 - Choosing a file shows it in the focused window; choosing one already open
   reuses its buffer.

@@ -360,10 +360,13 @@ The file and buffer lists are the exception: they match a *subsequence*, so
 `sfr` finds
 `src/find/render.rs`. Over prose that rule would match everything, which is why
 it is not the default; over paths it is the only useful one. The walk skips
-hidden entries and the usual build directories (`target`, `node_modules`, …)
-and stops at 20,000 files, saying so when it does. `.gitignore` is not read
-yet — that needs a matcher of its own and the git support bi does not have.
-See [docs/specs/files.md](docs/specs/files.md).
+hidden entries and everything the project ignores — its `.gitignore` files
+from the repository root down, and its `.git/info/exclude` — and stops at
+20,000 files, saying so when it does. `:set gitignore false` lists everything
+again; nothing else consults it, and `:e` on an ignored path has always
+worked. bi's walk is checked against git's own in
+`tests/gitignore_git.rs`. See [docs/specs/files.md](docs/specs/files.md) and
+[docs/specs/gitignore.md](docs/specs/gitignore.md).
 
 The buffer list is ordered by when each buffer was last *shown* and opens on
 the second row — the one you were in before this one — so `Ctrl-Tab` `Enter`

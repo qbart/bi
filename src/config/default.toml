@@ -37,6 +37,13 @@ color_swatches = true
 # command whose whole effect is invisible. See docs/specs/flash.md.
 yank_flash = 150
 
+# Whether Ctrl-P skips what the project's .gitignore says are not its files —
+# its own .git/info/exclude too, and the .gitignore files above it. Off lists
+# everything again, which is how you reach a file the project ignores. Nothing
+# else consults it: `:e` on an ignored path has always worked.
+# See docs/specs/gitignore.md.
+gitignore = true
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
 #

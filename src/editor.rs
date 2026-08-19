@@ -2584,7 +2584,7 @@ impl Editor {
     /// `Ctrl-P` — the picker over every file under the session's root.
     fn open_file_picker(&mut self) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
-        let files = crate::files::walk(&root, crate::files::LIMIT);
+        let files = crate::files::walk(&root, crate::files::LIMIT, self.options().gitignore);
         if files.is_empty() {
             // An empty overlay is a worse answer than saying so.
             self.session.status = format!("no files under {}", root.display());

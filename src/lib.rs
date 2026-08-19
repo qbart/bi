@@ -27,6 +27,7 @@ pub mod decoration;
 pub mod editor;
 pub mod editorconfig;
 pub mod files;
+pub mod gitignore;
 pub mod history;
 pub mod indent;
 pub mod input;

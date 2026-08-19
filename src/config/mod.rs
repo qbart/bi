@@ -123,6 +123,9 @@ pub struct Options {
     /// How long a yank stays lit, in milliseconds. 0 is a flash of no time at
     /// all, which is the honest spelling of off.
     pub yank_flash: usize,
+    /// Whether the file picker skips what the project says are not its files.
+    /// Nothing else consults it: `:e` on an ignored path has always worked.
+    pub gitignore: bool,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -153,6 +156,7 @@ impl Default for Options {
             todo_comments: true,
             color_swatches: true,
             yank_flash: 150,
+            gitignore: true,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -196,6 +200,8 @@ impl Options {
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
             ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
+            ("gitignore", OptionValue::Bool(on)) => self.gitignore = on,
+            ("gitignore", _) => return Err("gitignore takes true or false".into()),
             ("yank_flash", OptionValue::Int(n)) if n >= 0 => self.yank_flash = n as usize,
             ("yank_flash", _) => {
                 return Err("yank_flash takes milliseconds, or 0 to turn it off".into());
@@ -238,6 +244,7 @@ impl Options {
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
+            "gitignore" => OptionValue::Bool(self.gitignore),
             "trim.on_write" => OptionValue::Bool(self.trim.on_write),
             "trim.trailing" => OptionValue::Bool(self.trim.trailing),
             "trim.first_line" => OptionValue::Bool(self.trim.first_line),
