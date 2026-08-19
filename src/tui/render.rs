@@ -813,6 +813,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
         .title(match picker.kind {
             PickerKind::Register { .. } => " registers ",
             PickerKind::Buffer => " buffers ",
+            PickerKind::File => " files ",
             PickerKind::History => " history ",
         });
     let inner = outer.inner(rect);

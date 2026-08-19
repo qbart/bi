@@ -349,11 +349,20 @@ leaving whitespace nothing can see. See
 
 ### Picker
 
-One overlay over three lists: the register ring (`"p` / `"P`), the open buffers
-(`:ls`), and the `:` lines you have run (`Ctrl-R` on the command line). Typing
-filters by substring — every whitespace-separated term must appear somewhere, in
-any order, case-insensitively. Matches keep the order they were given, so the
-most recent is first.
+One overlay over four lists: the register ring (`"p` / `"P`), the open buffers
+(`:ls`), every file under the session's root (`Ctrl-P`), and the `:` lines you
+have run (`Ctrl-R` on the command line). Typing filters by substring — every
+whitespace-separated term must appear somewhere, in any order,
+case-insensitively. Matches keep the order they were given, so the most recent
+is first.
+
+The file list is the exception: it matches a *subsequence*, so `sfr` finds
+`src/find/render.rs`. Over prose that rule would match everything, which is why
+it is not the default; over paths it is the only useful one. The walk skips
+hidden entries and the usual build directories (`target`, `node_modules`, …)
+and stops at 20,000 files, saying so when it does. `.gitignore` is not read
+yet — that needs a matcher of its own and the git support bi does not have.
+See [docs/specs/files.md](docs/specs/files.md).
 
 | Key | Does |
 |---|---|

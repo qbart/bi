@@ -2520,6 +2520,28 @@ impl Editor {
         self.session.status = format!("\"{name}\" deleted");
     }
 
+    /// `Ctrl-P` — the picker over every file under the session's root.
+    fn open_file_picker(&mut self) {
+        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let files = crate::files::walk(&root, crate::files::LIMIT);
+        if files.is_empty() {
+            // An empty overlay is a worse answer than saying so.
+            self.session.status = format!("no files under {}", root.display());
+            return;
+        }
+        let capped = files.len() >= crate::files::LIMIT;
+        let items = files.into_iter().map(|text| Item { text, badge: None }).collect();
+        // No length floor: a file named `a` is a file.
+        self.session.picker = Some(Picker::new(PickerKind::File, items, 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+        if capped {
+            // Said rather than silently true: a list that stops somewhere has
+            // to say where, or the file you cannot find looks like a bug.
+            self.session.status =
+                format!("more than {} files — showing the first", crate::files::LIMIT);
+        }
+    }
+
     fn open_buffer_picker(&mut self) {
         let items = self
             .buffer_ids()
@@ -2966,6 +2988,7 @@ impl Editor {
             // from: both have to work in a window holding a tree, where there
             // is no rope to run anything against.
             Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
+            Action::OpenPicker(PickerKind::File) => self.open_file_picker(),
 
             // The same reason again: a letter can be sitting on a tree pane,
             // and pressing it changes which window is focused — which is a
@@ -3043,6 +3066,15 @@ impl Editor {
             // the list in order and it cannot change while the picker holds
             // every key.
             PickerKind::Buffer => self.run_buffer_cmd(BufferCmd::Chosen(chosen)),
+            // Through `:e`, like everything else that opens a file, so one
+            // already open comes back as the buffer it is rather than as a
+            // second copy of it.
+            PickerKind::File => {
+                let path = picker.items()[chosen].text.clone();
+                let root = self.tree_root(None);
+                let full = root.join(path).to_string_lossy().to_string();
+                self.edit_path(&full);
+            }
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
             }
@@ -11037,5 +11069,56 @@ mod tests {
 
         assert_eq!(ed.session.mode, Mode::Normal);
         assert_eq!(ed.cursor().unwrap().at, 10);
+    }
+
+    // ---- Ctrl-P, the file picker --------------------------------------------
+
+    #[test]
+    fn the_file_picker_lists_what_is_under_the_root_and_opens_what_you_choose() {
+        let files = Files::new("picker");
+        files.file("alpha.rs", "one\n");
+        let path = files.file("beta.rs", "two\n");
+        let mut ed = Editor::open(&path).unwrap();
+        ed.session.tree_root = Some(files.0.clone());
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+        assert_eq!(ed.session.mode, Mode::Pick);
+        let listed: Vec<String> =
+            ed.session.picker.as_ref().unwrap().items().iter().map(|i| i.text.clone()).collect();
+        assert_eq!(listed, ["alpha.rs", "beta.rs"]);
+
+        // Type enough to name the other one, and take it.
+        ed.apply(cmd(Action::PickChar('a')));
+        ed.apply(cmd(Action::PickChar('l')));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\n");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn choosing_a_file_that_is_already_open_reuses_its_buffer() {
+        let files = Files::new("picker-reuse");
+        let path = files.file("alpha.rs", "one\n");
+        let mut ed = Editor::open(&path).unwrap();
+        ed.session.tree_root = Some(files.0.clone());
+        let before = ed.buffer_ids().len();
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(ed.buffer_ids().len(), before, "one file, one buffer");
+    }
+
+    #[test]
+    fn a_root_with_no_files_says_so_rather_than_opening_an_empty_overlay() {
+        let files = Files::new("picker-empty");
+        let mut ed = Editor::empty();
+        ed.session.tree_root = Some(files.0.clone());
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert!(ed.session.status.starts_with("no files under"), "{}", ed.session.status);
     }
 }

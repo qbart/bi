@@ -728,6 +728,9 @@ impl Input {
                 Some(Command { count: 1, action: Action::CollapseCursors })
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
+            // The picker over every file under the session's root — see
+            // `docs/specs/files.md`.
+            KeyCode::Char('p') if ctrl => self.plain(Action::OpenPicker(PickerKind::File)),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
             KeyCode::Char('x') if ctrl => self.plain(Action::SkipCursorToNextMatch),
             KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(VisualKind::Block)),

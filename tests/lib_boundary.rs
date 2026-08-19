@@ -168,6 +168,7 @@ const LIB_MODULES: &[&str] = &[
     "decoration.rs",
     "editor.rs",
     "editorconfig.rs",
+    "files.rs",
     "history.rs",
     "indent.rs",
     "input.rs",

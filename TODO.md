@@ -4,10 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-### C-p fuzzy finder for files
-
-fuzzy serach files the files you want to jump to
-
 ###  Alternate mode
 
 i want to <leader>a to switch to alternate files thaat are defined as patterns in config:

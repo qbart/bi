@@ -36,6 +36,12 @@ pub enum PickerKind {
     /// the list is the chooser, and the number vim makes you carry never has to
     /// exist. The cost is that `:ls` has nothing to say to a script.
     Buffer,
+    /// `Ctrl-P` — every file under the session's root.
+    ///
+    /// The one kind that matches by subsequence rather than by terms: `sfr`
+    /// should find `src/find/render.rs`, which is exactly what terms cannot
+    /// do. See `docs/specs/files.md`.
+    File,
     /// `Ctrl-R` on the `:` line, over the lines you have run.
     ///
     /// The one kind that does not act on what you choose: it puts the line back
@@ -52,7 +58,17 @@ impl PickerKind {
     /// is one line and is already the row, so previewing it would show the same
     /// text twice and take the space from the list to do it.
     pub fn wants_preview(&self) -> bool {
-        !matches!(self, PickerKind::History)
+        !matches!(self, PickerKind::History | PickerKind::File)
+    }
+
+    /// Whether typed characters have to appear *in order* rather than as
+    /// whole terms.
+    ///
+    /// A file list is the one place the lax rule is the useful one. Over
+    /// prose — which is what a register holds — "these letters appear in
+    /// order" matches nearly everything, which is why it is not the default.
+    fn subsequence(&self) -> bool {
+        matches!(self, PickerKind::File)
     }
 }
 
@@ -86,6 +102,18 @@ fn matches_query(text: &str, query: &str) -> bool {
     }
     let hay = text.to_lowercase();
     query.split_whitespace().all(|term| hay.contains(&term.to_lowercase()))
+}
+
+/// Case-insensitive, every character in order but not necessarily together —
+/// what a path list wants and what prose does not. Whitespace in the query is
+/// ignored, so a stray space costs nothing.
+fn matches_subsequence(text: &str, query: &str) -> bool {
+    let mut chars = text.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .all(|wanted| chars.any(|c| c == wanted))
 }
 
 impl Picker {
@@ -148,12 +176,16 @@ impl Picker {
     fn refilter(&mut self) {
         let (query, show_short) = (self.query.clone(), self.show_short);
         let min_len = self.min_len;
+        let subsequence = self.kind.subsequence();
         self.matches = self
             .items
             .iter()
             .enumerate()
             .filter(|(_, item)| show_short || item.text.chars().count() >= min_len)
-            .filter(|(_, item)| matches_query(&item.text, &query))
+            .filter(|(_, item)| match subsequence {
+                true => matches_subsequence(&item.text, &query),
+                false => matches_query(&item.text, &query),
+            })
             .map(|(i, _)| i)
             .collect();
         // Clamp rather than reset: narrowing the query should not throw away
@@ -222,6 +254,11 @@ mod tests {
         Picker::new(PickerKind::Register { before: false }, items, min_len)
     }
 
+    fn files(texts: &[&str]) -> Picker {
+        let items = texts.iter().map(|t| Item { text: (*t).into(), badge: None }).collect();
+        Picker::new(PickerKind::File, items, 0)
+    }
+
     fn shown(p: &Picker) -> Vec<&str> {
         p.matches().iter().map(|i| p.items()[*i].text.as_str()).collect()
     }
@@ -230,6 +267,28 @@ mod tests {
         for c in q.chars() {
             p.push_char(c);
         }
+    }
+
+    /// The one kind that matches loosely, and the reason it is the one: `sfr`
+    /// finding `src/find/render.rs` is exactly what terms cannot do.
+    #[test]
+    fn a_file_list_matches_a_subsequence() {
+        let mut p = files(&["src/find/render.rs", "src/editor.rs", "README.md"]);
+        type_query(&mut p, "sfr");
+        assert_eq!(shown(&p), ["src/find/render.rs"]);
+
+        let mut p = files(&["src/find/render.rs", "src/editor.rs"]);
+        type_query(&mut p, "REND");
+        assert_eq!(shown(&p), ["src/find/render.rs"], "and it ignores case");
+    }
+
+    /// Which is why it is not what a register does: over prose, "these letters
+    /// appear in order" matches nearly everything.
+    #[test]
+    fn a_register_still_wants_whole_terms() {
+        let mut p = picker(&["the quick brown fox", "sedimentary rock"]);
+        type_query(&mut p, "sed");
+        assert_eq!(shown(&p), ["sedimentary rock"], "not the first one, which has s, e and d");
     }
 
     #[test]
