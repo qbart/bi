@@ -4,14 +4,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
-### surround 
-
-add support for surround 
-  -- is all about "surroundings": parentheses, brackets, quotes, XML tags, and more.
--- ys{motion}{char}, ds{char}, and cs{target}{replacement}
-so i can withing double quotes change double quotes to single quotes without moving cursor (while being insdie the quotes),
-same for brackets etc.
-
 ### new case command
 
 :case ....

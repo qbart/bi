@@ -440,6 +440,91 @@ impl Buffer {
         Ok(Cursor::at(self.rope.line_to_char(row) + col))
     }
 
+    // ---- surroundings ------------------------------------------------------
+
+    /// The char range a target covers, without touching it.
+    ///
+    /// Asked as a yank, because a yank is the operator that changes nothing:
+    /// `cw`'s quirk of stopping at the end of a word belongs to `c` and would
+    /// be wrong for `ysw`.
+    pub fn range_of(&self, at: Cursor, target: Target, count: usize) -> Option<(usize, usize)> {
+        let (mut start, mut end) = self.operator_range(at, Operator::Yank, target, count)?;
+        // A linewise target carries a line terminator — the one after it, or
+        // the one before it on the last line of a file that does not end in
+        // one. That is right for a yank and wrong for a surround, which would
+        // put the closing string on the next line.
+        let newline = |i: usize| matches!(self.rope.char(i), '\n' | '\r');
+        while end > start && newline(end - 1) {
+            end -= 1;
+        }
+        while start < end && newline(start) {
+            start += 1;
+        }
+        (end > start).then_some((start, end))
+    }
+
+    /// The two delimiter positions of the innermost `ch` pair the cursor is
+    /// inside, as an outer range.
+    ///
+    /// Built from the *inner* object rather than the outer one, because `a"`
+    /// reaches for the whitespace beside the quotes — right for `da"` and
+    /// wrong for `ds"`, which must take the quotes and nothing else. Every
+    /// pair bi surrounds with is one character on each side, so the delimiters
+    /// are exactly the characters either side of the innards.
+    pub fn surround_of(&self, at: Cursor, ch: char) -> Option<(usize, usize)> {
+        let object = crate::surround::object_for(ch)?;
+        let (start, end) = self.object_range(at, object, false)?;
+        (start >= 1 && end < self.rope.len_chars() + 1).then_some((start - 1, end + 1))
+    }
+
+    /// Wraps `start..end` in `pair`, and says where the cursor goes.
+    ///
+    /// The closing string first, so that inserting the opening one cannot
+    /// invalidate the position the closing one was going to. The cursor rides
+    /// on whatever was inserted to its left and nowhere else — which is the
+    /// whole point of the command.
+    pub fn surround(
+        &mut self,
+        at: Cursor,
+        start: usize,
+        end: usize,
+        pair: &crate::surround::Pair,
+    ) -> Cursor {
+        let base = self.pending_edits.len();
+        self.apply_edit(end, end, &pair.close);
+        self.apply_edit(start, start, &pair.open);
+        self.moved_across(at, base)
+    }
+
+    /// `ds{ch}` — removes the innermost `ch` pair around the cursor.
+    pub fn unsurround(&mut self, at: Cursor, ch: char) -> Option<Cursor> {
+        let (open, close) = self.surround_of(at, ch)?;
+        let base = self.pending_edits.len();
+        self.apply_edit(close - 1, close, "");
+        self.apply_edit(open, open + 1, "");
+        Some(self.moved_across(at, base))
+    }
+
+    /// `cs{from}{to}` — replaces one pair with another, in place.
+    pub fn resurround(
+        &mut self,
+        at: Cursor,
+        from: char,
+        pair: &crate::surround::Pair,
+    ) -> Option<Cursor> {
+        let (open, close) = self.surround_of(at, from)?;
+        let base = self.pending_edits.len();
+        self.apply_edit(close - 1, close, &pair.close);
+        self.apply_edit(open, open + 1, &pair.open);
+        Some(self.moved_across(at, base))
+    }
+
+    /// Where `at` ends up after the edits made since `base`.
+    fn moved_across(&self, at: Cursor, base: usize) -> Cursor {
+        let moved = self.pending_edits[base..].iter().fold(at.at, |at, edit| edit.map(at));
+        self.clamped(Cursor::at(moved), false)
+    }
+
     /// The text of `row`, without its terminator.
     fn line_text(&self, row: usize) -> String {
         if row >= self.rope.len_lines() {

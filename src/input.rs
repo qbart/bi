@@ -18,6 +18,27 @@ use crate::registers::Sink;
 use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
 
+/// Where a surround command has got to.
+///
+/// `ys` is the interesting one: it wants a motion, and rather than a second
+/// copy of the motion machinery it leaves the yank operator pending and is
+/// intercepted where a motion resolves — which is how `ysiw"`, `ys2w)` and
+/// `ysip>` all work without a line of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surround {
+    /// `ys` — waiting for the motion or object that says what to wrap.
+    Add,
+    /// The target arrived; waiting for the character to wrap it in.
+    AddWith(Target, usize),
+    /// `ds` — waiting for the character to remove.
+    Delete,
+    /// `cs` — waiting for the character to replace, and then for its
+    /// replacement.
+    Change(Option<char>),
+    /// Visual `S` — waiting for the character to wrap the selection in.
+    Selection,
+}
+
 #[derive(Default)]
 pub struct Input {
     count: Option<usize>,
@@ -27,6 +48,8 @@ pub struct Input {
     g_pending: bool,
     /// `"` has been typed and is waiting for the register it names.
     quote_pending: bool,
+    /// `ys`, `ds`, `cs` and visual `S` — see `docs/specs/surround.md`.
+    surround: Option<Surround>,
     /// `r` has been typed and is waiting for the character to write.
     replace_pending: bool,
     /// `f`/`F`/`t`/`T` has been typed and is waiting for its target character.
@@ -145,6 +168,7 @@ impl Input {
     /// also rebind `dw`.
     fn mid_command(&self) -> bool {
         self.replace_pending
+            || self.surround.is_some()
             || self.quote_pending
             || self.find_pending.is_some()
             || self.object_pending.is_some()
@@ -311,6 +335,17 @@ impl Input {
         if let Some(n) = self.count {
             s.push_str(&n.to_string());
         }
+        match self.surround {
+            Some(Surround::Add) | Some(Surround::AddWith(..)) => s.push_str("ys"),
+            Some(Surround::Delete) => s.push_str("ds"),
+            Some(Surround::Change(None)) => s.push_str("cs"),
+            Some(Surround::Change(Some(of))) => {
+                s.push_str("cs");
+                s.push(of);
+            }
+            Some(Surround::Selection) => s.push('S'),
+            None => {}
+        }
         if self.quote_pending {
             s.push('"');
         }
@@ -374,11 +409,41 @@ impl Input {
         self.motion_count.or(self.count)
     }
 
+    /// The character a half-typed surround is waiting for, if it is waiting
+    /// for one.
+    ///
+    /// `Some` means the key was consumed — the inner `Option` is the command
+    /// it produced, or `None` for `cs`'s first character, which only says
+    /// which pair to change.
+    fn surround_char(&mut self, c: char) -> Option<Option<Command>> {
+        let action = match self.surround? {
+            // Still waiting for a motion, so this key is not ours.
+            Surround::Add => return None,
+            Surround::AddWith(target, count) => Action::Surround { target, count, with: c },
+            Surround::Delete => Action::Unsurround { of: c },
+            Surround::Change(None) => {
+                self.surround = Some(Surround::Change(Some(c)));
+                return Some(None);
+            }
+            Surround::Change(Some(of)) => Action::Resurround { of, with: c },
+            Surround::Selection => Action::SurroundSelection { with: c },
+        };
+        self.reset();
+        Some(Some(Command { count: 1, action }))
+    }
+
     /// Resolves a motion: applies the pending operator to it, or just moves.
     fn resolve(&mut self, motion: Motion) -> Option<Command> {
         // An absolute motion already spent the count naming its destination —
         // `d5G` deletes to line 5 once, not five times.
         let count = if motion.is_absolute() { 1 } else { self.fold_count() };
+        // `ys` wants the motion and then a character, so the motion stops here
+        // rather than becoming a command.
+        if self.surround == Some(Surround::Add) {
+            self.operator = None;
+            self.surround = Some(Surround::AddWith(Target::Motion(motion), count));
+            return None;
+        }
         let operator = self.operator;
         let sink = self.sink;
         self.reset();
@@ -395,8 +460,13 @@ impl Input {
     /// there is no "just move there" case — `iw` on its own does nothing until
     /// visual mode gives it one.
     fn resolve_object(&mut self, object: TextObject, around: bool) -> Option<Command> {
-        let op = self.operator?;
         let count = self.fold_count();
+        if self.surround == Some(Surround::Add) {
+            self.operator = None;
+            self.surround = Some(Surround::AddWith(Target::Object { object, around }, count));
+            return None;
+        }
+        let op = self.operator?;
         let sink = self.sink;
         self.reset();
         Some(Command {
@@ -605,6 +675,15 @@ impl Input {
             return self.window_key(key);
         }
 
+        // A surround waiting for its character takes the next one whatever it
+        // would otherwise have meant — `ds(` must not read the `(` as a motion.
+        if let KeyCode::Char(c) = key.code
+            && !ctrl
+            && let Some(command) = self.surround_char(c)
+        {
+            return command;
+        }
+
         match key.code {
             // Esc clears the pending keymap state *and* drops any extra
             // cursors. Collapsing with one cursor is a no-op, so this can be
@@ -764,6 +843,30 @@ impl Input {
                     | (Operator::Indent { right: false }, '<')
             );
             if doubled {
+                return self.resolve(Motion::CurrentLine);
+            }
+            // `ys`, `ds`, `cs` — `s` is not a motion, so all three are
+            // sequences vim leaves unused and nothing has to be given up to
+            // have them. See `docs/specs/surround.md`.
+            if c == 's' && self.surround.is_none() {
+                self.surround = match op {
+                    Operator::Yank => Some(Surround::Add),
+                    Operator::Delete => Some(Surround::Delete),
+                    Operator::Change => Some(Surround::Change(None)),
+                    Operator::Indent { .. } => None,
+                };
+                if self.surround.is_some() {
+                    // `ys` keeps the yank operator pending, because what
+                    // follows is a motion and the machinery for that is the
+                    // operator's.
+                    if self.surround != Some(Surround::Add) {
+                        self.operator = None;
+                    }
+                    return None;
+                }
+            }
+            // `yss` — the whole line, the doubled form of `ys`.
+            if c == 's' && self.surround == Some(Surround::Add) {
                 return self.resolve(Motion::CurrentLine);
             }
             if c == 'i' || c == 'a' {
@@ -980,6 +1083,18 @@ impl Input {
         };
         if ctrl {
             return self.normal(key);
+        }
+
+        // A surround waiting for its character takes the next one, before the
+        // objects and operators below can read it as something else.
+        if let Some(command) = self.surround_char(c) {
+            return command;
+        }
+        // vim-surround's visual key. Normal mode's `S` is `cc` and stays that
+        // way; this one only exists where there is a selection to wrap.
+        if c == 'S' {
+            self.surround = Some(Surround::Selection);
+            return None;
         }
 
         // `r` over a selection overwrites every character in it, so it does not
@@ -1913,6 +2028,78 @@ leader = \" \"
             input.on_key(tab(true), &Mode::Insert, ContentKind::Text).unwrap().action,
             Action::InsertIndent { right: false }
         );
+    }
+
+    // ---- surround -----------------------------------------------------------
+
+    #[test]
+    fn ys_takes_a_motion_and_then_a_character() {
+        assert_eq!(
+            typed("ysiw\"").action,
+            Action::Surround {
+                target: Target::Object { object: TextObject::Word { big: false }, around: false },
+                count: 1,
+                with: '"',
+            }
+        );
+        assert_eq!(
+            typed("ys2w)").action,
+            Action::Surround {
+                target: Target::Motion(Motion::Word { big: false, forward: true, end: false }),
+                count: 2,
+                with: ')',
+            }
+        );
+    }
+
+    /// The doubled form, exactly as `dd` is `d` doubled.
+    #[test]
+    fn yss_is_the_whole_line() {
+        assert_eq!(
+            typed("yss\"").action,
+            Action::Surround { target: Target::Motion(Motion::CurrentLine), count: 1, with: '"' }
+        );
+    }
+
+    #[test]
+    fn ds_and_cs_take_their_characters_and_nothing_else() {
+        assert_eq!(typed("ds\"").action, Action::Unsurround { of: '"' });
+        assert_eq!(typed("cs\"'").action, Action::Resurround { of: '"', with: '\'' });
+    }
+
+    /// `(` is a motion nowhere and a surrounding here, which is the whole
+    /// reason the pending character is read before the motion table.
+    #[test]
+    fn a_pending_surround_swallows_a_key_that_would_otherwise_move() {
+        assert_eq!(typed("dsb").action, Action::Unsurround { of: 'b' });
+        assert_eq!(
+            typed("ysiwb").action,
+            Action::Surround {
+                target: Target::Object { object: TextObject::Word { big: false }, around: false },
+                count: 1,
+                with: 'b',
+            }
+        );
+    }
+
+    #[test]
+    fn visual_s_wraps_the_selection() {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in "S\"".chars() {
+            last = input.on_key(key(c), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+        }
+        assert_eq!(last.unwrap().action, Action::SurroundSelection { with: '"' });
+    }
+
+    #[test]
+    fn a_half_typed_surround_shows_in_the_pending_display() {
+        let mut input = Input::default();
+        input.on_key(key('c'), &Mode::Normal, ContentKind::Text);
+        input.on_key(key('s'), &Mode::Normal, ContentKind::Text);
+        assert_eq!(input.pending_display(), "cs");
+        input.on_key(key('"'), &Mode::Normal, ContentKind::Text);
+        assert_eq!(input.pending_display(), "cs\"");
     }
 
     #[test]

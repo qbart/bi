@@ -32,6 +32,7 @@ pub mod motion;
 pub mod picker;
 pub mod registers;
 pub mod selection;
+pub mod surround;
 pub mod syntax;
 pub mod theme;
 pub mod todo;

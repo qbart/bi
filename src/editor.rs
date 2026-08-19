@@ -258,6 +258,30 @@ pub enum Action {
     MoveLinesTo {
         row: usize,
     },
+    /// `ys{motion}{char}` — wrap what the motion covers.
+    ///
+    /// Spelled with the yank operator's key because yank is the operator that
+    /// changes nothing, and neither does the `y` in `ys`. See
+    /// `docs/specs/surround.md`.
+    Surround {
+        target: Target,
+        count: usize,
+        with: char,
+    },
+    /// `ds{char}` — remove the innermost pair the cursor is inside.
+    Unsurround {
+        of: char,
+    },
+    /// `cs{old}{new}` — one pair into another, in place.
+    Resurround {
+        of: char,
+        with: char,
+    },
+    /// `S{char}` in visual mode — wrap the selection.
+    SurroundSelection {
+        with: char,
+    },
+
     /// `R`
     EnterReplace,
     /// A character typed in replace mode.
@@ -414,6 +438,10 @@ impl Action {
             | Action::OpenLineAbove
             | Action::BlockInsert { .. }
             | Action::ReplaceSelection(_)
+            | Action::Surround { .. }
+            | Action::Unsurround { .. }
+            | Action::Resurround { .. }
+            | Action::SurroundSelection { .. }
             | Action::EnterReplace => true,
             _ => false,
         }
@@ -4235,6 +4263,77 @@ impl View<'_> {
                 });
                 self.session.mode =
                     if op == Operator::Change { Mode::Insert } else { Mode::Normal };
+            }
+
+            Action::Surround { target, count, with } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                let (count, with) = (*count, *with);
+                let Some(pair) = crate::surround::pair_for(with) else {
+                    self.session.status = format!("nothing surrounds with {with}");
+                    return;
+                };
+                self.for_each_selection(|ed, sel| {
+                    match ed.buffer.range_of(sel.head, target, count) {
+                        Some((start, end)) => {
+                            Selection::collapsed(ed.buffer.surround(sel.head, start, end, &pair))
+                        }
+                        None => sel,
+                    }
+                });
+            }
+            Action::SurroundSelection { with } => {
+                let with = *with;
+                let Some(pair) = crate::surround::pair_for(with) else {
+                    self.session.status = format!("nothing surrounds with {with}");
+                    return;
+                };
+                let linewise = self.session.mode.visual() == Some(VisualKind::Line);
+                self.for_each_selection(|ed, sel| {
+                    let len = ed.buffer.rope().len_chars();
+                    let (start, end) = match linewise {
+                        true => {
+                            let (lo, hi) = sel.range();
+                            ed.buffer.line_range(lo, hi, false)
+                        }
+                        false => sel.inclusive_range(len),
+                    };
+                    Selection::collapsed(ed.buffer.surround(sel.head, start, end, &pair))
+                });
+                self.session.mode = Mode::Normal;
+            }
+            Action::Unsurround { of } => {
+                let of = *of;
+                let mut missing = false;
+                self.for_each_selection(|ed, sel| match ed.buffer.unsurround(sel.head, of) {
+                    Some(landed) => Selection::collapsed(landed),
+                    None => {
+                        missing = true;
+                        sel
+                    }
+                });
+                if missing {
+                    self.session.status = format!("no {of} around the cursor");
+                }
+            }
+            Action::Resurround { of, with } => {
+                let (of, with) = (*of, *with);
+                let Some(pair) = crate::surround::pair_for(with) else {
+                    self.session.status = format!("nothing surrounds with {with}");
+                    return;
+                };
+                let mut missing = false;
+                self.for_each_selection(|ed, sel| {
+                    match ed.buffer.resurround(sel.head, of, &pair) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => {
+                            missing = true;
+                            sel
+                        }
+                    }
+                });
+                if missing {
+                    self.session.status = format!("no {of} around the cursor");
+                }
             }
 
             Action::SelectObject { object, around } => {
@@ -9921,5 +10020,116 @@ mod tests {
 
         assert!(lit(&ed).is_empty());
         assert_eq!(ed.redraw_in(), None, "and the loop goes back to blocking");
+    }
+
+    // ---- surround -----------------------------------------------------------
+
+    fn surrounded(text: &str, at: usize, action: Action) -> (String, usize) {
+        let mut ed = editor(text);
+        ed.set_cursor(Cursor::at(at));
+        ed.apply(cmd(action));
+        (ed.buffer().unwrap().rope().to_string(), ed.cursor().unwrap().at)
+    }
+
+    #[test]
+    fn ys_wraps_what_the_motion_covered() {
+        let word = Target::Object { object: TextObject::Word { big: false }, around: false };
+        assert_eq!(
+            surrounded("hello there", 0, Action::Surround { target: word, count: 1, with: '"' }).0,
+            "\"hello\" there"
+        );
+        // The open side adds a space inside; the close side does not.
+        assert_eq!(
+            surrounded("hello", 0, Action::Surround { target: word, count: 1, with: '{' }).0,
+            "{ hello }"
+        );
+        assert_eq!(
+            surrounded("hello", 0, Action::Surround { target: word, count: 1, with: '}' }).0,
+            "{hello}"
+        );
+    }
+
+    #[test]
+    fn yss_wraps_the_line_without_its_terminator() {
+        let line = Target::Motion(Motion::CurrentLine);
+        let (text, _) =
+            surrounded("alpha\nbeta\n", 0, Action::Surround { target: line, count: 1, with: ')' });
+        assert_eq!(text, "(alpha)\nbeta\n");
+    }
+
+    #[test]
+    fn ds_takes_the_delimiters_and_leaves_what_was_between_them() {
+        assert_eq!(
+            surrounded("say \"hello\" now", 6, Action::Unsurround { of: '"' }).0,
+            "say hello now"
+        );
+        assert_eq!(surrounded("f( x )", 3, Action::Unsurround { of: '(' }).0, "f x ");
+        assert_eq!(surrounded("f(x)", 2, Action::Unsurround { of: 'b' }).0, "fx", "`b` is `)`");
+    }
+
+    #[test]
+    fn ds_takes_the_innermost_pair() {
+        assert_eq!(surrounded("f(g(x))", 4, Action::Unsurround { of: '(' }).0, "f(gx)");
+    }
+
+    #[test]
+    fn ds_with_nothing_around_the_cursor_changes_nothing_and_says_so() {
+        let mut ed = editor("plain text\n");
+        ed.apply(cmd(Action::Unsurround { of: '"' }));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "plain text\n");
+        assert_eq!(ed.session.status, "no \" around the cursor");
+    }
+
+    /// The whole reason `cs` is worth a command: the cursor does not move.
+    #[test]
+    fn cs_changes_the_pair_in_place_and_leaves_the_cursor_alone() {
+        let (text, at) =
+            surrounded("say \"hello\" now", 7, Action::Resurround { of: '"', with: '\'' });
+        assert_eq!(text, "say 'hello' now");
+        assert_eq!(at, 7, "still on the same character");
+    }
+
+    #[test]
+    fn cs_to_an_open_bracket_adds_the_spaces_it_promises() {
+        assert_eq!(surrounded("f(x)", 2, Action::Resurround { of: ')', with: '{' }).0, "f{ x }");
+    }
+
+    /// The last line of a file that does not end in a newline is where a
+    /// linewise range reaches *backwards* for its terminator, and a surround
+    /// must not follow it there.
+    #[test]
+    fn yss_on_the_last_unterminated_line_stays_on_it() {
+        let line = Target::Motion(Motion::CurrentLine);
+        let (text, _) =
+            surrounded("alpha\nbeta", 7, Action::Surround { target: line, count: 1, with: ')' });
+        assert_eq!(text, "alpha\n(beta)");
+    }
+
+    #[test]
+    fn a_surround_is_one_undo_step() {
+        let mut ed = editor("hello");
+        ed.apply(cmd(Action::Surround {
+            target: Target::Object { object: TextObject::Word { big: false }, around: false },
+            count: 1,
+            with: '"',
+        }));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "\"hello\"");
+
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello", "both edits, one step");
+    }
+
+    #[test]
+    fn visual_s_wraps_the_selection_and_leaves_visual_mode() {
+        let mut ed = editor("hello there");
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        for _ in 0..4 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ed.apply(cmd(Action::SurroundSelection { with: '"' }));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "\"hello\" there");
+        assert_eq!(ed.session.mode, Mode::Normal);
     }
 }

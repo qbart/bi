@@ -175,6 +175,7 @@ const LIB_MODULES: &[&str] = &[
     "picker.rs",
     "registers.rs",
     "selection.rs",
+    "surround.rs",
     "syntax.rs",
     "theme.rs",
     "todo.rs",

@@ -67,6 +67,22 @@ the word, `dw` takes the word and the space after it.
 | `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
 | `X` | delete the char before the cursor — `dh` |
 
+**Surroundings** — add, remove and change what is around something.
+
+| Key | Does |
+|---|---|
+| `ys{motion}{char}` | wrap what the motion covers — `ysiw"`, `ys2w)`, `ysip>` |
+| `yss{char}` | wrap the whole line |
+| `ds{char}` | delete the innermost pair around the cursor |
+| `cs{old}{new}` | change one pair into another, in place |
+
+`(` `{` `[` `<` put a space inside — `{ x }` — and `)` `}` `]` `>` `b` `B` do
+not. Any of them *finds* the same pair, so `ds(`, `ds)` and `dsb` all delete
+the nearest parentheses. Every one of these keeps the cursor where it is, which
+is what makes `cs"'` from inside a string worth having. `S{char}` in visual
+mode wraps the selection. Tags (`dst`) are not here — a tag is a parse rather
+than a pair; see [docs/specs/surround.md](docs/specs/surround.md).
+
 **Text objects** — take the thing the cursor is *inside*, rather than a
 direction to move in. `i` is the object, `a` includes its surroundings.
 
