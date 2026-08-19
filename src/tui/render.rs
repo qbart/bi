@@ -733,6 +733,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
         .title(match picker.kind {
             PickerKind::Register { .. } => " registers ",
             PickerKind::Buffer => " buffers ",
+            PickerKind::History => " history ",
         });
     let inner = outer.inner(rect);
     frame.render_widget(outer, rect);
@@ -740,7 +741,12 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
         return;
     }
 
-    let preview_h = (inner.height / 3).max(1) + 1;
+    // A history row is a whole command line already, so previewing it would
+    // show the same text twice and take a third of the overlay to do it.
+    let preview_h = match picker.kind.wants_preview() {
+        true => (inner.height / 3).max(1) + 1,
+        false => 0,
+    };
     let [query_area, list_area, preview_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -785,6 +791,11 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
     let empty = rows.is_empty();
     frame.render_widget(Paragraph::new(rows), list_area);
 
+    if preview_h == 0 {
+        set_picker_cursor(frame, picker, query_area);
+        return;
+    }
+
     let preview = Block::default().borders(Borders::TOP).border_style(tui(ui.picker_divider));
     let preview_inner = preview.inner(preview_area);
     frame.render_widget(preview, preview_area);
@@ -799,6 +810,11 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui) {
         frame.render_widget(Paragraph::new(body).style(tui(ui.picker_preview)), preview_inner);
     }
 
+    set_picker_cursor(frame, picker, query_area);
+}
+
+/// After the `> ` prompt, at the end of what has been typed.
+fn set_picker_cursor(frame: &mut Frame, picker: &Picker, query_area: Rect) {
     frame.set_cursor_position((
         query_area.x + 2 + picker.query().chars().count() as u16,
         query_area.y,

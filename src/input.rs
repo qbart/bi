@@ -1139,6 +1139,10 @@ impl Input {
         let action = match key.code {
             KeyCode::Esc => Action::CommandCancel,
             KeyCode::Char('c') if ctrl => Action::CommandCancel,
+            // The shells' key for exactly this, and vim's register-insert key
+            // on a command line bi does not have. Above the char arm, which
+            // would otherwise take it and type a literal `r`.
+            KeyCode::Char('r') if ctrl => Action::OpenPicker(PickerKind::History),
             KeyCode::Enter => Action::CommandExecute,
             KeyCode::Backspace => Action::CommandBackspace,
             KeyCode::Char(c) => Action::CommandChar(c),
@@ -2137,6 +2141,24 @@ leader = \" \"
         assert_eq!(
             input.on_key(key('p'), &Mode::Pick, ContentKind::Text).unwrap().action,
             Action::PickChar('p')
+        );
+    }
+
+    /// The char arm below it would happily have typed a literal `r`, which is
+    /// what it did before the history existed.
+    #[test]
+    fn ctrl_r_on_the_command_line_opens_the_history() {
+        let mut input = Input::default();
+        let line = Mode::Command("w".into());
+
+        assert_eq!(
+            input.on_key(ctrl('r'), &line, ContentKind::Text).unwrap().action,
+            Action::OpenPicker(PickerKind::History),
+        );
+        assert_eq!(
+            input.on_key(key('r'), &line, ContentKind::Text).unwrap().action,
+            Action::CommandChar('r'),
+            "without the ctrl it is still a letter",
         );
     }
 

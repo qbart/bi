@@ -10,10 +10,11 @@ use anyhow::Result;
 
 use crate::buffer::{Buffer, BufferId, Cursor};
 use crate::clipboard::SystemClipboard;
+use crate::cmd_history::History;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
-use crate::picker::{Item, Picker, PickerKind};
+use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
@@ -527,11 +528,20 @@ pub struct Session {
     /// nothing, which is a diagnostic rather than a panic.
     system: Option<Box<dyn SystemClipboard>>,
     pub picker: Option<Picker>,
-    /// The visual mode the picker was opened from, so a register picked over a
-    /// selection replaces it and a cancel gives the selection back. On the
-    /// session rather than in `PickerKind` because the picker is a general
-    /// overlay and this is the editor's business, not the widget's.
-    pick_over: Option<VisualKind>,
+    /// The mode the picker was opened from, and the one it gives back.
+    ///
+    /// A register picked over a selection replaces it, so the visual mode has
+    /// to survive the overlay; a history picked over a half-typed `:` line has
+    /// to give that line back when you cancel. The whole mode rather than the
+    /// visual kind alone, so "the picker returns you where you were" is one
+    /// rule rather than one rule and a special case. On the session rather than
+    /// in `PickerKind` because the picker is a general overlay and this is the
+    /// editor's business, not the widget's.
+    pick_from: Option<Mode>,
+    /// The `:` lines you have run, for `Ctrl-R`. Beside the registers, and
+    /// session state for the same reason: it is not a fact about any buffer,
+    /// and it outlives every one of them. See `docs/specs/cmdline-history.md`.
+    pub cmd_history: History,
     pub mode: Mode,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
@@ -1726,8 +1736,37 @@ impl Editor {
             .into_iter()
             .map(|id| Item { text: self.name_of(id), badge: self.is_modified(id).then_some('+') })
             .collect();
-        self.session.picker = Some(Picker::new(PickerKind::Buffer, items));
-        self.session.mode = Mode::Pick;
+        // No length floor: a file named `a` is a file, and hiding it behind
+        // `Ctrl-A` is the register ring's problem, not this list's.
+        self.session.picker = Some(Picker::new(PickerKind::Buffer, items, 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
+    /// `Ctrl-R` on the `:` line: the picker over the lines you have run.
+    ///
+    /// The half-typed line becomes the query — it is what you already know
+    /// about the command you want — and is what `Esc` gives back.
+    fn open_history_picker(&mut self) {
+        if self.session.cmd_history.is_empty() {
+            // An empty overlay is a worse answer than saying so.
+            self.session.status = "no command history".into();
+            return;
+        }
+        let items = self
+            .session
+            .cmd_history
+            .lines()
+            .iter()
+            .map(|line| Item { text: line.clone(), badge: None })
+            .collect();
+        let typed = match &self.session.mode {
+            Mode::Command(line) => line.clone(),
+            _ => String::new(),
+        };
+        let mut picker = Picker::new(PickerKind::History, items, 0);
+        picker.set_query(typed);
+        self.session.picker = Some(picker);
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
     }
 
     // ---- the window tree ----------------------------------------------------
@@ -2119,6 +2158,12 @@ impl Editor {
                 let Mode::Command(line) = std::mem::take(&mut self.session.mode) else {
                     return true;
                 };
+                // Before running it, so a command that failed is the one you
+                // can recall and fix — which is most of what a history is for.
+                // Only what was typed here: an `Ex` action is a keybinding or
+                // an internal caller, and a history of lines you never typed is
+                // noise in the list that exists to give your own back.
+                self.session.cmd_history.push(&line);
                 self.run_ex(&line);
             }
             Action::Ex { line, run } => {
@@ -2128,6 +2173,11 @@ impl Editor {
                     false => self.session.mode = Mode::Command(line),
                 }
             }
+
+            // Here rather than in the view, beside the `:` line it is opened
+            // from: both have to work in a window holding a tree, where there
+            // is no rope to run anything against.
+            Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
 
             Action::PickChar(c) => {
                 if let Some(picker) = &mut self.session.picker {
@@ -2166,40 +2216,42 @@ impl Editor {
 
     /// Cancelling gives back the mode the picker was opened from, so `"p` over
     /// a selection and then `Esc` leaves the selection where it was rather
-    /// than silently ending it.
+    /// than silently ending it, and `Ctrl-R` over a half-typed `:` line gives
+    /// the line back rather than eating it.
     fn close_picker(&mut self) {
         self.session.picker = None;
-        self.session.mode = match self.session.pick_over.take() {
-            Some(kind) => Mode::Visual(kind),
-            None => Mode::Normal,
-        };
+        self.session.mode = self.session.pick_from.take().unwrap_or(Mode::Normal);
     }
 
     /// Runs whatever the highlighted row meant.
     ///
-    /// The two kinds part company here: a buffer pick reaches the list, which
-    /// is the editor's, and a register pick pastes, which needs a view — and a
-    /// tree pane has nothing to paste into.
+    /// The kinds part company here: a buffer pick reaches the list, which is
+    /// the editor's; a register pick pastes, which needs a view — and a tree
+    /// pane has nothing to paste into; and a history pick runs nothing at all,
+    /// because the line is going back to the command line to be edited.
     fn accept_pick(&mut self) {
         let picker = self.session.picker.take();
         // The selection the picker was opened over is still there, and the
         // paste is about to consume it — so the mode goes back to what it was
         // for `paste_pick` to read, and the paste itself ends visual mode.
-        self.session.mode = match self.session.pick_over.take() {
-            Some(kind) => Mode::Visual(kind),
-            None => Mode::Normal,
-        };
-        let Some(chosen) = picker.as_ref().and_then(Picker::selected) else {
-            self.session.mode = Mode::Normal;
-            return;
-        };
-        match picker.expect("checked above").kind {
+        self.session.mode = self.session.pick_from.take().unwrap_or(Mode::Normal);
+        let Some(picker) = picker else { return };
+        // Nothing highlighted is nothing to accept, which leaves you exactly
+        // where cancelling would.
+        let Some(chosen) = picker.selected() else { return };
+        match picker.kind {
             // A position rather than an id, because the rows were built from
             // the list in order and it cannot change while the picker holds
             // every key.
             PickerKind::Buffer => self.run_buffer_cmd(BufferCmd::Chosen(chosen)),
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
+            }
+            // Put back on the `:` line, unrun. Editing it is the point: the
+            // line you reach for a history for is the one with a word wrong.
+            PickerKind::History => {
+                let line = picker.items()[chosen].text.clone();
+                self.session.mode = Mode::Command(line);
             }
         }
     }
@@ -4131,11 +4183,10 @@ impl View<'_> {
                 },
             })
             .collect();
-        self.session.picker = Some(Picker::new(kind, items));
+        self.session.picker = Some(Picker::new(kind, items, REGISTER_MIN_LEN));
         // Remembered rather than dropped: the selection is what the chosen
         // entry will replace, and `Mode::Pick` is about to hide that it exists.
-        self.session.pick_over = self.session.mode.visual();
-        self.session.mode = Mode::Pick;
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
     }
 
     /// Pastes the register the picker landed on.
@@ -5495,6 +5546,152 @@ mod tests {
         ed.apply(cmd(Action::CommandExecute));
 
         assert!(ed.session.quit, "`:q` left the editor");
+    }
+
+    /// Types a `:` line and runs it, the way a keystroke would — `ex` calls the
+    /// parser directly and so never touches the history.
+    fn run_typed(ed: &mut Editor, line: &str) {
+        ed.apply(cmd(Action::EnterCommandMode));
+        for c in line.chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+        ed.apply(cmd(Action::CommandExecute));
+    }
+
+    /// Puts a half-typed line on the `:` line and leaves it there.
+    fn start_typing(ed: &mut Editor, line: &str) {
+        ed.apply(cmd(Action::EnterCommandMode));
+        for c in line.chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+    }
+
+    fn open_history(ed: &mut Editor) {
+        ed.apply(cmd(Action::OpenPicker(PickerKind::History)));
+    }
+
+    #[test]
+    fn running_a_typed_line_records_it_newest_first() {
+        let mut ed = editor("hello");
+
+        run_typed(&mut ed, "set number");
+        run_typed(&mut ed, "ls");
+
+        assert_eq!(ed.session.cmd_history.lines(), ["ls", "set number"]);
+    }
+
+    /// A keybinding or an internal caller reaching the same parser is not
+    /// something you typed, and a history of those is noise in the one list
+    /// that exists to give your own keystrokes back.
+    #[test]
+    fn a_line_run_by_a_keybinding_is_not_history() {
+        let mut ed = editor("hello");
+
+        ed.apply(cmd(Action::Ex { line: "set number".into(), run: true }));
+
+        assert!(ed.session.cmd_history.is_empty());
+    }
+
+    /// The line with a word wrong is the one you most want back.
+    #[test]
+    fn a_command_that_failed_is_still_in_the_history() {
+        let mut ed = editor("hello");
+
+        run_typed(&mut ed, "nosuchcommand");
+
+        assert_eq!(ed.session.cmd_history.lines(), ["nosuchcommand"]);
+        assert!(!ed.session.status.is_empty(), "and it still said why");
+    }
+
+    #[test]
+    fn ctrl_r_opens_the_history_narrowed_to_what_you_had_typed() {
+        let mut ed = editor("hello");
+        run_typed(&mut ed, "set number");
+        run_typed(&mut ed, "ls");
+        start_typing(&mut ed, "set");
+
+        open_history(&mut ed);
+
+        let picker = ed.session.picker.as_ref().expect("the picker is up");
+        assert_eq!(ed.session.mode, Mode::Pick);
+        assert_eq!(picker.query(), "set", "seeded with the half-typed line");
+        let shown: Vec<&str> =
+            picker.matches().iter().map(|i| picker.items()[*i].text.as_str()).collect();
+        assert_eq!(shown, ["set number"], "and narrowed to it");
+    }
+
+    /// The whole point: it arrives on the `:` line and waits to be edited.
+    #[test]
+    fn accepting_a_history_line_types_it_out_and_runs_nothing() {
+        let mut ed = editor("hello");
+        run_typed(&mut ed, "set number 5");
+        ed.session.options.number = LineNumbers::Every(1);
+        start_typing(&mut ed, "");
+
+        open_history(&mut ed);
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(ed.session.mode, Mode::Command("set number 5".into()));
+        assert_eq!(ed.session.options.number, LineNumbers::Every(1), "not run");
+        assert!(ed.session.picker.is_none(), "and the overlay is gone");
+    }
+
+    /// Cancelling has to give the line back, or `Ctrl-R` becomes a key you
+    /// hesitate over.
+    #[test]
+    fn cancelling_the_history_gives_the_half_typed_line_back() {
+        let mut ed = editor("hello");
+        run_typed(&mut ed, "ls");
+        start_typing(&mut ed, "w out");
+
+        open_history(&mut ed);
+        ed.apply(cmd(Action::PickChar('l')));
+        ed.apply(cmd(Action::PickCancel));
+
+        assert_eq!(ed.session.mode, Mode::Command("w out".into()), "exactly as it was");
+    }
+
+    #[test]
+    fn an_empty_history_says_so_and_leaves_you_on_the_command_line() {
+        let mut ed = editor("hello");
+        start_typing(&mut ed, "w");
+
+        open_history(&mut ed);
+
+        assert_eq!(ed.session.status, "no command history");
+        assert_eq!(ed.session.mode, Mode::Command("w".into()));
+        assert!(ed.session.picker.is_none());
+    }
+
+    /// One-character commands are the most typed there are. The register
+    /// ring's length floor would have hidden every one of them.
+    #[test]
+    fn the_shortest_commands_are_in_the_list() {
+        let mut ed = editor("hello");
+        // Refused — there is no file name — and recorded all the same.
+        run_typed(&mut ed, "w");
+        start_typing(&mut ed, "");
+
+        open_history(&mut ed);
+
+        let picker = ed.session.picker.as_ref().expect("the picker is up");
+        let shown: Vec<&str> =
+            picker.matches().iter().map(|i| picker.items()[*i].text.as_str()).collect();
+        assert_eq!(shown, ["w"], "the register ring's length floor would have hidden it");
+    }
+
+    /// The `:` line works in a tree window, and so must the history over it.
+    #[test]
+    fn the_history_picker_works_from_a_tree_window() {
+        let d = ScratchDir::new("tree-history").file("a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        run_typed(&mut ed, "set number");
+        start_typing(&mut ed, "");
+
+        open_history(&mut ed);
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(ed.session.mode, Mode::Command("set number".into()));
     }
 
     /// The picker is session state too, and `:ls` is reachable from a tree.

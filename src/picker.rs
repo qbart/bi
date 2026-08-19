@@ -8,9 +8,13 @@
 //! Deliberately knows nothing about registers. They are its first client, not
 //! its purpose — file finding and buffer switching want the same widget.
 
-/// Entries shorter than this are hidden until asked for. Exactly the
-/// single-character `x` deletes that would otherwise bury the list.
-const MIN_LEN: usize = 2;
+/// What the register ring hides until asked for: exactly the single-character
+/// `x` deletes that would otherwise bury the list.
+///
+/// A per-picker length rather than a rule for everyone. On a command history it
+/// would hide `w`, `q` and `x` — the shortest commands there are and the ones
+/// typed most often — so history and the buffer list pass 0 instead.
+pub const REGISTER_MIN_LEN: usize = 2;
 
 pub struct Item {
     /// Matched against, previewed, and the row label is its first line. One
@@ -32,6 +36,24 @@ pub enum PickerKind {
     /// the list is the chooser, and the number vim makes you carry never has to
     /// exist. The cost is that `:ls` has nothing to say to a script.
     Buffer,
+    /// `Ctrl-R` on the `:` line, over the lines you have run.
+    ///
+    /// The one kind that does not act on what you choose: it puts the line back
+    /// on the command line for you to edit, because a history you cannot fix a
+    /// typo in is a history that only helps when you were already right. See
+    /// `docs/specs/cmdline-history.md`.
+    History,
+}
+
+impl PickerKind {
+    /// Whether the preview pane earns its third of the overlay.
+    ///
+    /// It exists to show a register entry longer than its row. A command line
+    /// is one line and is already the row, so previewing it would show the same
+    /// text twice and take the space from the list to do it.
+    pub fn wants_preview(&self) -> bool {
+        !matches!(self, PickerKind::History)
+    }
 }
 
 pub struct Picker {
@@ -46,6 +68,10 @@ pub struct Picker {
     selected: usize,
     /// First visible row of the list.
     scroll: usize,
+    /// Entries shorter than this are hidden until `show_short` asks for them.
+    /// Zero hides nothing, which is what a list of commands or file names
+    /// wants — see [`REGISTER_MIN_LEN`].
+    min_len: usize,
     show_short: bool,
 }
 
@@ -63,7 +89,9 @@ fn matches_query(text: &str, query: &str) -> bool {
 }
 
 impl Picker {
-    pub fn new(kind: PickerKind, items: Vec<Item>) -> Self {
+    /// `min_len` hides entries shorter than it behind `Ctrl-A`. Zero hides
+    /// nothing.
+    pub fn new(kind: PickerKind, items: Vec<Item>, min_len: usize) -> Self {
         let mut picker = Self {
             kind,
             items,
@@ -71,10 +99,20 @@ impl Picker {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            min_len,
             show_short: false,
         };
         picker.refilter();
         picker
+    }
+
+    /// Opens with the query already typed.
+    ///
+    /// What makes `Ctrl-R` on a half-written `:` line narrow the list to what
+    /// you had started saying rather than asking you to say it again.
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.refilter();
     }
 
     pub fn query(&self) -> &str {
@@ -109,11 +147,12 @@ impl Picker {
 
     fn refilter(&mut self) {
         let (query, show_short) = (self.query.clone(), self.show_short);
+        let min_len = self.min_len;
         self.matches = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| show_short || item.text.chars().count() >= MIN_LEN)
+            .filter(|(_, item)| show_short || item.text.chars().count() >= min_len)
             .filter(|(_, item)| matches_query(&item.text, &query))
             .map(|(i, _)| i)
             .collect();
@@ -175,8 +214,12 @@ mod tests {
     use super::*;
 
     fn picker(texts: &[&str]) -> Picker {
+        with_min_len(texts, REGISTER_MIN_LEN)
+    }
+
+    fn with_min_len(texts: &[&str], min_len: usize) -> Picker {
         let items = texts.iter().map(|t| Item { text: (*t).into(), badge: None }).collect();
-        Picker::new(PickerKind::Register { before: false }, items)
+        Picker::new(PickerKind::Register { before: false }, items, min_len)
     }
 
     fn shown(p: &Picker) -> Vec<&str> {
@@ -270,6 +313,31 @@ mod tests {
         assert_eq!(shown(&p), ["x", "ab", "hello"]);
         p.toggle_short();
         assert_eq!(shown(&p), ["ab", "hello"]);
+    }
+
+    /// `w` and `q` are the shortest commands there are and the most typed. A
+    /// list that hid them would be hiding the rows it exists for.
+    #[test]
+    fn a_zero_threshold_hides_nothing() {
+        let p = with_min_len(&["w", "q", "ls"], 0);
+        assert_eq!(shown(&p), ["w", "q", "ls"]);
+    }
+
+    /// `Ctrl-R` on a half-typed `:` line opens already narrowed to it.
+    #[test]
+    fn a_seeded_query_filters_from_the_start() {
+        let mut p = with_min_len(&["w out.txt", "q", "w"], 0);
+        p.set_query("w".into());
+        assert_eq!(p.query(), "w");
+        assert_eq!(shown(&p), ["w out.txt", "w"]);
+    }
+
+    /// The one kind whose rows are already whole lines.
+    #[test]
+    fn only_the_history_goes_without_a_preview() {
+        assert!(!PickerKind::History.wants_preview());
+        assert!(PickerKind::Buffer.wants_preview());
+        assert!(PickerKind::Register { before: false }.wants_preview());
     }
 
     #[test]

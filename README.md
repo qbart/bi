@@ -303,9 +303,11 @@ mode with the cursor pulled back onto a character.
 
 ### Picker
 
-Opened with `"p` / `"P`. Typing filters by substring — every whitespace-separated
-term must appear somewhere, in any order, case-insensitively. Matches stay in
-ring order, so the most recent is first.
+One overlay over three lists: the register ring (`"p` / `"P`), the open buffers
+(`:ls`), and the `:` lines you have run (`Ctrl-R` on the command line). Typing
+filters by substring — every whitespace-separated term must appear somewhere, in
+any order, case-insensitively. Matches keep the order they were given, so the
+most recent is first.
 
 | Key | Does |
 |---|---|
@@ -313,13 +315,30 @@ ring order, so the most recent is first.
 | `Backspace` | delete a char; on an empty query, cancel |
 | `Ctrl-N`, `Down` | next match |
 | `Ctrl-P`, `Up` | previous match |
-| `Ctrl-A` | show or hide one-character entries, hidden by default |
-| `Enter` | paste the highlighted entry |
-| `Esc`, `Ctrl-C` | cancel |
+| `Ctrl-A` | show or hide one-character entries, hidden in the register list only |
+| `Enter` | take the highlighted row |
+| `Esc`, `Ctrl-C` | cancel, back to wherever it was opened from |
 
 A `¶` beside a row means the entry is linewise and will open a new line.
-Choosing an entry also moves it to the front of the ring, so a plain `p`
+Choosing a register also moves it to the front of the ring, so a plain `p`
 afterwards repeats it.
+
+### Command line
+
+`:` opens it. Every printable key is text, so nothing there is a command.
+
+| Key | Does |
+|---|---|
+| `Ctrl-R` | the picker over the `:` lines you have run, with what you have typed as the query |
+| `Enter` | run it |
+| `Backspace` | delete a char; on an empty line, leave |
+| `Esc`, `Ctrl-C` | cancel |
+
+A chosen history line is **put back on the `:` line and not run**, so the command
+with one word wrong is one keystroke from being fixed. The history is the
+session's — it is not written to disk — holds 200 lines, keeps one copy of a
+line however often you run it, and records what you typed rather than what a
+keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.md).
 
 ### Ex commands
 
@@ -359,7 +378,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | Key | Does |
 |---|---|
 | `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
-| `Ctrl-W e` | show or hide the tree beside this file, rooted at its directory with it selected |
+| `Ctrl-W e` | show or hide the tree beside this file, rooted where the session is with the file revealed |
 | `Ctrl-W h j k l` | focus the window in that direction |
 | `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
 | `Ctrl-W c` `Ctrl-W q` | close this window |
@@ -384,9 +403,14 @@ to the next buffer.
 
 `bi .` opens a directory, and so do `:e`, `:sp` and `:vs` — a path is a path,
 and which one you meant is a question for the disk. `-` goes the other way, out
-of a file and into the tree above it, and `Ctrl-W e` shows or hides one in a
-pane beside it. There is only ever one tree: `-` goes to the one that is open
-rather than making another. See [docs/specs/tree.md](docs/specs/tree.md).
+of a file and back into the tree, and `Ctrl-W e` shows or hides one in a pane
+beside it. There is only ever one tree: `-` goes to the one that is open rather
+than making another.
+
+**The root is the session's.** Whatever directory you opened is where every
+tree opens, with the file you were in revealed; opening a file never moves it.
+Only naming a directory, `+` and `-` do. See
+[docs/specs/tree.md](docs/specs/tree.md).
 
 | Key | Does |
 |---|---|
@@ -603,6 +627,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | `buffer.rs` | rope, cursor, motions, the single mutation primitive |
 | `config/` | `Config`, the TOML parser and diagnostics, `ConfigSource` |
 | `history.rs` | the undo tree: revisions, branching, invertible `Change`s |
+| `cmd_history.rs` | the `:` lines you have run, newest first |
 | `registers.rs` | the yank ring: entries, capture, eviction |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
