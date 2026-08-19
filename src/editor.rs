@@ -4,7 +4,7 @@
 //! actions and the keymap is hardcoded; when a config language shows up, it
 //! produces actions too and nothing here changes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -584,6 +584,16 @@ pub struct Session {
     match_cache: Option<(BufferId, String, bool, u64, Vec<usize>)>,
     /// An operator waiting for the search line to be finished.
     pending_search_op: Option<(Operator, Sink, usize)>,
+    /// The directory the session is scoped to — what `bi .` was pointed at,
+    /// and what every tree opens on afterwards.
+    ///
+    /// Session state rather than the tree's, because a tree is destroyed every
+    /// time a file displaces it and the scope you chose must outlive that.
+    /// Deriving it from the open file instead is what made opening `pkg/a.rs`
+    /// silently re-root at `pkg`: the root is something you set, with `+`, `-`
+    /// or a directory named outright, and nothing else may move it. See
+    /// `docs/specs/tree.md`.
+    pub tree_root: Option<PathBuf>,
     pub status: String,
     pub quit: bool,
 }
@@ -1074,9 +1084,13 @@ impl Editor {
         let path = path.as_ref();
         if path.is_dir() {
             let mut editor = Self::empty();
+            let tree = Tree::new(path)?;
+            // The directory bi was pointed at is the session's root from here
+            // on, whatever displaces the tree later.
+            editor.session.tree_root = Some(tree.root().to_path_buf());
             // Assigned rather than shown: there was nothing here before, so
             // there is no alternate to remember.
-            editor.window_mut().content = Content::Tree(Tree::new(path)?);
+            editor.window_mut().content = Content::Tree(tree);
             return Ok(editor);
         }
         Ok(Self::with_buffer(Buffer::open(path)?))
@@ -1795,8 +1809,17 @@ impl Editor {
             TreeCmd::Last => return tree.select(usize::MAX),
             TreeCmd::HalfPage { down } => return tree.step(down, (height / 2).max(1)),
             TreeCmd::Collapse => return tree.collapse(),
-            TreeCmd::Up => return tree.up(),
-            TreeCmd::Down => return tree.down(),
+            // The two keys that move the root, and so the two that tell the
+            // session where it is scoped from now on.
+            TreeCmd::Up | TreeCmd::Down => {
+                match cmd {
+                    TreeCmd::Up => tree.up(),
+                    _ => tree.down(),
+                }
+                let root = tree.root().to_path_buf();
+                self.session.tree_root = Some(root);
+                return;
+            }
             TreeCmd::Refresh => return tree.refresh(),
             TreeCmd::ToggleHidden => return tree.toggle_hidden(),
             TreeCmd::Prompt(op) => return self.prompt_file_op(op),
@@ -1948,13 +1971,11 @@ impl Editor {
                     return self.close_tree(open);
                 }
 
-                // Rooted before the split, because it is a fact about the
-                // window you are leaving rather than the one being made.
+                // Read before the split, because which file you are in is a
+                // fact about the window you are leaving rather than the one
+                // being made.
                 let path = self.buffer().and_then(|b| b.path.clone());
-                let root = match path.as_ref().and_then(|p| p.parent()) {
-                    Some(parent) => parent.to_path_buf(),
-                    None => std::env::current_dir().unwrap_or_default(),
-                };
+                let root = self.tree_root(path.as_deref());
                 let tree = match Tree::new(&root) {
                     Ok(tree) => tree,
                     Err(e) => {
@@ -1962,6 +1983,7 @@ impl Editor {
                         return;
                     }
                 };
+                self.session.tree_root = Some(tree.root().to_path_buf());
 
                 let new = self.fresh_window_id();
                 // A file tree belongs on the left, whichever side a plain
@@ -1973,7 +1995,7 @@ impl Editor {
                 }
                 self.windows.push(Window::showing(new, Content::Tree(tree)));
                 self.set_focus(new);
-                self.select_in_tree(path.as_deref());
+                self.reveal_in_tree(path.as_deref());
 
                 // A half-screen tree is not a sidebar. Narrowed to the width
                 // the frontend asked for, which becomes a share of the
@@ -2286,32 +2308,50 @@ impl Editor {
             self.entry_mut(buffer).last = pairs;
         }
         self.session.status = tree.root().display().to_string();
+        // Naming a directory is one of the three ways to say where the session
+        // is scoped — `+` and `-` are the others.
+        self.session.tree_root = Some(tree.root().to_path_buf());
         self.window_mut().show(Content::Tree(tree));
     }
 
-    /// `-` from a text window: the tree on this file's directory, with the
-    /// file selected. A `[No Name]` buffer has no directory, so it roots at
-    /// the working directory instead.
+    /// `-` from a text window: the tree on the session's root, with the file
+    /// you were in revealed.
+    ///
+    /// The root, not this file's directory. Opening `pkg/a.rs` and coming back
+    /// out must land where you were scoped, not one level above the file that
+    /// happened to be open — otherwise every trip through a file walks the
+    /// root somewhere you never asked for.
     fn show_tree_here(&mut self) {
         let path = self.buffer().and_then(|b| b.path.clone());
-        let root = match path.as_ref().and_then(|p| p.parent()) {
-            Some(parent) => parent.to_path_buf(),
-            None => std::env::current_dir().unwrap_or_default(),
-        };
+        let root = self.tree_root(path.as_deref());
 
         self.show_tree(&root.to_string_lossy());
-        self.select_in_tree(path.as_deref());
+        self.reveal_in_tree(path.as_deref());
     }
 
-    /// Puts the focused tree's selection on `path`, if it is showing it.
+    /// Where a tree opens: the session's root, or — the first time, with no
+    /// root ever set — the directory holding `path`, and failing that the
+    /// working directory. A `[No Name]` buffer has no directory, which is the
+    /// case that reaches the end.
+    fn tree_root(&self, path: Option<&Path>) -> PathBuf {
+        if let Some(root) = &self.session.tree_root {
+            return root.clone();
+        }
+        match path.and_then(Path::parent) {
+            Some(parent) => parent.to_path_buf(),
+            None => std::env::current_dir().unwrap_or_default(),
+        }
+    }
+
+    /// Opens the focused tree down to `path` and puts the selection on it.
     ///
     /// What makes `-` and `Ctrl-W e` land where you were rather than at the
-    /// top of the directory.
-    fn select_in_tree(&mut self, path: Option<&std::path::Path>) {
+    /// top of the directory. It has to open the way down as well as select,
+    /// because the root is the session's now and the file may sit several
+    /// directories below it.
+    fn reveal_in_tree(&mut self, path: Option<&Path>) {
         let (Some(path), Some(tree)) = (path, self.window_mut().tree_mut()) else { return };
-        if let Some(row) = tree.rows().iter().position(|r| r.path == path) {
-            tree.select(row);
-        }
+        tree.reveal(path);
     }
 
     // ---- the filesystem -----------------------------------------------------
@@ -6212,6 +6252,53 @@ mod tests {
         assert!(
             matches!(ed.window().alt, Some(Content::Tree(_))),
             "and the tree is the alternate, expansion and all",
+        );
+    }
+
+    /// `bi .` scopes the session to the directory it was given, and opening a
+    /// file out of the tree must not move that. The root is a thing you set,
+    /// with `+` and `-`; nothing else may set it for you.
+    #[test]
+    fn opening_a_file_out_of_the_tree_keeps_the_root_you_opened() {
+        let d = ScratchDir::new("keep-root").file("pkg/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Expand);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+
+        tree_key(&mut ed, TreeCmd::Enter);
+        // `-` out of the file it just opened, which is how you get the tree
+        // back when it was the only window.
+        tree_key(&mut ed, TreeCmd::Up);
+
+        let tree = ed.window().tree().expect("the tree is back");
+        assert_eq!(tree.root(), std::path::Path::new(d.path()), "the directory bi opened");
+        assert_eq!(
+            tree.selected_row().unwrap().name,
+            "a.rs",
+            "with the file you left revealed, however deep it sits",
+        );
+    }
+
+    /// The other half of the rule: `+` moves the root, and it stays moved.
+    #[test]
+    fn re_rooting_is_what_moves_the_root_and_it_outlives_the_tree() {
+        let d = ScratchDir::new("plus-sticks").file("pkg/sub/a.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Down);
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Expand);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 1 });
+
+        tree_key(&mut ed, TreeCmd::Enter);
+        tree_key(&mut ed, TreeCmd::Up);
+
+        let tree = ed.window().tree().expect("the tree is back");
+        assert_eq!(
+            tree.root(),
+            std::path::Path::new(&format!("{}/pkg", d.path())),
+            "where `+` put it, not where the file happens to live",
         );
     }
 

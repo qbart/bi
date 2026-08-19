@@ -354,6 +354,31 @@ impl Tree {
         self.rebuild();
     }
 
+    /// Opens every directory between the root and `path`, and selects it.
+    ///
+    /// What `-` out of a file uses to land you back on it. The root is the
+    /// session's rather than the file's directory, so the file can sit any
+    /// number of levels down and the way to it has to be opened first —
+    /// selecting alone would find no row.
+    ///
+    /// A path outside the root leaves the tree exactly as it was. That is the
+    /// honest answer: the tree cannot show it, and re-rooting to reach it is
+    /// the one thing `+` and `-` exist to be asked for.
+    pub fn reveal(&mut self, path: &Path) {
+        let Ok(rest) = path.strip_prefix(&self.root) else { return };
+        let mut dir = self.root.clone();
+        // The directories on the way, not the file itself — that one is a row
+        // to select, not a directory to open.
+        for part in rest.parent().unwrap_or(Path::new("")).components() {
+            dir.push(part);
+            self.expanded.insert(dir.clone());
+        }
+        self.rebuild();
+        if let Some(row) = self.rows.iter().position(|r| r.path == path) {
+            self.selected = row;
+        }
+    }
+
     /// Re-reads every open directory from disk. `R`.
     ///
     /// The same walk as any other change, because `rebuild` never caches: what
@@ -746,6 +771,35 @@ mod tests {
         tree.select(1);
         tree.down();
         assert_eq!(tree.root(), was);
+    }
+
+    /// `-` out of a file lands on it however deep it sits, which means opening
+    /// the way down and not merely looking for a row.
+    #[test]
+    fn revealing_opens_every_directory_down_to_the_file_and_selects_it() {
+        let d = ScratchDir::new("reveal").file("src/tui/render.rs").file("Cargo.toml");
+        let mut tree = Tree::new(d.path()).unwrap();
+        assert_eq!(shown(&tree), ["src/", "Cargo.toml"]);
+
+        tree.reveal(&d.0.join("src/tui/render.rs"));
+
+        assert_eq!(shown(&tree), ["src/", "  tui/", "    render.rs", "Cargo.toml"]);
+        assert_eq!(tree.selected_row().unwrap().name, "render.rs");
+    }
+
+    /// Re-rooting is the only way to see somewhere else, so a path the tree
+    /// cannot show leaves it alone rather than quietly moving.
+    #[test]
+    fn revealing_something_outside_the_root_changes_nothing() {
+        let d = ScratchDir::new("reveal-outside").file("src/lib.rs");
+        let mut tree = Tree::new(d.path()).unwrap();
+        let (was, rows) = (tree.root().to_path_buf(), shown(&tree));
+
+        tree.reveal(Path::new("/etc/hosts"));
+
+        assert_eq!(tree.root(), was);
+        assert_eq!(shown(&tree), rows);
+        assert_eq!(tree.selected(), 0);
     }
 
     fn clip(paths: &[&str], mode: ClipMode) -> Clipboard {

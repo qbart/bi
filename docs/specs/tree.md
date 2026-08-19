@@ -295,12 +295,33 @@ file is a row every motion has to know about.
 alternative and was rejected: it means repeat everywhere else in the editor, and
 a key that changes meaning per pane is worse than one more `g`.
 
-**`-` in a text window opens the tree** at the current file's directory with that
-file selected — the same path as `:e <dir>`, so it parks the buffer in `alt` and
+**`-` in a text window opens the tree** at the session's root with the current
+file revealed — the same path as `:e <dir>`, so it parks the buffer in `alt` and
 `Ctrl-^` goes straight back. One key, two directions: down into a file from the
-tree, back out to the tree from the file. On a `[No Name]` buffer it roots at the
-working directory. `-` is currently bound only after `Ctrl-W`, so nothing is
-displaced.
+tree, back out to the tree from the file. `-` is currently bound only after
+`Ctrl-W`, so nothing is displaced.
+
+## The root is the session's
+
+The root belongs to the session, not to any one tree, and only three things move
+it: a directory named outright (`bi .`, `:e <dir>`, `:vs <dir>`), `+`, and `-`.
+Every other way of opening a tree reads it.
+
+**Corrected.** This was the current file's *directory*, derived afresh every
+time a tree was opened. A tree is destroyed whenever a file displaces it, so the
+scope you chose did not survive one trip through a file: `bi .`, `Enter` on
+`pkg/a.rs`, `-`, and you were rooted at `pkg` having asked for nothing of the
+kind — and again at `pkg/sub` the next time, walking the root somewhere you
+never named. The root is now `Session::tree_root`, which outlives the tree, and
+the file's directory is only the fallback for a session that has never had one
+(`bi a.rs`, then `Ctrl-W e`). A `[No Name]` buffer has no directory, so that
+case still ends at the working directory.
+
+Because the root can now sit any number of levels above the file, landing on the
+file means opening the way down to it: `Tree::reveal` expands each directory
+between the root and the path before selecting the row. A path outside the root
+leaves the tree untouched — the tree cannot show it, and re-rooting to reach it
+is exactly what `+` and `-` are for.
 
 Because no key in that list enters insert or visual mode, and `Ctrl-W` is
 normal-mode only, **a tree can never be focused in insert or visual mode**. Mode
@@ -336,7 +357,7 @@ field, no per-tree state, and it follows you.
 ### The sidebar shortcut
 
 `Ctrl-W e` is that layout in one key: split vertically, root the new pane at the
-current file's directory, select the file, and narrow it to
+session's root, reveal the current file in it, and narrow it to
 `Chrome::tree_width`. Under the window prefix because it makes a window, which
 is where every other key that makes one lives.
 
@@ -577,6 +598,10 @@ pattern extends to one.
 - `gh` reveals dotfiles and hides them again; the selection clamps rather than
   resets when the list shrinks under it, as the picker's does.
 - `-` re-roots and lands selected on the directory it left, expanded.
+- `reveal` opens every directory down to a nested file and selects it; a path
+  outside the root changes nothing.
+- Opening a file out of the tree and coming back with `-` returns to the root
+  you opened, with the file revealed — and to where `+` put it, when it moved.
 - A directory that cannot be read expands to nothing and reports why.
 
 File operations, each of which is an ex command and needs no tree:
