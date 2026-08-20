@@ -50,10 +50,12 @@ and the point of matching vim here is muscle memory.
 because it is the only one whose argument starts with a character no command
 name contains. `:mark` still reads as `mark`.
 
-**A typed range — `:2,3m 4` — is not supported**, here or anywhere else in
-bi's `:` line: there is no range parser, and one command wanting one is not a
-reason to grow it. The range comes from the selection instead, which is the
-same block said with the keys you already have.
+**A typed range says which lines to move**: `:2,3m 4`, `:%m 0`, `:'<,'>m $`.
+With none written the selection does, which is what makes `Shift-Down` and a
+bare `:m +1` agree about what they are moving. The range language is
+`docs/specs/ranges.md` — it went into its own module the moment a second
+command needed one, and `:m`'s own argument is now read with the same parser
+rather than a private one.
 
 Over a visual selection, the whole block moves and stays selected, so a second
 `:m` — or a second `Shift-Down` — carries on from where the first left off.
@@ -77,9 +79,8 @@ number is a claim about a line that either exists or does not. The arrow keys
 clamp, because they name no line — that difference is the whole distinction
 between the two halves.
 
-**An address inside the block moves nothing.** With lines 2 and 3 selected,
-`:m 2` and `:m 3` are no-ops, which falls out of the arithmetic rather than
-needing a rule.
+**An address inside the block moves nothing.** `:2,3m 2` and `:2,3m 3` are
+no-ops, which falls out of the arithmetic rather than needing a rule.
 
 **Corrected, twice, and this is the second.** `:m` first read `+N` as N rows
 down and a bare `N` as "become line N". The bare number went first, being a
@@ -187,6 +188,8 @@ no-op on the undo stack.
 - `:m .+1`, `:m+1`, `:move.+1` and `:m .-2` all reach the same address the
   spaced signed forms do; `:m .` and `:m .-1` move nothing.
 - `:mark` is still an unknown command and `:move` alone still asks where.
+- `:2,3m $` moves those two lines whatever is selected; `:m $` with no range
+  moves the selection; a range past the end is refused and names the line.
 - `:m +99` clamps to the bottom rather than refusing.
 - `Shift-Up` on the first line and `Shift-Down` on the last do nothing at all —
   no edit, nothing to undo.

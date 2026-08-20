@@ -15,6 +15,7 @@ use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, 
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
+use crate::range::{Address, LineRange, Where};
 use crate::registers::{Entry, EntryKind, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
@@ -1098,8 +1099,15 @@ enum ExLine {
     Paste(Option<String>),
     /// `:paste-as <path>` — place the one that stopped, and carry on.
     PasteAs(String),
-    /// `:m +3`, `:m -2`, `:m 0`, `:m $`, `:m 12`.
-    Move(MoveTo),
+    /// `:m +3`, `:2,5m 0`, `:m $`.
+    ///
+    /// `lines` is what the range in front of the command said, and `None` is
+    /// what it says when nobody wrote one — where `:m`'s own default lives,
+    /// which is the selection. See `docs/specs/ranges.md`.
+    Move {
+        lines: Option<LineRange>,
+        to: Address,
+    },
     /// `:case snake` — respell what is selected, or the word under the cursor.
     Case(crate::case::Style),
     /// `:alt` — the other file: the test beside the implementation, the
@@ -1115,57 +1123,26 @@ enum ExLine {
     Revert {
         force: bool,
     },
-    /// `:42`.
-    Goto(usize),
+    /// `:42`, `:$`, `:%` — a range and no command, which goes to its last
+    /// line. A special case in the parser once; now the general rule falling
+    /// out. See `docs/specs/ranges.md`.
+    Goto(Address),
     /// `:reload` — the config, not the buffer. See [`ExLine::Revert`].
     ReloadConfig,
 }
 
-/// Where `:m` puts the lines — an address, exactly as in vim.
+/// `:m`'s argument: one address, and nothing after it.
 ///
-/// Every form names a line to land *after*, including the signed ones: `+3` is
-/// `.+3` and `-2` is `.-2`, which is why `:m -1` moves nothing at all. The
-/// arithmetic is vim's, measured against it rather than remembered. See
-/// `docs/specs/move-lines.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MoveTo {
-    /// `+N` / `-N`, relative to the cursor's line.
-    Relative(isize),
-    /// `:m 12` — after line 12. `:m 0` is before the first.
-    Row(usize),
-    /// `:m $`.
-    End,
-}
-
-fn parse_move(arg: &str) -> Option<MoveTo> {
-    let arg = arg.trim();
-    if arg == "$" {
-        return Some(MoveTo::End);
-    }
-    // `.` is the cursor's line, and it may be written out. `+1` already means
-    // `.+1`, but `:m .+1` and `:m .-2` are what a decade of vimrcs say, and a
-    // command that is vim in one spelling and an error in the other is worse
-    // than either.
-    let arg = match arg.strip_prefix('.') {
-        // `:m .` is the line the cursor is on, and moving something after
-        // where it already is moves nothing. Vim agrees.
-        Some("") => return Some(MoveTo::Relative(0)),
-        Some(rest) => rest.trim_start(),
-        None => arg,
-    };
-    // A bare `+` or `-` is one, which is what a finger reaching for the key
-    // rather than the number means. Vim reads them the same way.
-    let offset = |rest: &str| -> Option<isize> {
-        match rest.trim() {
-            "" => Some(1),
-            n => n.parse().ok(),
-        }
-    };
-    match arg.split_at_checked(1) {
-        Some(("+", rest)) => offset(rest).map(MoveTo::Relative),
-        Some(("-", rest)) => offset(rest).map(|n| MoveTo::Relative(-n)),
-        _ => arg.parse().ok().map(MoveTo::Row),
-    }
+/// The same language the range in front of the command is written in
+/// (`docs/specs/ranges.md`), which is the point of having taken it out of
+/// here: `:m .+1`, `:m -2`, `:m $` and `:m 12` are four spellings this file no
+/// longer knows the rules for. Trailing anything is refused, so `:m 3 4` is a
+/// message rather than a silent `:m 3`.
+fn parse_move(arg: &str) -> Option<Address> {
+    let (range, rest) = crate::range::parse(arg.trim());
+    let range = range?;
+    // One address, not a span: `:m 2,5` names two lines to land after.
+    (rest.is_empty() && range.first == range.last).then_some(range.first)
 }
 
 /// `m+1` as `("m", "+1")` — the address vim lets touch the command name.
@@ -1181,12 +1158,25 @@ fn split_glued_move(cmd: &str) -> Option<(&str, &str)> {
     address.then(|| cmd.split_at(cmd.len() - rest.len()))
 }
 
-/// Splits a `:` line into a command and its argument. `None` for a blank line,
-/// which is not an error and not a command.
+/// Splits a `:` line into a range, a command and its argument. `None` for a
+/// blank line, which is not an error and not a command.
 fn parse_ex(line: &str) -> Option<ExLine> {
     let line = line.trim();
     if line.is_empty() {
         return None;
+    }
+
+    // The lines the command applies to, off the front. A line that starts with
+    // no address has no range and comes back whole, which is what lets every
+    // command below read it exactly as it always did. See
+    // `docs/specs/ranges.md`.
+    let (range, line) = crate::range::parse(line);
+    if line.is_empty() {
+        // A range and no command goes to its last line: `:42`, `:$`, `:%`.
+        return Some(match range {
+            Some(range) => ExLine::Goto(range.last),
+            None => return None,
+        });
     }
 
     let (cmd, arg) = match line.split_once(char::is_whitespace) {
@@ -1203,6 +1193,14 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     let split = |dir| {
         ExLine::Window(WindowCmd::Split { dir, path: (!arg.is_empty()).then(|| arg.to_string()) })
     };
+
+    // A range handed to a command that has no use for one is an error rather
+    // than a range quietly dropped: vim writes part of a file for `:1,5w` and
+    // bi does not, and a command that ignores half of what you typed is the
+    // worse of the two ways to not support something.
+    if range.is_some() && !matches!(name, "m" | "move") {
+        return Some(ExLine::Error(format!("`:{name}` takes no range")));
+    }
 
     Some(match name {
         "w" | "write" => ExLine::Write(arg.into()),
@@ -1257,7 +1255,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "paste-as" if !arg.is_empty() => ExLine::PasteAs(arg.into()),
         "paste-as" => ExLine::Error("paste it as what?".into()),
         "m" | "move" => match parse_move(arg) {
-            Some(to) => ExLine::Move(to),
+            Some(to) => ExLine::Move { lines: range, to },
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
         },
         "alt" | "alternate" => ExLine::Alternate,
@@ -1269,10 +1267,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         },
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         "reload" => ExLine::ReloadConfig,
-        _ => match name.parse::<usize>() {
-            Ok(row) => ExLine::Goto(row),
-            Err(_) => ExLine::Unknown(name.into()),
-        },
+        // A bare line number never reaches here: it is a range with no
+        // command, and was handled before the table.
+        _ => ExLine::Unknown(name.into()),
     })
 }
 
@@ -3757,8 +3754,8 @@ impl Editor {
                 None => self.paste_into_selected(),
             },
             ExLine::PasteAs(path) => self.run_paste(Some(path.into())),
-            ExLine::Move(to) => {
-                self.in_view(|view| view.move_to(to));
+            ExLine::Move { lines, to } => {
+                self.in_view(|view| view.move_to(lines, to));
             }
             ExLine::Case(style) => {
                 self.in_view(|view| view.recase(style));
@@ -3775,8 +3772,8 @@ impl Editor {
             ExLine::Revert { force } => {
                 self.in_view(|view| view.edit(force));
             }
-            ExLine::Goto(row) => {
-                self.in_view(|view| view.goto_row(row));
+            ExLine::Goto(address) => {
+                self.in_view(|view| view.goto(address));
             }
             ExLine::WriteQuit(path) => {
                 if self.in_view(|view| view.write(&path)) == Some(true) {
@@ -5463,23 +5460,34 @@ impl View<'_> {
         }]);
     }
 
-    /// `:m {address}` — vim's move, arithmetic and all.
-    fn move_to(&mut self, to: MoveTo) {
-        let (first, last) = self.selected_rows();
-        let lines = self.buffer.line_count() as isize;
-        // `.` is the cursor's line. A range does not move it, which is why
-        // `:m +1` over a selection depends on which end the cursor is at —
-        // vim's behaviour, and the reason `Shift-Down` exists for the job.
-        let here = self.buffer.row_at(self.selections.cursor()) as isize + 1;
-        let address = match to {
-            MoveTo::Relative(by) => here + by,
-            MoveTo::Row(row) => row as isize,
-            MoveTo::End => lines,
+    /// `:[range]m {address}` — vim's move, arithmetic and all.
+    ///
+    /// The range says which lines; with none written, the selection does,
+    /// which is what makes `Shift-Down` and a bare `:m +1` agree about what
+    /// they are moving.
+    fn move_to(&mut self, lines_named: Option<LineRange>, to: Address) {
+        let at = self.line_numbers();
+        let (first, last) = match lines_named {
+            Some(range) => match range.rows(at) {
+                Ok(rows) => rows,
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            },
+            None => self.selected_rows(),
         };
+        let lines = self.buffer.line_count() as isize;
+        // `.` is still the cursor's line even with a range in front of the
+        // command — a range does not move the cursor, which is why `:m +1`
+        // over a selection depends on which end the cursor is at. Vim's
+        // behaviour, and the reason `Shift-Down` exists for the job.
+        let address = to.resolve(at);
 
         // Off either end is refused rather than clamped, because that is what
         // vim does — and unlike the arrow keys, a typed address is a claim
-        // about a line that either exists or does not.
+        // about a line that either exists or does not. Zero is not off the
+        // end: it is the line to land after that puts the block at the top.
         if address < 0 || address > lines {
             self.session.status = format!("no line {address}");
             return;
@@ -5543,7 +5551,31 @@ impl View<'_> {
         address - lifted
     }
 
-    /// `:42` — put the cursor on that row.
+    /// The three line numbers an address resolves against, one-based.
+    ///
+    /// Gathered here so `crate::range` never learns what a `Buffer` is — the
+    /// same division `Buffer` and `Indent` draw. See `docs/specs/ranges.md`.
+    fn line_numbers(&self) -> Where {
+        let (first, last) = self.selected_rows();
+        Where {
+            lines: self.buffer.line_count(),
+            cursor: self.buffer.row_at(self.selections.cursor()) + 1,
+            selection: (first + 1, last + 1),
+        }
+    }
+
+    /// `:42`, `:$`, `:%` — a range and no command puts the cursor on its last
+    /// line.
+    ///
+    /// Clamped rather than refused, unlike a range's own lines: this is the
+    /// oldest spelling of "take me there", `:0` has always meant the top, and
+    /// a number past the end means the bottom to everyone who types one.
+    fn goto(&mut self, address: Address) {
+        let row = address.resolve(self.line_numbers()).max(1) as usize;
+        self.goto_row(row);
+    }
+
+    /// Puts the cursor on a one-based row.
     fn goto_row(&mut self, row: usize) {
         let cursor = self.buffer.at_row(row.saturating_sub(1), false);
         *self.selections = Selections::single(cursor);
@@ -7287,7 +7319,7 @@ mod tests {
         };
 
         // The two every vimrc binds, written out and glued on.
-        for down in ["m .+1", "m+1", "m .+ 1", "move.+1"] {
+        for down in ["m .+1", "m+1", "move.+1"] {
             assert_eq!(at(1, down), "a\nc\nb\nd\ne\n", "{down}");
         }
         for up in ["m .-2", "m-2", "move-2"] {
@@ -7298,6 +7330,77 @@ mod tests {
         assert_eq!(at(1, "m .-1"), "a\nb\nc\nd\ne\n", "and neither does the line above it");
         assert_eq!(at(1, "m$"), "a\nc\nd\ne\nb\n");
         assert_eq!(at(1, "m0"), "b\na\nc\nd\ne\n");
+    }
+
+    /// A range in front of the command says which lines, whatever the
+    /// selection is — which is the whole reason `:2,5m` exists rather than
+    /// "select it first". See `docs/specs/ranges.md`.
+    #[test]
+    fn a_range_says_which_lines_move_and_no_range_means_the_selection() {
+        let mut ed = editor("a\nb\nc\nd\ne\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+        ex(&mut ed, "2,3m $");
+        assert_eq!(whole(&ed), "a\nd\ne\nb\nc\n", "the range, not the cursor's line");
+
+        // The same command with no range moves what is selected.
+        let mut ed = editor("a\nb\nc\nd\ne\n");
+        ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
+        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ex(&mut ed, "m $");
+        assert_eq!(whole(&ed), "a\nd\ne\nb\nc\n");
+
+        // And `%` is every line, which moves them all and changes nothing.
+        let mut ed = editor("a\nb\nc\n");
+        ex(&mut ed, "%m 0");
+        assert_eq!(whole(&ed), "a\nb\nc\n");
+    }
+
+    /// A range's lines have to exist, unlike `:m`'s argument, which may name
+    /// line 0 because it is a line to land *after*.
+    #[test]
+    fn a_range_past_the_end_is_refused_and_names_the_line() {
+        let mut ed = editor("a\nb\nc\n");
+        ex(&mut ed, "2,9m 0");
+        assert_eq!(ed.session.status, "no line 9");
+        assert_eq!(whole(&ed), "a\nb\nc\n", "and nothing moved");
+    }
+
+    /// A range handed to a command that has no use for one is an error, not a
+    /// range quietly dropped: vim writes part of a file for `:1,5w`, and a
+    /// command that ignores half of what you typed is the worse of the two
+    /// ways to not support something.
+    #[test]
+    fn a_command_that_takes_no_range_says_so_rather_than_ignoring_it() {
+        let mut ed = editor("a\nb\nc\n");
+        for line in ["1,5w out.txt", "2q", "%case snake"] {
+            ex(&mut ed, line);
+            assert!(ed.session.status.ends_with("takes no range"), "{line}: {}", ed.session.status);
+        }
+        assert_eq!(whole(&ed), "a\nb\nc\n");
+    }
+
+    /// A range with no command goes to its last line. `:42` was a special case
+    /// in the parser; now it is this rule falling out, and `:$` and `:%` come
+    /// with it.
+    #[test]
+    fn a_range_with_no_command_goes_to_its_last_line() {
+        let row = |line: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
+            ex(&mut ed, line);
+            ed.cursor_row().unwrap()
+        };
+
+        assert_eq!(row("3"), 2, "one-based on the way in");
+        assert_eq!(row("$"), 4);
+        assert_eq!(row("%"), 4, "the last line of `1,$`");
+        assert_eq!(row("+2"), 2, "an offset from where the cursor is");
+        assert_eq!(row("2,4"), 3, "the last line of the range");
+        // Clamped rather than refused, unlike a range's own lines: this is the
+        // oldest spelling of "take me there".
+        assert_eq!(row("99"), 4);
+        assert_eq!(row("0"), 0);
     }
 
     /// The split only fires where an address is stuck to the name, or every

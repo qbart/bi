@@ -212,8 +212,13 @@ lines after line 12, and the signed forms are addresses too: `+3` means `.+3`,
 which is why `:m -1` names the line above and moves nothing, and `:m -2` is how
 you go up one. Write the `.` out if your fingers do — `:m .+1` and `:m .-2` are
 the same two addresses, and so are `:m+1` and `:m-2` with nothing in between.
-A typed range is not: `:2,3m 4` has no range parser to read it, and the
-selection says the same thing with the keys you already have.
+
+A range in front of the command says *which* lines: `:2,3m 4`, `:%m 0`,
+`:'<,'>m $`. With none written the selection does. Ranges are their own small
+language — `%`, `.`, `$`, a line number, `'<` and `'>`, each with `+N`/`-N`
+offsets — shared by every command that takes one; see
+[docs/specs/ranges.md](docs/specs/ranges.md). A range with no command after it
+goes to its last line, which is what `:42` has always been.
 
 Being an address is also why it is direction-dependent: coming from above line
 12 the line becomes line 12, coming from below it becomes line 13. And an
@@ -439,10 +444,11 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:bd` `:bd!` | delete this buffer and close the windows showing it, refusing unsaved changes unless forced |
 | `:hls` `:noh` | start / stop highlighting every search match |
 | `:set number {n}` | line numbers: `0` off, `-1` relative, `{n}` every *n*th |
-| `:{n}` | go to line *n* |
+| `:{n}` `:$` `:%` | a range and no command goes to its last line |
 | `:m 12` `:m 0` `:m $` | move this line, or the selection, after that line |
 | `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
 | `:m .+1` `:m+1` | the `.` written out, or the space left off. Both are the address above |
+| `:2,5m 0` `:%m $` | a range says *which* lines; with none, the selection does |
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:case <style>` | respell the selection, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
@@ -837,6 +843,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `picker.rs` | the overlay's state: query, matches, selection |
+| `range.rs` | `:` line addresses — `%`, `.`, `$`, `'<`, offsets, and resolving them |
 | `selection.rs` | selections: the editing primitive normal/visual/multi-cursor share |
 | `tree.rs` | the file tree: expansion, the flattened rows, the filesystem |
 | `syntax.rs` | tree-sitter: incremental reparse, highlight spans |

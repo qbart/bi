@@ -35,6 +35,7 @@ pub mod key;
 pub mod label;
 pub mod motion;
 pub mod picker;
+pub mod range;
 pub mod registers;
 pub mod selection;
 pub mod surround;
