@@ -92,7 +92,9 @@ gutter_current = "#ffffff"
 rule           = "#00aaaa"
 filler         = "#5555ff"
 indent_guide   = "#00aaaa"
-context        = "#005555"                           # the cursor line's blue
+# EGA has no half-cyan, so the annotation takes the palette's own — the same
+# teal the rule and the guides use, which is as quiet as this theme goes.
+context        = "#00aaaa"                           # cyan
 # The IDE's menu bar: black on light gray, across the top of the screen.
 context_header = { fg = "#000000", bg = "#aaaaaa" }
 

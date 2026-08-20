@@ -162,6 +162,7 @@ const LIB_MODULES: &[&str] = &[
     "case.rs",
     "clipboard.rs",
     "cmd_history.rs",
+    "cmdline.rs",
     "colors.rs",
     "config/keys.rs",
     "config/mod.rs",

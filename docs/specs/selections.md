@@ -176,6 +176,15 @@ testing against vim:
 - **A collapsed selection still covers something in visual mode** — one
   character for `v`, a whole line for `V`. The renderer skipped collapsed
   selections, so `V` on a single line highlighted nothing.
+- **A linewise highlight reaches the edge of the pane.** Stopping it at the
+  last character is what vim does and it does not survive a cursor line: `V` on
+  `alpha` lit five cells in `selection` inside a bar of `cursorline`, two
+  colours a shade apart in every theme here, and the answer to "is anything
+  selected" became "apply an operator and find out". A filled row says `V`
+  where a patch of it said nothing. The gutter stays out of it — the number
+  column is not part of what you selected — and on the cursor's own row it
+  keeps the cursor line, because the fill only paints cells nothing has
+  claimed.
 
 ### Replace
 

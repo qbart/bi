@@ -11,6 +11,7 @@ use anyhow::Result;
 use crate::buffer::{Buffer, BufferId, Cursor};
 use crate::clipboard::SystemClipboard;
 use crate::cmd_history::History;
+use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -35,6 +36,18 @@ pub enum VisualKind {
     Char,
     Line,
     Block,
+}
+
+/// Where a key moves the cursor on the `:` line.
+///
+/// Four values because four is what a prompt has: one character either way,
+/// and the two ends. See `docs/specs/cmdline.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdMove {
+    Left,
+    Right,
+    Home,
+    End,
 }
 
 /// What the gutter shows. `:set number`.
@@ -100,8 +113,9 @@ pub enum Mode {
     Replace,
     /// Selections have room in them and motions move the head.
     Visual(VisualKind),
-    /// The `:` line being typed, without the leading colon.
-    Command(String),
+    /// The `:` line being typed, without the leading colon. Its cursor rides
+    /// with it — see `docs/specs/cmdline.md`.
+    Command(crate::cmdline::CmdLine),
     /// The `/` or `?` line being typed, without the leading key.
     Search {
         query: String,
@@ -357,6 +371,14 @@ pub enum Action {
     },
     CommandChar(char),
     CommandBackspace,
+    /// Moving the cursor along the `:` line. Arrows and the shells' `Ctrl-A` /
+    /// `Ctrl-E`, because there is no normal mode on a prompt to put motions in
+    /// — see `docs/specs/cmdline.md`.
+    CommandMove(CmdMove),
+    /// `Up` / `Down`: older or newer, out of the command history.
+    CommandRecall {
+        older: bool,
+    },
     CommandExecute,
     CommandCancel,
 
@@ -2913,7 +2935,7 @@ impl Editor {
             .map(|line| Item { text: line.clone(), badge: None })
             .collect();
         let typed = match &self.session.mode {
-            Mode::Command(line) => line.clone(),
+            Mode::Command(line) => line.to_string(),
             _ => String::new(),
         };
         let mut picker = Picker::new(PickerKind::History, items, 0);
@@ -3308,18 +3330,40 @@ impl Editor {
         match action {
             Action::EnterCommandMode => {
                 self.session.status.clear();
-                self.session.mode = Mode::Command(String::new());
+                self.session.mode = Mode::Command(CmdLine::default());
             }
             Action::CommandChar(c) => {
                 if let Mode::Command(line) = &mut self.session.mode {
-                    line.push(*c);
+                    line.insert(*c);
                 }
             }
             Action::CommandBackspace => {
+                // Nothing to delete on an empty line is how `Backspace` leaves;
+                // nothing to delete at column 0 of a line with text on it is
+                // just nothing to delete.
                 if let Mode::Command(line) = &mut self.session.mode
-                    && line.pop().is_none()
+                    && !line.backspace()
+                    && line.is_empty()
                 {
                     self.session.mode = Mode::Normal;
+                }
+            }
+            Action::CommandMove(how) => {
+                if let Mode::Command(line) = &mut self.session.mode {
+                    match how {
+                        CmdMove::Left => line.left(),
+                        CmdMove::Right => line.right(),
+                        CmdMove::Home => line.home(),
+                        CmdMove::End => line.end(),
+                    }
+                }
+            }
+            Action::CommandRecall { older } => {
+                // The store and the line are both on the session, so this is
+                // the one place that can hand one to the other.
+                let history = self.session.cmd_history.lines().to_vec();
+                if let Mode::Command(line) = &mut self.session.mode {
+                    line.recall(&history, *older);
                 }
             }
             Action::CommandCancel => {
@@ -3343,7 +3387,7 @@ impl Editor {
                 let line = line.clone();
                 match run {
                     true => self.run_ex(&line),
-                    false => self.session.mode = Mode::Command(line),
+                    false => self.session.mode = Mode::Command(line.into()),
                 }
             }
 
@@ -3451,7 +3495,7 @@ impl Editor {
             // line you reach for a history for is the one with a word wrong.
             PickerKind::History => {
                 let line = picker.items()[chosen].text.clone();
-                self.session.mode = Mode::Command(line);
+                self.session.mode = Mode::Command(line.into());
             }
         }
     }
@@ -3829,7 +3873,7 @@ impl Editor {
             if target.exists() {
                 // Stop rather than overwrite, and ask. Esc on that line
                 // abandons the rest — see `Action::CommandCancel`.
-                self.session.mode = Mode::Command(format!("paste-as {}", target.display()));
+                self.session.mode = Mode::Command(format!("paste-as {}", target.display()).into());
                 self.session.pasting = Some(pasting);
                 return;
             }
@@ -3903,7 +3947,7 @@ impl Editor {
             FileOp::Rename => format!("rename {path} {path}"),
         };
         self.session.status.clear();
-        self.session.mode = Mode::Command(line);
+        self.session.mode = Mode::Command(line.into());
     }
 
     /// Runs a `:` line.
@@ -5361,6 +5405,8 @@ impl View<'_> {
             | Action::Ex { .. }
             | Action::CommandChar(_)
             | Action::CommandBackspace
+            | Action::CommandMove(_)
+            | Action::CommandRecall { .. }
             | Action::CommandCancel
             | Action::CommandExecute
             | Action::PickChar(_)
@@ -7151,6 +7197,110 @@ mod tests {
 
     fn open_history(ed: &mut Editor) {
         ed.apply(cmd(Action::OpenPicker(PickerKind::History)));
+    }
+
+    /// The `:` line as it stands, and where its cursor is.
+    fn cmdline(ed: &Editor) -> (String, usize) {
+        let Mode::Command(line) = &ed.session.mode else { panic!("not on the `:` line") };
+        (line.to_string(), line.cursor())
+    }
+
+    fn cmd_move(ed: &mut Editor, how: CmdMove) {
+        ed.apply(cmd(Action::CommandMove(how)));
+    }
+
+    fn recall(ed: &mut Editor, older: bool) {
+        ed.apply(cmd(Action::CommandRecall { older }));
+    }
+
+    /// A prompt with no cursor makes you hold Backspace to fix one character.
+    /// See `docs/specs/cmdline.md`.
+    #[test]
+    fn typing_lands_where_the_cursor_is() {
+        let mut ed = editor("hello");
+        start_typing(&mut ed, "sm/a/b/");
+        cmd_move(&mut ed, CmdMove::Home);
+        ed.apply(cmd(Action::CommandChar('%')));
+
+        assert_eq!(cmdline(&ed), ("%sm/a/b/".to_string(), 1));
+    }
+
+    #[test]
+    fn backspace_takes_what_is_before_the_cursor_and_an_empty_line_leaves() {
+        let mut ed = editor("hello");
+        start_typing(&mut ed, "wq");
+        cmd_move(&mut ed, CmdMove::Left);
+        ed.apply(cmd(Action::CommandBackspace));
+        assert_eq!(cmdline(&ed), ("q".to_string(), 0));
+
+        // At column 0 with text still on the line there is nothing to delete,
+        // and nothing to delete is not a reason to leave.
+        ed.apply(cmd(Action::CommandBackspace));
+        assert_eq!(cmdline(&ed), ("q".to_string(), 0));
+
+        cmd_move(&mut ed, CmdMove::End);
+        ed.apply(cmd(Action::CommandBackspace));
+        ed.apply(cmd(Action::CommandBackspace));
+        assert_eq!(ed.session.mode, Mode::Normal, "an empty line still leaves");
+    }
+
+    #[test]
+    fn the_ends_of_the_line_are_a_keypress_away() {
+        let mut ed = editor("hello");
+        start_typing(&mut ed, "set number");
+
+        cmd_move(&mut ed, CmdMove::Home);
+        assert_eq!(cmdline(&ed).1, 0);
+        cmd_move(&mut ed, CmdMove::Left);
+        assert_eq!(cmdline(&ed).1, 0, "and stays there");
+
+        cmd_move(&mut ed, CmdMove::End);
+        assert_eq!(cmdline(&ed).1, "set number".len());
+        cmd_move(&mut ed, CmdMove::Right);
+        assert_eq!(cmdline(&ed).1, "set number".len());
+    }
+
+    /// `Up` is for the last thing you ran, or the one before it; `Ctrl-R` is
+    /// for finding one. Both walk the same list.
+    #[test]
+    fn up_and_down_walk_the_history_and_give_the_draft_back() {
+        let mut ed = editor("hello");
+        run_typed(&mut ed, "set number");
+        run_typed(&mut ed, "ls");
+        start_typing(&mut ed, "half");
+
+        recall(&mut ed, true);
+        assert_eq!(cmdline(&ed), ("ls".to_string(), 2), "newest first, cursor at its end");
+        recall(&mut ed, true);
+        assert_eq!(cmdline(&ed).0, "set number");
+        recall(&mut ed, true);
+        assert_eq!(cmdline(&ed).0, "set number", "the oldest does not wrap");
+
+        recall(&mut ed, false);
+        assert_eq!(cmdline(&ed).0, "ls");
+        recall(&mut ed, false);
+        assert_eq!(cmdline(&ed).0, "half", "past the newest is what you were typing");
+    }
+
+    #[test]
+    fn a_recalled_line_runs_and_is_recorded_again() {
+        let mut ed = editor("hello");
+        run_typed(&mut ed, "set number 3");
+        ed.apply(cmd(Action::EnterCommandMode));
+        recall(&mut ed, true);
+        ed.apply(cmd(Action::CommandExecute));
+
+        assert_eq!(ed.session.cmd_history.lines(), ["set number 3"], "one entry, not two");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn up_with_no_history_leaves_the_line_alone() {
+        let mut ed = editor("hello");
+        start_typing(&mut ed, "half");
+        recall(&mut ed, true);
+
+        assert_eq!(cmdline(&ed), ("half".to_string(), 4));
     }
 
     #[test]

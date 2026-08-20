@@ -21,6 +21,7 @@ pub mod buffer;
 pub mod case;
 pub mod clipboard;
 pub mod cmd_history;
+pub mod cmdline;
 pub mod colors;
 pub mod config;
 pub mod context;

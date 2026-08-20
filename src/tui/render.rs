@@ -285,34 +285,46 @@ fn decorate(
     spans
 }
 
-/// Paints `bg` behind a line and pads it to `width`, so the highlight reaches
-/// the edge of the pane instead of stopping at the last character.
+/// Paints `bg` behind a line from column `from` on, and pads it to `width`, so
+/// the highlight reaches the edge of the pane instead of stopping at the last
+/// character.
 ///
 /// `None` is a theme that asked for no such highlight, and leaves the line
 /// alone rather than painting it a colour nobody chose.
 ///
+/// `from` is what keeps a linewise selection out of the gutter: the cursor
+/// line takes the whole row, numbers included, and a selection takes the text
+/// area — the number column is not part of what you selected. It is a column
+/// of the built line, so callers pass the gutter width rather than 0.
+///
 /// Span styles are patched rather than replaced — the syntax colours are the
 /// foreground and have to survive.
-fn fill_line(spans: Vec<Span<'static>>, bg: Option<ThemeColor>, width: usize) -> Line<'static> {
-    let Some(bg) = bg.map(color) else { return Line::from(spans) };
+fn fill_line(
+    spans: Vec<Span<'static>>,
+    bg: Option<ThemeColor>,
+    from: usize,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let Some(bg) = bg.map(color) else { return spans };
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let mut spans: Vec<Span<'static>> = spans
-        .into_iter()
-        .map(|s| {
-            // Only where nothing is painted yet: a selection on the cursor's
-            // own line has already claimed those cells, and the cursor line
-            // must not paint over it.
-            match s.style.bg {
-                Some(_) => s,
-                None => {
-                    let style = s.style.bg(bg);
-                    s.style(style)
-                }
+    let (mut out, rest) = split_at_col(spans, from);
+    out.extend(rest.into_iter().map(|s| {
+        // Only where nothing is painted yet: a selection on the cursor's own
+        // line has already claimed those cells, and the cursor line must not
+        // paint over it.
+        match s.style.bg {
+            Some(_) => s,
+            None => {
+                let style = s.style.bg(bg);
+                s.style(style)
             }
-        })
-        .collect();
-    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), Style::default().bg(bg)));
-    Line::from(spans)
+        }
+    }));
+    out.push(Span::styled(
+        " ".repeat(width.saturating_sub(used.max(from))),
+        Style::default().bg(bg),
+    ));
+    out
 }
 
 /// Splits one line into styled pieces, expanding tabs as it goes.
@@ -465,8 +477,10 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     }
 
     match &ed.session.mode {
+        // Where the `:` line says its cursor is, not the end of it — the line
+        // has one now. The `1` is the colon the status row draws.
         Mode::Command(line) => {
-            frame.set_cursor_position((footer.x + 1 + line.chars().count() as u16, footer.y));
+            frame.set_cursor_position((footer.x + 1 + line.cursor() as u16, footer.y));
         }
         // Only the focused window gets it: there is one cursor, and it goes
         // where typing goes.
@@ -550,7 +564,7 @@ fn render_tree(
         // cursor this is where the *next* Enter goes, so hiding it would make
         // switching to a tree a guess.
         let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
-        lines.push(fill_line(spans, bg, area.width as usize));
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
         if focused {
             let col = indent.chars().count() as u16;
             cursor_at = Some((
@@ -672,6 +686,13 @@ fn render_window(
         // Selected columns on this row, in screen columns and offset past the
         // gutter. Charwise includes the character under the head; linewise
         // covers the row whatever the columns are.
+        // Whether this row is inside a *linewise* selection, which is filled to
+        // the edge of the pane below rather than stopping at the last
+        // character. `V` says "this whole line", and five highlighted cells
+        // inside a cursor-line bar is not a sentence anyone can read — the two
+        // colours are a shade apart in most themes, which is right for a bar
+        // under the cursor and wrong for the thing you are about to delete.
+        let mut linewise = false;
         for selection in selections.all() {
             // A collapsed selection still covers something in visual mode — one
             // character for `v`, the whole line for `V` — so only skip it
@@ -685,7 +706,10 @@ fn render_window(
                 continue;
             }
             let cols = match ed.session.mode.visual() {
-                Some(VisualKind::Line) => 0..raw.chars().count().max(1),
+                Some(VisualKind::Line) => {
+                    linewise = true;
+                    0..display_col(raw, raw.chars().count(), tab).max(1)
+                }
                 // A rectangle says nothing about char ranges, so the block
                 // reads its own spans rather than the selection's range.
                 Some(VisualKind::Block) => {
@@ -734,14 +758,21 @@ fn render_window(
         // column above this point is a column of the text as it stands.
         spans = insert_inline(spans, &line, &decorations);
 
-        // The cursor line is lit only in the focused window, as vim's
-        // `'cursorline'` is. A dark bar in every pane reads as noise rather
-        // than as a place.
-        lines.push(if row == cursor_row && focused {
-            fill_line(spans, ed.theme().ui.cursorline.bg, text_area.width as usize)
-        } else {
-            Line::from(spans)
-        });
+        // A linewise selection reaches the edge of the pane, past the gutter —
+        // it wins over the cursor line, which is the weaker statement about the
+        // same row. The cursor line itself is lit only in the focused window,
+        // as vim's `'cursorline'` is: a dark bar in every pane reads as noise
+        // rather than as a place.
+        let width = text_area.width as usize;
+        if linewise {
+            spans = fill_line(spans, ed.theme().ui.selection.bg, gutter, width);
+        }
+        // After the selection, so the gutter of a selected row still wears the
+        // cursor line: the fill only paints cells nothing has claimed.
+        if row == cursor_row && focused {
+            spans = fill_line(spans, ed.theme().ui.cursorline.bg, 0, width);
+        }
+        lines.push(Line::from(spans));
     }
 
     // Past-the-end rows, so an empty buffer doesn't look like a hang.
@@ -1249,6 +1280,61 @@ mod tests {
         assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
     }
 
+    /// The `:` line has a cursor of its own now, and the terminal's has to be
+    /// where it says. See `docs/specs/cmdline.md`.
+    #[test]
+    fn the_terminal_cursor_follows_the_command_line_cursor() {
+        use bi::editor::{Action, CmdMove, Command};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        ed.apply(Command { count: 1, action: Action::EnterCommandMode });
+        for c in "wq".chars() {
+            ed.apply(Command { count: 1, action: Action::CommandChar(c) });
+        }
+
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        let end = terminal.get_cursor_position().unwrap();
+        assert_eq!(end.x, 3, "past `:wq`");
+
+        ed.apply(Command { count: 1, action: Action::CommandMove(CmdMove::Home) });
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        let home = terminal.get_cursor_position().unwrap();
+        assert_eq!((home.x, home.y), (1, end.y), "on the `w`, and on the same row");
+    }
+
+    /// `V` says "this whole line", and the highlight has to say it too. It
+    /// used to stop at the last character, which put five selected cells inside
+    /// a cursor-line bar a shade away from them — a selection you had to take
+    /// on trust. See `docs/specs/selections.md`.
+    #[test]
+    fn a_linewise_selection_reaches_the_edge_of_the_pane() {
+        use bi::editor::{Action, Command, VisualKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "alpha\nbeta\n");
+        ed.set_cursor(Cursor::at(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        ed.apply(Command { count: 1, action: Action::EnterVisual(VisualKind::Line) });
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+
+        let bg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].style().bg;
+        let selection = Some(color(ed.theme().ui.selection.bg.unwrap()));
+        let cursorline = Some(color(ed.theme().ui.cursorline.bg.unwrap()));
+
+        assert_eq!(bg(2, 0), selection, "the first character of the line");
+        assert_eq!(bg(6, 0), selection, "past its last character");
+        assert_eq!(bg(19, 0), selection, "and all the way to the edge");
+        assert_eq!(bg(0, 0), cursorline, "but not the gutter, which is not selected");
+        assert_ne!(bg(2, 1), selection, "and the row below is not in it");
+    }
+
     /// The same pipeline for `Eol`, which needs a file on disk rather than a
     /// scratch buffer: no path, no grammar, and no block to name. See
     /// `docs/specs/tree-sitter-context.md`.
@@ -1587,26 +1673,26 @@ int main(void) {
 
     #[test]
     fn the_cursor_line_is_padded_to_the_full_width() {
-        let line = fill_line(vec![Span::raw("abc")], Some(CURSOR_LINE), 10);
-        let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let line = fill_line(vec![Span::raw("abc")], Some(CURSOR_LINE), 0, 10);
+        let width: usize = line.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 10, "highlight must reach the edge of the pane");
-        assert!(line.spans.iter().all(|s| s.style.bg == Some(color(CURSOR_LINE))));
+        assert!(line.iter().all(|s| s.style.bg == Some(color(CURSOR_LINE))));
     }
 
     #[test]
     fn the_background_does_not_disturb_syntax_colours() {
         let spans =
             vec![Span::styled("kw", Style::default().fg(Color::Magenta)), Span::raw(" plain")];
-        let line = fill_line(spans, Some(CURSOR_LINE), 20);
-        assert_eq!(line.spans[0].style.fg, Some(Color::Magenta));
-        assert_eq!(line.spans[0].style.bg, Some(color(CURSOR_LINE)));
-        assert_eq!(line.spans[1].style.fg, None);
+        let line = fill_line(spans, Some(CURSOR_LINE), 0, 20);
+        assert_eq!(line[0].style.fg, Some(Color::Magenta));
+        assert_eq!(line[0].style.bg, Some(color(CURSOR_LINE)));
+        assert_eq!(line[1].style.fg, None);
     }
 
     #[test]
     fn a_line_wider_than_the_pane_is_not_truncated_or_panicked_on() {
-        let line = fill_line(vec![Span::raw("a".repeat(30))], Some(CURSOR_LINE), 10);
-        let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let line = fill_line(vec![Span::raw("a".repeat(30))], Some(CURSOR_LINE), 0, 10);
+        let width: usize = line.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 30);
     }
 }

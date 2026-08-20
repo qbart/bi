@@ -10,7 +10,9 @@
 //! `g` is holding out for its second key.
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
-use crate::editor::{Action, BufferCmd, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd};
+use crate::editor::{
+    Action, BufferCmd, CmdMove, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd,
+};
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
@@ -1352,6 +1354,20 @@ impl Input {
             KeyCode::Char('r') if ctrl => Action::OpenPicker(PickerKind::History),
             KeyCode::Enter => Action::CommandExecute,
             KeyCode::Backspace => Action::CommandBackspace,
+            // Arrows, because every printable key on a prompt is a character of
+            // the command and there is no normal mode to put `hjkl` in. The
+            // `Ctrl` pair is the shells', not vim's `Ctrl-B`/`Ctrl-E`: these
+            // are the keys the fingers already reach for at a prompt. Above the
+            // char arm, which would otherwise type a literal `a`.
+            // See `docs/specs/cmdline.md`.
+            KeyCode::Left => Action::CommandMove(CmdMove::Left),
+            KeyCode::Right => Action::CommandMove(CmdMove::Right),
+            KeyCode::Home => Action::CommandMove(CmdMove::Home),
+            KeyCode::End => Action::CommandMove(CmdMove::End),
+            KeyCode::Char('a') if ctrl => Action::CommandMove(CmdMove::Home),
+            KeyCode::Char('e') if ctrl => Action::CommandMove(CmdMove::End),
+            KeyCode::Up => Action::CommandRecall { older: true },
+            KeyCode::Down => Action::CommandRecall { older: false },
             KeyCode::Char(c) => Action::CommandChar(c),
             _ => return None,
         };
@@ -2558,6 +2574,38 @@ leader = \" \"
             Action::CommandChar('r'),
             "without the ctrl it is still a letter",
         );
+    }
+
+    /// A prompt has a cursor and a history, and the keys that reach them are
+    /// the ones every other prompt on the machine uses. See
+    /// `docs/specs/cmdline.md`.
+    #[test]
+    fn the_command_line_takes_the_keys_a_prompt_takes() {
+        let mut input = Input::default();
+        let line = Mode::Command("w".into());
+        let act = |input: &mut Input, key: Key| {
+            input.on_key(key, &line, ContentKind::Text).unwrap().action
+        };
+
+        for (code, how) in [
+            (KeyCode::Left, CmdMove::Left),
+            (KeyCode::Right, CmdMove::Right),
+            (KeyCode::Home, CmdMove::Home),
+            (KeyCode::End, CmdMove::End),
+        ] {
+            assert_eq!(act(&mut input, Key::code(code)), Action::CommandMove(how));
+        }
+        assert_eq!(act(&mut input, ctrl('a')), Action::CommandMove(CmdMove::Home));
+        assert_eq!(act(&mut input, ctrl('e')), Action::CommandMove(CmdMove::End));
+        assert_eq!(act(&mut input, Key::code(KeyCode::Up)), Action::CommandRecall { older: true });
+        assert_eq!(
+            act(&mut input, Key::code(KeyCode::Down)),
+            Action::CommandRecall { older: false }
+        );
+
+        // And without the ctrl they are still letters of the command.
+        assert_eq!(act(&mut input, key('a')), Action::CommandChar('a'));
+        assert_eq!(act(&mut input, key('e')), Action::CommandChar('e'));
     }
 
     #[test]

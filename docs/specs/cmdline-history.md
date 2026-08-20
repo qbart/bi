@@ -180,6 +180,8 @@ lives per platform, what caps it, and what two instances do when both write.
 That is a subsystem, and the session-only list is worth having before it. When
 it comes, it fills `History` at startup and reads it at exit; nothing else moves.
 
-**`Up`/`Down` on the `:` line** stepping through history without the overlay.
-Vim's, and cheap, but it is the half of vim's answer that makes you guess at a
-list you cannot see — which is the half the picker exists to replace.
+**`Up`/`Down` on the `:` line** — no longer deferred. It is built, over this
+same store, and [cmdline.md](cmdline.md) has the rules. The argument above
+still holds and is why it stayed small: no prefix filtering, no wrapping, and
+`Ctrl-R` remains the way to *find* a line. `Up` is for the last one, or the one
+before it, which is a different job and a real one.
