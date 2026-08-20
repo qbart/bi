@@ -69,6 +69,7 @@ gutter_current = "yellow"
 rule           = "darkgray"
 filler         = "darkgray"
 indent_guide   = "darkgray"
+whitespace     = "gray"
 context        = "darkgray"
 context_header = { fg = "white", bg = "color238" }
 

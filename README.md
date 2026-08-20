@@ -683,6 +683,23 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### Showing the whitespace
+
+`:whitespace` draws every blank in the file: a space as `·`, a tab as `→` at
+the column it starts in, a newline as `¶`, and a non-breaking space as `␣` so
+it stops looking like the space it is not. `:ws` is the short form, `:whitespace
+on` and `off` are the explicit ones, and the bare command toggles.
+
+A debugging mode, so it is literal — every space, not just the leading or the
+trailing ones. The tab keeps the rest of its expansion blank, so nothing on the
+line moves and one tab does not read as four spaces. And the pilcrow only
+appears where there is actually a newline, which means a file with no final
+newline says so on its last row; nothing else on screen ever does.
+
+It is an option like any other underneath — `:set whitespace true`, or
+`whitespace = true` under `[filetype.<name>]` for a kind of file that has
+earned it. The colour is the theme's `whitespace`.
+
 #### `TODO:` and friends
 
 `TODO:`, `FIX:`, `HACK:`, `WARN:`, `PERF:`, `NOTE:` and `TEST:` are picked out

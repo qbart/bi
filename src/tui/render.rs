@@ -1280,6 +1280,46 @@ mod tests {
         assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
     }
 
+    /// `:whitespace` on a real frame — the same argument as the test above,
+    /// for the mode whose entire output is decorations.
+    #[test]
+    fn the_whitespace_marks_reach_the_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "a b\n\tc\nd\u{a0}e");
+        ed.set_cursor(Cursor::at(0));
+        ed.run_ex("set indent_guides false");
+        ed.run_ex("whitespace");
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+
+        let rows: Vec<String> = (0..3)
+            .map(|y| {
+                (0..24)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            [
+                "1 a·b¶",
+                // The arrow at the tab's own column; the three cells it still
+                // spans stay blank, so `c` is where it was.
+                "2 →   c¶",
+                // No pilcrow: the file does not end in a newline, which is the
+                // one thing only this mode says out loud.
+                "3 d␣e",
+            ]
+        );
+    }
+
     /// The `:` line has a cursor of its own now, and the terminal's has to be
     /// where it says. See `docs/specs/cmdline.md`.
     #[test]

@@ -1067,6 +1067,66 @@ fn indent_guides(
     }
 }
 
+/// Every blank on screen, made visible — what `:whitespace` is.
+///
+/// A debugging mode, so it is literal: every space is marked, not just the
+/// leading or the trailing ones. The question it answers is "what is actually
+/// in this line", and an answer that had already decided which blanks were
+/// interesting would not be one.
+///
+/// `Under` the selection, like the guides: selecting a line must still look
+/// like selecting a line.
+fn whitespace(
+    buffer: &Buffer,
+    options: &Options,
+    theme: &Theme,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+
+    let tab_width = options.tab_width.max(1);
+    let style = theme.ui.whitespace;
+
+    for row in rows.start..rows.end.min(buffer.line_count()) {
+        let line = buffer.line(row);
+        // Walked once, carrying the column, rather than asking `display_col`
+        // per character: a tab is only as wide as where it starts, so the
+        // column has to be accumulated anyway.
+        let mut col = 0;
+        for ch in line.chars() {
+            let text = match ch {
+                ' ' => Some(WS_SPACE),
+                '\t' => Some(WS_TAB),
+                // The one that earns its own glyph. A non-breaking space
+                // pasted out of a document looks exactly like a space and is
+                // not one, and every other way of finding it is a search for a
+                // character you cannot type.
+                '\u{a0}' => Some(WS_NBSP),
+                _ => None,
+            };
+            if let Some(text) = text {
+                out.push(Decoration::Overlay {
+                    row,
+                    col,
+                    text: text.to_string(),
+                    style,
+                    layer: Layer::Under,
+                });
+            }
+            col += match ch {
+                '\t' => tab_width - (col % tab_width),
+                _ => 1,
+            };
+        }
+        // Only where there is one. The last row of a file that does not end in
+        // a newline gets no pilcrow, and that absence is the report.
+        if buffer.has_newline(row) {
+            out.push(Decoration::Eol { row, text: WS_EOL.to_string(), style });
+        }
+    }
+}
+
 /// `TODO:` and its friends, wherever they appear.
 ///
 /// Not restricted to comments, and that is a decision rather than an omission:
@@ -1189,6 +1249,21 @@ fn color_swatches(
 /// grammar for a handful of characters and is not worth copying for one.
 const GUIDE: &str = "\u{2502}";
 
+/// What `:whitespace` draws over each kind of blank.
+///
+/// Fixed, for the same reason [`GUIDE`] is: vim spells this `listchars`, a
+/// grammar for a handful of characters, and four constants are not worth one.
+/// The day a font cannot draw `·` is the day they become options.
+///
+/// A tab gets its arrow at its *first* column and leaves the rest of the
+/// expansion blank, so a line's width is what it was — the point is to see
+/// where the tab starts, and filling its span would make one tab look like
+/// four spaces, which is the confusion being cleared up.
+const WS_SPACE: &str = "\u{b7}"; // ·
+const WS_TAB: &str = "\u{2192}"; // →
+const WS_EOL: &str = "\u{b6}"; // ¶
+const WS_NBSP: &str = "\u{2423}"; // ␣
+
 /// The file type of a buffer, by the same whole-name-then-extension rule the
 /// grammar is chosen by.
 fn filetype_of(buffer: &Buffer) -> Option<&'static str> {
@@ -1219,6 +1294,13 @@ enum ExLine {
     /// `:wa` — writes every modified buffer.
     WriteAll,
     Highlight(bool),
+    /// `:whitespace`, `:whitespace on|off` — show the blanks.
+    ///
+    /// `None` is the bare form, which flips whatever is in force where the
+    /// cursor is. A toggle rather than only `:set whitespace true` because this
+    /// is a thing you turn on to look at something and off again once you have
+    /// seen it, and typing the value both times is typing the wrong one.
+    Whitespace(Option<bool>),
     Set(String),
     Create(String),
     Rename {
@@ -1401,6 +1483,15 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
+        // `on`/`off` as well as `true`/`false`: this one is spelled as a
+        // command rather than as a setting, and a command reads better with the
+        // words a switch uses.
+        "ws" | "whitespace" => match arg {
+            "" => ExLine::Whitespace(None),
+            "on" | "true" => ExLine::Whitespace(Some(true)),
+            "off" | "false" => ExLine::Whitespace(Some(false)),
+            _ => ExLine::Error("whitespace takes on, off, or nothing to toggle".into()),
+        },
         // The tree keys are prefills over these three, which is why they are
         // ex commands rather than tree-only actions: typeable without a tree,
         // and testable without one.
@@ -2360,6 +2451,14 @@ impl Editor {
         }
         if options.indent_guides {
             indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
+        }
+        // After the guides, so a bullet wins the column a guide wanted: with
+        // this on you asked to see every space, and a guide hiding one of them
+        // is the mode failing at its only job. Before the context marks, so the
+        // pilcrow sits at the true end of the line and the `} // if ...` that
+        // follows it reads as being past the line rather than inside it.
+        if options.whitespace {
+            whitespace(buffer, options, &self.theme, rows.clone(), &mut out);
         }
         if options.todo_comments {
             todo_comments(buffer, &self.theme, rows.clone(), &mut out);
@@ -3999,6 +4098,7 @@ impl Editor {
             ExLine::QuitAll { force } => self.quit_all(force),
             ExLine::WriteAll => self.write_all(),
             ExLine::Highlight(on) => self.session.options.hlsearch = on,
+            ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Rename { from, to } => self.rename_path(&from, &to),
@@ -4053,6 +4153,20 @@ impl Editor {
     /// The names and their meanings live in [`Options`], not here, so `:set`
     /// and `config.toml` cannot disagree about what an option is or what it
     /// accepts.
+    /// `:whitespace` — the same layer `:set whitespace` writes to.
+    ///
+    /// It goes through `set_option` rather than reaching for the field, so the
+    /// override is remembered and re-applied over the next file's type and
+    /// project the way every other `:set` is. A toggle reads the value in force
+    /// *where the cursor is*, not the session's: that is the one you can see,
+    /// and flipping the one behind it would turn the mark off in a window that
+    /// never had it on.
+    fn set_whitespace(&mut self, on: Option<bool>) {
+        let on = on.unwrap_or(!self.options().whitespace);
+        self.set_option(&format!("whitespace {on}"));
+        self.session.status = format!("whitespace={on}");
+    }
+
     fn set_option(&mut self, arg: &str) {
         let (name, value) = match arg.split_once(['=', ' ']) {
             Some((name, value)) => (name.trim(), value.trim()),
@@ -11585,6 +11699,216 @@ mod tests {
         ex(&mut ed, "set todo_comments false");
 
         assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    // ---- whitespace ---------------------------------------------------------
+
+    /// An editor over `text` with `:whitespace` on and the guides out of the
+    /// way, so what comes back is this provider's and only this provider's.
+    fn shown(text: &str) -> Editor {
+        let mut ed = editor(text);
+        ex(&mut ed, "set indent_guides false");
+        ex(&mut ed, "whitespace");
+        ed
+    }
+
+    /// The marks on each row, as (column, glyph). The pilcrow has no column of
+    /// its own — it is drawn past the end of the line — and comes back as
+    /// `None`.
+    fn marks(ed: &Editor) -> Vec<(usize, Option<usize>, String)> {
+        let rows = ed.buffer().unwrap().line_count();
+        let style = ed.theme().ui.whitespace;
+        ed.decorations(ed.focus(), 0..rows)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { row, col, text, style: s, layer } if s == style => {
+                    assert_eq!(layer, Layer::Under, "or a selected line stops looking selected");
+                    Some((row, Some(col), text))
+                }
+                Decoration::Eol { row, text, style: s } if s == style => Some((row, None, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_space_is_marked_and_nothing_else_is() {
+        let ed = shown("a b  c\n");
+
+        assert_eq!(
+            marks(&ed),
+            [
+                (0, Some(1), WS_SPACE.into()),
+                (0, Some(3), WS_SPACE.into()),
+                (0, Some(4), WS_SPACE.into()),
+                (0, None, WS_EOL.into()),
+            ],
+            "the blanks, in the columns they occupy, and the letters left alone"
+        );
+    }
+
+    #[test]
+    fn a_tab_is_marked_at_the_column_it_starts_in() {
+        let mut ed = editor("\tx\ty\n");
+        ex(&mut ed, "set indent_guides false");
+        ex(&mut ed, "set expandtab false");
+        ex(&mut ed, "set tab_width 8");
+        ex(&mut ed, "whitespace");
+
+        assert_eq!(
+            marks(&ed),
+            [
+                (0, Some(0), WS_TAB.into()),
+                // The second tab starts at column 9 and runs to the next stop
+                // at 16 — an arrow at 16 would be pointing from the wrong end.
+                (0, Some(9), WS_TAB.into()),
+                (0, None, WS_EOL.into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_tab_leaves_the_rest_of_its_expansion_alone() {
+        let mut ed = editor("\tab\n");
+        ex(&mut ed, "set indent_guides false");
+        ex(&mut ed, "whitespace");
+
+        let cols: Vec<_> = marks(&ed).into_iter().filter_map(|(_, col, _)| col).collect();
+        assert_eq!(cols, [0], "one mark for one tab, not four for the columns it covers");
+    }
+
+    #[test]
+    fn a_non_breaking_space_does_not_look_like_a_space() {
+        let ed = shown("a\u{a0}b\n");
+
+        assert_eq!(marks(&ed)[0], (0, Some(1), WS_NBSP.into()), "which is the whole point of it");
+    }
+
+    #[test]
+    fn the_last_line_says_whether_it_ends_in_a_newline() {
+        assert_eq!(
+            marks(&shown("a\nb\n")).last().unwrap(),
+            &(1, None, WS_EOL.into()),
+            "a file that ends in one gets a pilcrow on its last row"
+        );
+        assert_eq!(
+            marks(&shown("a\nb")),
+            [(0, None, WS_EOL.into())],
+            "and one that does not gets none there — the absence is the report"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_is_a_pilcrow_and_nothing_else() {
+        assert_eq!(marks(&shown("a\n\nb\n"))[1], (1, None, WS_EOL.into()));
+    }
+
+    #[test]
+    fn the_marks_are_bounded_by_the_rows_that_were_asked_for() {
+        let ed = shown("a b\nc d\ne f\n");
+
+        let visible = ed.decorations(ed.focus(), 1..2);
+
+        assert!(
+            visible.iter().all(|d| matches!(
+                d,
+                Decoration::Overlay { row: 1, .. } | Decoration::Eol { row: 1, .. }
+            )),
+            "one row asked for, one row's worth back"
+        );
+    }
+
+    #[test]
+    fn whitespace_off_produces_nothing() {
+        let mut ed = editor("a b\n");
+        ex(&mut ed, "set indent_guides false");
+
+        assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    #[test]
+    fn a_bullet_wins_the_column_a_guide_wanted() {
+        // Both are `Under` overlays at column 0 of an indented row, so the one
+        // pushed later is the one you see — and with this mode on, that has to
+        // be the space.
+        let mut ed = editor("    x\n");
+        ex(&mut ed, "whitespace");
+
+        let at_zero: Vec<String> = ed
+            .decorations(ed.focus(), 0..1)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { col: 0, text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(at_zero, [GUIDE, WS_SPACE], "the guide first, the bullet over it");
+    }
+
+    #[test]
+    fn the_pilcrow_comes_before_the_context_that_follows_the_line() {
+        let (_d, mut ed) = in_c_block("ws-context", "do_something");
+        ex(&mut ed, "whitespace");
+
+        let eols: Vec<String> = ed
+            .decorations(ed.focus(), 0..6)
+            .into_iter()
+            .filter_map(|d| match d {
+                // Row 3 is the `}` that closes the `if`, so it carries both.
+                Decoration::Eol { row: 3, text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(eols.len(), 2);
+        assert_eq!(eols[0], WS_EOL, "the end of the line, then what is past it");
+        assert!(eols[1].contains("if (value == 0)"));
+    }
+
+    #[test]
+    fn the_command_toggles_and_says_which_way_it_went() {
+        let mut ed = editor("a b\n");
+        assert!(!ed.options().whitespace, "off out of the box");
+
+        ex(&mut ed, "whitespace");
+        assert!(ed.options().whitespace);
+        assert_eq!(ed.session.status, "whitespace=true");
+
+        ex(&mut ed, "ws");
+        assert!(!ed.options().whitespace, "the bare form is a toggle");
+
+        ex(&mut ed, "whitespace on");
+        assert!(ed.options().whitespace);
+        ex(&mut ed, "whitespace on");
+        assert!(ed.options().whitespace, "and the explicit form is not");
+
+        ex(&mut ed, "whitespace off");
+        assert!(!ed.options().whitespace);
+    }
+
+    #[test]
+    fn the_command_refuses_a_word_it_does_not_know() {
+        let mut ed = editor("a b\n");
+
+        ex(&mut ed, "whitespace maybe");
+
+        assert!(!ed.options().whitespace);
+        assert_eq!(ed.session.status, "whitespace takes on, off, or nothing to toggle");
+    }
+
+    #[test]
+    fn the_toggle_is_a_layer_a_later_file_keeps() {
+        // `:set` is remembered as an override rather than as a value, and this
+        // goes through the same door — so opening another buffer does not
+        // quietly resolve it back off.
+        let d = ScratchDir::new("ws-layer").written("a.txt", "a b\n").written("b.txt", "c d\n");
+        let mut ed = Editor::open(format!("{}/a.txt", d.path())).unwrap();
+
+        ex(&mut ed, "whitespace");
+        ex(&mut ed, &format!("e {}/b.txt", d.path()));
+
+        assert!(ed.options().whitespace, "still on in the file opened after it");
     }
 
     // ---- tree-sitter context ------------------------------------------------

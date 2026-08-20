@@ -152,6 +152,11 @@ pub struct Ui {
     /// The vertical line down each level of indentation. Furniture, like
     /// `rule` — it marks structure rather than naming anything in the text.
     pub indent_guide: Style,
+    /// The marks `:whitespace` puts on the spaces, tabs and newlines. Louder
+    /// than `indent_guide`, which is furniture you stop seeing: these are on
+    /// screen because you asked what is actually in the line, and one you have
+    /// to squint at answers nothing.
+    pub whitespace: Style,
     /// The line that opened the block you are in, repeated after the line that
     /// closes it. Furniture too, and the dimmest of it: the moment it competes
     /// with the code for attention it has failed. See
@@ -215,6 +220,7 @@ impl Ui {
         "rule",
         "filler",
         "indent_guide",
+        "whitespace",
         "context",
         "context_header",
         "todo_fix",
@@ -260,6 +266,7 @@ impl Ui {
             "rule" => self.rule = style,
             "filler" => self.filler = style,
             "indent_guide" => self.indent_guide = style,
+            "whitespace" => self.whitespace = style,
             "context" => self.context = style,
             "context_header" => self.context_header = style,
             "todo_fix" => self.todo_fix = style,

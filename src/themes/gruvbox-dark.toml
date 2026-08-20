@@ -83,6 +83,8 @@ gutter_current = "#fabd2f"
 rule           = "#504945"
 filler         = "#504945"
 indent_guide   = "#3c3836"
+# bg3, two steps up from the guides: you turn these on to read them.
+whitespace     = "#665c54"
 # Black, and deliberately near-invisible against bg0: the block you are in is
 # something you glance down at, not something that should catch your eye.
 context        = "#121010"                           # bg0_h

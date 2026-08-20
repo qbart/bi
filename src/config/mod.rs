@@ -116,6 +116,10 @@ pub struct Options {
     pub autoindent: bool,
     /// Whether each level of indentation gets a vertical line down it.
     pub indent_guides: bool,
+    /// Whether every space, tab, newline and non-breaking space is drawn as a
+    /// visible mark. A debugging mode rather than a way to live: `:whitespace`
+    /// turns it on when a line is not doing what it looks like it should.
+    pub whitespace: bool,
     /// Whether `TODO:` and its friends are picked out of the text.
     pub todo_comments: bool,
     /// Whether a colour literal is drawn in the colour it names.
@@ -167,6 +171,7 @@ impl Default for Options {
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
             indent_guides: true,
+            whitespace: false,
             todo_comments: true,
             color_swatches: true,
             context_depth: 1,
@@ -213,6 +218,8 @@ impl Options {
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
             ("indent_guides", OptionValue::Bool(on)) => self.indent_guides = on,
             ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
+            ("whitespace", OptionValue::Bool(on)) => self.whitespace = on,
+            ("whitespace", _) => return Err("whitespace takes true or false".into()),
             ("todo_comments", OptionValue::Bool(on)) => self.todo_comments = on,
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
@@ -274,6 +281,7 @@ impl Options {
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
             "indent_guides" => OptionValue::Bool(self.indent_guides),
+            "whitespace" => OptionValue::Bool(self.whitespace),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "context_depth" => OptionValue::Int(self.context_depth as i64),

@@ -23,6 +23,13 @@ autoindent = true
 # `indent_guide`. See docs/specs/indent.md.
 indent_guides = true
 
+# Every space as `·`, every tab as `→`, every newline as `¶`, and a
+# non-breaking space as `␣` so it stops looking like a space. A debugging mode
+# — `:whitespace` toggles it where you are, and it can be turned on for one
+# kind of file with a [filetype.<name>] section. Its colour is the theme's
+# `whitespace`.
+whitespace = false
+
 # TODO:, FIX:, HACK:, WARN:, PERF:, NOTE: and TEST: picked out of the text,
 # wherever they appear — the colours are the theme's `todo_*` keys.
 # See docs/specs/todo-comments.md.

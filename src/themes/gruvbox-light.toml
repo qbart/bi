@@ -70,6 +70,7 @@ gutter_current = "#b57614"
 rule           = "#d5c4a1"
 filler         = "#d5c4a1"
 indent_guide   = "#d5c4a1"
+whitespace     = "#bdae93"                           # bg3
 context        = "#79740e"                           # bg1
 context_header = { fg = "#7c6f64", bg = "#ebdbb2" }
 

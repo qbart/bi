@@ -727,6 +727,15 @@ impl Buffer {
         indent::is_blank(&self.line_text(row))
     }
 
+    /// Whether `row` actually ends in a line terminator.
+    ///
+    /// False for the last row of a file that does not end in one, which is the
+    /// only place the two ever differ and is exactly what `:whitespace` is for:
+    /// a missing final newline is invisible in every other way.
+    pub fn has_newline(&self, row: usize) -> bool {
+        row < self.rope.len_lines() && self.rope.line(row).len_chars() > self.line_len(row)
+    }
+
     // ---- trimming ----------------------------------------------------------
 
     /// Tidies the text on its way to disk, and hands back the edits it made so
