@@ -887,6 +887,46 @@ fn resolve_options(
 /// guides while one between two blocks shows none. The scan for those
 /// neighbours stops at the first non-blank line in each direction, so it is
 /// bounded by how blank the file actually is.
+/// The block the cursor is in, named after the line that opened it, hung off
+/// the line that closes it.
+///
+/// `Eol` rather than `Inline`: past the end of the row is the one place
+/// virtual text costs nothing, so the search highlight, the selection and the
+/// block arithmetic all go on seeing the row as the file says it is. See
+/// `docs/specs/tree-sitter-context.md`.
+fn context_marks(
+    buffer: &Buffer,
+    syntax: &Syntax,
+    text: &crate::window::Text,
+    options: &Options,
+    theme: &Theme,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    // No line comment, no annotation. Lending CSS or JSON a `//` writes
+    // something that reads as a mistake in the file rather than a note about
+    // it.
+    let Some(marker) = crate::syntax::line_comment(syntax.filetype()) else { return };
+    let byte = buffer.rope().char_to_byte(text.selections.cursor().at);
+    let found = crate::context::contexts(
+        syntax,
+        buffer.rope(),
+        byte,
+        options.context_depth,
+        options.context_min_lines,
+    );
+    for context in found {
+        if !rows.contains(&context.row) {
+            continue;
+        }
+        out.push(crate::decoration::Decoration::Eol {
+            row: context.row,
+            text: format!(" {marker} {}", context.opener),
+            style: theme.ui.context,
+        });
+    }
+}
+
 fn indent_guides(
     buffer: &Buffer,
     options: &Options,
@@ -2165,7 +2205,9 @@ impl Editor {
                 out.extend(self.window_label(window, label, &rows));
             }
         }
-        let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
+        let Some(Pane::Text { buffer, options, syntax, text, .. }) = self.pane(window) else {
+            return out;
+        };
         // `s` is aiming: everything dims, what matched lights up, and each
         // match wears the letter that goes to it. Only in the window it is
         // aiming in. The order these are pushed in is the order they paint in,
@@ -2193,6 +2235,14 @@ impl Editor {
         }
         if options.todo_comments {
             todo_comments(buffer, &self.theme, rows.clone(), &mut out);
+        }
+        // Only in the focused window: an unfocused pane's cursor is not where
+        // you are looking, and annotating a brace for reasons off the screen
+        // is worse than not annotating it.
+        if window == self.focus
+            && let Some(syntax) = syntax
+        {
+            context_marks(buffer, syntax, text, options, &self.theme, rows.clone(), &mut out);
         }
         if options.color_swatches {
             color_swatches(buffer, rows, &mut out);
@@ -2965,6 +3015,42 @@ impl Editor {
         Some(new)
     }
 
+    /// Opens `tree` as the sidebar: a full-height column down the left of the
+    /// screen, `Chrome::tree_width` wide, focused.
+    ///
+    /// Every key that makes a tree pane comes through here — `Ctrl-W e` and
+    /// `:vs .` alike — so the two cannot drift apart about where a tree lives.
+    /// `None` means there was no room, and it has already said so.
+    fn open_tree_pane(&mut self, tree: Tree) -> Option<WindowId> {
+        let (area, chrome) = (self.area, self.chrome);
+        let new = self.fresh_window_id();
+        // The root rather than the focused window. A file tree is a column of
+        // the *screen*: which pane you happened to press the key in is not a
+        // fact about where a sidebar belongs, and splitting that pane put the
+        // tree in a different place every time.
+        if !self.layout.split_root(new, Dir::Vertical, Place::Before, area, &chrome) {
+            // Hand the id back rather than leaving a hole in the sequence.
+            self.next_window -= 1;
+            self.session.status = "not enough room to split".into();
+            return None;
+        }
+        self.windows.push(Window::showing(new, Content::Tree(tree)));
+        self.set_focus(new);
+
+        // A half-screen tree is not a sidebar. Narrowed to the width the
+        // frontend asked for, which becomes a share of the terminal from here
+        // on, like every other pane.
+        let width = self
+            .layout
+            .rect_of(new, area, &chrome)
+            .map_or(0, |rect| rect.width)
+            .saturating_sub(chrome.tree_width);
+        if width > 0 {
+            self.layout.resize(new, Dir::Vertical, -(width as i32), area, &chrome);
+        }
+        Some(new)
+    }
+
     fn run_window_cmd(&mut self, cmd: WindowCmd) {
         let focus = self.focus;
         let (area, chrome) = (self.area, self.chrome);
@@ -2975,17 +3061,23 @@ impl Editor {
                 // showing the wrong thing. `None` means a bare split, which
                 // duplicates whatever this window holds rather than naming
                 // something to go and find.
-                let content = match path.as_deref() {
+                let buffer = match path.as_deref() {
                     None => None,
-                    Some(path) if std::path::Path::new(path).is_dir() => match Tree::new(path) {
-                        Ok(tree) => Some(Content::Tree(tree)),
-                        Err(e) => {
-                            self.session.status = format!("{e:#}");
-                            return;
+                    // A directory is a tree, and a tree is a sidebar wherever
+                    // it was asked for: down the left of the screen rather
+                    // than beside this pane, and never in the direction `:sp`
+                    // named. See `docs/specs/tree.md`.
+                    Some(path) if std::path::Path::new(path).is_dir() => {
+                        match Tree::new(path) {
+                            Ok(tree) => {
+                                self.open_tree_pane(tree);
+                            }
+                            Err(e) => self.session.status = format!("{e:#}"),
                         }
-                    },
+                        return;
+                    }
                     Some(path) => match self.open_path(path) {
-                        Ok(id) => Some(Content::Text(Text::new(id))),
+                        Ok(id) => Some(id),
                         Err(e) => {
                             self.session.status = format!("{e:#}");
                             return;
@@ -2994,12 +3086,10 @@ impl Editor {
                 };
 
                 let Some(new) = self.split_focus(dir) else { return };
-                match content {
-                    // Through `show`, so the new window records where the
-                    // duplicated one was before it moves off that buffer.
-                    Some(Content::Text(text)) => self.show(new, text.buffer),
-                    Some(tree) => self.window_mut().show(tree),
-                    None => {}
+                // Through `show`, so the new window records where the
+                // duplicated one was before it moves off that buffer.
+                if let Some(id) = buffer {
+                    self.show(new, id);
                 }
             }
 
@@ -3043,29 +3133,10 @@ impl Editor {
                 };
                 self.session.tree_root = Some(tree.root().to_path_buf());
 
-                let new = self.fresh_window_id();
-                // A file tree belongs on the left, whichever side a plain
-                // split opens on.
-                if !self.layout.split(focus, new, Dir::Vertical, Place::Before, area, &chrome) {
-                    self.next_window -= 1;
-                    self.session.status = "not enough room to split".into();
+                if self.open_tree_pane(tree).is_none() {
                     return;
                 }
-                self.windows.push(Window::showing(new, Content::Tree(tree)));
-                self.set_focus(new);
                 self.reveal_in_tree(path.as_deref());
-
-                // A half-screen tree is not a sidebar. Narrowed to the width
-                // the frontend asked for, which becomes a share of the
-                // terminal from here on, like every other pane.
-                let width = self
-                    .layout
-                    .rect_of(new, area, &chrome)
-                    .map_or(0, |rect| rect.width)
-                    .saturating_sub(chrome.tree_width);
-                if width > 0 {
-                    self.layout.resize(new, Dir::Vertical, -(width as i32), area, &chrome);
-                }
             }
 
             WindowCmd::Focus(side) => {
@@ -6529,6 +6600,13 @@ mod tests {
             self
         }
 
+        fn written(self, rel: &str, text: &str) -> Self {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            self
+        }
+
         fn dir(self, rel: &str) -> Self {
             std::fs::create_dir_all(self.0.join(rel)).unwrap();
             self
@@ -6744,6 +6822,55 @@ mod tests {
         let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
         assert!(ed.window().tree().is_some(), "focus is in the tree");
         assert!(rect(&ed, ed.focus()).x < rect(&ed, before).x, "and the tree is on the left");
+    }
+
+    /// And on the left of the *screen*. Splitting the focused pane put the
+    /// tree wherever you happened to be standing — open it from the bottom
+    /// half of a `:sp` and it was a half-height column in the bottom left,
+    /// which is not a sidebar. See `docs/specs/tree.md`.
+    #[test]
+    fn the_tree_is_a_column_of_the_screen_whatever_the_splits_are() {
+        let d = ScratchDir::new("sidebar-full").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        let top = ed.focus();
+        ex(&mut ed, "sp");
+        let bottom = ed.focus();
+        assert_ne!(top, bottom, "two panes, stacked");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
+        let tree = rect(&ed, ed.focus());
+        assert!(tree.x < rect(&ed, top).x, "left of the pane above");
+        assert!(tree.x < rect(&ed, bottom).x, "and of the one below");
+        assert_eq!((tree.y, tree.height), (ed.area.y, ed.area.height), "full height");
+    }
+
+    /// `:vs .` is the same sidebar by another name, so it goes to the same
+    /// place at the same width — and `:sp .` too, because a directory asked
+    /// for a tree and a tree belongs on the left whichever way you spelled the
+    /// split.
+    #[test]
+    fn naming_a_directory_in_a_split_opens_the_sidebar_too() {
+        let d = ScratchDir::new("sidebar-named").file("a.rs");
+        for line in ["vs", "sp"] {
+            let mut ed = editor("one");
+            sized(&mut ed);
+            let before = ed.focus();
+            ex(&mut ed, &format!("{line} {}", d.path()));
+
+            let rect = |ed: &Editor, id| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
+            let tree = rect(&ed, ed.focus());
+            assert!(ed.window().tree().is_some(), "{line} opened a tree");
+            assert!(tree.x < rect(&ed, before).x, "{line} put it on the left");
+            assert_eq!((tree.y, tree.height), (ed.area.y, ed.area.height), "{line}: full height");
+            assert!(
+                tree.width <= TEST_CHROME.tree_width + 1,
+                "{line}: a sidebar, not half the screen: {}",
+                tree.width
+            );
+        }
     }
 
     /// The whole point of an ex binding: `:bd` was not reachable by any name,
@@ -7885,9 +8012,11 @@ mod tests {
         let second = ed.focus();
         assert_ne!(first, second);
 
-        // The tree goes between the two files, so a single step reaches it
-        // from either one — which is what makes "the window you came from"
-        // the thing under test rather than the cycling order.
+        // The tree is the leftmost pane, so the layout is tree, first, second
+        // and a single step reaches it from either one — forwards off the end
+        // from `second`, and backwards off the start from `first`. That is
+        // what makes "the window you came from" the thing under test rather
+        // than the cycling order.
         while ed.focus() != first {
             ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
         }
@@ -7902,7 +8031,7 @@ mod tests {
         while ed.focus() != second {
             ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
         }
-        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: true })));
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
         assert_eq!(ed.focus(), tree, "one step onto the tree");
         tree_key(&mut ed, TreeCmd::Enter);
 
@@ -10916,6 +11045,105 @@ mod tests {
         ex(&mut ed, "set todo_comments false");
 
         assert!(ed.decorations(ed.focus(), 0..1).is_empty());
+    }
+
+    // ---- tree-sitter context ------------------------------------------------
+
+    const C_BLOCK: &str = "\
+int main(void) {
+    if (value == 0) {
+        do_something();
+    }
+    return 0;
+}
+";
+
+    /// A C file with the cursor on the line holding `mark`.
+    fn in_c_block(name: &str, mark: &str) -> (ScratchDir, Editor) {
+        let d = ScratchDir::new(name).written("a.c", C_BLOCK);
+        let mut ed = Editor::open(format!("{}/a.c", d.path())).unwrap();
+        ed.set_cursor(Cursor::at(C_BLOCK.find(mark).expect("the test marks a row")));
+        (d, ed)
+    }
+
+    /// Every annotation drawn over `rows` of `window`, as (row, text).
+    fn context(
+        ed: &Editor,
+        window: WindowId,
+        rows: std::ops::Range<usize>,
+    ) -> Vec<(usize, String)> {
+        let style = ed.theme().ui.context;
+        ed.decorations(window, rows)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Eol { row, text, style: s } if s == style => Some((row, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The line that opened the block, after the line that closes it, behind
+    /// that language's comment marker. See
+    /// `docs/specs/tree-sitter-context.md`.
+    #[test]
+    fn the_block_the_cursor_is_in_names_itself_on_its_closing_row() {
+        let (_d, ed) = in_c_block("context", "do_something");
+
+        assert_eq!(
+            context(&ed, ed.focus(), 0..6),
+            [(3, " // if (value == 0) {".to_string())],
+            "the innermost block, on the row that closes it"
+        );
+    }
+
+    #[test]
+    fn depth_walks_outwards_and_zero_turns_it_off() {
+        let (_d, mut ed) = in_c_block("context-depth", "do_something");
+
+        ex(&mut ed, "set context_depth 2");
+        assert_eq!(
+            context(&ed, ed.focus(), 0..6),
+            [(3, " // if (value == 0) {".to_string()), (5, " // int main(void) {".to_string()),],
+        );
+
+        ex(&mut ed, "set context_depth 0");
+        assert!(context(&ed, ed.focus(), 0..6).is_empty());
+    }
+
+    /// Bounded by the rows on screen, like every other decoration: a closing
+    /// brace scrolled past the bottom is not a row to draw on.
+    #[test]
+    fn an_annotation_off_the_screen_is_not_produced() {
+        let (_d, ed) = in_c_block("context-rows", "do_something");
+
+        assert!(context(&ed, ed.focus(), 0..3).is_empty(), "the closing row is row 3");
+        assert_eq!(context(&ed, ed.focus(), 3..4).len(), 1);
+    }
+
+    /// An unfocused pane's cursor is not where you are looking.
+    #[test]
+    fn only_the_focused_window_says_where_it_is() {
+        let (_d, mut ed) = in_c_block("context-focus", "do_something");
+        sized(&mut ed);
+        let first = ed.focus();
+        ed.apply(cmd(Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None })));
+        let second = ed.focus();
+        assert_ne!(first, second);
+
+        assert_eq!(context(&ed, second, 0..6).len(), 1, "the focused one still does");
+        assert!(context(&ed, first, 0..6).is_empty(), "the other one does not");
+    }
+
+    /// No line comment, nothing to write it behind. A borrowed `//` in a JSON
+    /// file reads as a mistake in the file.
+    #[test]
+    fn a_language_with_no_line_comment_gets_no_annotation() {
+        let json = "{\n  \"a\": {\n    \"b\": 1\n  }\n}\n";
+        let d = ScratchDir::new("context-json").written("a.json", json);
+        let mut ed = Editor::open(format!("{}/a.json", d.path())).unwrap();
+        ed.set_cursor(Cursor::at(json.find("\"b\"").unwrap()));
+
+        assert!(context(&ed, ed.focus(), 0..5).is_empty());
     }
 
     // ---- the yank flash -----------------------------------------------------

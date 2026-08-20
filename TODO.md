@@ -25,8 +25,8 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ### tree sitter context
 
-
-### treeee sitter context vt
+The sticky header at the top of the viewport. The *virtual text* half is built
+— see docs/specs/tree-sitter-context.md.
 
 ### snippets
 

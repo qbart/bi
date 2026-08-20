@@ -288,6 +288,14 @@ and disappears as the terminal is resized.
 **A split that cannot give both children `Chrome`'s floor is refused** with a
 message, rather than producing a pane with nothing in it.
 
+**`split_root` splits the screen instead of a pane.** `split` replaces one leaf
+with a split of two; `split_root` wraps the entire tree in one, putting the
+newcomer on the outside edge, so the new pane spans the whole width or height
+whatever the existing layout is. Its one client is the file tree, which is a
+column of the screen rather than of whichever pane you pressed the key in —
+see [tree.md](tree.md). The floor is checked against `area` rather than a
+leaf's rect, and closing collapses the wrapper through the ordinary `close`.
+
 ### Directional switching
 
 `Ctrl-W l` takes the nearest window on the right whose rect overlaps the focused

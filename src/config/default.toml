@@ -33,6 +33,17 @@ todo_comments = true
 # See docs/specs/colors.md.
 color_swatches = true
 
+# The line that opened the block you are in, repeated after the line that
+# closes it, as a comment in that language: `} // if (value == 0) {`. Virtual
+# text, in the theme's `context` — nothing is added to the file.
+#
+# `context_depth` is how many enclosing blocks say so, innermost first; 0 turns
+# it off. `context_min_lines` is how many rows a block must span before it
+# bothers — 1 is any block that opens and closes on different rows.
+# See docs/specs/tree-sitter-context.md.
+context_depth = 1
+context_min_lines = 1
+
 # How long a yank stays lit, in milliseconds — 0 turns it off. `yy` is the one
 # command whose whole effect is invisible. See docs/specs/flash.md.
 yank_flash = 150

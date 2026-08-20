@@ -351,6 +351,40 @@ impl Layout {
         true
     }
 
+    /// Wraps the whole layout in a split, putting `new` on the outside edge.
+    ///
+    /// [`Layout::split`] replaces one leaf with a split of two; this replaces
+    /// the root, so the new pane spans the screen's full width or height
+    /// whatever the existing panes are doing. The file tree is the client: a
+    /// sidebar is a column of the *screen*, not of whichever pane the key
+    /// happened to be pressed in — see `docs/specs/tree.md`.
+    ///
+    /// Returns whether there was room, on the same terms as `split`, measured
+    /// against `area` rather than a leaf's rect because that is what is being
+    /// divided.
+    pub fn split_root(
+        &mut self,
+        new: WindowId,
+        dir: Dir,
+        place: Place,
+        area: Rect,
+        chrome: &Chrome,
+    ) -> bool {
+        if extent(area, dir) < chrome.min(dir) * 2 + chrome.gap(dir) {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.root, Node::Leaf(new));
+        let (first, second) = match place {
+            Place::Before => (Node::Leaf(new), old),
+            Place::After => (old, Node::Leaf(new)),
+        };
+        self.root = Node::Split {
+            dir,
+            children: vec![Child { weight: 0.5, node: first }, Child { weight: 0.5, node: second }],
+        };
+        true
+    }
+
     /// Removes `id` and gives its space to the sibling that grows into it.
     ///
     /// Returns where focus goes: the first leaf of that sibling in layout

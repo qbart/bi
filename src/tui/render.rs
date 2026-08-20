@@ -1249,6 +1249,38 @@ mod tests {
         assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
     }
 
+    /// The same pipeline for `Eol`, which needs a file on disk rather than a
+    /// scratch buffer: no path, no grammar, and no block to name. See
+    /// `docs/specs/tree-sitter-context.md`.
+    #[test]
+    fn the_context_annotation_reaches_the_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        const SOURCE: &str = "int main(void) {\n    if (v == 0) {\n        go();\n    }\n}\n";
+        let path = std::env::temp_dir().join(format!("bi-render-{}-ctx.c", std::process::id()));
+        std::fs::write(&path, SOURCE).unwrap();
+        let mut ed = Editor::open(path.to_str().unwrap()).unwrap();
+        ed.set_cursor(Cursor::at(SOURCE.find("go()").unwrap()));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let rows: Vec<String> = (0..5)
+            .map(|y| {
+                (0..40)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(rows[3], "4 │   } // if (v == 0) {", "past the brace that closes it");
+        assert_eq!(rows[2], "3 │   │   go();", "and no other row grew");
+    }
+
     /// The other end of the same pipeline, for the decoration that moves a
     /// cell: the letter is on the screen *and* so is everything that was there
     /// before it.

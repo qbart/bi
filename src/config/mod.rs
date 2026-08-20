@@ -120,6 +120,13 @@ pub struct Options {
     pub todo_comments: bool,
     /// Whether a colour literal is drawn in the colour it names.
     pub color_swatches: bool,
+    /// How many enclosing blocks repeat their opening line after the line that
+    /// closes them, innermost first. 0 is off — the honest spelling, since a
+    /// feature whose size is a number needs no second option saying whether
+    /// the number counts. See `docs/specs/tree-sitter-context.md`.
+    pub context_depth: usize,
+    /// How many rows a block must span before it earns that annotation.
+    pub context_min_lines: usize,
     /// How long a yank stays lit, in milliseconds. 0 is a flash of no time at
     /// all, which is the honest spelling of off.
     pub yank_flash: usize,
@@ -157,6 +164,8 @@ impl Default for Options {
             indent_guides: true,
             todo_comments: true,
             color_swatches: true,
+            context_depth: 1,
+            context_min_lines: 1,
             yank_flash: 150,
             gitignore: true,
             trim: crate::trim::Trim::default(),
@@ -202,6 +211,16 @@ impl Options {
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
             ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
+            ("context_depth", OptionValue::Int(n)) if n >= 0 => self.context_depth = n as usize,
+            ("context_depth", _) => {
+                return Err("context_depth takes a count, or 0 to turn it off".into());
+            }
+            ("context_min_lines", OptionValue::Int(n)) if n >= 1 => {
+                self.context_min_lines = n as usize;
+            }
+            ("context_min_lines", _) => {
+                return Err("context_min_lines takes a count of 1 or more".into());
+            }
             ("gitignore", OptionValue::Bool(on)) => self.gitignore = on,
             ("gitignore", _) => return Err("gitignore takes true or false".into()),
             ("yank_flash", OptionValue::Int(n)) if n >= 0 => self.yank_flash = n as usize,
@@ -245,6 +264,8 @@ impl Options {
             "indent_guides" => OptionValue::Bool(self.indent_guides),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
+            "context_depth" => OptionValue::Int(self.context_depth as i64),
+            "context_min_lines" => OptionValue::Int(self.context_min_lines as i64),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),
             "trim_on_write" => OptionValue::Bool(self.trim.on_write),

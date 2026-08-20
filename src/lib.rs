@@ -23,6 +23,7 @@ pub mod clipboard;
 pub mod cmd_history;
 pub mod colors;
 pub mod config;
+pub mod context;
 pub mod decoration;
 pub mod editor;
 pub mod editorconfig;

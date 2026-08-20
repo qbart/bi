@@ -70,6 +70,7 @@ gutter_current = "#b57614"
 rule           = "#d5c4a1"
 filler         = "#d5c4a1"
 indent_guide   = "#d5c4a1"
+context        = "#ebdbb2"                           # bg1
 
 # TODO: and friends. See docs/specs/todo-comments.md.
 todo_fix   = { fg = "#fbf1c7", bg = "#9d0006", bold = true }

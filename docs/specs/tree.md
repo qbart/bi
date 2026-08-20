@@ -17,10 +17,10 @@ rendering and the three file operations. Deliberately out: filtering the tree,
 git status, file watching, editing the listing to move files, and multi-select
 — all listed at the end with their reasons.
 
-Five things below were wrong when this was written and are corrected in place,
+Six things below were wrong when this was written and are corrected in place,
 marked **Corrected**: what `View` does with a pane's height, what `Escalation`
 had left to do, what the root row is called, what a relative root does to `-`,
-and which trees a file operation refreshes.
+which trees a file operation refreshes, and which window a tree pane splits.
 
 ## The tree is not a buffer
 
@@ -403,6 +403,44 @@ So `:vs .` is a persistent sidebar and `bi .` is netrw, out of one rule and no
 sidebar concept. The window tree needs no special case, `:only` needs no special
 case, and a tree pane resizes and closes like anything else.
 
+### A tree splits the screen, not the pane — **Corrected**
+
+The paragraph above is right about where a *file* goes and wrong about where the
+*tree* goes. Both `Ctrl-W e` and `:vs .` split the focused window, and with any
+splits already open that puts the tree beside one pane rather than down the side
+of the screen: open a tree from the bottom-right of a four-pane layout and it is
+a quarter-height column in the bottom right, which is not a sidebar and is not
+what either key was for. Worse, where it lands depends on which pane you
+happened to be in when you pressed it.
+
+**A tree pane splits the root.** `Layout::split_root` wraps the whole tree in a
+new split and puts the newcomer on the outside edge:
+
+```rust
+pub fn split_root(&mut self, new: WindowId, dir: Dir, place: Place,
+                  area: Rect, chrome: &Chrome) -> bool;
+```
+
+`root` becomes `Split { Vertical, [tree, old_root] }`, so the tree is full
+height whatever the other panes are doing and lands in the same place every
+time. Closing it collapses the wrapper through the existing `close_at`, which
+needs no change: a split left holding one child already becomes that child.
+
+`Editor::open_tree_pane` is the one path both keys now take — root-split left,
+focus the new pane, narrow it to `Chrome::tree_width`. That makes two behaviour
+changes beyond the position:
+
+- **`:sp .` also opens on the left.** A horizontal split naming a directory
+  asked for a tree, and a file tree belongs on the left is the older rule. The
+  direction you typed loses to it.
+- **`:vs .` is now `tree_width` wide** rather than half the pane it was typed
+  in. Half of one pane was a defensible size; half the *screen* is not, and
+  going through one helper is what stops the two keys drifting apart again.
+
+Unchanged: the one-tree rule and the toggle, `Editor::open_target`, `:only`,
+resizing, and `:e .`, which makes no window at all — it re-roots the pane you
+are in, and that is still what naming a directory means.
+
 This needs `Editor::previous: Option<WindowId>`, set on every focus change. If it
 names a window that has since closed, or one holding a tree, the target is the
 first leaf in layout order holding text; if there is none, the file opens in
@@ -420,10 +458,11 @@ field, no per-tree state, and it follows you.
 
 ### The sidebar shortcut
 
-`Ctrl-W e` is that layout in one key: split vertically, root the new pane at the
-session's root, reveal the current file in it, and narrow it to
+`Ctrl-W e` is that layout in one key: split the screen vertically, root the new
+pane at the session's root, reveal the current file in it, and narrow it to
 `Chrome::tree_width`. Under the window prefix because it makes a window, which
-is where every other key that makes one lives.
+is where every other key that makes one lives. The screen rather than the
+focused pane — see the correction above.
 
 **There is one tree, and `Ctrl-W e` toggles it.** Pressed with a tree open —
 from the tree or from anywhere else — it puts that one away rather than opening

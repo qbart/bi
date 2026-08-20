@@ -92,6 +92,7 @@ gutter_current = "#ffffff"
 rule           = "#00aaaa"
 filler         = "#5555ff"
 indent_guide   = "#00aaaa"
+context        = "#000080"                           # the cursor line's blue
 
 # TODO: and friends, in the EGA sixteen. See docs/specs/todo-comments.md.
 todo_fix   = { fg = "#000000", bg = "#ff5555", bold = true }

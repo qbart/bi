@@ -83,6 +83,9 @@ gutter_current = "#fabd2f"
 rule           = "#504945"
 filler         = "#504945"
 indent_guide   = "#3c3836"
+# Black, and deliberately near-invisible against bg0: the block you are in is
+# something you glance down at, not something that should catch your eye.
+context        = "#1d2021"                           # bg0_h
 
 # TODO: and friends. Loud on purpose — the point is that they stop reading as
 # ordinary comment-grey. See docs/specs/todo-comments.md.

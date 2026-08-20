@@ -152,6 +152,11 @@ pub struct Ui {
     /// The vertical line down each level of indentation. Furniture, like
     /// `rule` — it marks structure rather than naming anything in the text.
     pub indent_guide: Style,
+    /// The line that opened the block you are in, repeated after the line that
+    /// closes it. Furniture too, and the dimmest of it: the moment it competes
+    /// with the code for attention it has failed. See
+    /// `docs/specs/tree-sitter-context.md`.
+    pub context: Style,
 
     /// `FIX:`, `TODO:` and the rest — five meanings rather than one per
     /// keyword, because the same thought has more than one spelling and two
@@ -205,6 +210,7 @@ impl Ui {
         "rule",
         "filler",
         "indent_guide",
+        "context",
         "todo_fix",
         "todo_todo",
         "todo_warn",
@@ -248,6 +254,7 @@ impl Ui {
             "rule" => self.rule = style,
             "filler" => self.filler = style,
             "indent_guide" => self.indent_guide = style,
+            "context" => self.context = style,
             "todo_fix" => self.todo_fix = style,
             "todo_todo" => self.todo_todo = style,
             "todo_warn" => self.todo_warn = style,

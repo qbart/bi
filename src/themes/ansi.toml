@@ -69,6 +69,7 @@ gutter_current = "yellow"
 rule           = "darkgray"
 filler         = "darkgray"
 indent_guide   = "darkgray"
+context        = "darkgray"
 
 # TODO: and friends, in your terminal's own sixteen.
 todo_fix   = { fg = "black", bg = "red", bold = true }

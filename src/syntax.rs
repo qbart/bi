@@ -199,9 +199,28 @@ fn grammar(filetype: &str) -> Option<(Language, &'static str)> {
     })
 }
 
-/// Grammar for a file, or `None` for plain text.
-fn language_for(file: &str) -> Option<(Language, &'static str)> {
-    grammar(filetype(file)?)
+/// How `filetype` starts a line comment, or `None` when it has no such thing.
+///
+/// One arm per language, beside [`filetype`], which is where the language
+/// table already lives. The first client is the tree-sitter context virtual
+/// text (`docs/specs/tree-sitter-context.md`), which has to write a comment in
+/// a language it is only passing through; a comment-toggle key is the obvious
+/// second one.
+///
+/// **`None` is a real answer.** CSS, JSON and the markup languages have no
+/// line comment — CSS and the markup family have only a bracketing form, JSON
+/// has none at all — and lending them `//` produces something that reads as a
+/// mistake in the file rather than as a note about it.
+pub fn line_comment(filetype: &str) -> Option<&'static str> {
+    Some(match filetype {
+        "rust" | "go" | "c" | "cpp" | "c3" | "slang" | "glsl" | "hlsl" | "javascript"
+        | "typescript" | "tsx" | "swift" | "java" | "csharp" | "scss" | "templ" => "//",
+        "python" | "bash" | "ruby" | "crystal" | "toml" | "yaml" | "cmake" | "make"
+        | "dockerfile" | "hcl" | "r" | "julia" => "#",
+        "lua" => "--",
+        "ini" => ";",
+        _ => return None,
+    })
 }
 
 /// HCL's highlights, which the grammar crate does not ship. See the file.
@@ -319,6 +338,11 @@ pub struct Syntax {
     /// Patterns carrying a predicate tree-sitter cannot evaluate, indexed by
     /// pattern id. See [`unevaluatable`].
     unevaluatable: Vec<bool>,
+    /// Which language this is, as [`filetype`] named it. Kept because a
+    /// grammar is not the only per-language fact a caller wants — see
+    /// [`line_comment`] — and re-deriving it from the path is a second place
+    /// for the answer to be different.
+    filetype: &'static str,
 }
 
 /// Whether a pattern is guarded by a predicate tree-sitter will not run.
@@ -375,7 +399,8 @@ impl Syntax {
     /// extension. `None` when no grammar is known: an unrecognised file is
     /// plain text, never an error.
     pub fn new(file: &str, rope: &Rope) -> Option<Self> {
-        let (language, highlights) = language_for(file)?;
+        let filetype = filetype(file)?;
+        let (language, highlights) = grammar(filetype)?;
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
         let query = Query::new(&language, highlights).ok()?;
@@ -383,7 +408,12 @@ impl Syntax {
         let specificity = query.capture_names().iter().map(|n| specificity(n)).collect();
         let unevaluatable =
             (0..query.pattern_count()).map(|p| unevaluatable(&query, p)).collect::<Vec<_>>();
-        Some(Self { parser, tree, query, specificity, unevaluatable })
+        Some(Self { parser, tree, query, specificity, unevaluatable, filetype })
+    }
+
+    /// The language this was parsed as, in [`filetype`]'s spelling.
+    pub fn filetype(&self) -> &'static str {
+        self.filetype
     }
 
     pub fn capture_name(&self, capture: u32) -> &str {
