@@ -13,6 +13,9 @@ example: you cannot write the buffer partially with :w but you can apple :case p
 
 same for range i can apply case for range but not for writing range of file
 
+also there are some bugs when i do rectangular selection
+and then i press command line then selection turns into normal selection and it does not maintain rectangular shape
+
 ### find_in_files
 
 find in fiels proper search form,
