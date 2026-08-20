@@ -525,6 +525,23 @@ mod tests {
         }
     }
 
+    /// A match has to be legible on whatever it lands on, and while `s` is
+    /// aiming that is dimmed text — so a `search` with no foreground of its
+    /// own wears `dim`'s, and gruvbox-dark's `dim` was the same colour as the
+    /// background `search` painted. The match was there and invisible.
+    #[test]
+    fn a_search_match_names_both_halves_and_neither_is_the_dim() {
+        for name in Theme::BUILTINS.iter().chain(std::iter::once(&"pascal")) {
+            let ui = parsed(name).ui;
+            assert!(ui.search.fg.is_some(), "{name}: a match with no foreground of its own");
+            assert!(ui.search.bg.is_some(), "{name}: a match with no background of its own");
+            assert_ne!(ui.search.bg, ui.dim.fg, "{name}: a match painted its own colour");
+            // And the letter that points at a match is not the match: `s`
+            // draws them touching, so one colour would read as one thing.
+            assert_ne!(ui.label.bg, ui.search.bg, "{name}: the label is the match's colour");
+        }
+    }
+
     /// The promise `ansi` exists to keep: choosing a theme is not a one-way
     /// door. If the type cannot say what render.rs used to hardcode, this is
     /// where that shows up — it is how `reverse` came to exist.
@@ -536,7 +553,7 @@ mod tests {
         assert_eq!(ansi.style("comment"), Some(Style::fg(Color::Ansi(Ansi::DarkGray))));
         assert_eq!(ansi.ui.cursorline, Style { bg: Some(Color::Indexed(236)), ..Style::default() });
         assert_eq!(ansi.ui.selection, Style { bg: Some(Color::Indexed(239)), ..Style::default() });
-        assert_eq!(ansi.ui.search, Style { bg: Some(Color::Indexed(58)), ..Style::default() });
+        assert_eq!(ansi.ui.flash, Style { bg: Some(Color::Indexed(58)), ..Style::default() });
         assert!(ansi.ui.statusline.reverse, "the focused status row was reverse video");
 
         // And the whole point of the ANSI spelling: it names no background, so

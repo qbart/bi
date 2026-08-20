@@ -131,7 +131,7 @@ rather than for the constant it replaces:
 | `foreground` | text no capture claimed |
 | `cursorline` | the line the cursor is on |
 | `selection` | selected text |
-| `search` | a search match |
+| `search` | a search match — **both halves**, see below |
 | `cursor_alt` | every cursor but the primary one |
 | `gutter` | the line-number column |
 | `gutter_current` | the number on the cursor's own row |
@@ -145,6 +145,24 @@ rather than for the constant it replaces:
 | `tree_dir` `tree_link` | directory and symlink rows |
 | `mark_copy` `mark_cut` | a marked tree row |
 | `picker_border` `picker_prompt` `picker_selected` `picker_badge` `picker_divider` `picker_preview` | the picker |
+
+### `search` names a foreground as well as a background
+
+Most of the highlights above are a background alone, and let whatever colour
+the syntax gave the text show through. `search` cannot be, and this is the
+rule rather than a preference: while `s` is aiming, everything on screen is
+wearing `dim`'s foreground, so a match with no foreground of its own is a
+match drawn in the colour of the text it is supposed to stand out from.
+gruvbox-dark got this exactly wrong — `search` was a `#665c54` background and
+`dim` was a `#665c54` foreground, so a match was painted its own colour and
+disappeared.
+
+`label` has the same job and the same rule, plus one more: it must not be the
+*match's* colour either. `s` draws the letter touching the match it belongs
+to, and one colour across both reads as one thing.
+
+A test walks every built-in and checks all three: `search` sets both halves,
+its background is not `dim`'s foreground, and `label`'s is neither.
 
 ### The background is the theme's to claim
 
@@ -267,7 +285,8 @@ The default. From the palette in
 | punctuation, delimiter | fg4 `#a89984` |
 | property, string.special.key | blue `#83a598` |
 | background / foreground | bg0 `#282828` / fg1 `#ebdbb2` |
-| cursorline / selection / search | `#32302f` / `#504945` / `#665c54` |
+| cursorline / selection | `#32302f` / `#504945` |
+| search | bg0 `#282828` on yellow `#fabd2f`, gruvbox's own `Search` |
 
 **Operators are orange, and gruvbox.vim says foreground.** That is a
 deliberate departure. `Operator` linking to plain foreground is exactly the

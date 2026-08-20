@@ -49,15 +49,19 @@ property             = "blue"
 "text.reference" = "lightmagenta"
 
 [ui]
-# The two 256-colour indices the old code used. Neither is an ANSI name, and
-# both are here rather than approximated, because "exactly what it was" is the
-# whole promise of this file.
+# The 256-colour indices the old code used, kept rather than approximated
+# because "exactly what it was" is the whole promise of this file. `search` is
+# the one that had to move: `color58` was a background alone, and a match with
+# no foreground of its own is a match wearing `dim`'s while `s` is aiming.
 cursorline = { bg = "color236" }
 selection  = { bg = "color239" }
-search     = { bg = "color58" }
+search     = { fg = "black", bg = "yellow" }
 cursor_alt = { bg = "magenta" }
 flash      = { bg = "color58" }
-label      = { fg = "black", bg = "yellow", bold = true }
+# Yellow next door, the way gruvbox puts the label an orange away from the
+# match: a letter that is the same colour as the thing it points at is a
+# letter you cannot find.
+label      = { fg = "black", bg = "lightred", bold = true }
 dim        = "darkgray"
 
 gutter         = "darkgray"

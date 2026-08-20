@@ -68,7 +68,11 @@ foreground = "#ebdbb2"                               # fg1
 
 cursorline = { bg = "#32302f" }                      # bg0_s
 selection  = { bg = "#504945" }                      # bg2
-search     = { bg = "#665c54" }                      # bg3
+# Both halves, and gruvbox's own Search: a match has to be legible against
+# whatever it is sitting on, and while `s` is aiming that is dimmed text. A
+# background alone would leave `dim`'s foreground on it — which was `#665c54`
+# on `#665c54`, a match painted its own colour.
+search     = { fg = "#282828", bg = "#fabd2f" }      # bg0 on yellow
 cursor_alt = { bg = "#b16286" }                      # purple, dim
 flash      = { bg = "#665c54" }
 label      = { fg = "#282828", bg = "#fe8019", bold = true }
