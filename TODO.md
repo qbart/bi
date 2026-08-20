@@ -4,6 +4,15 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NEXT
 
+### print whitespaces
+
+i need command for displaying whitespace characters for debug purposes,
+so each space becomes bullet displayed,
+each new line becomes paragraph symbol,
+tab arrow etc.
+
+:whitespace
+
 ### proper seleciton with commandline
 
 when i press : to go command mode and i have somehting selected,
