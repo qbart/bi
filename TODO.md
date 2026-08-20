@@ -23,11 +23,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ### tree sitter navigation
 
-### tree sitter context
-
-The sticky header at the top of the viewport. The *virtual text* half is built
-— see docs/specs/tree-sitter-context.md.
-
 ### snippets
 
 ### debugger

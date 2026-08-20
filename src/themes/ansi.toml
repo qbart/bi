@@ -70,6 +70,7 @@ rule           = "darkgray"
 filler         = "darkgray"
 indent_guide   = "darkgray"
 context        = "darkgray"
+context_header = { fg = "white", bg = "color238" }
 
 # TODO: and friends, in your terminal's own sixteen.
 todo_fix   = { fg = "black", bg = "red", bold = true }

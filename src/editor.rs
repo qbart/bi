@@ -916,13 +916,85 @@ fn context_marks(
         options.context_min_lines,
     );
     for context in found {
-        if !rows.contains(&context.row) {
+        if !rows.contains(&context.closes) {
             continue;
         }
         out.push(crate::decoration::Decoration::Eol {
-            row: context.row,
+            row: context.closes,
             text: format!(" {marker} {}", context.opener),
             style: theme.ui.context,
+        });
+    }
+}
+
+/// The blocks the cursor is inside whose opening lines have scrolled off,
+/// drawn over the top rows of the pane.
+///
+/// `Overlay` rather than a row of its own: a decoration cannot change which
+/// rows exist, and a header that added one would make every piece of
+/// row-to-screen-line arithmetic learn about it. Covering the top row costs a
+/// line of the file and no new concept.
+///
+/// See `docs/specs/tree-sitter-context.md`.
+#[allow(clippy::too_many_arguments)]
+fn context_header(
+    buffer: &Buffer,
+    syntax: &Syntax,
+    text: &crate::window::Text,
+    width: usize,
+    options: &Options,
+    theme: &Theme,
+    rows: std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    let depth = options.context_header_depth;
+    // A pane the frontend has never sized has no width to fill, and a header
+    // is a full-width bar or it is nothing.
+    let area = width.saturating_sub(options.gutter_width(buffer.line_count()));
+    if depth == 0 || area == 0 {
+        return;
+    }
+    let scroll = text.scroll;
+    let cursor_row = buffer.row_at(text.selections.cursor());
+    let byte = buffer.rope().char_to_byte(text.selections.cursor().at);
+
+    // The whole chain, then the ones that have scrolled off, outermost first —
+    // a header repeating a line three rows below it says nothing and costs a
+    // row of code to say it.
+    let found = crate::context::contexts(
+        syntax,
+        buffer.rope(),
+        byte,
+        usize::MAX,
+        options.context_min_lines,
+    );
+    let lines = found.iter().rev().filter(|c| c.opens < scroll).take(depth);
+
+    for (i, context) in lines.enumerate() {
+        let row = scroll + i;
+        // Never over the row the cursor is on: scrolling up with `k` puts the
+        // cursor on the top row, and a header there hides the line being
+        // edited. Everything below this row is the cursor's or past it.
+        if row >= cursor_row {
+            break;
+        }
+        if !rows.contains(&row) {
+            continue;
+        }
+        // The row as it is written, indentation and all, so a header two deep
+        // reads as the nesting it describes. Padded to the pane, because a bar
+        // that stops at the last character is not a bar.
+        let mut header = crate::indent::expand_tabs(&buffer.line(context.opens), options.tab_width);
+        header.truncate(header.char_indices().nth(area).map_or(header.len(), |(i, _)| i));
+        let pad = area - header.chars().count();
+        header.push_str(&" ".repeat(pad));
+
+        out.push(crate::decoration::Decoration::Overlay {
+            row,
+            col: 0,
+            text: header,
+            style: theme.ui.context_header,
+            layer: crate::decoration::Layer::Over,
         });
     }
 }
@@ -2205,7 +2277,8 @@ impl Editor {
                 out.extend(self.window_label(window, label, &rows));
             }
         }
-        let Some(Pane::Text { buffer, options, syntax, text, .. }) = self.pane(window) else {
+        let Some(Pane::Text { buffer, options, syntax, text, window: pane }) = self.pane(window)
+        else {
             return out;
         };
         // `s` is aiming: everything dims, what matched lights up, and each
@@ -2243,6 +2316,16 @@ impl Editor {
             && let Some(syntax) = syntax
         {
             context_marks(buffer, syntax, text, options, &self.theme, rows.clone(), &mut out);
+            context_header(
+                buffer,
+                syntax,
+                text,
+                pane.width,
+                options,
+                &self.theme,
+                rows.clone(),
+                &mut out,
+            );
         }
         if options.color_swatches {
             color_swatches(buffer, rows, &mut out);
@@ -11144,6 +11227,112 @@ int main(void) {
         ed.set_cursor(Cursor::at(json.find("\"b\"").unwrap()));
 
         assert!(context(&ed, ed.focus(), 0..5).is_empty());
+    }
+
+    // ---- the context header -------------------------------------------------
+
+    const C_LONG: &str = "\
+int main(void) {
+    if (value == 0) {
+        a();
+        b();
+        c();
+        d();
+        e();
+    }
+    return 0;
+}
+";
+
+    /// `C_LONG` open in a pane `height` rows tall, scrolled to the cursor on
+    /// the line holding `mark`.
+    fn scrolled(name: &str, mark: &str, height: usize) -> (ScratchDir, Editor) {
+        let d = ScratchDir::new(name).written("a.c", C_LONG);
+        let mut ed = Editor::open(format!("{}/a.c", d.path())).unwrap();
+        sized(&mut ed);
+        ed.set_cursor(Cursor::at(C_LONG.find(mark).expect("the test marks a row")));
+        let focus = ed.focus();
+        ed.size_window(focus, 40, height);
+        (d, ed)
+    }
+
+    /// Every header drawn over `rows`, as (row, text), with the padding cut off
+    /// so the assertions read.
+    fn header(ed: &Editor, rows: std::ops::Range<usize>) -> Vec<(usize, String)> {
+        let style = ed.theme().ui.context_header;
+        ed.decorations(ed.focus(), rows)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { row, col, text, style: s, .. } if s == style => {
+                    assert_eq!(col, 0, "a header starts at the left of the text area");
+                    Some((row, text.trim_end().to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Scrolled into the `if`, the top row says which function you are in.
+    #[test]
+    fn the_top_row_carries_the_outermost_line_that_scrolled_off() {
+        let (_d, ed) = scrolled("header", "e();", 5);
+
+        // Five rows and a scrolloff margin of two puts the top of the pane at
+        // row 4, so rows 0 and 1 — the two openers — are off it.
+        assert_eq!(header(&ed, 4..9), [(4, "int main(void) {".to_string())]);
+    }
+
+    /// And depth 2 reads top-down, exactly as the file does.
+    #[test]
+    fn depth_adds_rows_downwards_outermost_first() {
+        let (_d, mut ed) = scrolled("header-depth", "e();", 5);
+
+        ex(&mut ed, "set context_header_depth 2");
+        assert_eq!(
+            header(&ed, 4..9),
+            [(4, "int main(void) {".to_string()), (5, "    if (value == 0) {".to_string()),],
+            "indentation kept, so the nesting reads",
+        );
+
+        ex(&mut ed, "set context_header_depth 0");
+        assert!(header(&ed, 4..9).is_empty(), "and zero is off");
+    }
+
+    /// A header repeating a line three rows below it says nothing, and costs a
+    /// row of code to say it.
+    #[test]
+    fn nothing_when_the_opening_line_is_still_on_screen() {
+        let (_d, ed) = scrolled("header-visible", "b();", 20);
+
+        assert!(header(&ed, 0..10).is_empty());
+    }
+
+    /// Scrolling up with `k` puts the cursor on the top row, and a header
+    /// there hides the line being edited.
+    #[test]
+    fn a_header_never_covers_the_row_the_cursor_is_on() {
+        let (_d, mut ed) = scrolled("header-cursor", "e();", 5);
+        assert_eq!(header(&ed, 4..9).len(), 1, "drawn while the cursor is below it");
+
+        // The cursor onto the top row, leaving the scroll where it was.
+        ed.set_cursor(Cursor::at(C_LONG.find("c();").unwrap()));
+
+        assert!(header(&ed, 4..9).is_empty());
+    }
+
+    /// A bar that stops at the last character is not a bar.
+    #[test]
+    fn the_header_is_as_wide_as_the_text_area() {
+        let (_d, ed) = scrolled("header-width", "e();", 5);
+        let gutter = ed.options().gutter_width(ed.buffer().unwrap().line_count());
+
+        let style = ed.theme().ui.context_header;
+        let drawn = ed.decorations(ed.focus(), 4..9);
+        let width = drawn.iter().find_map(|d| match d {
+            Decoration::Overlay { text, style: s, .. } if *s == style => Some(text.chars().count()),
+            _ => None,
+        });
+        assert_eq!(width, Some(40 - gutter), "the pane, less the gutter");
     }
 
     // ---- the yank flash -----------------------------------------------------

@@ -12,13 +12,18 @@ use ropey::Rope;
 
 use crate::syntax::Syntax;
 
-/// One block around the cursor: where it closes, and the line that opened it.
+/// One block around the cursor: where it opens, where it closes, and the line
+/// that opened it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
     /// The row the block ends on. In C that is the `}`; in Python, which has
     /// no closing line, it is the block's last statement — which is where the
     /// block ends, and inventing a row to hang it on would be worse.
-    pub row: usize,
+    pub closes: usize,
+    /// The row `opener` was read from, which the header needs in order to ask
+    /// whether it is on screen already. Not always the row the node starts on:
+    /// see the walk up past bare punctuation below.
+    pub opens: usize,
     /// The opening row's text, trimmed at both ends.
     pub opener: String,
 }
@@ -94,7 +99,7 @@ pub fn contexts(
         // in `int main(void)\n{` the block starts on the brace, `} // {` is a
         // joke, and the signature above it is what a reader would have said.
         let Some(named) = named_row_at_or_above(rope, start) else { continue };
-        out.push(Context { row: end, opener: line(rope, named) });
+        out.push(Context { closes: end, opens: named, opener: line(rope, named) });
         if out.len() == depth {
             break;
         }
@@ -162,7 +167,7 @@ int main(void) {
     fn the_innermost_block_gives_the_line_that_opened_it() {
         let found = at("a.c", C, 1, 1);
         assert_eq!(openers(&found), ["if (value == 0) {"]);
-        assert_eq!(found[0].row, 3, "hung off the row that closes it");
+        assert_eq!(found[0].closes, 3, "hung off the row that closes it");
     }
 
     /// `if_statement` and `compound_statement` are two nodes over the same
@@ -230,7 +235,7 @@ def greet(name):
 ";
         let found = at("a.py", text, 1, 1);
         assert_eq!(openers(&found), ["if name:"]);
-        assert_eq!(found[0].row, 3, "the last row of the block");
+        assert_eq!(found[0].closes, 3, "the last row of the block");
     }
 
     /// Rust nests three ways at once, and a match arm's brace is a block whose
@@ -259,7 +264,7 @@ end
 ";
         let found = at("a.lua", text, 1, 1);
         assert_eq!(openers(&found), ["function greet(name)"]);
-        assert_eq!(found[0].row, 2);
+        assert_eq!(found[0].closes, 2);
     }
 
     /// No grammar, no context — the answer `S` gives, for the same reason:

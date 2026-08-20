@@ -125,7 +125,12 @@ pub struct Options {
     /// feature whose size is a number needs no second option saying whether
     /// the number counts. See `docs/specs/tree-sitter-context.md`.
     pub context_depth: usize,
-    /// How many rows a block must span before it earns that annotation.
+    /// How many enclosing blocks are drawn over the top rows of the pane,
+    /// outermost first — the sticky header. 0 is off. Counted the other way
+    /// round from `context_depth` because it answers the other question: what
+    /// closed here is the innermost thing, what contains you is the outermost.
+    pub context_header_depth: usize,
+    /// How many rows a block must span before it earns either.
     pub context_min_lines: usize,
     /// How long a yank stays lit, in milliseconds. 0 is a flash of no time at
     /// all, which is the honest spelling of off.
@@ -165,6 +170,7 @@ impl Default for Options {
             todo_comments: true,
             color_swatches: true,
             context_depth: 1,
+            context_header_depth: 1,
             context_min_lines: 1,
             yank_flash: 150,
             gitignore: true,
@@ -214,6 +220,12 @@ impl Options {
             ("context_depth", OptionValue::Int(n)) if n >= 0 => self.context_depth = n as usize,
             ("context_depth", _) => {
                 return Err("context_depth takes a count, or 0 to turn it off".into());
+            }
+            ("context_header_depth", OptionValue::Int(n)) if n >= 0 => {
+                self.context_header_depth = n as usize;
+            }
+            ("context_header_depth", _) => {
+                return Err("context_header_depth takes a count, or 0 to turn it off".into());
             }
             ("context_min_lines", OptionValue::Int(n)) if n >= 1 => {
                 self.context_min_lines = n as usize;
@@ -265,6 +277,7 @@ impl Options {
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "context_depth" => OptionValue::Int(self.context_depth as i64),
+            "context_header_depth" => OptionValue::Int(self.context_header_depth as i64),
             "context_min_lines" => OptionValue::Int(self.context_min_lines as i64),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),

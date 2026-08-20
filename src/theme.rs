@@ -157,6 +157,11 @@ pub struct Ui {
     /// with the code for attention it has failed. See
     /// `docs/specs/tree-sitter-context.md`.
     pub context: Style,
+    /// The block you are in, drawn over the top row of the pane when its
+    /// opening line has scrolled off. Chrome rather than furniture: it
+    /// replaces a row of code, so it has to be legible *and* read as not being
+    /// part of the file. See `docs/specs/tree-sitter-context.md`.
+    pub context_header: Style,
 
     /// `FIX:`, `TODO:` and the rest — five meanings rather than one per
     /// keyword, because the same thought has more than one spelling and two
@@ -211,6 +216,7 @@ impl Ui {
         "filler",
         "indent_guide",
         "context",
+        "context_header",
         "todo_fix",
         "todo_todo",
         "todo_warn",
@@ -255,6 +261,7 @@ impl Ui {
             "filler" => self.filler = style,
             "indent_guide" => self.indent_guide = style,
             "context" => self.context = style,
+            "context_header" => self.context_header = style,
             "todo_fix" => self.todo_fix = style,
             "todo_todo" => self.todo_todo = style,
             "todo_warn" => self.todo_warn = style,

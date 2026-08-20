@@ -1281,6 +1281,52 @@ mod tests {
         assert_eq!(rows[2], "3 │   │   go();", "and no other row grew");
     }
 
+    /// And the header at the other end of the block: over the top row's text,
+    /// not over the gutter, and nothing below it moved.
+    #[test]
+    fn the_context_header_reaches_the_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        const SOURCE: &str = "\
+int main(void) {
+    if (v == 0) {
+        a();
+        b();
+        c();
+        d();
+        e();
+    }
+}
+";
+        let path = std::env::temp_dir().join(format!("bi-render-{}-hdr.c", std::process::id()));
+        std::fs::write(&path, SOURCE).unwrap();
+        let mut ed = Editor::open(path.to_str().unwrap()).unwrap();
+        ed.set_cursor(Cursor::at(SOURCE.find("e();").unwrap()));
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let row = |y: u16| -> String {
+            (0..30)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // The pane scrolled to row 3, whose number is still 4 — the header
+        // covers the text area and the gutter is the frontend's.
+        assert_eq!(row(0), "4 int main(void) {", "the header, over the top row's text");
+        assert_eq!(row(1), "5 │   │   c();", "and the row below is the file's own");
+
+        let header = terminal.backend().buffer()[(3, 0)].style();
+        assert_eq!(header.bg, Some(color(ed.theme().ui.context_header.bg.unwrap())));
+        let below = terminal.backend().buffer()[(3, 1)].style();
+        assert_ne!(below.bg, header.bg, "one row only");
+    }
+
     /// The other end of the same pipeline, for the decoration that moves a
     /// cell: the letter is on the screen *and* so is everything that was there
     /// before it.

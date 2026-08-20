@@ -1,4 +1,4 @@
-# Tree-sitter context, as virtual text
+# Tree-sitter context
 
 A closing brace says nothing. Twenty lines into a function, inside a loop,
 inside a match arm, the `}` under the cursor is one of four that look the same,
@@ -7,12 +7,15 @@ looking familiar. The parse tree already knows: `S` asks it what is around the
 cursor and gets back the chain of nodes, innermost first
 (`docs/specs/scopes.md`).
 
-This puts the answer on the screen. The line that opened the block you are in
-is repeated, as a comment, after the line that closes it.
+This puts the answer on the screen, twice, from the two ends. The line that
+opened the block you are in is repeated as a comment after the line that closes
+it — and when that opening line has scrolled off the top, it is drawn over the
+top row of the pane instead. One walk of the parse tree, two places to read it.
 
 ## Status
 
-**Built.**
+**Built**, both halves: the annotation after the closing line and the header
+over the top of the pane.
 
 ## What you see
 
@@ -170,9 +173,9 @@ tells you confidently about a block that is inside a string.
 ## The comment marker
 
 `syntax::line_comment(filetype) -> Option<&'static str>` — `//` for the C
-family, `#` for Python, shell, TOML and YAML, `--` for Lua and SQL, `;` for
-Lisp and ini-shaped files, `%` for TeX. One arm per language beside
-`syntax::filetype`, which is where the language table already lives.
+family, `#` for Python, shell, Ruby, TOML, YAML and the make/cmake pair, `--`
+for Lua, `;` for ini. One arm per language beside `syntax::filetype`, which is
+where the language table already lives.
 
 **Per language rather than a fixed `//`.** The annotation is meant to read as a
 comment, and `// end` in a Python file reads as a mistake in the file. A
@@ -192,8 +195,9 @@ Flat, like every other option (`docs/specs/options.md`):
 
 | option | default | what it does |
 |---|---|---|
-| `context_depth` | `1` | How many enclosing blocks are annotated, innermost first. `0` is off. |
-| `context_min_lines` | `1` | How many rows a block must span before it earns an annotation. `1` is any block that opens and closes on different rows. |
+| `context_depth` | `1` | How many enclosing blocks are annotated after the line that closes them, innermost first. `0` is off. |
+| `context_header_depth` | `1` | How many enclosing blocks are drawn over the top rows of the pane, outermost first. `0` is off. |
+| `context_min_lines` | `1` | How many rows a block must span before it earns either. `1` is any block that opens and closes on different rows. |
 
 `context_min_lines` exists for the file that is nothing but three-line
 guard clauses, where the annotations outnumber the code. It is not the default
@@ -204,7 +208,7 @@ a Rust file in two panes can disagree about the depth.
 
 ## Theme
 
-One new `[ui]` key, `context`.
+Two new `[ui]` keys, `context` and `context_header`.
 
 It is furniture in the sense `indent_guide` is: it marks structure rather than
 naming anything in the text, and the moment it competes with the code for
@@ -222,15 +226,88 @@ background, in whichever direction recedes there:
 black against `#282828` is a shape you notice when you look for it and not
 before. `:set` it or override `context` in a theme file to make it louder.
 
+`context_header` is the opposite job and needs the opposite treatment: it
+replaces a row of code, so it has to be legible and it has to read as chrome.
+Each built-in gives it a background one step off the frame and a foreground
+quieter than the body text:
+
+| theme | value |
+|---|---|
+| `gruvbox-dark` | `{ fg = "#a89984", bg = "#3c3836" }` |
+| `gruvbox-light` | `{ fg = "#7c6f64", bg = "#ebdbb2" }` |
+| `pascal` | `{ fg = "#000000", bg = "#aaaaaa" }` — the IDE's menu bar |
+| `ansi` | `{ fg = "white", bg = "color238" }` |
+
+## The header at the top of the pane
+
+The other half of the same fact, for the other half of the problem. The
+annotation above answers "what does this brace close" — a question you ask
+while looking at the bottom of a block. Scrolled into the middle of a long
+function you ask the opposite one, "what am I inside", and the line that
+answers it is off the top of the screen.
+
+So the top row of the pane shows it instead:
+
+```
+   14 impl Server {                            <- the header
+   15         for item in queue {
+   16             send(item);
+```
+
+Row 14 is still row 14 in the file and its number still says so; what the pane
+draws over its text is `impl Server {`, in `context_header`, across the whole
+text area.
+
+**It covers a row rather than adding one.** A decoration cannot change which
+rows exist — that is the line `decorations.md` draws, and wrapping and folding
+are on the far side of it. A header that added a row would have to, and every
+piece of arithmetic that turns a row into a screen line would need to learn
+about it. Covering one costs a line of the file and no new concept, which is
+also what makes it honest: the pane is showing you the same rows it always was.
+
+**The gutter keeps the real row's number.** `Overlay`'s columns are columns of
+the *text area*; the frontend owns the gutter and the core does not reach into
+it (`decorations.md`). The number therefore belongs to the row underneath,
+which is where the pane actually is.
+
+### Which lines, and when there are none
+
+The same chain, the same rules — every filter in "The rule" above applies
+unchanged, `context_min_lines` included. Two more on top:
+
+**Only blocks whose opening line is scrolled off.** A header repeating a line
+that is three rows below it is a header saying nothing, and it costs a row of
+code to say it.
+
+**Outermost first, reading down.** `context_header_depth` is 1 by default, and
+the one line worth a row of screen is the outermost — the `impl`, the
+`fn`, the thing you would have said if someone asked where you were. At 2 the
+next one down joins it on the second row, so the header reads top-down exactly
+as the file does. That is the opposite direction from `context_depth`, which
+counts inwards, and it is the opposite question: what closed here is the
+innermost thing, what contains you is the outermost.
+
+**Never over the cursor's own row.** Scrolling up with `k` puts the cursor on
+the top row, and a header there hides the line being edited. So a header draws
+only on rows strictly above the cursor — which means it quietly gets out of the
+way as you reach the top of the pane, and comes back as you leave it.
+
+**`context_header_depth = 0` is off**, the same spelling as `context_depth`.
+
+With nothing left after those filters, nothing is drawn and the row shows its
+own text. There is no empty bar.
+
+### One style, not the syntax colours
+
+The header is a single `Overlay` in one `Style`, so `impl Server {` arrives in
+the header's colours rather than in the keyword's and the type's. A
+syntax-coloured header would mean a decoration carrying a list of spans, which
+is a different model — and a bar that is a flat block of colour is what makes
+it read as chrome rather than as a line of the file that has gone strange.
+
 ## What this is not
 
-**Not a sticky header.** The other reading of "tree-sitter context" pins the
-enclosing lines to the top of the viewport, over the buffer's own rows. That is
-a different feature with a different cost — it eats screen — and it changes
-which rows exist, which decorations deliberately cannot do. This one adds
-nothing to the top of the pane and moves no cell.
-
-**Not folding.** It repeats a line that is still there.
+**Not folding.** Both halves repeat a line that is still there.
 
 **Not written to the file.** It is a decoration. Yanking the closing line yanks
 `}`.
@@ -267,3 +344,15 @@ Through a rendered frame:
 - The annotation appears after the closing brace, past the gutter, and the
   row's own text is unchanged — a decoration produced and not painted looks
   exactly like one never produced.
+- The header covers the top row's text and nothing else: the gutter still
+  reads the row's own number, and the row below is untouched.
+
+And for the header, in `editor.rs`:
+
+- Scrolled into a function, the top row carries the outermost enclosing line;
+  `context_header_depth = 2` puts the next one down on the second row, in that
+  order.
+- Nothing at all when the opening line is still on screen, when the cursor is
+  on the row the header would cover, or when the depth is 0.
+- The overlay is as wide as the text area, so the background reaches the edge
+  of the pane rather than stopping at the last character.

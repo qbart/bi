@@ -86,6 +86,9 @@ indent_guide   = "#3c3836"
 # Black, and deliberately near-invisible against bg0: the block you are in is
 # something you glance down at, not something that should catch your eye.
 context        = "#1d2021"                           # bg0_h
+# The other half, which replaces a row of code and so has to be read: bg1
+# behind fg4, a step off the frame in both directions.
+context_header = { fg = "#a89984", bg = "#3c3836" }
 
 # TODO: and friends. Loud on purpose — the point is that they stop reading as
 # ordinary comment-grey. See docs/specs/todo-comments.md.
