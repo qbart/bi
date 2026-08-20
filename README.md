@@ -763,6 +763,35 @@ dialect is the format's own — `**`, `{a,b}`, `{1..9}` and all. Nothing is
 cached, so `:reload` picks up an edit to it. See
 [docs/specs/editorconfig.md](docs/specs/editorconfig.md).
 
+#### `:retab`
+
+`.editorconfig` says what an editor *inserts*; it does not reformat what is
+already in the file, which is why a tab-indented file in a project that asks
+for spaces stays tab-indented while everything you type gets spaces. `:retab`
+is the conversion:
+
+```
+:retab            the whole file
+:10,20retab       a range
+:'<,'>retab       what is selected
+```
+
+It rewrites each line's indentation to what the options in force say — the
+project's file, your config, the filetype table and any `:set`, resolved the
+usual way, so `:set expandtab false` still wins here as it does everywhere.
+Width is preserved: a tab that was drawn eight columns wide becomes eight
+spaces, so the characters change and the layout does not.
+
+**Leading whitespace only.** A tab inside a string, or one aligning a trailing
+comment, is content — vim's `:retab` rewrites those too, and that is how it
+earned its reputation. A line with nothing but whitespace on it is left to
+`trim_trailing`, which already empties it on write.
+
+One undo step, cursors carried across rather than reset, and nothing happens on
+write: trimming touches the lines you edited, but retabbing touches every
+indented line in the file, and a save that turns a one-line fix into a
+whole-file diff is not a save.
+
 An unknown option or a value of the wrong type drops that one line and
 reports it rather than refusing to start — `1 config problem: unknown
 option: nmber` on the status line, not stderr, which the alternate screen

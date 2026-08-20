@@ -1332,6 +1332,13 @@ enum ExLine {
     },
     /// `:case snake` — respell what is selected, or the word under the cursor.
     Case(crate::case::Style),
+    /// `:retab` — rewrite the indentation to the options in force.
+    ///
+    /// `None` is the whole file, which is what "convert this file" means and
+    /// what vim's `:retab` does. Unlike `:s`, whose no-range default is the
+    /// cursor's line: a one-line substitute is a thing people want, and a
+    /// one-line retab is not.
+    Retab(Option<LineRange>),
     /// `:alt` — the other file: the test beside the implementation, the
     /// header beside the source.
     Alternate,
@@ -1443,7 +1450,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // than a range quietly dropped: vim writes part of a file for `:1,5w` and
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
-    if range.is_some() && !matches!(name, "m" | "move" | "s" | "substitute") {
+    if range.is_some() && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab") {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
     }
 
@@ -1523,6 +1530,13 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 ExLine::Error(format!("case what? one of {}", crate::case::Style::NAMES.join(", ")))
             }
         },
+        // No argument: what it converts to is what the options already say,
+        // and a `:retab 8` that disagreed with `tab_width` would be a second
+        // place to set the same number.
+        "ret" | "retab" if arg.is_empty() => ExLine::Retab(range),
+        "ret" | "retab" => {
+            ExLine::Error("retab takes no argument — it follows tab_width and expandtab".into())
+        }
         "wq" | "x" => ExLine::WriteQuit(arg.into()),
         "reload" => ExLine::ReloadConfig,
         // A bare line number never reaches here: it is a range with no
@@ -4114,6 +4128,9 @@ impl Editor {
             ExLine::Case(style) => {
                 self.in_view(|view| view.recase(style));
             }
+            ExLine::Retab(lines) => {
+                self.in_view(|view| view.retab(lines));
+            }
             ExLine::Substitute { lines, how } => {
                 // The last search is the session's, and an empty pattern means
                 // it — so it is read here, where both are in reach.
@@ -6107,6 +6124,66 @@ impl View<'_> {
             }
             slot => *slot = Some(Flash { buffer: self.id, ranges: vec![range], until }),
         }
+    }
+
+    /// `:retab` — rewrites the indentation to whatever the options in force
+    /// say it should be.
+    ///
+    /// **The options in force, not the `.editorconfig`.** They are usually the
+    /// same thing, and where they are not it is because you said so: the
+    /// project's file is one layer of five, and `:set expandtab false` sits
+    /// above it (`docs/specs/options.md`). A command that read the project's
+    /// file directly would be the one place in bi where an explicit `:set` did
+    /// nothing, and you would have to read the source to find out why.
+    ///
+    /// **Not on write.** Trimming touches the lines you edited; this touches
+    /// every indented line in the file, and turning a one-line fix into a
+    /// whole-file diff is not a thing a save should do behind you.
+    fn retab(&mut self, lines: Option<LineRange>) {
+        let at = self.line_numbers();
+        // No range is the whole file — see [`ExLine::Retab`].
+        let (first, last) = match lines {
+            Some(range) => match range.rows(at) {
+                Ok(rows) => rows,
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            },
+            None => (0, self.buffer.line_count().saturating_sub(1)),
+        };
+
+        let before = self.selections.as_pairs();
+        let (rows, edits) = self.buffer.retab(first, last, &self.options.indent());
+        if rows == 0 {
+            // Which is the answer to "is this file already conformant", and
+            // worth saying out loud: an empty status after a command that
+            // rewrites files reads as "did that work?".
+            self.session.status = "indentation is already what the options ask for".into();
+            return;
+        }
+
+        // Mapped rather than clamped, for the reason `trim_for_write` maps:
+        // the cursor was on a line, and it is still on that line.
+        let across = |at: usize| edits.iter().fold(at, |at, edit| edit.map(at));
+        let mapped: Vec<Selection> = self
+            .selections
+            .all()
+            .iter()
+            .map(|selection| Selection {
+                anchor: self.buffer.clamped(Cursor::at(across(selection.anchor.at)), false),
+                head: self.buffer.clamped(Cursor::at(across(selection.head.at)), false),
+            })
+            .collect();
+        self.selections.set(mapped);
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        let how = match self.options.expandtab {
+            true => "spaces",
+            false => "tabs",
+        };
+        self.session.status =
+            format!("{rows} line{} retabbed to {how}", if rows == 1 { "" } else { "s" });
     }
 
     /// Tidies the text before it goes to disk, and carries the cursors across
@@ -11571,6 +11648,173 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- retab --------------------------------------------------------------
+
+    /// The buffer as one string, for the tests that care what was written
+    /// rather than where the cursor ended up.
+    fn text(ed: &Editor) -> String {
+        ed.buffer().unwrap().rope().to_string()
+    }
+
+    #[test]
+    fn retab_converts_tabs_to_what_the_options_ask_for() {
+        let mut ed = editor("fn main()\n{\n\tlet x = 1;\n\t\tdeep();\n}\n");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(text(&ed), "fn main()\n{\n    let x = 1;\n        deep();\n}\n");
+        assert_eq!(ed.session.status, "2 lines retabbed to spaces");
+    }
+
+    #[test]
+    fn retab_converts_the_other_way_too() {
+        let mut ed = editor("{\n    a;\n        b;\n}\n");
+        ex(&mut ed, "set expandtab false");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(text(&ed), "{\n\ta;\n\t\tb;\n}\n");
+        assert_eq!(ed.session.status, "2 lines retabbed to tabs");
+    }
+
+    #[test]
+    fn retab_keeps_the_file_the_width_it_was() {
+        // A tab was eight columns, so it becomes eight spaces — not four. The
+        // characters change; the layout does not, which is the only promise
+        // worth making about a conversion.
+        let mut ed = editor("\tx\n");
+        ex(&mut ed, "set tab_width 8");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(text(&ed), "        x\n");
+    }
+
+    #[test]
+    fn retab_does_not_reach_inside_the_line() {
+        let mut ed = editor("\tmsg = \"a\tb\";\t// note\n");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(
+            text(&ed),
+            "    msg = \"a\tb\";\t// note\n",
+            "the tab in the string and the aligning one are content, not indentation"
+        );
+    }
+
+    #[test]
+    fn retab_leaves_a_blank_line_to_the_trimmer() {
+        let mut ed = editor("\ta;\n\t\t\n\tb;\n");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(text(&ed), "    a;\n\t\t\n    b;\n", "a line with no text has no indent");
+        assert_eq!(ed.session.status, "2 lines retabbed to spaces");
+    }
+
+    #[test]
+    fn retab_takes_a_range_and_a_bare_one_takes_the_file() {
+        let mut ed = editor("\ta;\n\tb;\n\tc;\n");
+
+        ex(&mut ed, "2,3retab");
+
+        assert_eq!(text(&ed), "\ta;\n    b;\n    c;\n", "only the lines named");
+    }
+
+    #[test]
+    fn retab_refuses_a_line_that_is_not_there() {
+        let mut ed = editor("\ta;\n");
+
+        ex(&mut ed, "1,99retab");
+
+        assert_eq!(ed.session.status, "no line 99");
+        assert_eq!(text(&ed), "\ta;\n", "and changed nothing");
+    }
+
+    #[test]
+    fn retab_says_when_there_was_nothing_to_do() {
+        let mut ed = editor("    a;\n");
+
+        ex(&mut ed, "retab");
+
+        assert_eq!(ed.session.status, "indentation is already what the options ask for");
+    }
+
+    #[test]
+    fn retab_is_one_undo_step() {
+        let mut ed = editor("\ta;\n\tb;\n\tc;\n");
+
+        ex(&mut ed, "retab");
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(text(&ed), "\ta;\n\tb;\n\tc;\n", "three lines back in one press");
+    }
+
+    #[test]
+    fn retab_carries_the_cursor_with_its_line() {
+        let mut ed = editor("\ta;\n\tb;\n\tlanding;\n");
+        // On the `l` of `landing`, which is one tab in on the third row.
+        ed.set_cursor(Cursor::at(text(&ed).find("landing").unwrap()));
+
+        ex(&mut ed, "retab");
+
+        let at = ed.cursor().unwrap().at;
+        assert_eq!(
+            text(&ed)[..at].chars().count(),
+            text(&ed).find("landing").unwrap(),
+            "still on the same character, not clamped to the start of the line"
+        );
+    }
+
+    #[test]
+    fn retab_takes_no_argument() {
+        let mut ed = editor("\ta;\n");
+
+        ex(&mut ed, "retab 8");
+
+        assert_eq!(
+            ed.session.status,
+            "retab takes no argument — it follows tab_width and expandtab"
+        );
+        assert_eq!(text(&ed), "\ta;\n");
+    }
+
+    #[test]
+    fn retab_follows_the_project_the_way_everything_else_does() {
+        // The whole point, in one test: a tab-indented file in a project whose
+        // .editorconfig asks for four spaces.
+        let files = Files::new("retab-editorconfig");
+        files.file(".editorconfig", "root = true\n[*.c3]\nindent_style = space\nindent_size = 4\n");
+        let path = files.file("main.c3", "fn main()\n{\n\tio::printn(\"hi\");\n}\n");
+        let mut ed = Editor::open(&path).unwrap();
+
+        ex(&mut ed, "retab");
+        ex(&mut ed, "w");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main()\n{\n    io::printn(\"hi\");\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_later_set_outranks_the_project_here_as_everywhere() {
+        let files = Files::new("retab-set-wins");
+        files.file(".editorconfig", "root = true\n[*.c3]\nindent_style = space\nindent_size = 4\n");
+        let path = files.file("main.c3", "{\n    a;\n}\n");
+        let mut ed = Editor::open(&path).unwrap();
+
+        ex(&mut ed, "set expandtab false");
+        ex(&mut ed, "retab");
+
+        assert_eq!(
+            text(&ed),
+            "{\n\ta;\n}\n",
+            "`:set` is the layer above the project, and :retab reads the result"
+        );
     }
 
     // ---- decorations --------------------------------------------------------

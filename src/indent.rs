@@ -118,6 +118,33 @@ pub fn leading(line: &str) -> &str {
     &line[..end]
 }
 
+/// `line`'s leading whitespace, rewritten the way `indent` asks for it —
+/// `None` when it is already written that way.
+///
+/// The whole of `:retab`, and it is three lines because [`Indent::render`] is
+/// already the tabs-versus-spaces policy: measure the indent in columns, then
+/// ask for that many columns back. A file converted this way is the same width
+/// on screen as it was, which is the only promise worth making — the point is
+/// to change the characters, not the layout.
+///
+/// **Leading whitespace only.** A tab inside a string literal is content, and
+/// an editor that rewrites it has corrupted the file to satisfy a setting
+/// about indentation. That is the difference between this and vim's `:retab`,
+/// which walks every whitespace run on the line.
+///
+/// **A line with nothing but whitespace on it is left alone.** It has no
+/// indentation to convert — it has trailing whitespace, and removing that is
+/// `trim_trailing`'s job (`docs/specs/trim.md`). Two features rewriting the
+/// same characters to different ends is how they come to disagree.
+pub fn retab(line: &str, indent: &Indent) -> Option<String> {
+    let was = leading(line);
+    if was.len() == line.len() {
+        return None;
+    }
+    let now = indent.render(width_of(was, indent.tab_width));
+    (now != was).then_some(now)
+}
+
 /// The columns a line indented `width` gets vertical guides at: 0, one step
 /// in, two steps in, up to but not including the text itself.
 ///
@@ -181,6 +208,43 @@ mod tests {
         assert_eq!(guide_columns(0, 4).collect::<Vec<_>>(), [], "nothing to guide");
         assert_eq!(guide_columns(6, 4).collect::<Vec<_>>(), [0, 4], "a ragged indent still gets 4");
         assert_eq!(guide_columns(3, 4).collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn retab_rewrites_the_indent_and_leaves_the_line_alone() {
+        assert_eq!(retab("\tx", &spaces()), Some("    ".to_string()));
+        assert_eq!(retab("    x", &tabs()), Some("\t".to_string()));
+        assert_eq!(retab("    x", &spaces()), None, "already what it should be");
+        assert_eq!(retab("x", &tabs()), None, "nothing to convert");
+    }
+
+    #[test]
+    fn retab_keeps_the_width_the_line_had() {
+        // Six columns of indent stay six columns. The characters change; where
+        // the text starts on screen does not.
+        let wide = Indent { tab_width: 8, ..spaces() };
+        assert_eq!(retab("\tx", &wide), Some(" ".repeat(8)), "a tab was eight columns wide");
+        assert_eq!(
+            retab("\t  x", &Indent { expandtab: false, tab_width: 4, ..spaces() }),
+            None,
+            "a tab and two spaces is six columns, which is how it is already written"
+        );
+    }
+
+    #[test]
+    fn retab_does_not_reach_into_the_line() {
+        assert_eq!(
+            retab("\tmsg = \"a\tb\";\t// note", &spaces()),
+            Some("    ".to_string()),
+            "the leading tab only — the ones in the string and the alignment are content"
+        );
+    }
+
+    #[test]
+    fn retab_leaves_a_whitespace_only_line_to_the_trimmer() {
+        assert_eq!(retab("\t\t", &spaces()), None);
+        assert_eq!(retab("", &spaces()), None);
+        assert_eq!(retab("   ", &tabs()), None);
     }
 
     #[test]

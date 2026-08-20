@@ -795,6 +795,36 @@ impl Buffer {
         self.pending_edits[base..].to_vec()
     }
 
+    /// Rewrites the indentation of rows `first..=last` the way `indent` asks,
+    /// and hands back how many lines changed and the edits that changed them.
+    ///
+    /// The edits are returned for the same reason [`Buffer::trim`] returns
+    /// them: retabbing line 3 moves every offset below it, and a cursor on
+    /// line 400 has to be carried across rather than clamped or reset.
+    ///
+    /// Beside `trim` rather than up in the editor because it is the same shape
+    /// — a bulk rewrite of leading whitespace — and because a frontend that is
+    /// not this one should be able to offer it without reimplementing the
+    /// walk. The policy itself is [`indent::retab`]'s; this is the rope.
+    pub fn retab(&mut self, first: usize, last: usize, indent: &Indent) -> (usize, Vec<Edit>) {
+        let base = self.pending_edits.len();
+        let mut lines = 0;
+
+        // Bottom-up, so an edit on one row cannot move the rows still to come
+        // — the same reason `trim` counts down.
+        let last = last.min(self.line_count().saturating_sub(1));
+        for row in (first..=last).rev() {
+            let text = self.line_text(row);
+            let Some(now) = indent::retab(&text, indent) else { continue };
+            let start = self.rope.line_to_char(row);
+            let was = indent::leading(&text).chars().count();
+            self.apply_edit(start, start + was, &now);
+            lines += 1;
+        }
+
+        (lines, self.pending_edits[base..].to_vec())
+    }
+
     /// Clears a line that is nothing but whitespace, on the way out of insert
     /// mode.
     ///
