@@ -9,3 +9,4 @@
    about the future.
 4. When the work is done, commit and push it. Straight to `master` — never a
    feature branch.
+5. Git commits should be simple, rather short. Never add Co-Authored-By messages or any other Claude related.
