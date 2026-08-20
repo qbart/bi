@@ -377,7 +377,8 @@ The buffer list is ordered by when each buffer was last *shown* and opens on
 the second row — the one you were in before this one — so `Ctrl-Tab` `Enter`
 switches back and doing it twice returns you. Where a terminal cannot tell
 `Ctrl-Tab` from `Tab` you simply get buffer-next, which is what that key always
-did. See [docs/specs/buffers.md](docs/specs/buffers.md).
+did — and `gf` opens the switcher on every terminal, beside `ga` for the
+alternate file. See [docs/specs/buffers.md](docs/specs/buffers.md).
 
 Only the register ring gets a preview pane. A file name, a command line and a
 buffer are each already the row you are reading, so the pane would repeat it
@@ -480,7 +481,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W =` | equalise every pane |
 | `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
 | `Ctrl-I` `Ctrl-O` | cycle the buffer list forwards / backwards. `Ctrl-I` is `Tab`, byte for byte |
-| `Ctrl-Tab` | the buffer switcher: newest first, opening on the one you were in before |
+| `Ctrl-Tab` `gf` | the buffer switcher: newest first, opening on the one you were in before |
 
 Two windows may show one buffer, with their own cursor and their own scroll.
 An edit in one moves the other's cursor *with the text* rather than clamping it
@@ -521,11 +522,13 @@ Only naming a directory, `+` and `-` do. See
 | `c` `x` | mark for copying / for cutting, and unmark |
 | `p` | put what is marked into the selected directory |
 | `Esc` | forget what is marked |
+| `Ctrl-P` | the file picker — a tree is where you look files up |
 
 Enter on a file opens it in the last window focused before this one, so a tree
 pane is a sidebar that stays put and files land in whichever pane you reached it
-from. With one window it opens in place, and `Ctrl-^` brings the tree back with
-its expansion intact.
+from. `Ctrl-P` and `:e <file>` follow the same rule, so nothing opened from a
+tree closes the tree. With one window it opens in place, and `Ctrl-^` brings the
+tree back with its expansion intact.
 
 A split opens on the far side — below for `:sp`, right for `:vs` — and focus
 goes there, so you can see that you moved. Vim's default is the other way
@@ -694,18 +697,18 @@ color_swatches false` turns it off. See
 
 #### Trimming
 
-`:w` tidies the file on its way out: trailing whitespace goes, and so do the
-blank lines at either end of it. `trim.final_newline` is off until you or the
-project asks for it — a file that does not end in a newline is a file somebody
-may have meant, and adding one is a diff you did not ask for.
+`:w` tidies the file on its way out: trailing whitespace goes, the blank lines
+at either end of it go, and a file that does not end in a newline gets one. All
+five are on, because a write that tidies is the point; a project that disagrees
+says so once, in its config or its `.editorconfig`, and is obeyed everywhere.
 
 ```toml
 [options]
-trim.on_write      = true    # the master switch
-trim.trailing      = true
-trim.first_line    = true
-trim.last_line     = true
-trim.final_newline = false
+trim_on_write      = true    # the master switch
+trim_trailing      = true
+trim_first_line    = true
+trim_last_line     = true
+trim_final_newline = true
 ```
 
 Markdown keeps its trailing spaces, because two of them are a hard line break

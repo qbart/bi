@@ -269,11 +269,20 @@ Ctrl-W …        every window key, unchanged
 Ctrl-W e        a tree beside this one, in a pane of its own
 :               the command line
 Ctrl-^          the alternate content, tree or file
+Tab Ctrl-I / Ctrl-O   the next / previous buffer, shown from here
+Ctrl-P          the file picker
 ```
 
 Nothing else. `/` is not in the list because the tree has no search, and neither
 are `i`, `a`'s normal-mode meaning, `p` or `x` — an allowlist does not have to
 name what it excludes.
+
+**`Ctrl-P` is in the list because a tree is where you look files up.** The one
+key that finds a file by name has no business being the one key that does not
+work in the pane built for finding files. It is also the case the allowlist
+gets wrong quietly rather than loudly: `p` is paste, `ctrl` was not checked,
+and `Ctrl-P` in a tree pasted the marked files into the directory under the
+cursor.
 
 `-` and `+` are inverses, and the pair is the reason the tree does not only get
 wider as you use it: `+` scopes to the directory you are standing in — the one
@@ -334,6 +343,13 @@ anywhere.
 Enter on a file opens it in the **last-focused window that is not this one**, and
 the tree stays where it is. With no other window it opens in place, and the tree
 goes to `alt`.
+
+**That is the rule for every way of opening a file from a tree**, not only for
+Enter: `Ctrl-P` and `:e <file>` land in the same window and leave the sidebar
+alone. One question — "which window does a file go in" — answered in one place
+(`Editor::open_target`), because a picker that closed the pane you opened it
+from is the same bug written twice. Naming a *directory* still re-roots the
+pane you are in, tree or not: that is what naming one means.
 
 So `:vs .` is a persistent sidebar and `bi .` is netrw, out of one rule and no
 sidebar concept. The window tree needs no special case, `:only` needs no special
@@ -621,6 +637,7 @@ design's two claims live:
   `alt`; `Ctrl-^` brings it back with its expansion intact.
 - Enter on a file with a split sends the file to the previously focused window
   and leaves the tree alone.
+- `Ctrl-P` from a tree does the same, and does not paste.
 - No `View` can be built on a tree window — `Editor::view` returns `None`, which
   is the compiler-checked form of "the editing commands never see a tree".
 

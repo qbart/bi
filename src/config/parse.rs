@@ -56,11 +56,11 @@ fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
 /// A table as flat `name` / `(line, value)` pairs, with dotted names for what
 /// was nested.
 ///
-/// `trim.trailing = false`, `trim = { trailing = false }` and
-/// `[options.trim] trailing = false` are three TOML spellings of one setting,
-/// and `:set trim.trailing false` is a fourth. They arrive here as different
-/// shapes and leave as the same name, which is what keeps `[options]` a single
-/// namespace rather than a namespace and a set of exceptions.
+/// No option has a dotted name any more — the trimming five are `trim_trailing`
+/// and friends — so nothing here is *meant* to nest, and the flattening is what
+/// turns a nested spelling into a diagnostic instead of a silence. Write
+/// `[options.trim] trailing = false` and it arrives as `trim.trailing`, which
+/// `Options::set` does not know and says so, naming the thing you wrote.
 fn flatten(src: &str, table: &Table, prefix: &str) -> Vec<(String, (usize, OptionValue))> {
     let mut out = Vec::new();
     for (key, item) in table.iter() {
@@ -105,8 +105,8 @@ fn read_filetypes(src: &str, table: &Table, config: &mut Config, problems: &mut 
             continue;
         };
         let patch = config.filetypes.entry(name.to_string()).or_default();
-        // Flattened, so `trim.trailing = false` here means what it means in
-        // `[options]` — one namespace, whichever scope it is written in.
+        // Through the same flatten as `[options]`, so a key means what it
+        // means there and a nested one is the same diagnostic in both.
         for (key, (line, value)) in flatten(src, inner, "") {
             if let Err(message) = super::Options::default().set(&key, value.clone()) {
                 problems.push(Diagnostic { line, message });
@@ -430,6 +430,20 @@ mod tests {
         let (config, problems) = ok("[options]\nnumber = 5\nnmber = 9\n");
         assert_eq!(problems, ["3: unknown option: nmber"]);
         assert_eq!(config.options.number, LineNumbers::Every(5), "the good line still applied");
+    }
+
+    /// No option has a dotted name, so a nested section is somebody writing
+    /// the old spelling of the trimming five. It has to say so: flattening it
+    /// into a name `Options::set` rejects is what turns a setting that
+    /// silently does nothing into a line number and the text you wrote.
+    #[test]
+    fn a_nested_option_is_an_unknown_one_and_names_what_was_written() {
+        let (config, problems) = ok("[options.trim]\ntrailing = false\n");
+        assert_eq!(problems, ["2: unknown option: trim.trailing"]);
+        assert!(config.options.trim.trailing, "and nothing was applied");
+
+        let (_, problems) = ok("[options]\ntrim = { trailing = false }\n");
+        assert_eq!(problems, ["2: unknown option: trim.trailing"], "the inline shape too");
     }
 
     #[test]

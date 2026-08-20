@@ -400,10 +400,10 @@ fn to_patch(properties: &[(String, String)]) -> OptionPatch {
     // The two properties that are bi's trim options by another name — see
     // `docs/specs/trim.md`.
     if let Some(value) = get("trim_trailing_whitespace") {
-        patch.set("trim.trailing", OptionValue::Bool(value == "true"));
+        patch.set("trim_trailing", OptionValue::Bool(value == "true"));
     }
     if let Some(value) = get("insert_final_newline") {
-        patch.set("trim.final_newline", OptionValue::Bool(value == "true"));
+        patch.set("trim_final_newline", OptionValue::Bool(value == "true"));
     }
     match get("indent_style") {
         Some("tab") => patch.set("expandtab", OptionValue::Bool(false)),

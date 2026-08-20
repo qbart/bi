@@ -130,9 +130,11 @@ pub struct Options {
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
     /// A struct rather than five more fields because they are one feature with
-    /// a master switch, and because `Buffer` takes the bundle. The `:set`
-    /// names are dotted — `trim.trailing` — which is one namespace still, not
-    /// a second one.
+    /// a master switch, and because `Buffer` takes the bundle. That is a fact
+    /// about the Rust, though, and not about the config: the five are spelled
+    /// `trim_trailing` and the rest, flat, like every other option. The
+    /// grouping is in the prefix, where a reader can see it, rather than in a
+    /// table that made `[options]` a namespace with one exception in it.
     pub trim: crate::trim::Trim,
 }
 
@@ -206,14 +208,14 @@ impl Options {
             ("yank_flash", _) => {
                 return Err("yank_flash takes milliseconds, or 0 to turn it off".into());
             }
-            ("trim.on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
-            ("trim.trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
-            ("trim.first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
-            ("trim.last_line", OptionValue::Bool(on)) => self.trim.last_line = on,
-            ("trim.final_newline", OptionValue::Bool(on)) => self.trim.final_newline = on,
+            ("trim_on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
+            ("trim_trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
+            ("trim_first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
+            ("trim_last_line", OptionValue::Bool(on)) => self.trim.last_line = on,
+            ("trim_final_newline", OptionValue::Bool(on)) => self.trim.final_newline = on,
             (
-                "trim.on_write" | "trim.trailing" | "trim.first_line" | "trim.last_line"
-                | "trim.final_newline",
+                "trim_on_write" | "trim_trailing" | "trim_first_line" | "trim_last_line"
+                | "trim_final_newline",
                 _,
             ) => return Err(format!("{name} takes true or false")),
             _ => return Err(format!("unknown option: {name}")),
@@ -245,11 +247,11 @@ impl Options {
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),
-            "trim.on_write" => OptionValue::Bool(self.trim.on_write),
-            "trim.trailing" => OptionValue::Bool(self.trim.trailing),
-            "trim.first_line" => OptionValue::Bool(self.trim.first_line),
-            "trim.last_line" => OptionValue::Bool(self.trim.last_line),
-            "trim.final_newline" => OptionValue::Bool(self.trim.final_newline),
+            "trim_on_write" => OptionValue::Bool(self.trim.on_write),
+            "trim_trailing" => OptionValue::Bool(self.trim.trailing),
+            "trim_first_line" => OptionValue::Bool(self.trim.first_line),
+            "trim_last_line" => OptionValue::Bool(self.trim.last_line),
+            "trim_final_newline" => OptionValue::Bool(self.trim.final_newline),
             _ => return None,
         })
     }
@@ -333,7 +335,7 @@ pub fn filetype_defaults(filetype: &str) -> OptionPatch {
         "go" => patch.set("expandtab", OptionValue::Bool(false)),
         // Two trailing spaces are a hard line break in Markdown — actual
         // syntax, in a format where whitespace is content.
-        "markdown" => patch.set("trim.trailing", OptionValue::Bool(false)),
+        "markdown" => patch.set("trim_trailing", OptionValue::Bool(false)),
         _ => {}
     }
     patch

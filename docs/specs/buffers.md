@@ -56,9 +56,18 @@ key had to be given up — which is the reason the *window* picker went to
 
 `:ls` opens the same list, always, in every terminal.
 
+**`gf` is the default that always arrives.** `Ctrl-Tab` is the key this was
+asked for and the one to use where it works, but "where it works" is a
+property of the terminal, and a switcher you cannot reach on half of them is
+not a default. `gf` sits under the `g` prefix beside `ga`
+(`docs/specs/alternate.md`), on a sequence vim spends on "open the file named
+under the cursor" — a command bi does not have, so nothing is given up, and
+`f` is the letter people reach for when they mean *file*.
+
 ## Tests
 
 - Three buffers opened in order list newest-first.
 - Opening and accepting is a switch to the previous buffer; twice is a toggle.
 - Typing leaves the default row and matches a subsequence.
 - The overlay is a list: no preview pane, the same as `Ctrl-P`.
+- `gf` opens it, and `ga` still reaches the alternate file.

@@ -61,19 +61,20 @@ theme = "gruvbox-dark"
 # Set it to the same as `theme` to turn the distinction off.
 ssh_theme = "gruvbox-light"
 
-# What a write tidies up on its way out. `on_write` is the master switch: off,
-# none of the rest happens. `first_line` removes blank lines at the top of the
-# file and `last_line` removes them at the bottom — a run of empty lines is the
-# same accident at either end, and leaving it there means every write hands the
-# reviewer a diff of nothing. `final_newline` only ever adds one, and is off:
-# a file that does not end in a newline is a file somebody may have meant.
+# What a write tidies up on its way out. `trim_on_write` is the master switch:
+# off, none of the rest happens. `trim_first_line` removes blank lines at the
+# top of the file and `trim_last_line` removes them at the bottom — a run of
+# empty lines is the same accident at either end, and leaving it there means
+# every write hands the reviewer a diff of nothing. `trim_final_newline` only
+# ever adds one; removing the extra ones is `trim_last_line`'s job, which is
+# why they are two settings and not one.
 # Markdown keeps its trailing spaces: two of them are a hard line break there.
 # See docs/specs/trim.md.
-trim.on_write = true
-trim.trailing = true
-trim.first_line = true
-trim.last_line = true
-trim.final_newline = false
+trim_on_write = true
+trim_trailing = true
+trim_first_line = true
+trim_last_line = true
+trim_final_newline = true
 
 # A [filetype.<name>] section holds options for one kind of file, laid over
 # [options] above — a [filetype.go] section setting tab_width to 4, say. The

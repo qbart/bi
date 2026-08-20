@@ -11,40 +11,40 @@ out removes the hook, the lint and the review comment with it.
 ## The options
 
 ```
-trim.on_write      = true    do any of this at all, on `:w`
-trim.trailing      = true    spaces and tabs at the end of a line
-trim.first_line    = true    blank lines at the top of the file
-trim.last_line     = true    blank lines at the bottom of it
-trim.final_newline = false   end the file with a newline if it has none
+trim_on_write      = true    do any of this at all, on `:w`
+trim_trailing      = true    spaces and tabs at the end of a line
+trim_first_line    = true    blank lines at the top of the file
+trim_last_line     = true    blank lines at the bottom of it
+trim_final_newline = true    end the file with a newline if it has none
 ```
 
-Dotted names, inside `[options]`, because `[options]` **is** the `:set`
-namespace and there is exactly one of those — `:set trim.trailing false` and
-`trim.trailing = false` reach one setting, the same promise every other option
-makes. TOML spells the same thing three ways (`trim.trailing = false`, an
-inline table, or an `[options.trim]` section) and all three arrive here.
+**Flat names with a prefix, not a table.** An earlier draft spelled these
+`trim.trailing` and made `[options]` accept three TOML shapes for the same
+setting — a dotted key, an inline table, an `[options.trim]` section. It was
+one option in the file that behaved unlike every other, three code paths to
+keep agreeing, and a `:set` name with a `.` in it that reads like a path. The
+prefix does the grouping that a table was there to do, where a reader sees it,
+and `[options]` goes back to being a flat list of names. Nesting is now an
+error that names what you wrote.
 
-`trim.on_write` is the master switch rather than a fifth thing to remember: off,
-nothing below it happens, whatever the four say. It exists because "I want bi
-to leave this repository's files exactly as it found them" is a real sentence,
-and answering it should not mean turning four options off one at a time.
+`trim_on_write` is the master switch rather than a fifth thing to remember:
+off, nothing below it happens, whatever the four say. It exists because "I want
+bi to leave this repository's files exactly as it found them" is a real
+sentence, and answering it should not mean turning four options off one at a
+time.
 
-**`trim.last_line` and `trim.first_line` both default to on**, because they are
-the same accident at the two ends of a file. An earlier draft had `last_line`
-off, on the grounds that blank lines at the bottom are load-bearing often
-enough — a heredoc, a fixture, a file whose format counts them — that removing
-them would be bi editing data. It is a real case and it is rare, and paying for
-it with a run of empty lines in every other diff is the wrong trade: the file
-that counts its trailing newlines says `trim.last_line = false` once, in the
-project's config, and everyone else gets a write that tidies both ends.
+**All five are on.** Earlier drafts shipped `last_line` and `final_newline`
+off, on the grounds that blank lines at the bottom of a file are load-bearing
+often enough — a heredoc, a fixture, a file whose format counts them — and that
+a file without a final newline might be a file somebody meant. Both are real
+and both are rare, and paying for them with untidy writes everywhere else is
+the wrong trade. A write tidies the file; the project that wants otherwise says
+`trim_last_line = false` once, in its config or its `.editorconfig`, and is
+obeyed everywhere.
 
 Note what this still does *not* do: a file that is nothing but blank lines is
-left exactly as it was, and the last line keeps whatever terminator it had.
-
-**`trim.final_newline` defaults to off**, which is not what `.editorconfig`
-usually says, and deliberately: bi's job out of the box is to write the file
-you have. A project that wants the newline says so in its `.editorconfig` and
-gets it; nobody is surprised by a diff they did not ask for.
+left exactly as it was, `final_newline` only ever adds, and an empty file has
+no line to terminate and stays empty.
 
 ## What each one does
 
@@ -66,11 +66,11 @@ keeping the two separate is what lets a project ask for one without the other.
 ## Markdown is exempt, and not by a list
 
 Two trailing spaces in Markdown are a hard line break — actual syntax, in a
-format where whitespace is content. So bi ships `trim.trailing = false` as a
+format where whitespace is content. So bi ships `trim_trailing = false` as a
 built-in default for `markdown`, in the same tiny table that gives a Makefile
 its tabs (`docs/specs/options.md`).
 
-An earlier draft had `trim.ft_blocklist = ["markdown"]`. It was dropped, and
+An earlier draft had `trim_ft_blocklist = ["markdown"]`. It was dropped, and
 the reason is worth writing down: options already resolve per file type, so a
 list inside an option would be a *second* mechanism answering the question the
 first one exists for — and the config that disables trimming in one and enables
@@ -80,7 +80,7 @@ line trimmed, because only the option that would break it is off.
 
 ```toml
 [filetype.markdown]
-trim.trailing = true      # if you disagree with bi about this
+trim_trailing = true      # if you disagree with bi about this
 ```
 
 ## `.editorconfig`
@@ -89,13 +89,14 @@ Two of the format's properties are these options by another name, and they map
 straight across:
 
 ```
-trim_trailing_whitespace = true|false   → trim.trailing
-insert_final_newline     = true|false   → trim.final_newline
+trim_trailing_whitespace = true|false   → trim_trailing
+insert_final_newline     = true|false   → trim_final_newline
 ```
 
-Which is the layer that makes the conservative defaults above the right ones: a
-project that has an opinion states it and is obeyed, and one that does not gets
-an editor that does not rewrite its files.
+Which is the layer that makes the defaults above affordable: a project that
+disagrees states it once, in the file every other editor already reads, and is
+obeyed. The two properties are the only ones anybody sets `false` on purpose,
+and they are exactly the two that map.
 
 ## When it happens, and what it costs you
 
@@ -118,10 +119,13 @@ windows on the same buffer follow through `settle`, like every other edit.
 - Trailing spaces and tabs go, on every line, and a whitespace-only line
   becomes empty.
 - Blank lines go from both ends by default, and trailing ones stay when
-  `trim.last_line` is off.
+  `trim_last_line` is off.
 - A file of nothing but blank lines is left alone.
-- `final_newline` adds one when there is none and changes nothing when there is.
-- `trim.on_write = false` means none of it happens.
+- `final_newline` adds one when there is none, changes nothing when there is,
+  and leaves an empty file empty.
+- A nested spelling — `[options.trim] trailing = false` — is an unknown option
+  that names what was written, not a setting that quietly does nothing.
+- `trim_on_write = false` means none of it happens.
 - A markdown buffer keeps its two trailing spaces, and a `[filetype.markdown]`
   section can turn that back on.
 - `.editorconfig`'s two properties reach the two options.

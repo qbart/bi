@@ -654,6 +654,12 @@ impl Input {
             KeyCode::Char('i') if ctrl => return self.plain(Action::Buffer(BufferCmd::Next)),
             KeyCode::Char('o') if ctrl => return self.plain(Action::Buffer(BufferCmd::Prev)),
             KeyCode::Tab => return self.plain(Action::Buffer(BufferCmd::Next)),
+            // Before `p`, which is paste: a tree is a place you look files up,
+            // so the key that looks one up by name belongs here more than
+            // anywhere. Without this it read as `p` and pasted.
+            KeyCode::Char('p') if ctrl => {
+                return self.plain(Action::OpenPicker(PickerKind::File));
+            }
 
             KeyCode::Char('j') | KeyCode::Down => TreeCmd::Select { down: true, count },
             KeyCode::Char('k') | KeyCode::Up => TreeCmd::Select { down: false, count },
@@ -856,6 +862,12 @@ impl Input {
                 // and a leader binding can spell it `<leader>a` instead.
                 // See `docs/specs/alternate.md`.
                 'a' => self.plain(Action::Ex { line: "alt".into(), run: true }),
+                // The buffer switcher, for the terminals that cannot tell
+                // `Ctrl-Tab` from `Tab`. Vim's `gf` opens the file named under
+                // the cursor; bi has no such command, and the letter is the
+                // one people reach for when they mean "go to a file".
+                // See `docs/specs/buffers.md`.
+                'f' => self.plain(Action::Buffer(BufferCmd::List)),
                 _ => {
                     self.reset();
                     None
@@ -1940,6 +1952,27 @@ leader = \" \"
         let mut input = Input::default();
         let next = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree).unwrap();
         assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
+    }
+
+    /// The two keys under the `g` prefix that go somewhere rather than move
+    /// the cursor. Both are sequences vim spends on something bi does not
+    /// have, so neither cost anything to take.
+    #[test]
+    fn the_g_prefix_reaches_the_other_file_and_the_buffer_list() {
+        assert_eq!(typed("ga").action, Action::Ex { line: "alt".into(), run: true });
+        assert_eq!(typed("gf").action, Action::Buffer(BufferCmd::List));
+    }
+
+    /// A tree is where you look files up, so the key that looks one up by
+    /// name has to reach it — and it must not fall through to `p`, which
+    /// pastes into the directory under the cursor.
+    #[test]
+    fn ctrl_p_opens_the_file_picker_from_a_tree() {
+        let mut input = Input::default();
+        let cmd = input.on_key(ctrl('p'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        assert_eq!(cmd.action, Action::OpenPicker(PickerKind::File));
+
+        assert_eq!(tree_action("p"), Action::Tree(TreeCmd::Paste), "and a bare p still pastes");
     }
 
     #[test]

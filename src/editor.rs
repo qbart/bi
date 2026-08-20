@@ -2777,7 +2777,7 @@ impl Editor {
         }
 
         let path = row.path.clone();
-        let target = self.handoff_window();
+        let target = self.open_target();
         match self.open_path(&path.to_string_lossy()) {
             Ok(id) => {
                 self.show(target, id);
@@ -3244,17 +3244,32 @@ impl Editor {
     /// `:e` — reload from disk — still refuses, and needs a view.
     fn edit_path(&mut self, path: &str) {
         // A path is a path: `:e` asks the disk what it is rather than making
-        // you remember which command a directory wants.
+        // you remember which command a directory wants. A directory re-roots
+        // the pane you are in, tree or not — that is what naming one means.
         if std::path::Path::new(path).is_dir() {
             return self.show_tree(path);
         }
+        let target = self.open_target();
         match self.open_path(path) {
             Ok(id) => {
-                let focus = self.focus;
-                self.show(focus, id);
+                self.show(target, id);
+                self.set_focus(target);
                 self.session.status = format!("\"{}\" loaded", self.name_of(id));
             }
             Err(e) => self.session.status = format!("{e:#}"),
+        }
+    }
+
+    /// Which window a file being opened should appear in.
+    ///
+    /// This one, unless it is a tree — a sidebar you looked a file up in is a
+    /// sidebar you still want, so the file goes where Enter on a tree row
+    /// sends it and focus follows it there. One rule for `Ctrl-P`, `:e` and
+    /// the tree's own Enter. See `docs/specs/tree.md`.
+    fn open_target(&self) -> WindowId {
+        match self.window().tree().is_some() {
+            true => self.handoff_window(),
+            false => self.focus,
         }
     }
 
@@ -10337,7 +10352,7 @@ mod tests {
         let f = Scratch::new("trim-off.rs", "\nalpha  \n");
         let mut ed = opened(&f);
 
-        ex(&mut ed, "set trim.on_write false");
+        ex(&mut ed, "set trim_on_write false");
         ex(&mut ed, "w");
 
         assert_eq!(f.read(), "\nalpha  \n");
@@ -10360,7 +10375,7 @@ mod tests {
         let f = Scratch::new("opinion.md", "a line  \n");
         let mut ed = opened(&f);
 
-        ed.load_config(ConfigText(Some("[filetype.markdown]\ntrim.trailing = true\n")));
+        ed.load_config(ConfigText(Some("[filetype.markdown]\ntrim_trailing = true\n")));
         ex(&mut ed, "w");
 
         assert_eq!(f.read(), "a line\n");
@@ -11280,6 +11295,27 @@ mod tests {
         ed.apply(cmd(Action::PickAccept));
 
         assert_eq!(ed.buffer_ids().len(), before, "one file, one buffer");
+    }
+
+    /// The picker reached from a tree opens the file the way Enter on a tree
+    /// row does — in the window you came from, sidebar intact. Opening it over
+    /// the tree would close the thing you were looking a file up in.
+    #[test]
+    fn a_file_picked_from_a_tree_lands_beside_it_and_not_on_it() {
+        let d = ScratchDir::new("picker-tree").file("a.rs");
+        let mut ed = editor("one");
+        sized(&mut ed);
+        let file = ed.focus();
+        ex(&mut ed, &format!("vs {}", d.path()));
+        let tree = ed.focus();
+        ed.session.tree_root = Some(std::path::PathBuf::from(d.path()));
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert!(ed.window_of(tree).unwrap().tree().is_some(), "the sidebar stayed");
+        assert_eq!(ed.focus(), file, "and the file landed where you came from");
+        assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
     }
 
     #[test]

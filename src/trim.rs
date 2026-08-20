@@ -27,6 +27,8 @@ pub struct Trim {
     /// `last_line`'s job, and keeping them apart is what lets a project ask
     /// for one without the other.
     pub final_newline: bool,
+    // Every one of these is on by default. A write tidies the file; the
+    // project that wants otherwise says so once.
 }
 
 impl Default for Trim {
@@ -36,7 +38,7 @@ impl Default for Trim {
             trailing: true,
             first_line: true,
             last_line: true,
-            final_newline: false,
+            final_newline: true,
         }
     }
 }
@@ -70,16 +72,24 @@ mod tests {
     }
 
     #[test]
-    fn blank_lines_go_from_both_ends_of_a_file_by_default() {
+    fn a_write_tidies_the_file_unless_it_is_told_not_to() {
         let default = Trim::default();
+        assert!(default.on_write);
+        assert!(default.trailing);
         assert!(default.first_line);
-        assert!(default.last_line);
+        assert!(default.last_line, "blank lines go from both ends, not one");
+        assert!(default.final_newline);
     }
 
     #[test]
     fn the_master_switch_stands_in_for_all_four() {
-        let all_off =
-            Trim { trailing: false, first_line: false, last_line: false, ..Trim::default() };
+        let all_off = Trim {
+            trailing: false,
+            first_line: false,
+            last_line: false,
+            final_newline: false,
+            ..Trim::default()
+        };
         assert!(!all_off.does_anything());
         assert!(!Trim { on_write: false, ..Trim::default() }.does_anything());
         assert!(Trim::default().does_anything());
