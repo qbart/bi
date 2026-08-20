@@ -53,6 +53,16 @@ you can resize lower or higher to break viewport, so full height page cannot rea
 but two splits can grow/shrink by x, vertical split by y etc.
 if more splits next to each other then obciously you need to grow one, shrink the other
 
+
+also for the resize i want weight based resize
+so when i do:
+
+:resize 1:2
+it means that buffers resize in proportions of 1:2 horizontally
+:resize 1:2y it goes vertically
+
+:resize 1:2,1:2 it does the resize x then resize y proportionally on all splits
+
 ### symbols
 
 new command :symbols
