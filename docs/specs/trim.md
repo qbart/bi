@@ -14,7 +14,7 @@ out removes the hook, the lint and the review comment with it.
 trim.on_write      = true    do any of this at all, on `:w`
 trim.trailing      = true    spaces and tabs at the end of a line
 trim.first_line    = true    blank lines at the top of the file
-trim.last_line     = false   blank lines at the bottom of it
+trim.last_line     = true    blank lines at the bottom of it
 trim.final_newline = false   end the file with a newline if it has none
 ```
 
@@ -29,11 +29,17 @@ nothing below it happens, whatever the four say. It exists because "I want bi
 to leave this repository's files exactly as it found them" is a real sentence,
 and answering it should not mean turning four options off one at a time.
 
-**`trim.last_line` defaults to off** while `first_line` defaults to on, which
-looks asymmetric and is not. A blank line at the top of a file is a mistake in
-every language there is. Blank lines at the *bottom* are load-bearing often
+**`trim.last_line` and `trim.first_line` both default to on**, because they are
+the same accident at the two ends of a file. An earlier draft had `last_line`
+off, on the grounds that blank lines at the bottom are load-bearing often
 enough — a heredoc, a fixture, a file whose format counts them — that removing
-them by default would be bi silently editing data.
+them would be bi editing data. It is a real case and it is rare, and paying for
+it with a run of empty lines in every other diff is the wrong trade: the file
+that counts its trailing newlines says `trim.last_line = false` once, in the
+project's config, and everyone else gets a write that tidies both ends.
+
+Note what this still does *not* do: a file that is nothing but blank lines is
+left exactly as it was, and the last line keeps whatever terminator it had.
 
 **`trim.final_newline` defaults to off**, which is not what `.editorconfig`
 usually says, and deliberately: bi's job out of the box is to write the file
@@ -111,7 +117,8 @@ windows on the same buffer follow through `settle`, like every other edit.
 
 - Trailing spaces and tabs go, on every line, and a whitespace-only line
   becomes empty.
-- Leading blank lines go; trailing ones stay until `trim.last_line` is on.
+- Blank lines go from both ends by default, and trailing ones stay when
+  `trim.last_line` is off.
 - A file of nothing but blank lines is left alone.
 - `final_newline` adds one when there is none and changes nothing when there is.
 - `trim.on_write = false` means none of it happens.

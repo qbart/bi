@@ -57,13 +57,24 @@ list, and a list has no business inside a `Mode` enum.
 
 ## Drawing them
 
-An `Overlay` decoration per label (`docs/specs/decorations.md`) on the `Over`
-layer — a letter you are about to press has to be readable wherever it lands,
-including on top of a selection. The colour is the theme's `label`.
+An `Inline` decoration per label (`docs/specs/decorations.md`) — the letter is
+inserted *between* two cells and pushes the rest of the row right, rather than
+sitting on top of a character and hiding it.
 
-Because they are decorations, the frontend does not learn anything new: the
-letters arrive in the same list as the indent guides and are painted by the
-same code.
+**Not an overlay**, which is what this was first, and the reason is the whole
+point of a label: it names a place, and the place is a character. A letter
+drawn over that character answers "press `f`" and takes away "for *what*" —
+`return` reads as `geturn` and you are picking blind. One cell cannot hold two
+characters, so the row gets wider for as long as the letters are up, which
+costs a column at the right edge and is worth it.
+
+Two labels wanting the same column get a cell each, in the order they were
+produced. `S` is the client that needs this: two scopes can end in the same
+place, and a letter that quietly wins is a scope you cannot see the extent of.
+
+The colour is the theme's `label`. Because they are decorations, the frontend
+does not learn anything new: the letters arrive in the same list as the indent
+guides and are painted by the same code.
 
 ## Windows, the first client
 
@@ -87,6 +98,9 @@ depending on where you are, which is exactly what a label is supposed not to do.
 - More targets than keys: the good keys stay single and the tail doubles up,
   and every label is unique.
 - An excluded character appears in no label, not even as a prefix.
+- A label is inserted rather than drawn over: the character it names is still
+  on the screen, one cell along.
+- Two labels at one column are two cells, in the order they were produced.
 - Zero targets is no labels; more targets than two characters can name is as
   many as can be named, and it says so rather than losing them silently.
 - `Ctrl-W f` labels every window including the focused one, and the letter

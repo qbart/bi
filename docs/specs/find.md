@@ -34,9 +34,15 @@ between them. Every character that could extend *any* match on screen is
 excluded, in both cases, so the answer does not depend on which match you were
 looking at.
 
-The label is drawn **after** its match, over the character that follows it, and
-pressing it goes to the **start** of the match — you aim at the word and land
-on its first character.
+The label is drawn **after** its match, in a cell of its own between the match
+and whatever follows it, and pressing it goes to the **start** of the match —
+you aim at the word and land on its first character. Inserted rather than
+overlaid (`docs/specs/labels.md`), so the word after the match is still a word
+you can read.
+
+**The dim arrives with the keypress**, before a single character of the query.
+It is the announcement that `s` is aiming; one that waits for the first letter
+leaves you looking at an ordinary screen wondering whether the key registered.
 
 ## What it searches
 
@@ -61,16 +67,18 @@ Three kinds of decoration, in this order, which is why the order a provider
 pushes them in is the order they paint in:
 
 1. one `Repaint` over the whole visible range in the theme's `dim`, so the
-   syntax colours stop competing with the matches
+   syntax colours stop competing with the matches — from the moment `s` is
+   pressed, whether or not anything has been typed or matched yet
 2. one `Repaint` per match in `search` — the same colour `/` uses, because it
    is the same thing
-3. one `Overlay` per label in `label`, on the `Over` layer
+3. one `Inline` per label in `label`, inserted after its match
 
 Nothing new reaches the frontend; the letters and the dimming arrive in the
 same list as the indent guides.
 
 ## Tests
 
+- The screen dims on the press, before anything is typed.
 - Typing narrows: `f`, then `fu`, then `fun` each match fewer things.
 - Every match gets a label, and no label is a character that could extend a
   match.

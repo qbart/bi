@@ -6,12 +6,16 @@ one character wrong.
 
 ```
 :case snake
-:case camel     :case pascal    :case kebab    :case constant
+:case camel     :case pascal    :case dash     :case const
 :case upper     :case lower     :case title
 ```
 
-`capital` is `title`, `screaming` is `constant`, and `dash` is `kebab` — the
-same styles under the names people reach for.
+**One name each, and no aliases.** An earlier draft took `capital` for `title`,
+`screaming` for `constant` and `dash` for `kebab`. A second name for a style is
+a second thing in the error message and a second thing to keep true, and it
+buys nothing that completing the one name does not — so `kebab` is `dash`,
+which says what the separator is, and `constant` is `const`, which is what the
+languages that want it call it.
 
 ## Status
 
@@ -80,4 +84,5 @@ already shorter than remembering which of `gU`, `gu`, `g~`, `crs`, `crc` and
   something is; the cursor on the first character afterwards.
 - Whitespace under the cursor is not a word.
 - One undo step.
-- An unknown style lists the ones that exist and changes nothing.
+- An unknown style lists the ones that exist and changes nothing, and the
+  dropped aliases are unknown styles.

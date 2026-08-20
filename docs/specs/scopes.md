@@ -35,6 +35,18 @@ Press `b` and that becomes the selection, in charwise visual mode.
 one letter tells you where a scope starts *and* where it ends, so you can see
 how much you are about to select before you select it.
 
+**The letters go between the characters, not on top of them.** They are
+inserted, so the line gets wider while they are up and every character it had
+is still there — the example above is `{ "hello/plugin" },` with six letters
+threaded through it, not six characters of it painted over. A label that hides
+what you are aiming at is aiming for you.
+
+**Two scopes ending in the same place get a cell each.** `ab` after a `}` says
+the inner scope and the outer one both end there, which is exactly what you
+needed to know and is what a letter quietly winning the cell would not tell
+you. Closing letters read innermost first, opening ones outermost first, so the
+whole list nests the way the brackets do.
+
 **`a`, `b`, `c` — the alphabet, not the home row.** Everywhere else in bi a
 label is chosen for the finger; here it is chosen for the *order*, because the
 scopes are a nesting and `a` inside `b` inside `c` says so at a glance. This is
@@ -64,15 +76,21 @@ stays vim-surround's, which is a different key in a different mode.
 
 ## How it is drawn
 
-Two `Overlay` decorations per scope, on the first and last character of its
-range, on the `Over` layer, in the theme's `label`. Outermost first, so where
-two scopes share an edge the tighter one's letter is the one you see — it is
-the one you are more likely to want, and the outer one still shows at its other
-end.
+Two `Inline` decorations per scope, in the theme's `label`: one in front of the
+first character of its range and one after the last. Inserted rather than
+overlaid (`docs/specs/labels.md`), so nothing the line said is lost to a
+letter.
+
+Where two of them want one column the renderer gives each a cell, in the order
+they were produced, so the order is the whole of the policy here: the closing
+letters innermost first, the opening ones outermost first. That is what makes
+`}ab` and `cd{` read as a nesting rather than as a pile.
 
 ## Tests
 
 - The Lua example, exactly: three scopes, `a` innermost, both ends marked.
+- Two scopes sharing an edge keep a letter each, and the closing ones read
+  innermost first.
 - A node whose range equals its parent's is offered once.
 - Pressing a letter selects that range in charwise visual.
 - The letters are `a`, `b`, `c` in nesting order.

@@ -67,9 +67,11 @@ the word, `dw` takes the word and the space after it.
 | `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
 | `X` | delete the char before the cursor — `dh` |
 
-**Jumping** — `s` dims the screen, then every match of what you type gets a
-letter after it; press the letter and you are on the first character of that
-match. The letters never include a character that could narrow the search
+**Jumping** — `s` dims the screen the moment you press it, then every match of
+what you type gets a letter after it; press the letter and you are on the first
+character of that match. The letters are inserted between the cells rather than
+drawn over them, so nothing on the line is hidden by the thing pointing at it.
+The letters never include a character that could narrow the search
 further, so typing and jumping share the keyboard with no mode switch between
 them. Only the viewport is searched, `Esc` leaves, `Backspace` takes a
 character back, and a query that matches nothing leaves by itself. Vim's `s`
@@ -78,7 +80,10 @@ was `cl` spelled shorter, and `cl` still works. See
 
 **Selecting by structure** — `S` puts a letter at *both ends* of every scope
 around the cursor, tightest first: `a` inside `b` inside `c`, so one letter
-tells you where a scope starts and where it ends before you commit to it.
+tells you where a scope starts and where it ends before you commit to it. The
+letters go *between* the characters rather than over them, and two scopes
+ending in the same place get a cell each — `}ab` — so nothing on the line and
+nothing in the list is lost to a letter.
 Press one and it becomes the selection. The list is the chain of tree-sitter
 nodes containing the cursor, so `{ "hello/plugin" }` in Lua offers the string's
 contents, the string, and the table with no special case for any of them. Vim's
@@ -374,6 +379,10 @@ switches back and doing it twice returns you. Where a terminal cannot tell
 `Ctrl-Tab` from `Tab` you simply get buffer-next, which is what that key always
 did. See [docs/specs/buffers.md](docs/specs/buffers.md).
 
+Only the register ring gets a preview pane. A file name, a command line and a
+buffer are each already the row you are reading, so the pane would repeat it
+and take a third of the overlay to do it; the rows get the space instead.
+
 | Key | Does |
 |---|---|
 | any printable | add to the query |
@@ -446,9 +455,9 @@ default, because bi's leader has no built-in meaning and the first binding to
 claim one should be yours. See
 [docs/specs/alternate.md](docs/specs/alternate.md).
 
-`:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `kebab` or
-`constant` — `capital`, `screaming` and `dash` are the same three under other
-names. It respells every *identifier* in range and leaves what is between them
+`:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `dash` or
+`const` — one name each, no aliases.
+It respells every *identifier* in range and leaves what is between them
 alone, so `foo_bar baz_qux` in camel is `fooBar bazQux`. With nothing selected
 it takes the word under the cursor, which is what renaming one usually is. See
 [docs/specs/case.md](docs/specs/case.md).
@@ -685,17 +694,17 @@ color_swatches false` turns it off. See
 
 #### Trimming
 
-`:w` tidies the file on its way out: trailing whitespace goes, blank lines at
-the top go, and `trim.last_line` / `trim.final_newline` are off until you or
-the project asks for them — bi's job out of the box is to write the file you
-have, not the one it would have written.
+`:w` tidies the file on its way out: trailing whitespace goes, and so do the
+blank lines at either end of it. `trim.final_newline` is off until you or the
+project asks for it — a file that does not end in a newline is a file somebody
+may have meant, and adding one is a diff you did not ask for.
 
 ```toml
 [options]
 trim.on_write      = true    # the master switch
 trim.trailing      = true
 trim.first_line    = true
-trim.last_line     = false
+trim.last_line     = true
 trim.final_newline = false
 ```
 

@@ -819,9 +819,20 @@ impl Buffer {
         at - self.rope.line_to_char(self.row_of(at))
     }
 
+    /// The nearest position `cur` may legally hold.
+    ///
+    /// Also the row: a file ending in a newline has a phantom last line that
+    /// [`Buffer::line_count`] does not count, and normal mode must not come to
+    /// rest on it. `dd` on the last line used to land there — the row is one
+    /// past the last one there is, and every linewise operator after it works
+    /// out a range that starts below where it ends. Insert mode keeps the
+    /// phantom, which is the line `o` on the last row is about to make real.
     pub fn clamped(&self, cur: Cursor, allow_eol: bool) -> Cursor {
         let at = cur.at.min(self.rope.len_chars());
-        let row = self.row_of(at);
+        let row = match allow_eol {
+            true => self.row_of(at),
+            false => self.row_of(at).min(self.line_count().saturating_sub(1)),
+        };
         let max = self.rope.line_to_char(row) + self.max_col(row, allow_eol);
         Cursor { at: at.min(max), goal_col: cur.goal_col }
     }
@@ -1155,8 +1166,11 @@ impl Buffer {
 
     /// The inclusive row span a linewise motion covers.
     fn linewise_rows(&self, at: Cursor, motion: Motion, count: usize) -> (usize, usize) {
-        let start_row = self.row_at(at);
         let last_row = self.line_count().saturating_sub(1);
+        // Clamped before anything is worked out from it, so the pair can never
+        // come back inside out — a cursor past the last row would otherwise
+        // give a first row below the last one and a range no rope will slice.
+        let start_row = self.row_at(at).min(last_row);
         let target_row = match motion {
             Motion::CurrentLine => start_row + count.max(1) - 1,
             _ => self.row_of(self.motion_target(motion, count, at).at),
@@ -2362,10 +2376,10 @@ mod tests {
     }
 
     #[test]
-    fn blank_lines_go_from_the_top_and_stay_at_the_bottom() {
+    fn blank_lines_go_from_both_ends_of_the_file() {
         let default = Trim::default();
-        assert_eq!(trimmed("\n\na\n\n\n", default), "a\n\n\n");
-        assert_eq!(trimmed("\n\na\n\n\n", Trim { last_line: true, ..default }), "a\n");
+        assert_eq!(trimmed("\n\na\n\n\n", default), "a\n");
+        assert_eq!(trimmed("\n\na\n\n\n", Trim { last_line: false, ..default }), "a\n\n\n");
     }
 
     #[test]
@@ -2746,6 +2760,26 @@ mod tests {
         b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1);
         assert_eq!(b.rope().to_string(), "");
         assert_eq!(b.cursor.at, 0);
+    }
+
+    /// The cursor may never come to rest on the phantom row past the end of a
+    /// file that ends in a newline: `dd` there has no line to take, and the
+    /// range it works out comes back inside out.
+    #[test]
+    fn dd_over_and_over_on_the_last_blank_line_runs_out_of_lines_quietly() {
+        let mut b = buf("a\n\n\n\n");
+        b.goto_row(3, false);
+        for _ in 0..6 {
+            b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1);
+            assert!(
+                b.cursor_row() < b.line_count(),
+                "{:?} left the cursor on row {} of {}",
+                b.rope().to_string(),
+                b.cursor_row(),
+                b.line_count()
+            );
+        }
+        assert_eq!(b.rope().to_string(), "");
     }
 
     #[test]

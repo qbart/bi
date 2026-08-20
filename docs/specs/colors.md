@@ -19,11 +19,20 @@ rgba(251,73,52,0.5)
 rgb(0.5f,0.1f,0.1)   floats, where 1.0 is 255 — the shader spelling
 ```
 
-**Per component**, a number that contains a `.` or ends in `f` is a float and
-is scaled by 255; anything else is an integer taken as it stands. That is what
-lets `rgb(0.5f, 0.1f, 0.1)` work, and it means a file that mixes the two
-spellings gets both right rather than picking one and being wrong half the
-time.
+**Per literal**, not per component: a number that contains a `.` or ends in `f`
+says the whole thing is written in floats, where 1.0 is 255, and one that has
+neither says it is written in integers taken as they stand.
+
+An earlier draft decided this per component, so that a line mixing the two
+spellings got both right. It does not: `rgb(1,1,1.0f)` is white in every
+language that accepts it, and reading each component on its own makes it two
+channels of almost nothing and one of everything, which is blue. Nobody writes
+one literal in two number systems. A `1` next to a `1.0` is the same 1.0.
+
+**The alpha has no say and takes none.** Alpha is 0 to 1 in both spellings, so
+`rgba(255,153,68,0.5)` is an integer colour with a half alpha, not a float
+colour of three clamped 255s. It has to parse as a number — `rgba(1,2,3,x)` is
+not a colour — and that is all it is asked for.
 
 Out of range clamps rather than being rejected: `rgb(300,0,0)` is red, which is
 what the person who typed it meant and what every renderer they will hand it to
@@ -74,8 +83,10 @@ is why decorations carry a resolved style rather than a theme key.
 ## Tests
 
 - Each spelling parses to the same colour: `#f94`, `#ff9944`, `rgb(255,153,68)`.
-- A float component scales by 255, an integer one does not, and a line may mix
-  them.
+- Floats scale by 255 and integers do not.
+- One float component puts every component in float space: `rgb(1,1,1.0f)` is
+  white, and `rgb(1,1,1)` is not.
+- The alpha does not decide the space: `rgba(255,153,68,0.5)` is still orange.
 - Eight hex digits are one match, not a six and a leftover.
 - Out of range clamps.
 - Black text on a light swatch, white on a dark one, and the green that a

@@ -111,7 +111,9 @@ caught.
 **No preview pane for history.** The preview exists to show a register entry
 that is longer than its row. A command line is one line and is already the row,
 so the pane would repeat it and take a third of the overlay to do it. The rows
-get the space.
+get the space. The file and buffer lists went the same way for the same reason
+(`docs/specs/buffers.md`), which leaves the register ring as the only kind that
+previews at all.
 
 ## Where the state lives
 

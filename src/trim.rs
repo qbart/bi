@@ -18,10 +18,10 @@ pub struct Trim {
     pub on_write: bool,
     pub trailing: bool,
     pub first_line: bool,
-    /// Off by default, unlike `first_line`, and the asymmetry is deliberate: a
-    /// blank line at the top of a file is a mistake in every language there
-    /// is, and blank lines at the bottom are load-bearing often enough that
-    /// removing them would be bi silently editing data.
+    /// Blank lines at the bottom. On, like `first_line`: a run of empty lines
+    /// at the end of a file is the same accident at the other end of it, and
+    /// leaving them there means every write hands the reviewer a diff of
+    /// nothing.
     pub last_line: bool,
     /// Only ever *adds* one. Removing extra newlines at the end is
     /// `last_line`'s job, and keeping them apart is what lets a project ask
@@ -35,7 +35,7 @@ impl Default for Trim {
             on_write: true,
             trailing: true,
             first_line: true,
-            last_line: false,
+            last_line: true,
             final_newline: false,
         }
     }
@@ -67,6 +67,13 @@ mod tests {
         assert_eq!(trailing("code"), 0);
         assert_eq!(trailing("   "), 3, "a blank line is all of it");
         assert_eq!(trailing(""), 0);
+    }
+
+    #[test]
+    fn blank_lines_go_from_both_ends_of_a_file_by_default() {
+        let default = Trim::default();
+        assert!(default.first_line);
+        assert!(default.last_line);
     }
 
     #[test]

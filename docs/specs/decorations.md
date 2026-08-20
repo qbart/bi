@@ -30,13 +30,16 @@ pub enum Decoration {
     /// Draw `text` over the cells at (`row`, `col`), replacing what is there
     /// and moving nothing.
     Overlay { row: usize, col: usize, text: String, style: Style, layer: Layer },
+    /// Draw `text` *between* the cells at (`row`, `col`), pushing the rest of
+    /// the row right.
+    Inline { row: usize, col: usize, text: String, style: Style },
     /// Draw `text` after the end of `row`.
     Eol { row: usize, text: String, style: Style },
 }
 ```
 
-Three variants rather than one struct with an anchor and a payload, because
-every combination of the two that would be legal is one of these three and the
+Four variants rather than one struct with an anchor and a payload, because
+every combination of the two that would be legal is one of these four and the
 rest are nonsense a type should not be able to say.
 
 **`Repaint` is in char offsets and `Overlay` is in display columns**, which
@@ -59,18 +62,40 @@ selecting a line. Jump labels belong over it: a letter you are about to press
 has to be readable wherever it lands. Two values because two is what the
 clients need; a z-order integer would be a number nobody could choose.
 
+`Inline` and `Eol` have no `Layer`, and it is not an omission: neither of them
+is *on* the text. One is out past the end of the line and the other makes its
+own cells, so there is nothing for either to be over or under.
+
+## `Inline`, and what it cost
+
+An earlier draft of this file listed inline virtual text under "deliberately
+not here", on the grounds that display column stops being a function of char
+column and everything that computes one has to route through the decoration
+list. The day came: a jump label drawn *over* the text hides the character it
+is pointing at, which is the one character you were looking at, and no colour
+fixes that. So it is here, and this is the bill.
+
+**It is the last pass.** Every other column — the search highlight, the
+selection, the block arithmetic, the guides — is worked out and painted before
+a single label is inserted, so all of them go on seeing the row as the text
+says it is. Only the terminal's own cursor has to be adjusted, by the width of
+the labels at or before its column, and that is one function.
+
+**Two at one column are two cells.** They are applied left to right, sorted by
+column, with a running shift; the sort is stable, so where two labels want the
+same place the order they were produced in is the order they read in. That is
+what lets `S` mark two scopes that end together as `ab` instead of dropping
+one — see `scopes.md`.
+
+**Nothing that has to survive an edit may use it.** The row is wider than its
+text while the decoration is up, so this is for things that are up for one
+keystroke. Diagnostics still want `Eol`: a message after the code, not inside
+it.
+
 ## What is deliberately not here
 
-**Inline virtual text** — text inserted mid-line that pushes the rest of the
-line right. It is the one placement with a cost that is not local: display
-column stops being a function of char column, so the cursor, the mouse, every
-`display_col` call and the block-selection arithmetic all have to route through
-the decoration list. `Eol` covers what inline diagnostics actually want (a
-message after the code, not inside it), and the day something genuinely needs
-mid-line insertion is the day to pay for it.
-
-**Wrapping and folding** are not decorations either. Both change which rows
-exist, which is a different question from what is drawn on one.
+**Wrapping and folding** are not decorations. Both change which rows exist,
+which is a different question from what is drawn on one.
 
 ## Who produces them
 
@@ -102,10 +127,14 @@ For each row it is already formatting:
   existing `paint_range` is that function; it did not have to change.
 - `Overlay` — split the spans at the column and put a span of the decoration's
   own text there, dropping as many columns as the text is wide.
+- `Inline` — split the spans at the column and put a span of the decoration's
+  own text there, dropping nothing. Sorted by column and applied with a running
+  shift, so every column named is a column of the row as it stands.
 - `Eol` — push a span after the last one.
 
 `Under` decorations are painted after the syntax spans and before the search
-and selection passes; `Over` ones after everything. That order lives in the
+and selection passes; `Over` ones after everything; `Inline` after those, last
+of all, because it is the only one that moves a cell. That order lives in the
 renderer because painting order *is* rendering; what lives in the core is the
 `Layer` value that says which group a decoration is in.
 
@@ -117,6 +146,10 @@ renderer because painting order *is* rendering; what lives in the core is the
 - `Overlay` replaces exactly as many columns as its text is wide and leaves the
   line the same length, so nothing after it shifts.
 - An overlay inside a tab's expansion lands on the column it asked for.
+- `Inline` drops nothing: the character it was inserted in front of is still
+  there, one cell further along.
+- Two `Inline`s at one column are two cells, in the order they were produced,
+  and a third at a later column still lands where the original text put it.
 - `Eol` lands after the last character and does not pad the line.
 - A decoration under the selection is painted over by it; one over it is not.
 - `decorations()` asks for the visible rows only, and a provider that is off

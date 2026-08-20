@@ -54,11 +54,13 @@ pub enum PickerKind {
 impl PickerKind {
     /// Whether the preview pane earns its third of the overlay.
     ///
-    /// It exists to show a register entry longer than its row. A command line
-    /// is one line and is already the row, so previewing it would show the same
-    /// text twice and take the space from the list to do it.
+    /// It exists to show a register entry longer than its row, and only a
+    /// register has one. A command line and a file name are one line and are
+    /// already the row; a buffer is a name you know — you are switching *back*
+    /// to it — so its first line says nothing you needed and costs the list a
+    /// third of its rows to say it.
     pub fn wants_preview(&self) -> bool {
-        !matches!(self, PickerKind::History | PickerKind::File)
+        matches!(self, PickerKind::Register { .. })
     }
 
     /// Whether typed characters have to appear *in order* rather than as
@@ -419,12 +421,13 @@ mod tests {
         assert_eq!(shown(&p), ["w out.txt", "w"]);
     }
 
-    /// The one kind whose rows are already whole lines.
+    /// The one kind whose rows do not already say what you are choosing.
     #[test]
-    fn only_the_history_goes_without_a_preview() {
-        assert!(!PickerKind::History.wants_preview());
-        assert!(PickerKind::Buffer.wants_preview());
+    fn only_a_register_earns_a_preview() {
         assert!(PickerKind::Register { before: false }.wants_preview());
+        assert!(!PickerKind::History.wants_preview());
+        assert!(!PickerKind::File.wants_preview());
+        assert!(!PickerKind::Buffer.wants_preview(), "a list, like Ctrl-P");
     }
 
     #[test]

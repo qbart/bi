@@ -187,6 +187,59 @@ fn overlay(
     out
 }
 
+/// Inserts every inline label on one row, left to right.
+///
+/// Sorted by column and applied with a running shift, so the columns the
+/// decorations name are all columns of the *original* row and none of them has
+/// to know what the ones before it did. The sort is stable, which is what makes
+/// two labels wanting one column come out in the order they were produced —
+/// two cells side by side rather than one on top of the other.
+fn insert_inline(
+    mut spans: Vec<Span<'static>>,
+    line: &Row,
+    decorations: &[Decoration],
+) -> Vec<Span<'static>> {
+    let mut mine: Vec<(usize, &str, ThemeStyle)> = decorations
+        .iter()
+        .filter_map(|d| match d {
+            Decoration::Inline { row, col, text, style } if *row == line.row => {
+                Some((*col, text.as_str(), *style))
+            }
+            _ => None,
+        })
+        .collect();
+    if mine.is_empty() {
+        return spans;
+    }
+    mine.sort_by_key(|&(col, _, _)| col);
+
+    let mut shift = 0;
+    for (col, text, style) in mine {
+        let (mut out, right) = split_at_col(spans, col + line.gutter + shift);
+        out.push(Span::styled(text.to_string(), tui(style)));
+        out.extend(right);
+        spans = out;
+        shift += text.chars().count();
+    }
+    spans
+}
+
+/// How far the inline labels on `row` push the cell at `col` to the right.
+///
+/// A label at the cursor's own column goes *before* the cursor, because it
+/// points at the character the cursor is on and would otherwise be under it.
+fn inline_shift(decorations: &[Decoration], row: usize, col: usize) -> usize {
+    decorations
+        .iter()
+        .filter_map(|d| match d {
+            Decoration::Inline { row: at, col: c, text, .. } if *at == row && *c <= col => {
+                Some(text.chars().count())
+            }
+            _ => None,
+        })
+        .sum()
+}
+
 /// One row, as everything that paints over it needs to see it: which row it
 /// is, its text, where that text starts in the rope, and where its columns
 /// begin on screen.
@@ -567,7 +620,8 @@ fn render_window(
         let raw = raw.trim_end_matches(['\n', '\r']);
 
         if row == cursor_row {
-            cursor_screen_col = display_col(raw, buffer.col_at(cursor), tab);
+            let col = display_col(raw, buffer.col_at(cursor), tab);
+            cursor_screen_col = col + inline_shift(&decorations, row, col);
         }
 
         // A blank cell where a number is not due, so the text stays put.
@@ -679,6 +733,9 @@ fn render_window(
         // Over everything: a letter you are about to press has to be readable
         // wherever it lands.
         spans = decorate(spans, &line, &decorations, Layer::Over);
+        // And last of all the ones that make their own cells, because every
+        // column above this point is a column of the text as it stands.
+        spans = insert_inline(spans, &line, &decorations);
 
         // The cursor line is lit only in the focused window, as vim's
         // `'cursorline'` is. A dark bar in every pane reads as noise rather
@@ -1193,6 +1250,39 @@ mod tests {
         assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
     }
 
+    /// The other end of the same pipeline, for the decoration that moves a
+    /// cell: the letter is on the screen *and* so is everything that was there
+    /// before it.
+    #[test]
+    fn a_jump_label_reaches_the_screen_without_eating_the_text() {
+        use bi::editor::{Action, Command};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "alpha beta gamma\n");
+        ed.set_cursor(Cursor::at(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        // Once first, so the window learns how tall it is: `s` aims at the
+        // viewport, and a window of nought rows is showing nothing.
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+
+        ed.apply(Command { count: 1, action: Action::EnterFind });
+        for c in "beta".chars() {
+            ed.apply(Command { count: 1, action: Action::FindChar(c) });
+        }
+        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+
+        let row: String = (0..24)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+
+        assert_eq!(row, "1 alpha betaf gamma", "the space after `beta` is still a space");
+    }
+
     fn line_of(spans: &[Span<'static>]) -> String {
         spans.iter().map(|s| s.content.to_string()).collect()
     }
@@ -1231,6 +1321,65 @@ mod tests {
         let out = decorate(vec![Span::raw("code".to_string())], &line, &decorations, Layer::Over);
 
         assert_eq!(line_of(&out), "code  ← here");
+    }
+
+    /// The whole point of `Inline`: the character the label points at is still
+    /// on the screen, one cell further along.
+    #[test]
+    fn an_inline_label_drops_nothing() {
+        let line = Row { row: 0, raw: "\tcode", start: 0, gutter: 2, tab: 4 };
+        let spans = vec![Span::raw("  ".to_string()), Span::raw(expand_tabs("\tcode", 4))];
+        let decorations = [Decoration::Inline {
+            row: 0,
+            col: 4,
+            text: "f".to_string(),
+            style: ThemeStyle::default(),
+        }];
+
+        let out = insert_inline(spans, &line, &decorations);
+
+        // Column 4 is the `c`, which a tab has pushed out there, and the
+        // gutter is the frontend's own two cells in front of all of it.
+        assert_eq!(line_of(&out), "      fcode");
+    }
+
+    /// Two labels wanting one column are two cells side by side, in the order
+    /// they were produced — which is what `S` needs to say where a scope ends
+    /// when another one ends in the same place.
+    #[test]
+    fn two_inline_labels_at_one_column_are_two_cells() {
+        let line = Row { row: 0, raw: "ab", start: 0, gutter: 0, tab: 4 };
+        let at = |col: usize, text: &str| Decoration::Inline {
+            row: 0,
+            col,
+            text: text.to_string(),
+            style: ThemeStyle::default(),
+        };
+        // Out of order on purpose: the columns name the row as it stands, so
+        // the later one must not have moved by the time it is placed.
+        let decorations = [at(1, "y"), at(0, "x"), at(1, "z")];
+
+        let out = insert_inline(vec![Span::raw("ab".to_string())], &line, &decorations);
+
+        assert_eq!(line_of(&out), "xayzb");
+    }
+
+    /// The one thing the inline pass has to tell the rest of the frame: where
+    /// the cursor went. A label at the cursor's own column goes in front of
+    /// it, because it is pointing at the character the cursor is on.
+    #[test]
+    fn the_cursor_moves_over_by_the_labels_in_front_of_it() {
+        let at = |col: usize| Decoration::Inline {
+            row: 0,
+            col,
+            text: "ab".to_string(),
+            style: ThemeStyle::default(),
+        };
+        let decorations = [at(0), at(4), at(9)];
+
+        assert_eq!(inline_shift(&decorations, 0, 4), 4, "the two at or before column 4");
+        assert_eq!(inline_shift(&decorations, 0, 0), 2);
+        assert_eq!(inline_shift(&decorations, 1, 9), 0, "and nothing from another row");
     }
 
     /// The whole of what `Layer` is for: a guide has to let a selected line

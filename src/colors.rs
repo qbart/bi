@@ -80,32 +80,52 @@ fn functional(chars: &[char], at: usize) -> Option<Swatch> {
         return None;
     }
 
+    // One decision for the whole literal, taken from the three colour
+    // components: a float anywhere among them says which of the two spellings
+    // this is, and the bare `1`s beside it are the same 1.0. Per component,
+    // `rgb(1,1,1.0f)` reads as two channels of almost nothing and one of
+    // everything, and paints white blue.
+    let floats = parts[..3].iter().any(|part| is_float(part));
     let mut rgb = [0u8; 3];
     for (slot, part) in rgb.iter_mut().zip(&parts) {
-        *slot = channel(part)?;
+        *slot = channel(part, floats)?;
     }
-    // The alpha, if there is one, has to at least be a number — `rgb(1,2,x)`
-    // is not a colour and should not be painted as one.
-    if parts.len() == 4 && channel(parts[3]).is_none() {
+    // The alpha, if there is one, has to at least be a number — `rgba(1,2,3,x)`
+    // is not a colour and should not be painted as one. It has no say in the
+    // decision above and takes none from it: alpha is 0 to 1 in both
+    // spellings, which is why `rgba(255,153,68,0.5)` is still an integer
+    // colour.
+    if parts.len() == 4 && !is_number(parts[3]) {
         return None;
     }
     Some(Swatch { range: at..close + 1, rgb: (rgb[0], rgb[1], rgb[2]) })
 }
 
-/// One component. A number with a `.` in it, or an `f` after it, is a float
-/// where 1.0 is 255; anything else is an integer taken as it stands.
+/// Whether a component is written as a float: a `.` in it, or an `f` after it.
+fn is_float(text: &str) -> bool {
+    let text = text.trim();
+    text.contains('.') || text.strip_suffix(['f', 'F']).is_some_and(|bare| !bare.is_empty())
+}
+
+/// Whether a component is a number at all, in either spelling.
+fn is_number(text: &str) -> bool {
+    let text = text.trim();
+    let bare = text.strip_suffix(['f', 'F']).unwrap_or(text);
+    !bare.is_empty() && bare.parse::<f64>().is_ok()
+}
+
+/// One component, read in the space the literal is written in: a float where
+/// 1.0 is 255, or an integer taken as it stands.
 ///
-/// Per component rather than per literal, so a line that mixes the two
-/// spellings gets both right instead of picking one and being wrong half the
-/// time. Out of range clamps: `rgb(300,0,0)` is red, which is what the person
-/// who typed it meant.
-fn channel(text: &str) -> Option<u8> {
+/// Out of range clamps: `rgb(300,0,0)` is red, which is what the person who
+/// typed it meant.
+fn channel(text: &str, float: bool) -> Option<u8> {
     let text = text.trim();
     let bare = text.strip_suffix(['f', 'F']).unwrap_or(text);
     if bare.is_empty() {
         return None;
     }
-    if text.contains('.') || text.len() != bare.len() {
+    if float {
         let value: f64 = bare.parse().ok()?;
         return Some((value * 255.0).round().clamp(0.0, 255.0) as u8);
     }
@@ -156,10 +176,29 @@ mod tests {
     }
 
     #[test]
-    fn floats_scale_by_255_and_integers_do_not_and_a_line_may_mix_them() {
+    fn floats_scale_by_255_and_integers_do_not() {
         assert_eq!(found("rgb(1.0f,0.0,0)").first().unwrap().1, (255, 0, 0));
         assert_eq!(found("rgb(0.5f,0.1f,0.1)").first().unwrap().1, (128, 26, 26));
-        assert_eq!(found("rgb(255,0.5,0)").first().unwrap().1, (255, 128, 0), "mixed, both right");
+        assert_eq!(found("rgb(255,153,68)").first().unwrap().1, (0xff, 0x99, 0x44));
+    }
+
+    /// One float makes the whole literal a float: the bare `1`s beside it are
+    /// the same 1.0, and reading them as integers paints white blue.
+    #[test]
+    fn one_float_component_puts_every_component_in_float_space() {
+        let white = (255, 255, 255);
+        assert_eq!(found("rgb(1,1,1.0f)").first().unwrap().1, white);
+        assert_eq!(found("rgb(1.0,1.0,1.0)").first().unwrap().1, white);
+        assert_eq!(found("rgb(1,1.0,1)").first().unwrap().1, white);
+        assert_eq!(found("rgb(1,1,1)").first().unwrap().1, (1, 1, 1), "and no float, no scaling");
+    }
+
+    /// Alpha is 0 to 1 in both spellings, so it says nothing about which one
+    /// the colour is written in.
+    #[test]
+    fn the_alpha_does_not_decide_the_space() {
+        assert_eq!(found("rgba(255, 153, 68, 0.5)").first().unwrap().1, (0xff, 0x99, 0x44));
+        assert_eq!(found("rgba(1.0, 0.6, 0.267, 0.5)").first().unwrap().1, (255, 153, 68));
     }
 
     #[test]

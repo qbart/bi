@@ -22,30 +22,31 @@ pub enum Style {
     /// `hello_world`
     Snake,
     /// `hello-world`
-    Kebab,
+    Dash,
     /// `HELLO_WORLD`
-    Constant,
+    Const,
 }
 
 impl Style {
     /// Every name a style answers to, for `:case` to accept and to complain
     /// with.
+    ///
+    /// One name each, and no aliases: a second name for a style is a second
+    /// thing to read in the error message and a second thing to keep true,
+    /// and it buys nothing that completing the one name does not.
     pub const NAMES: &'static [&'static str] =
-        &["upper", "lower", "title", "camel", "pascal", "snake", "kebab", "constant"];
+        &["upper", "lower", "title", "camel", "pascal", "snake", "dash", "const"];
 
     pub fn parse(name: &str) -> Option<Style> {
         Some(match name {
             "upper" => Style::Upper,
             "lower" => Style::Lower,
-            // `capital` because that is what people call it when they are not
-            // thinking about typography.
-            "title" | "capital" => Style::Title,
+            "title" => Style::Title,
             "camel" => Style::Camel,
             "pascal" => Style::Pascal,
             "snake" => Style::Snake,
-            "kebab" | "dash" => Style::Kebab,
-            // `screaming` is the name the internet gave it.
-            "constant" | "screaming" => Style::Constant,
+            "dash" => Style::Dash,
+            "const" => Style::Const,
             _ => return None,
         })
     }
@@ -158,8 +159,8 @@ fn title(word: &str) -> String {
 fn join(words: &[String], style: Style) -> String {
     match style {
         Style::Snake => words.join("_"),
-        Style::Kebab => words.join("-"),
-        Style::Constant => words.join("_").to_uppercase(),
+        Style::Dash => words.join("-"),
+        Style::Const => words.join("_").to_uppercase(),
         Style::Pascal => words.iter().map(|w| title(w)).collect(),
         Style::Camel => words
             .iter()
@@ -236,10 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn the_names_a_style_answers_to() {
-        assert_eq!(Style::parse("capital"), Some(Style::Title));
-        assert_eq!(Style::parse("screaming"), Some(Style::Constant));
-        assert_eq!(Style::parse("dash"), Some(Style::Kebab));
+    fn a_style_answers_to_one_name_and_no_other() {
+        assert_eq!(Style::parse("dash"), Some(Style::Dash));
+        assert_eq!(Style::parse("const"), Some(Style::Const));
+        // The aliases that used to exist are gone: one name per style.
+        for gone in ["capital", "screaming", "kebab", "constant"] {
+            assert_eq!(Style::parse(gone), None, "{gone}");
+        }
         assert_eq!(Style::parse("nope"), None);
         // Every listed name parses, or `:case` would offer one it cannot take.
         for name in Style::NAMES {

@@ -1004,20 +1004,15 @@ fn find_decorations(
         if !label.starts_with(&labels.typed) {
             continue;
         }
-        // Drawn *after* the match it belongs to, over whatever follows it —
-        // you aim at the word and land on its first character.
+        // Drawn *after* the match it belongs to and between the cells rather
+        // than over them — you aim at the word and land on its first
+        // character, and the word after it is still a word you can read.
         let Some(&(_, end)) = find.matches.iter().find(|(at, _)| at == start) else { continue };
-        let row = buffer.row_at(Cursor::at(end));
+        let row = buffer.row_at(Cursor::at(end.saturating_sub(1)));
         let line = buffer.line(row);
         let col =
             crate::indent::display_col(&line, end - rope.line_to_char(row), options.tab_width);
-        out.push(Decoration::Overlay {
-            row,
-            col,
-            text: label.clone(),
-            style: theme.ui.label,
-            layer: Layer::Over,
-        });
+        out.push(Decoration::Inline { row, col, text: label.clone(), style: theme.ui.label });
     }
 }
 
@@ -2086,33 +2081,45 @@ impl Editor {
             && window == self.focus
             && let Some(Pane::Text { buffer, options, .. }) = self.pane(window)
         {
-            // Outermost first, so where two scopes share an edge the tighter
-            // one's letter is the one left showing — it is the one you are
-            // more likely to want, and the outer still shows at its other end.
-            for (label, target) in labels.targets.iter().rev() {
-                let LabelTarget::Scope(start, end) = target else { continue };
+            // The closing letters innermost first, the opening ones outermost
+            // first, so the whole list nests the way brackets do —
+            // `c{ b"ahello/plugina"b }c` — and two scopes sharing an edge read
+            // as `ab` rather than as one letter hiding the other. The renderer
+            // keeps the order they are pushed in where the column is the same.
+            let scope = |at: usize, on: usize, label: &str, out: &mut Vec<_>| {
+                let row = buffer.row_at(Cursor::at(on));
+                if !rows.contains(&row) {
+                    return;
+                }
+                let line = buffer.line(row);
+                let col = crate::indent::display_col(
+                    &line,
+                    at - buffer.rope().line_to_char(row),
+                    options.tab_width,
+                );
+                out.push(crate::decoration::Decoration::Inline {
+                    row,
+                    col,
+                    text: label.to_string(),
+                    style: self.theme.ui.label,
+                });
+            };
+            for (label, target) in &labels.targets {
+                let LabelTarget::Scope(_, end) = target else { continue };
                 if !label.starts_with(&labels.typed) {
                     continue;
                 }
-                for at in [*start, end.saturating_sub(1)] {
-                    let row = buffer.row_at(Cursor::at(at));
-                    if !rows.contains(&row) {
-                        continue;
-                    }
-                    let line = buffer.line(row);
-                    let col = crate::indent::display_col(
-                        &line,
-                        at - buffer.rope().line_to_char(row),
-                        options.tab_width,
-                    );
-                    out.push(crate::decoration::Decoration::Overlay {
-                        row,
-                        col,
-                        text: label.clone(),
-                        style: self.theme.ui.label,
-                        layer: crate::decoration::Layer::Over,
-                    });
+                // In front of the cell *after* the last character, which is
+                // where a closing letter belongs and is why the row is taken
+                // from the character itself.
+                scope(*end, end.saturating_sub(1), label, &mut out);
+            }
+            for (label, target) in labels.targets.iter().rev() {
+                let LabelTarget::Scope(start, _) = target else { continue };
+                if !label.starts_with(&labels.typed) {
+                    continue;
                 }
+                scope(*start, *start, label, &mut out);
             }
         }
         if let Some(labels) = &self.session.labels {
@@ -2121,14 +2128,14 @@ impl Editor {
                 if *id != window || !label.starts_with(&labels.typed) {
                     continue;
                 }
-                out.push(crate::decoration::Decoration::Overlay {
+                // Inline rather than over: a letter you are about to press has
+                // to be readable wherever it lands, and so does what it
+                // landed on.
+                out.push(crate::decoration::Decoration::Inline {
                     row: rows.start,
                     col: 0,
                     text: label.clone(),
                     style: self.theme.ui.label,
-                    // Over everything: a letter you are about to press has to
-                    // be readable wherever it lands.
-                    layer: crate::decoration::Layer::Over,
                 });
             }
         }
@@ -2137,9 +2144,13 @@ impl Editor {
         // match wears the letter that goes to it. Only in the window it is
         // aiming in. The order these are pushed in is the order they paint in,
         // so the dim goes down first and the matches over it.
+        //
+        // From the press, not from the first letter typed: the dim *is* the
+        // announcement that `s` is aiming, and one that arrives a keystroke
+        // later leaves you looking at a normal screen wondering whether the
+        // key registered.
         if window == self.focus
             && let Some(find) = &self.session.find
-            && !find.matches.is_empty()
         {
             find_decorations(
                 buffer,
@@ -10309,6 +10320,18 @@ mod tests {
         assert_eq!(ed.cursor_row(), Some(1), "still on beta, rather than two rows past it");
     }
 
+    /// The case that started this: a `.toml` with a few stray blank lines at
+    /// the end of it, and a write that is supposed to take them.
+    #[test]
+    fn a_write_takes_the_blank_lines_off_the_end() {
+        let f = Scratch::new("trim-last.toml", "edition = \"2024\"\n\n\n\n");
+        let mut ed = opened(&f);
+
+        ex(&mut ed, "w");
+
+        assert_eq!(f.read(), "edition = \"2024\"\n");
+    }
+
     #[test]
     fn trim_on_write_off_means_none_of_it() {
         let f = Scratch::new("trim-off.rs", "\nalpha  \n");
@@ -10744,7 +10767,7 @@ mod tests {
     #[test]
     fn case_is_one_undo_step() {
         let mut ed = editor("hello_world\n");
-        ex(&mut ed, "case constant");
+        ex(&mut ed, "case const");
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "HELLO_WORLD\n");
 
         ed.apply(cmd(Action::Undo));
@@ -10808,11 +10831,8 @@ mod tests {
             let LabelTarget::Window(id) = target else { panic!("a window label") };
             let drawn = ed.decorations(*id, 0..1);
             assert!(
-                drawn.iter().any(|d| matches!(
-                    d,
-                    Decoration::Overlay { row: 0, col: 0, text, layer: Layer::Over, .. }
-                        if text == label
-                )),
+                drawn.iter().any(|d| matches!(d, Decoration::Inline { row: 0, col: 0, text, .. }
+                        if text == label)),
                 "{label} is not on its own window"
             );
         }
@@ -11021,11 +11041,23 @@ mod tests {
             "and the match lights up"
         );
         assert!(
-            drawn.iter().any(|d| matches!(
-                d,
-                Decoration::Overlay { row: 0, col: 10, layer: Layer::Over, .. }
-            )),
-            "with its letter after it"
+            drawn.iter().any(|d| matches!(d, Decoration::Inline { row: 0, col: 10, .. })),
+            "with its letter after it, in a cell of its own"
+        );
+    }
+
+    /// The dim is the announcement that `s` is aiming. One that waits for the
+    /// first letter leaves you looking at an ordinary screen, wondering
+    /// whether the key registered.
+    #[test]
+    fn the_screen_dims_the_moment_s_is_pressed() {
+        let ed = aiming("alpha beta\n");
+        let dim = ed.theme().ui.dim;
+        assert!(
+            ed.decorations(ed.focus(), 0..1)
+                .iter()
+                .any(|d| matches!(d, Decoration::Repaint { style, .. } if *style == dim)),
+            "before a single character of the query"
         );
     }
 
@@ -11086,18 +11118,91 @@ mod tests {
         ed.apply(cmd(Action::ShowScopes));
 
         let (label, (start, end)) = scopes(&ed)[0].clone();
-        let drawn: Vec<usize> = ed
-            .decorations(ed.focus(), 0..1)
+        let drawn = inline(&ed);
+
+        let mine: Vec<usize> =
+            drawn.iter().filter(|(_, text)| *text == label).map(|&(col, _)| col).collect();
+        assert_eq!(mine.len(), 2, "one letter, both ends");
+        assert!(mine.contains(&start), "in front of the first character of the scope");
+        assert!(mine.contains(&end), "and after its last one");
+    }
+
+    /// Row 0 with its letters threaded in, the way the renderer inserts them:
+    /// each label in front of the column it names, and two at one column in
+    /// the order they were produced.
+    fn lettered(ed: &Editor, text: &str) -> String {
+        let width = text.chars().count();
+        let mut before = vec![String::new(); width + 1];
+        for (col, label) in inline(ed) {
+            before[col].push_str(&label);
+        }
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| format!("{}{c}", before[i]))
+            .chain(std::iter::once(before[width].clone()))
+            .collect()
+    }
+
+    /// The picture in `docs/specs/scopes.md`, built out of what the
+    /// decorations actually say. Every character of the line is still there
+    /// and the letters are between them.
+    #[test]
+    fn the_letters_thread_through_the_line_rather_than_over_it() {
+        let text = "return { \"hello/plugin\" },";
+        let (_f, mut ed) = parsed("picture.lua", &format!("{text}\n"));
+        ed.set_cursor(Cursor::at(12)); // inside `hello/plugin`
+        ed.apply(cmd(Action::ShowScopes));
+
+        let drawn = lettered(&ed, text);
+
+        assert!(
+            drawn.contains("c{ b\"ahello/plugina\"b }c"),
+            "the spec's own picture is not what is drawn: {drawn}"
+        );
+        let bare: String = drawn.chars().filter(|c| !c.is_ascii_lowercase()).collect();
+        let stripped: String = text.chars().filter(|c| !c.is_ascii_lowercase()).collect();
+        assert_eq!(bare, stripped, "and nothing of the line was dropped to make room");
+    }
+
+    /// Every inline label on row 0, as the renderer takes them: column and
+    /// text, in the order they were produced.
+    fn inline(ed: &Editor) -> Vec<(usize, String)> {
+        ed.decorations(ed.focus(), 0..1)
             .into_iter()
             .filter_map(|d| match d {
-                Decoration::Overlay { col, text, .. } if text == label => Some(col),
+                Decoration::Inline { row: 0, col, text, .. } => Some((col, text)),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
 
-        assert_eq!(drawn.len(), 2, "one letter, both ends");
-        assert!(drawn.contains(&start), "the first character of the scope");
-        assert!(drawn.contains(&(end - 1)), "and its last one");
+    /// Two scopes ending in the same place are two cells, not one letter on
+    /// top of another — the whole point of the letters is seeing how much you
+    /// are about to select.
+    #[test]
+    fn scopes_sharing_an_edge_get_a_cell_each() {
+        let (_f, mut ed) = parsed("share.lua", "return { \"hi\" },\n");
+        ed.set_cursor(Cursor::at(10));
+        ed.apply(cmd(Action::ShowScopes));
+
+        let found = scopes(&ed);
+        let drawn = inline(&ed);
+        // The string and its contents end one character apart, and the string
+        // and the table start one apart: nothing here may be dropped.
+        for (label, _) in &found {
+            assert_eq!(
+                drawn.iter().filter(|(_, text)| text == label).count(),
+                2,
+                "{label} lost an end"
+            );
+        }
+
+        // Where two do share a column, the closing letters come innermost
+        // first and the opening ones outermost first, so the whole list nests
+        // the way brackets do.
+        let ends: Vec<&String> =
+            drawn.iter().filter(|&&(col, _)| col == found[0].1.1).map(|(_, text)| text).collect();
+        assert!(ends.len() <= 2 && ends.first().is_some_and(|first| *first == &found[0].0));
     }
 
     #[test]

@@ -32,6 +32,16 @@ A buffer name is a path, so it matches the way the file picker matches: `sfr`
 finds `src/find/render.rs`. Over prose that rule matches everything, which is
 why the register ring still wants whole terms — see `docs/specs/files.md`.
 
+## No preview
+
+A list and nothing else, the way `Ctrl-P` is. The preview pane exists to show a
+register entry that is longer than its row; a buffer is a file you know — you
+are switching *back* to it — so its first line tells you nothing you were
+missing and takes a third of the overlay to say it. Rows are what this picker
+has to spend space on.
+
+That leaves the register ring as the only kind that previews.
+
 ## The key
 
 `Ctrl-Tab`, which is what was asked for, with one caveat worth stating: `Tab`
@@ -51,3 +61,4 @@ key had to be given up — which is the reason the *window* picker went to
 - Three buffers opened in order list newest-first.
 - Opening and accepting is a switch to the previous buffer; twice is a toggle.
 - Typing leaves the default row and matches a subsequence.
+- The overlay is a list: no preview pane, the same as `Ctrl-P`.
