@@ -80,6 +80,22 @@ impl PickerKind {
     fn subsequence(&self) -> bool {
         matches!(self, PickerKind::File | PickerKind::Buffer | PickerKind::TreeRow)
     }
+
+    /// Whether matches are sorted by how well they match, rather than kept in
+    /// the order they were given.
+    ///
+    /// Only the tree list, and the reason is that only its order is
+    /// meaningless: the register ring, the buffer list and the command history
+    /// are all newest-first, which is an answer to "which one did you mean"
+    /// that a score would throw away. A tree in filesystem order has no such
+    /// answer, and the whole-tree list is long enough to need one.
+    ///
+    /// The sort is stable, which is the other half of it: the caller puts the
+    /// rows it would rather offer first, and they win every tie without
+    /// winning an argument. See `docs/specs/tree.md`.
+    fn ranked(&self) -> bool {
+        matches!(self, PickerKind::TreeRow)
+    }
 }
 
 pub struct Picker {
@@ -130,6 +146,56 @@ fn matches_subsequence(text: &str, query: &str) -> bool {
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
         .all(|wanted| chars.any(|c| c == wanted))
+}
+
+/// How well `text` matches `query`, for the kinds that rank rather than keep
+/// the order they were given.
+///
+/// Three weights and a tiebreak, and the numbers are the whole design:
+///
+/// - **8, consecutive** — a run of characters is what you meant. `mod` finding
+///   `mod` beats `mod` finding `m`y `o`ther `d`irectory.
+/// - **4, at a boundary** — the start of the text, or the first character of a
+///   path segment or a word. `sfr` should find `src/find/render.rs`, and it
+///   does because all three land on one.
+/// - **1, anywhere else** — it counted, and that is all.
+/// - **shorter wins a tie**, by a small subtraction rather than a rule, so a
+///   deep path never loses to a short one it genuinely matched better.
+///
+/// Greedy and left to right, which is what [`matches_subsequence`] already
+/// does: the alternative is every alignment of the query, and no fuzzy finder
+/// that people like does that.
+fn score(text: &str, query: &str) -> i32 {
+    let wanted: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+    if wanted.is_empty() {
+        return 0;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let boundary = |i: usize| match i {
+        0 => true,
+        i => {
+            let before = chars[i - 1];
+            !before.is_alphanumeric() || (before.is_lowercase() && chars[i].is_uppercase())
+        }
+    };
+
+    let (mut total, mut at, mut previous) = (0, 0, None);
+    for want in wanted {
+        let want = want.to_lowercase().next().unwrap_or(want);
+        let found = chars[at..].iter().position(|c| c.to_lowercase().next() == Some(want));
+        let Some(offset) = found else { return 0 };
+        let i = at + offset;
+        total += match (previous == Some(i.wrapping_sub(1)), boundary(i)) {
+            (true, _) => 8,
+            (false, true) => 4,
+            (false, false) => 1,
+        };
+        previous = Some(i);
+        at = i + 1;
+    }
+    // A tiebreak, not a weight: it can separate two equal matches and can
+    // never outrank one character landing where it should.
+    total - (chars.len() as i32) / 8
 }
 
 impl Picker {
@@ -215,6 +281,11 @@ impl Picker {
             })
             .map(|(i, _)| i)
             .collect();
+        if self.kind.ranked() {
+            // Stable, so equal scores keep the order they were given — which
+            // is how the caller says which rows it would rather offer.
+            self.matches.sort_by_key(|&i| -score(&self.items[i].text, &query));
+        }
         // Clamp rather than reset: narrowing the query should not throw away
         // where you were.
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
@@ -427,6 +498,78 @@ mod tests {
         p.set_query("w".into());
         assert_eq!(p.query(), "w");
         assert_eq!(shown(&p), ["w out.txt", "w"]);
+    }
+
+    /// The three weights, each shown beating the one below it. The numbers
+    /// themselves are arbitrary; what is not is the order they put things in.
+    #[test]
+    fn a_run_beats_a_boundary_beats_a_letter_that_merely_counted() {
+        // `mod` as a run, `mod` as three path-segment starts, `mod` scattered.
+        let run = score("a/module.rs", "mod");
+        let boundaries = score("m/o/d.rs", "mod");
+        let scattered = score("xmxoxdx", "mod");
+        assert!(run > boundaries, "{run} vs {boundaries}");
+        assert!(boundaries > scattered, "{boundaries} vs {scattered}");
+        assert_eq!(score("nothing here", "mod"), 0, "and no match is no score");
+    }
+
+    /// The tiebreak, and the reason it is a subtraction rather than a rule: it
+    /// separates two matches that are otherwise equal and can never outrank a
+    /// character landing where it should.
+    #[test]
+    fn the_shorter_of_two_equal_matches_wins_and_only_just() {
+        assert!(score("thing.rs", "thing") > score("a/very/deep/thing.rs", "thing"));
+        // A boundary hit is worth more than the whole length penalty here.
+        assert!(score("src/thing.rs", "sthing") > score("something.rs", "sthing"));
+    }
+
+    #[test]
+    fn an_empty_query_scores_everything_the_same() {
+        assert_eq!(score("anything", ""), 0);
+        assert_eq!(score("", ""), 0);
+    }
+
+    /// The order the caller gave survives every tie, which is what makes a
+    /// stable sort the whole of "prefer these".
+    #[test]
+    fn ranking_keeps_the_given_order_where_the_scores_agree() {
+        let items = ["b/x.rs", "a/x.rs", "c/x.rs"]
+            .iter()
+            .map(|t| Item { text: (*t).into(), badge: None })
+            .collect();
+        let mut p = Picker::new(PickerKind::TreeRow, items, 0);
+        p.set_query("x.rs".into());
+
+        let shown: Vec<&str> = p.matches().iter().map(|&i| p.items()[i].text.as_str()).collect();
+        assert_eq!(shown, ["b/x.rs", "a/x.rs", "c/x.rs"], "equal matches, untouched");
+    }
+
+    /// And a better match moves past them, which is the other half.
+    #[test]
+    fn ranking_puts_the_better_match_first_however_it_was_given() {
+        let items = ["zzz/other.rs", "exact.rs"]
+            .iter()
+            .map(|t| Item { text: (*t).into(), badge: None })
+            .collect();
+        let mut p = Picker::new(PickerKind::TreeRow, items, 0);
+        p.set_query("exact".into());
+
+        assert_eq!(p.items()[p.selected().unwrap()].text, "exact.rs");
+    }
+
+    /// The lists whose order is an answer keep it: newest-first is what the
+    /// register ring, the buffer list and the history are telling you.
+    #[test]
+    fn only_the_tree_list_is_ranked() {
+        assert!(PickerKind::TreeRow.ranked());
+        for kind in [
+            PickerKind::File,
+            PickerKind::Buffer,
+            PickerKind::History,
+            PickerKind::Register { before: false },
+        ] {
+            assert!(!kind.ranked(), "{kind:?}");
+        }
     }
 
     /// The one kind whose rows do not already say what you are choosing.

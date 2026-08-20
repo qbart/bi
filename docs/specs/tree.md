@@ -271,12 +271,12 @@ Ctrl-W e        a tree beside this one, in a pane of its own
 Ctrl-^          the alternate content, tree or file
 Tab Ctrl-I / Ctrl-O   the next / previous buffer, shown from here
 Ctrl-P          the file picker
-gf              find a row by name and select it
+gf              find any path under the root by name, and go to it
+/               the same, over the rows on screen
 ```
 
-Nothing else. `/` is not in the list because the tree has no search, and neither
-are `i`, `a`'s normal-mode meaning, `p` or `x` — an allowlist does not have to
-name what it excludes.
+Nothing else. `i`, `a`'s normal-mode meaning, `p` and `x` are not in the list —
+an allowlist does not have to name what it excludes.
 
 **`Ctrl-P` is in the list because a tree is where you look files up.** The one
 key that finds a file by name has no business being the one key that does not
@@ -285,29 +285,52 @@ gets wrong quietly rather than loudly: `p` is paste, `ctrl` was not checked,
 and `Ctrl-P` in a tree pasted the marked files into the directory under the
 cursor.
 
-### `gf` — the rows, not the filesystem
+### `gf` and `/` — going somewhere in the tree
 
 `gf` asks the same question in both keymaps — go to a thing by name — over
 whatever the pane is made of. In a text window that is the open buffers; here
-it is **the rows this tree is showing**, and taking one moves the selection to
-it and opens nothing.
+it is **every path under the root**, and taking one opens the way down to it
+and puts the cursor there. `/` is the same list narrowed to **the rows on
+screen**.
 
-Twenty rows into an expanded tree, `j` twenty times is the work the fuzzy list
-exists to save, and it is a different job from `Ctrl-P`'s in three ways worth
-naming:
+Twenty rows into an expanded tree, `j` twenty times is the work a fuzzy list
+exists to save, and this one is a different job from `Ctrl-P`'s in two ways:
 
 - **It offers directories.** A directory is a tree item; `Ctrl-P` lists files
   and can never reach one.
-- **It offers only what is expanded.** The list is what the pane has on it, so
-  a row it names is a row you can be moved to. A file inside a collapsed
-  directory is not on this pane — `Ctrl-P` is how you reach that, and it opens
-  it, which is what you wanted if you knew its name already.
 - **It moves rather than opens.** Nothing is loaded, nothing is displaced, and
-  the pane you were looking at is the pane you are still looking at.
+  the pane you were looking at is the pane you are still looking at. `Ctrl-P`
+  is the one that opens a file, which is what you wanted if you knew the name
+  already.
 
 Each row is named by its path *below the root*, so a query can say which
-`mod.rs`. The root row itself is left out: it has no such path, and `gg`
-already goes there.
+`mod.rs`. The root row itself is left out of `/`'s list: it has no such path,
+and `gg` already goes there.
+
+**`gf` searches the whole tree, and an earlier draft searched only the open
+rows.** That was wrong for the state a tree spends most of its life in: mostly
+closed, with the file you want two directories down. A list that can only offer
+what you have already found is a list you do not need. Taking a path that is
+not a row yet goes through `Tree::reveal`, which opens every directory between
+the root and it — the same call `-` uses coming back out of a file, so there is
+one answer to "make this path visible".
+
+**The rows on screen come first, and only win ties.** They are put at the front
+of the list, the picker's sort is stable, and so a row you can already see
+outranks a buried one that matched exactly as well — and loses to one that
+matched better. That is the whole mechanism; there is no bonus, no weight, and
+nothing to tune. A visible `thing.rs` beats a buried `thing.rs`; a buried
+`x_thing.rs` beats both of them for `xth`, because it should.
+
+**`/` exists for when that trade is not the one you want**, and because `/` is
+search everywhere else in bi. The difference between the two keys is one
+boolean and one sentence: `gf` is the disk, `/` is the pane.
+
+The walk is bounded by the same limit `Ctrl-P` uses — a tree rooted at `/` is a
+real thing to do by accident — and obeys `gh`, so the list and the pane agree
+about whether dotfiles exist. It does *not* consult `.gitignore`, because the
+tree does not either: a list that offered files the pane refuses to show would
+be a list that cannot take you to half of what it names.
 
 `-` and `+` are inverses, and the pair is the reason the tree does not only get
 wider as you use it: `+` scopes to the directory you are standing in — the one
@@ -663,9 +686,11 @@ design's two claims live:
 - Enter on a file with a split sends the file to the previously focused window
   and leaves the tree alone.
 - `Ctrl-P` from a tree does the same, and does not paste.
-- `gf` lists the rows and not the root, directories included, and taking one
-  moves the selection without opening anything; a collapsed directory's
-  contents are not on the list until it is opened.
+- `gf` reaches a file inside a closed directory, opens the way down to it and
+  selects it, without opening the file.
+- `/` lists only what is on screen, directories included, and grows when a
+  directory is expanded.
+- A row on screen outranks an equal match below it and loses to a better one.
 - No `View` can be built on a tree window — `Editor::view` returns `None`, which
   is the compiler-checked form of "the editing commands never see a tree".
 

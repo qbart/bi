@@ -379,6 +379,46 @@ impl Tree {
         }
     }
 
+    /// Every path under the root, whether its directory is open or not.
+    ///
+    /// What `gf` searches: a fuzzy list of only the rows that happen to be
+    /// expanded is a list that hides the file you are looking for behind the
+    /// directories you have not opened yet — which is the state a tree spends
+    /// most of its life in.
+    ///
+    /// The visible rows come **first**, in the order the tree shows them, and
+    /// the rest follow. The picker's sort is stable, so that ordering is how a
+    /// row already on screen wins a tie without winning an argument: a better
+    /// fuzzy match further down still comes out on top.
+    ///
+    /// Bounded by `limit`, and the walk stops there rather than growing — a
+    /// tree rooted at `/` is a real thing to do by accident. The same rule
+    /// `crate::files::walk` follows, for the same reason. Dotfiles obey
+    /// `show_hidden`, so this list and the pane agree about what exists.
+    pub fn every_path(&self, limit: usize) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.rows[1..].iter().map(|row| row.path.clone()).collect();
+        let seen: BTreeSet<PathBuf> = out.iter().cloned().collect();
+        // Breadth first, so what is left over is shallowest first: with two
+        // equal matches and nothing else to separate them, the one nearer the
+        // root is the one you meant.
+        let mut queue = std::collections::VecDeque::from([self.root.clone()]);
+        while let Some(dir) = queue.pop_front() {
+            if out.len() >= limit {
+                break;
+            }
+            for row in children_of(&dir, 0, self.show_hidden) {
+                if row.kind == Kind::Dir {
+                    queue.push_back(row.path.clone());
+                }
+                if !seen.contains(&row.path) {
+                    out.push(row.path);
+                }
+            }
+        }
+        out.truncate(limit);
+        out
+    }
+
     /// Re-reads every open directory from disk. `R`.
     ///
     /// The same walk as any other change, because `rebuild` never caches: what

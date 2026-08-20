@@ -1344,6 +1344,14 @@ pub enum TreeCmd {
     ClearMarks,
     Refresh,
     ToggleHidden,
+    /// `gf` and `/` — the fuzzy list over this pane's rows.
+    ///
+    /// `whole` is the difference between the two keys: `gf` searches every
+    /// path under the root and `/` searches only what is on screen. Both move
+    /// the selection and open nothing. See `docs/specs/tree.md`.
+    Find {
+        whole: bool,
+    },
     /// `a` `r` `d` — fills the command line in and hands over.
     Prompt(FileOp),
 }
@@ -2687,22 +2695,32 @@ impl Editor {
         }
     }
 
-    /// `gf` in a tree — the picker over the rows it is showing.
+    /// The fuzzy list over a tree pane, and the one thing that separates its
+    /// two keys: `gf` searches the whole tree, `/` searches what is on screen.
     ///
-    /// The rows rather than the filesystem, which is the whole difference from
-    /// `Ctrl-P`: this moves the selection inside the pane, so it can only
-    /// offer what the pane has on it. Each row is named by its path below the
-    /// root, so a query can say which `mod.rs`. See `docs/specs/tree.md`.
-    fn open_tree_picker(&mut self) {
+    /// The rows rather than the filesystem is the whole difference from
+    /// `Ctrl-P` either way — this moves the selection inside the pane and
+    /// opens nothing. Each row is named by its path below the root, so a query
+    /// can say which `mod.rs`. See `docs/specs/tree.md`.
+    ///
+    /// `whole` puts the visible rows at the front of the list and the rest
+    /// after them. The picker's sort is stable, so that is how a row already
+    /// on screen wins a tie: a better fuzzy match further down still comes out
+    /// on top, which is the trade `/` exists for when you want neither.
+    fn open_tree_picker(&mut self, whole: bool) {
         let Some(tree) = self.window().tree() else { return };
         let root = tree.root().to_path_buf();
-        // From row 1: row 0 is the root itself, which has no path below the
-        // root to be named by and is where `gg` already goes.
-        let items: Vec<Item> = tree.rows()[1..]
+        let paths = match whole {
+            true => tree.every_path(crate::files::LIMIT),
+            // From row 1: row 0 is the root itself, which has no path below
+            // the root to be named by and is where `gg` already goes.
+            false => tree.rows()[1..].iter().map(|row| row.path.clone()).collect(),
+        };
+        let items: Vec<Item> = paths
             .iter()
-            .map(|row| Item {
-                text: row.path.strip_prefix(&root).unwrap_or(&row.path).to_string_lossy().into(),
-                badge: (row.kind == Kind::Dir).then_some('/'),
+            .map(|path| Item {
+                text: path.strip_prefix(&root).unwrap_or(path).to_string_lossy().into(),
+                badge: path.is_dir().then_some('/'),
             })
             .collect();
         if items.is_empty() {
@@ -2715,12 +2733,15 @@ impl Editor {
 
     /// Puts the tree's cursor on the row the picker chose, and scrolls to it.
     ///
-    /// `chosen + 1` because the list left the root row out. Nothing can have
-    /// moved in between — the picker held every key while it was open.
-    fn select_tree_row(&mut self, chosen: usize) {
+    /// Through `reveal`, by path, rather than by row index: the whole-tree
+    /// list offers rows that are not rows yet, and opening the way down to one
+    /// is exactly what `reveal` is. A path already on screen is simply
+    /// selected, which is what makes one function serve both keys.
+    fn select_tree_row(&mut self, path: String) {
         let height = self.window().height;
         let Some(tree) = self.window_mut().tree_mut() else { return };
-        tree.select(chosen + 1);
+        let full = tree.root().join(path);
+        tree.reveal(&full);
         tree.scroll_to_selected(height);
     }
 
@@ -2860,6 +2881,7 @@ impl Editor {
             }
             TreeCmd::Refresh => return tree.refresh(),
             TreeCmd::ToggleHidden => return tree.toggle_hidden(),
+            TreeCmd::Find { whole } => return self.open_tree_picker(whole),
             TreeCmd::Prompt(op) => return self.prompt_file_op(op),
             TreeCmd::Delete => return self.delete_selected(),
             TreeCmd::Yank => return self.yank_selected_path(),
@@ -3176,8 +3198,6 @@ impl Editor {
             // is no rope to run anything against.
             Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
             Action::OpenPicker(PickerKind::File) => self.open_file_picker(),
-            // This one is a tree pane by definition.
-            Action::OpenPicker(PickerKind::TreeRow) => self.open_tree_picker(),
 
             // The same reason again: a letter can be sitting on a tree pane,
             // and pressing it changes which window is focused — which is a
@@ -3266,7 +3286,10 @@ impl Editor {
             }
             // A row rather than a file: this one moves the tree's cursor and
             // opens nothing, which is why it is not `PickerKind::File`.
-            PickerKind::TreeRow => self.select_tree_row(chosen),
+            PickerKind::TreeRow => {
+                let path = picker.items()[chosen].text.clone();
+                self.select_tree_row(path);
+            }
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
             }
@@ -7895,6 +7918,20 @@ mod tests {
         tree_key(ed, TreeCmd::Select { down: true, count: 1 });
     }
 
+    /// Every item the tree's fuzzy list is offering, in the order it offers
+    /// them once the query has been applied.
+    fn offered(ed: &Editor) -> Vec<String> {
+        let picker = ed.session.picker.as_ref().expect("a list is up");
+        picker.matches().iter().map(|&i| picker.items()[i].text.clone()).collect()
+    }
+
+    fn find_in_tree(ed: &mut Editor, whole: bool, query: &str) {
+        tree_key(ed, TreeCmd::Find { whole });
+        for c in query.chars() {
+            ed.apply(cmd(Action::PickChar(c)));
+        }
+    }
+
     /// `gf` in a tree is the same question as `gf` in a text window — go to a
     /// thing by name — over the things this pane has. Taking one moves the
     /// selection to it and opens nothing.
@@ -7904,11 +7941,9 @@ mod tests {
         let mut ed = Editor::open(d.path()).unwrap();
         assert_eq!(ed.window().tree().unwrap().selected(), 0, "on the root");
 
-        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
+        find_in_tree(&mut ed, true, "");
         assert_eq!(ed.session.mode, Mode::Pick);
-        let listed: Vec<String> =
-            ed.session.picker.as_ref().unwrap().items().iter().map(|i| i.text.clone()).collect();
-        assert_eq!(listed, ["alpha.rs", "beta.rs", "gamma.rs"], "the rows, not the root");
+        assert_eq!(offered(&ed), ["alpha.rs", "beta.rs", "gamma.rs"], "the rows, not the root");
 
         ed.apply(cmd(Action::PickChar('g')));
         ed.apply(cmd(Action::PickAccept));
@@ -7918,26 +7953,72 @@ mod tests {
         assert_eq!(ed.session.mode, Mode::Normal);
     }
 
-    /// A directory is a tree item and `Ctrl-P` cannot reach one, which is half
-    /// the reason this list is the rows and not the filesystem. Only the rows,
-    /// though: what a collapsed directory hides is not on this pane.
+    /// `gf` searches the whole tree, because a list of only the rows that
+    /// happen to be expanded hides the file you are looking for behind the
+    /// directories you have not opened — which is a tree's usual state. Taking
+    /// one opens the way down to it.
     #[test]
-    fn the_tree_picker_offers_directories_and_only_what_is_expanded() {
-        let d = ScratchDir::new("tree-pick-dirs").dir("pkg").file("pkg/deep.rs").file("top.rs");
+    fn gf_reaches_a_file_inside_a_directory_that_is_still_closed() {
+        let d = ScratchDir::new("tree-pick-deep").dir("pkg").file("pkg/deep.rs").file("top.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        assert_eq!(offered_with(&mut ed, false), ["pkg", "top.rs"], "not on the pane yet");
+
+        find_in_tree(&mut ed, true, "deep");
+        assert_eq!(offered(&ed), ["pkg/deep.rs"]);
+        ed.apply(cmd(Action::PickAccept));
+
+        let tree = ed.window().tree().expect("still a tree");
+        assert_eq!(tree.selected_row().unwrap().name, "deep.rs");
+        assert!(tree.rows().iter().any(|r| r.name == "pkg" && r.open), "the way down was opened");
+    }
+
+    /// `/` is the same list narrowed to the pane you can see — the trade for
+    /// when the whole disk is not what you meant.
+    #[test]
+    fn slash_searches_only_what_is_on_screen() {
+        let d = ScratchDir::new("tree-pick-visible").dir("pkg").file("pkg/deep.rs").file("top.rs");
         let mut ed = Editor::open(d.path()).unwrap();
 
-        let listed = |ed: &Editor| -> Vec<String> {
-            ed.session.picker.as_ref().unwrap().items().iter().map(|i| i.text.clone()).collect()
-        };
-        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
-        assert_eq!(listed(&ed), ["pkg", "top.rs"], "the closed directory hides its file");
-        ed.apply(cmd(Action::PickCancel));
+        assert_eq!(
+            offered_with(&mut ed, false),
+            ["pkg", "top.rs"],
+            "the closed one hides its file"
+        );
 
         select_first_entry(&mut ed);
         tree_key(&mut ed, TreeCmd::Expand);
-        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
+        assert_eq!(offered_with(&mut ed, false), ["pkg", "pkg/deep.rs", "top.rs"], "once open");
+    }
 
-        assert_eq!(listed(&ed), ["pkg", "pkg/deep.rs", "top.rs"], "and shows it once open");
+    /// A row already on screen wins a tie and loses to a genuinely better
+    /// match. The stable sort is the whole mechanism: the visible rows go in
+    /// first, and only a higher score moves anything past them.
+    #[test]
+    fn an_open_row_wins_a_tie_and_a_better_match_wins_outright() {
+        let d = ScratchDir::new("tree-pick-rank")
+            .dir("pkg")
+            .file("pkg/thing.rs")
+            .file("pkg/x_thing.rs")
+            .file("thing.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        find_in_tree(&mut ed, true, "thing");
+        let ranked = offered(&ed);
+        assert_eq!(ranked[0], "thing.rs", "on screen, and no worse a match than the others");
+        assert!(ranked.contains(&"pkg/thing.rs".to_string()), "the closed ones are still offered");
+
+        // A query only the buried file matches well: being on screen does not
+        // save `thing.rs` from a match that is genuinely better.
+        find_in_tree(&mut ed, true, "xth");
+        assert_eq!(offered(&ed)[0], "pkg/x_thing.rs");
+    }
+
+    /// Opens the list, reads it, and closes it again.
+    fn offered_with(ed: &mut Editor, whole: bool) -> Vec<String> {
+        tree_key(ed, TreeCmd::Find { whole });
+        let out = offered(ed);
+        ed.apply(cmd(Action::PickCancel));
+        out
     }
 
     #[test]

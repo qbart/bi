@@ -600,11 +600,11 @@ impl Input {
             // The second half of `gf`, and only while the `g` is armed: a bare
             // `f` is not a tree key, so a `[keys.normal]` binding may have it.
             KeyCode::Char('f') if self.g_pending => true,
-            // Movement, marks, the two prompts, the command line, and `g` and
-            // `d`, which are prefixes rather than keys.
+            // Movement, marks, the two prompts, the two command lines, and `g`
+            // and `d`, which are prefixes rather than keys.
             KeyCode::Char(
                 'h' | 'j' | 'k' | 'l' | 'g' | 'd' | 'G' | 'R' | 'y' | 'c' | 'x' | 'p' | 'a' | 'r'
-                | '-' | '+' | ':',
+                | '-' | '+' | ':' | '/',
             ) => true,
             KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => true,
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => true,
@@ -639,11 +639,12 @@ impl Input {
             KeyCode::Char('g') if g => TreeCmd::First,
             KeyCode::Char('h') if g => TreeCmd::ToggleHidden,
             // `gf` is "go to a thing by name" in both maps. In a text window
-            // the things are buffers; here they are the rows on this pane, and
-            // taking one moves the cursor to it rather than opening it.
-            KeyCode::Char('f') if g => {
-                return self.plain(Action::OpenPicker(PickerKind::TreeRow));
-            }
+            // the things are buffers; here they are every path under the root,
+            // and taking one opens the way down to it rather than opening it.
+            KeyCode::Char('f') if g => TreeCmd::Find { whole: true },
+            // `/` is search, which in a tree is the same list narrowed to what
+            // is on screen — the pane you can see, not the disk behind it.
+            KeyCode::Char('/') => TreeCmd::Find { whole: false },
             KeyCode::Char('g') => {
                 self.g_pending = true;
                 return None;
@@ -1979,6 +1980,29 @@ leader = \" \"
     fn the_g_prefix_reaches_the_other_file_and_the_buffer_list() {
         assert_eq!(typed("ga").action, Action::Ex { line: "alt".into(), run: true });
         assert_eq!(typed("gf").action, Action::Buffer(BufferCmd::List));
+    }
+
+    /// Two keys, one list: `gf` over every path under the root, `/` over the
+    /// rows on screen. `/` is search everywhere else in bi, and a tree's
+    /// search is a list you pick from rather than a cursor that moves.
+    #[test]
+    fn a_tree_searches_the_whole_thing_with_gf_and_the_pane_with_slash() {
+        assert_eq!(tree_action("gf"), Action::Tree(TreeCmd::Find { whole: true }));
+        assert_eq!(tree_action("/"), Action::Tree(TreeCmd::Find { whole: false }));
+        // Still the tree's own map: `/` in a text window is a search line.
+        let mut input = Input::default();
+        let cmd = input.on_key(key('/'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert!(matches!(cmd.action, Action::EnterSearch { .. }));
+    }
+
+    /// `Ctrl-W f` had no name in `[keys.normal]`, so it was the one window key
+    /// a config could not rebind.
+    #[test]
+    fn the_window_picker_has_a_name_to_bind_to() {
+        let mut input =
+            with_leader("[keys.normal]\n\"<leader>f\" = \"window_pick\"\n\"j\" = \"left\"\n");
+        let cmd = feed(&mut input, " f", ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Pick));
     }
 
     /// A tree is where you look files up, so the key that looks one up by

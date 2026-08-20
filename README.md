@@ -363,11 +363,14 @@ leaving whitespace nothing can see. See
 ### Picker
 
 One overlay over five lists: the register ring (`"p` / `"P`), the open buffers
-(`:ls`), every file under the session's root (`Ctrl-P`), the rows of a tree
-pane (`gf` in one), and the `:` lines you have run (`Ctrl-R` on the command
+(`:ls`), every file under the session's root (`Ctrl-P`), a tree pane's paths
+(`gf` and `/` in one), and the `:` lines you have run (`Ctrl-R` on the command
 line). Typing filters by substring — every whitespace-separated term must
 appear somewhere, in any order, case-insensitively. Matches keep the order they
-were given, so the most recent is first.
+were given, so the most recent is first — which is an answer to "which one did
+you mean" that only the tree list has no version of, and so the only one that
+is *ranked*: consecutive characters beat characters at a path or word boundary,
+which beat characters that merely counted, and a shorter path breaks a tie.
 
 The path lists are the exception: they match a *subsequence*, so
 `sfr` finds
@@ -533,7 +536,8 @@ Only naming a directory, `+` and `-` do. See
 | `p` | put what is marked into the selected directory |
 | `Esc` | forget what is marked |
 | `Ctrl-P` | the file picker — a tree is where you look files up |
-| `gf` | find a row by name and go to it. The rows this pane is showing, directories included — it moves the selection and opens nothing |
+| `gf` | find any path under the root by name and go to it, opening the way down. Rows already on screen win a tie and lose to a better match |
+| `/` | the same list, narrowed to the rows on screen |
 
 Enter on a file opens it in the last window focused before this one, so a tree
 pane is a sidebar that stays put and files land in whichever pane you reached it
@@ -769,6 +773,7 @@ leader = " "
 "l" = "up"
 ";" = "right"
 "<leader>e" = "window_tree"
+"<leader>f" = "window_pick"    # what `Ctrl-W f` is called
 "<leader>t" = "goto_first_line"
 
 [keys.tree]

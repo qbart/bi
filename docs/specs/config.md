@@ -298,8 +298,13 @@ absent because vim spells them with two keys now exist: `goto_first_line`,
 `word_end_backward`, `big_word_end_backward`, `last_non_blank`, the tree's
 `tree_delete`, `tree_first` and `tree_toggle_hidden`, and the window prefix —
 `window_split`, `window_vsplit`, `window_close`, `window_only`, `window_tree`,
-`window_cycle` and the four `window_focus_*`. Each is still a key sequence bi
-already has; none is a new command.
+`window_pick`, `window_cycle` and the four `window_focus_*`. Each is still a
+key sequence bi already has; none is a new command.
+
+`window_pick` — `Ctrl-W f` — was missing from that list and is the reason it is
+worth restating: the table is the *only* way a binding reaches one of these, so
+a key left out of it is a key nobody can rebind, and nothing but reading the
+table says which. Every `Ctrl-W` sequence has a name now, in both maps.
 
 Two rules that fell out of building it, both worth keeping:
 
