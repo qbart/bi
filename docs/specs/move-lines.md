@@ -34,7 +34,26 @@ keys are the arrows.
 :m $        after the last line
 :m +3       after `.+3`
 :m -2       after `.-2`, which is one row up
+:m .+1      the same address written out
+:m+1        the same again, with the space vim does not require
 ```
+
+**Two spellings that had to be added, and the reason is the same both times.**
+`.` is the cursor's line, so `+3` already means `.+3` — but `:m .+1` and
+`:m .-2` are what a decade of vimrcs actually say, and so is `:m+1` with
+nothing between the command and its address. Both used to miss: one was an
+address that did not parse, the other a command called `m+1`. A command that
+is vim in one spelling and an error message in the other is worse than either,
+and the point of matching vim here is muscle memory.
+
+`m` is the only command that lets its argument touch its name, and it can be
+because it is the only one whose argument starts with a character no command
+name contains. `:mark` still reads as `mark`.
+
+**A typed range — `:2,3m 4` — is not supported**, here or anywhere else in
+bi's `:` line: there is no range parser, and one command wanting one is not a
+reason to grow it. The range comes from the selection instead, which is the
+same block said with the keys you already have.
 
 Over a visual selection, the whole block moves and stays selected, so a second
 `:m` — or a second `Shift-Down` — carries on from where the first left off.
@@ -58,8 +77,9 @@ number is a claim about a line that either exists or does not. The arrow keys
 clamp, because they name no line — that difference is the whole distinction
 between the two halves.
 
-**An address inside the range moves nothing.** `:2,3m 2` and `:2,3m 3` are
-no-ops, which falls out of the arithmetic rather than needing a rule.
+**An address inside the block moves nothing.** With lines 2 and 3 selected,
+`:m 2` and `:m 3` are no-ops, which falls out of the arithmetic rather than
+needing a rule.
 
 **Corrected, twice, and this is the second.** `:m` first read `+N` as N rows
 down and a bare `N` as "become line N". The bare number went first, being a
@@ -164,6 +184,9 @@ no-op on the undo stack.
 - Down one, up one, in the middle of a file, cursor riding along.
 - A three-line block moved as one, still selected afterwards.
 - `:m 0` and `:m $` from the middle.
+- `:m .+1`, `:m+1`, `:move.+1` and `:m .-2` all reach the same address the
+  spaced signed forms do; `:m .` and `:m .-1` move nothing.
+- `:mark` is still an unknown command and `:move` alone still asks where.
 - `:m +99` clamps to the bottom rather than refusing.
 - `Shift-Up` on the first line and `Shift-Down` on the last do nothing at all —
   no edit, nothing to undo.

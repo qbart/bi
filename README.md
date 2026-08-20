@@ -210,7 +210,10 @@ rather than a row index — see [docs/specs/motions.md](docs/specs/motions.md).
 *after*, not a distance. `:m 0` is the top, `:m $` the bottom, `:m 12` puts the
 lines after line 12, and the signed forms are addresses too: `+3` means `.+3`,
 which is why `:m -1` names the line above and moves nothing, and `:m -2` is how
-you go up one.
+you go up one. Write the `.` out if your fingers do — `:m .+1` and `:m .-2` are
+the same two addresses, and so are `:m+1` and `:m-2` with nothing in between.
+A typed range is not: `:2,3m 4` has no range parser to read it, and the
+selection says the same thing with the keys you already have.
 
 Being an address is also why it is direction-dependent: coming from above line
 12 the line becomes line 12, coming from below it becomes line 13. And an
@@ -354,14 +357,14 @@ leaving whitespace nothing can see. See
 
 ### Picker
 
-One overlay over four lists: the register ring (`"p` / `"P`), the open buffers
-(`:ls`), every file under the session's root (`Ctrl-P`), and the `:` lines you
-have run (`Ctrl-R` on the command line). Typing filters by substring — every
-whitespace-separated term must appear somewhere, in any order,
-case-insensitively. Matches keep the order they were given, so the most recent
-is first.
+One overlay over five lists: the register ring (`"p` / `"P`), the open buffers
+(`:ls`), every file under the session's root (`Ctrl-P`), the rows of a tree
+pane (`gf` in one), and the `:` lines you have run (`Ctrl-R` on the command
+line). Typing filters by substring — every whitespace-separated term must
+appear somewhere, in any order, case-insensitively. Matches keep the order they
+were given, so the most recent is first.
 
-The file and buffer lists are the exception: they match a *subsequence*, so
+The path lists are the exception: they match a *subsequence*, so
 `sfr` finds
 `src/find/render.rs`. Over prose that rule would match everything, which is why
 it is not the default; over paths it is the only useful one. The walk skips
@@ -439,6 +442,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:{n}` | go to line *n* |
 | `:m 12` `:m 0` `:m $` | move this line, or the selection, after that line |
 | `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
+| `:m .+1` `:m+1` | the `.` written out, or the space left off. Both are the address above |
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:case <style>` | respell the selection, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
@@ -473,7 +477,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W s` `Ctrl-W v` | split horizontally / vertically |
 | `Ctrl-W e` | show or hide the tree beside this file, rooted where the session is with the file revealed |
 | `Ctrl-W h j k l` | focus the window in that direction |
-| `Ctrl-W f` | a letter on every window — press one to go there |
+| `Ctrl-W f` | a letter in the middle of every window — press one to go there |
 | `Ctrl-W w` `Ctrl-W W` | cycle focus forwards / backwards |
 | `Ctrl-W c` `Ctrl-W q` | close this window |
 | `Ctrl-W o` | close every other window |
@@ -523,6 +527,7 @@ Only naming a directory, `+` and `-` do. See
 | `p` | put what is marked into the selected directory |
 | `Esc` | forget what is marked |
 | `Ctrl-P` | the file picker — a tree is where you look files up |
+| `gf` | find a row by name and go to it. The rows this pane is showing, directories included — it moves the selection and opens nothing |
 
 Enter on a file opens it in the last window focused before this one, so a tree
 pane is a sidebar that stays put and files land in whichever pane you reached it
@@ -535,8 +540,10 @@ goes there, so you can see that you moved. Vim's default is the other way
 round, which made focus look broken: the new pane took the space the old one
 occupied. The tree sidebar is the exception and still opens on the left.
 
-`Ctrl-W f` puts a letter at the top-left of every window — home row first, `f`
-and `j` before the rest — and the next key goes there. It is the first client
+`Ctrl-W f` puts a letter in the middle of every window — home row first, `f`
+and `j` before the rest — and the next key goes there. A three-row block, not a
+single character in a corner: it names a whole pane, and on a screen of four
+panes of code one more character is a thing you have to hunt for. It is the first client
 of bi's label machinery, which `s` and `S` will reuse; see
 [docs/specs/labels.md](docs/specs/labels.md). Not `<Tab>`, which is `Ctrl-I`
 byte for byte in a terminal and would have taken buffer-next with it.

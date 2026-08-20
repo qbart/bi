@@ -256,6 +256,21 @@ impl Options {
         })
     }
 
+    /// How many cells the line-number column takes for a file of `lines`
+    /// lines: the digits of the last number, and one space after them.
+    ///
+    /// In the core rather than the frontend, where it started, because it is a
+    /// fact about the options and the file and not about a terminal — and
+    /// because the core has to know it to put anything in the *middle* of a
+    /// pane. The frontend still draws the column; it no longer decides how
+    /// wide it is on its own.
+    pub fn gutter_width(&self, lines: usize) -> usize {
+        match self.number {
+            crate::editor::LineNumbers::Off => 0,
+            _ => lines.to_string().len() + 1,
+        }
+    }
+
     /// The indentation settings, bundled for the code that edits text.
     ///
     /// `Buffer` takes one of these rather than reaching for `Options`, which is

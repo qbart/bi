@@ -271,6 +271,7 @@ Ctrl-W e        a tree beside this one, in a pane of its own
 Ctrl-^          the alternate content, tree or file
 Tab Ctrl-I / Ctrl-O   the next / previous buffer, shown from here
 Ctrl-P          the file picker
+gf              find a row by name and select it
 ```
 
 Nothing else. `/` is not in the list because the tree has no search, and neither
@@ -283,6 +284,30 @@ work in the pane built for finding files. It is also the case the allowlist
 gets wrong quietly rather than loudly: `p` is paste, `ctrl` was not checked,
 and `Ctrl-P` in a tree pasted the marked files into the directory under the
 cursor.
+
+### `gf` — the rows, not the filesystem
+
+`gf` asks the same question in both keymaps — go to a thing by name — over
+whatever the pane is made of. In a text window that is the open buffers; here
+it is **the rows this tree is showing**, and taking one moves the selection to
+it and opens nothing.
+
+Twenty rows into an expanded tree, `j` twenty times is the work the fuzzy list
+exists to save, and it is a different job from `Ctrl-P`'s in three ways worth
+naming:
+
+- **It offers directories.** A directory is a tree item; `Ctrl-P` lists files
+  and can never reach one.
+- **It offers only what is expanded.** The list is what the pane has on it, so
+  a row it names is a row you can be moved to. A file inside a collapsed
+  directory is not on this pane — `Ctrl-P` is how you reach that, and it opens
+  it, which is what you wanted if you knew its name already.
+- **It moves rather than opens.** Nothing is loaded, nothing is displaced, and
+  the pane you were looking at is the pane you are still looking at.
+
+Each row is named by its path *below the root*, so a query can say which
+`mod.rs`. The root row itself is left out: it has no such path, and `gg`
+already goes there.
 
 `-` and `+` are inverses, and the pair is the reason the tree does not only get
 wider as you use it: `+` scopes to the directory you are standing in — the one
@@ -638,6 +663,9 @@ design's two claims live:
 - Enter on a file with a split sends the file to the previously focused window
   and leaves the tree alone.
 - `Ctrl-P` from a tree does the same, and does not paste.
+- `gf` lists the rows and not the root, directories included, and taking one
+  moves the selection without opening anything; a collapsed directory's
+  contents are not on the list until it is opened.
 - No `View` can be built on a tree window — `Editor::view` returns `None`, which
   is the compiler-checked form of "the editing commands never see a tree".
 

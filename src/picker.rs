@@ -42,6 +42,14 @@ pub enum PickerKind {
     /// should find `src/find/render.rs`, which is exactly what terms cannot
     /// do. See `docs/specs/files.md`.
     File,
+    /// `gf` in a tree — every row it is showing, to jump the selection to one.
+    ///
+    /// The rows and not the filesystem, which is what separates it from
+    /// [`PickerKind::File`]: this one moves the cursor inside the pane you are
+    /// looking at, so it can only offer what that pane has on it. Directories
+    /// included — a directory is a tree item, and `Ctrl-P` cannot reach one.
+    /// See `docs/specs/tree.md`.
+    TreeRow,
     /// `Ctrl-R` on the `:` line, over the lines you have run.
     ///
     /// The one kind that does not act on what you choose: it puts the line back
@@ -70,7 +78,7 @@ impl PickerKind {
     /// prose — which is what a register holds — "these letters appear in
     /// order" matches nearly everything, which is why it is not the default.
     fn subsequence(&self) -> bool {
-        matches!(self, PickerKind::File | PickerKind::Buffer)
+        matches!(self, PickerKind::File | PickerKind::Buffer | PickerKind::TreeRow)
     }
 }
 

@@ -1142,6 +1142,17 @@ fn parse_move(arg: &str) -> Option<MoveTo> {
     if arg == "$" {
         return Some(MoveTo::End);
     }
+    // `.` is the cursor's line, and it may be written out. `+1` already means
+    // `.+1`, but `:m .+1` and `:m .-2` are what a decade of vimrcs say, and a
+    // command that is vim in one spelling and an error in the other is worse
+    // than either.
+    let arg = match arg.strip_prefix('.') {
+        // `:m .` is the line the cursor is on, and moving something after
+        // where it already is moves nothing. Vim agrees.
+        Some("") => return Some(MoveTo::Relative(0)),
+        Some(rest) => rest.trim_start(),
+        None => arg,
+    };
     // A bare `+` or `-` is one, which is what a finger reaching for the key
     // rather than the number means. Vim reads them the same way.
     let offset = |rest: &str| -> Option<isize> {
@@ -1157,6 +1168,19 @@ fn parse_move(arg: &str) -> Option<MoveTo> {
     }
 }
 
+/// `m+1` as `("m", "+1")` — the address vim lets touch the command name.
+///
+/// `:m` is the only command that needs this, and it needs it because it is the
+/// only one whose argument begins with a character no command name contains.
+/// Without it `:m+1` — which is how every vimrc in the world writes it — is a
+/// command called `m+1`, and the message says so instead of moving the line.
+fn split_glued_move(cmd: &str) -> Option<(&str, &str)> {
+    let rest = cmd.strip_prefix("move").or_else(|| cmd.strip_prefix('m'))?;
+    let address =
+        rest.starts_with(['+', '-', '$', '.']) || rest.starts_with(|c: char| c.is_ascii_digit());
+    address.then(|| cmd.split_at(cmd.len() - rest.len()))
+}
+
 /// Splits a `:` line into a command and its argument. `None` for a blank line,
 /// which is not an error and not a command.
 fn parse_ex(line: &str) -> Option<ExLine> {
@@ -1168,6 +1192,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     let (cmd, arg) = match line.split_once(char::is_whitespace) {
         Some((c, a)) => (c, a.trim()),
         None => (line, ""),
+    };
+    // Nothing after a space, so the argument may be stuck to the name.
+    let (cmd, arg) = match arg.is_empty() {
+        true => split_glued_move(cmd).unwrap_or((cmd, arg)),
+        false => (cmd, arg),
     };
     let force = cmd.ends_with('!');
     let name = cmd.trim_end_matches('!');
@@ -2128,15 +2157,7 @@ impl Editor {
                 if *id != window || !label.starts_with(&labels.typed) {
                     continue;
                 }
-                // Inline rather than over: a letter you are about to press has
-                // to be readable wherever it lands, and so does what it
-                // landed on.
-                out.push(crate::decoration::Decoration::Inline {
-                    row: rows.start,
-                    col: 0,
-                    text: label.clone(),
-                    style: self.theme.ui.label,
-                });
+                out.extend(self.window_label(window, label, &rows));
             }
         }
         let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else { return out };
@@ -2184,6 +2205,61 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// One window's letter for `Ctrl-W f`, as a block in the middle of it.
+    ///
+    /// Three rows tall and two cells wider than the letter, painted in the
+    /// theme's `label` with the letter in the centre. A single character in a
+    /// corner is what this was, and on a screen of four panes of code it is
+    /// one more character on a screen full of them — you have to hunt for the
+    /// thing that exists to save you hunting.
+    ///
+    /// **Over the text, not inserted into it**, which is the opposite of what
+    /// every other label does (`docs/specs/labels.md`). The rule there is that
+    /// a label must not hide the character it points at; this one points at a
+    /// *window*, and the nine cells it covers are nine cells it is not talking
+    /// about. Nothing is lost that the next keystroke does not give straight
+    /// back.
+    ///
+    /// Centred on the middle of what the pane is showing. A row of the box
+    /// that falls outside it is simply not drawn — a two-line file gets less
+    /// of a box, which still reads, rather than a box drawn over the `~`s
+    /// where there is no line to decorate.
+    fn window_label(
+        &self,
+        window: WindowId,
+        label: &str,
+        rows: &std::ops::Range<usize>,
+    ) -> Vec<crate::decoration::Decoration> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let width = label.chars().count() + 2;
+        // The gutter is the frontend's to draw and the core's to know: a
+        // column of the *text area* is what a decoration names, so the middle
+        // of the pane is the middle of what is left after the numbers.
+        let gutter = match self.pane(window) {
+            Some(Pane::Text { buffer, options, .. }) => options.gutter_width(buffer.line_count()),
+            _ => 0,
+        };
+        let text_width = self.window_of(window).map_or(0, |w| w.width).saturating_sub(gutter);
+        let col = text_width.saturating_sub(width) / 2;
+
+        let middle = rows.start + (rows.end - rows.start) / 2;
+        (middle.saturating_sub(1)..=middle + 1)
+            .filter(|row| rows.contains(row))
+            .map(|row| crate::decoration::Decoration::Overlay {
+                row,
+                col,
+                text: match row == middle {
+                    true => format!(" {label} "),
+                    false => " ".repeat(width),
+                },
+                style: self.theme.ui.label,
+                layer: crate::decoration::Layer::Over,
+            })
+            .collect()
     }
 
     /// How long until something on screen changes on its own, if anything
@@ -2612,6 +2688,43 @@ impl Editor {
             self.session.status =
                 format!("more than {} files — showing the first", crate::files::LIMIT);
         }
+    }
+
+    /// `gf` in a tree — the picker over the rows it is showing.
+    ///
+    /// The rows rather than the filesystem, which is the whole difference from
+    /// `Ctrl-P`: this moves the selection inside the pane, so it can only
+    /// offer what the pane has on it. Each row is named by its path below the
+    /// root, so a query can say which `mod.rs`. See `docs/specs/tree.md`.
+    fn open_tree_picker(&mut self) {
+        let Some(tree) = self.window().tree() else { return };
+        let root = tree.root().to_path_buf();
+        // From row 1: row 0 is the root itself, which has no path below the
+        // root to be named by and is where `gg` already goes.
+        let items: Vec<Item> = tree.rows()[1..]
+            .iter()
+            .map(|row| Item {
+                text: row.path.strip_prefix(&root).unwrap_or(&row.path).to_string_lossy().into(),
+                badge: (row.kind == Kind::Dir).then_some('/'),
+            })
+            .collect();
+        if items.is_empty() {
+            self.session.status = "nothing in this tree".into();
+            return;
+        }
+        self.session.picker = Some(Picker::new(PickerKind::TreeRow, items, 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
+    /// Puts the tree's cursor on the row the picker chose, and scrolls to it.
+    ///
+    /// `chosen + 1` because the list left the root row out. Nothing can have
+    /// moved in between — the picker held every key while it was open.
+    fn select_tree_row(&mut self, chosen: usize) {
+        let height = self.window().height;
+        let Some(tree) = self.window_mut().tree_mut() else { return };
+        tree.select(chosen + 1);
+        tree.scroll_to_selected(height);
     }
 
     fn open_buffer_picker(&mut self) {
@@ -3066,6 +3179,8 @@ impl Editor {
             // is no rope to run anything against.
             Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
             Action::OpenPicker(PickerKind::File) => self.open_file_picker(),
+            // This one is a tree pane by definition.
+            Action::OpenPicker(PickerKind::TreeRow) => self.open_tree_picker(),
 
             // The same reason again: a letter can be sitting on a tree pane,
             // and pressing it changes which window is focused — which is a
@@ -3152,6 +3267,9 @@ impl Editor {
                 let full = root.join(path).to_string_lossy().to_string();
                 self.edit_path(&full);
             }
+            // A row rather than a file: this one moves the tree's cursor and
+            // opens nothing, which is why it is not `PickerKind::File`.
+            PickerKind::TreeRow => self.select_tree_row(chosen),
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
             }
@@ -7156,6 +7274,44 @@ mod tests {
         assert_eq!(at(1, "m $"), "a\nc\nd\ne\nb\n");
     }
 
+    /// `:m .+1` and `:m+1` are the same command, and both are how a decade of
+    /// vimrcs write it. Neither used to reach `:m` at all: one was an address
+    /// that did not parse, the other a command called `m+1`.
+    #[test]
+    fn the_address_may_spell_the_cursors_line_and_may_touch_the_command() {
+        let at = |row: usize, arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(row, false));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
+
+        // The two every vimrc binds, written out and glued on.
+        for down in ["m .+1", "m+1", "m .+ 1", "move.+1"] {
+            assert_eq!(at(1, down), "a\nc\nb\nd\ne\n", "{down}");
+        }
+        for up in ["m .-2", "m-2", "move-2"] {
+            assert_eq!(at(2, up), "a\nc\nb\nd\ne\n", "{up}");
+        }
+
+        assert_eq!(at(1, "m."), "a\nb\nc\nd\ne\n", "the cursor's own line moves nothing");
+        assert_eq!(at(1, "m .-1"), "a\nb\nc\nd\ne\n", "and neither does the line above it");
+        assert_eq!(at(1, "m$"), "a\nc\nd\ne\nb\n");
+        assert_eq!(at(1, "m0"), "b\na\nc\nd\ne\n");
+    }
+
+    /// The split only fires where an address is stuck to the name, or every
+    /// command starting with `m` would lose its first letter.
+    #[test]
+    fn a_command_that_merely_begins_with_m_is_not_a_move() {
+        let mut ed = editor("a\nb\n");
+        ex(&mut ed, "mark");
+        assert_eq!(ed.session.status, "not a command: mark");
+        ex(&mut ed, "move");
+        assert!(ed.session.status.starts_with("move where?"), "{}", ed.session.status);
+        assert_eq!(whole(&ed), "a\nb\n", "and the buffer is untouched by either");
+    }
+
     /// The address arithmetic has to count the block's own rows: from above,
     /// the address falls through the hole the block leaves. Both of these are
     /// what `:2,3m {addr}` prints in vim 9.0.
@@ -7634,6 +7790,51 @@ mod tests {
     /// Down one row from the root, onto the first entry.
     fn select_first_entry(ed: &mut Editor) {
         tree_key(ed, TreeCmd::Select { down: true, count: 1 });
+    }
+
+    /// `gf` in a tree is the same question as `gf` in a text window — go to a
+    /// thing by name — over the things this pane has. Taking one moves the
+    /// selection to it and opens nothing.
+    #[test]
+    fn gf_in_a_tree_finds_a_row_and_selects_it() {
+        let d = ScratchDir::new("tree-pick").file("alpha.rs").file("beta.rs").file("gamma.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        assert_eq!(ed.window().tree().unwrap().selected(), 0, "on the root");
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
+        assert_eq!(ed.session.mode, Mode::Pick);
+        let listed: Vec<String> =
+            ed.session.picker.as_ref().unwrap().items().iter().map(|i| i.text.clone()).collect();
+        assert_eq!(listed, ["alpha.rs", "beta.rs", "gamma.rs"], "the rows, not the root");
+
+        ed.apply(cmd(Action::PickChar('g')));
+        ed.apply(cmd(Action::PickAccept));
+
+        let tree = ed.window().tree().expect("still a tree, because nothing was opened");
+        assert_eq!(tree.selected_row().unwrap().name, "gamma.rs");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    /// A directory is a tree item and `Ctrl-P` cannot reach one, which is half
+    /// the reason this list is the rows and not the filesystem. Only the rows,
+    /// though: what a collapsed directory hides is not on this pane.
+    #[test]
+    fn the_tree_picker_offers_directories_and_only_what_is_expanded() {
+        let d = ScratchDir::new("tree-pick-dirs").dir("pkg").file("pkg/deep.rs").file("top.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+
+        let listed = |ed: &Editor| -> Vec<String> {
+            ed.session.picker.as_ref().unwrap().items().iter().map(|i| i.text.clone()).collect()
+        };
+        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
+        assert_eq!(listed(&ed), ["pkg", "top.rs"], "the closed directory hides its file");
+        ed.apply(cmd(Action::PickCancel));
+
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Expand);
+        ed.apply(cmd(Action::OpenPicker(PickerKind::TreeRow)));
+
+        assert_eq!(listed(&ed), ["pkg", "pkg/deep.rs", "top.rs"], "and shows it once open");
     }
 
     #[test]
@@ -10824,6 +11025,19 @@ mod tests {
 
     // ---- labels -------------------------------------------------------------
 
+    /// The letter `Ctrl-W f` put on one window.
+    fn label_of_window(ed: &Editor, id: WindowId) -> String {
+        ed.session
+            .labels
+            .as_ref()
+            .expect("letters are up")
+            .targets
+            .iter()
+            .find(|(_, target)| *target == LabelTarget::Window(id))
+            .map(|(label, _)| label.clone())
+            .expect("that window has a letter")
+    }
+
     /// Two windows, so there is something to pick between.
     fn two_windows(text: &str) -> Editor {
         let mut ed = editor(text);
@@ -10841,16 +11055,76 @@ mod tests {
         assert_eq!(labels.targets.len(), 2, "the focused window gets one too");
         assert_eq!(labels.targets[0].0, "f", "the hand, not the alphabet");
 
-        // And each one is drawn in its own window, at the top-left of it.
+        // And each one is drawn in its own window.
         for (label, target) in &labels.targets {
             let LabelTarget::Window(id) = target else { panic!("a window label") };
+            let wanted = format!(" {label} ");
             let drawn = ed.decorations(*id, 0..1);
             assert!(
-                drawn.iter().any(|d| matches!(d, Decoration::Inline { row: 0, col: 0, text, .. }
-                        if text == label)),
+                drawn.iter().any(|d| matches!(d, Decoration::Overlay { text, .. }
+                        if *text == wanted)),
                 "{label} is not on its own window"
             );
         }
+    }
+
+    /// A single character in a corner is one more character on a screen full
+    /// of them. The letter is a block you cannot miss, in the middle of the
+    /// pane it belongs to.
+    #[test]
+    fn a_window_letter_is_a_block_in_the_middle_of_its_pane() {
+        let mut ed = two_windows("one\ntwo\nthree\nfour\nfive\n");
+        sized(&mut ed);
+        let focus = ed.focus();
+        ed.size_window(focus, 21, 5);
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+
+        let box_of: Vec<(usize, usize, String)> = ed
+            .decorations(focus, 0..5)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { row, col, text, layer: Layer::Over, .. } => {
+                    Some((row, col, text))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Three rows tall, the letter in the middle one, every row the same
+        // width and the same column — a block, not three loose strings.
+        //
+        // Row 2 of 0..5, and column 8: the pane is 21 wide with a two-cell
+        // gutter for a five-line file, so the three-wide block starts at
+        // (19 - 3) / 2.
+        let letter = label_of_window(&ed, focus);
+        assert_eq!(
+            box_of,
+            [(1, 8, "   ".into()), (2, 8, format!(" {letter} ")), (3, 8, "   ".into())],
+            "the letter is not a block in the middle"
+        );
+    }
+
+    /// A file with fewer lines than the box has rows keeps the rows it has:
+    /// the missing ones would land on the `~` filler, where there is no line
+    /// to decorate.
+    #[test]
+    fn a_short_file_gets_as_much_of_the_block_as_it_has_room_for() {
+        let mut ed = two_windows("only\n");
+        sized(&mut ed);
+        let focus = ed.focus();
+        ed.size_window(focus, 21, 20);
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+
+        let rows: Vec<usize> = ed
+            .decorations(focus, 0..1)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { row, .. } => Some(row),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rows, [0], "the one row there is, and no box drawn over nothing");
     }
 
     #[test]

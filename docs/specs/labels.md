@@ -72,6 +72,14 @@ Two labels wanting the same column get a cell each, in the order they were
 produced. `S` is the client that needs this: two scopes can end in the same
 place, and a letter that quietly wins is a scope you cannot see the extent of.
 
+**A window label is the exception, and it proves the rule.** `Ctrl-W f` names
+a *window*, not a character, so there is nothing under it that it is talking
+about — it is an `Overlay` in the middle of the pane, three rows tall and two
+cells wider than the letter, painted in `label`. A single character in a corner
+is one more character on a screen full of them, and you end up hunting for the
+thing that exists to save you hunting. Nine cells go missing for one keystroke;
+the next one gives them back.
+
 The colour is the theme's `label`. Because they are decorations, the frontend
 does not learn anything new: the letters arrive in the same list as the indent
 guides and are painted by the same code.
@@ -92,6 +100,15 @@ Every window gets a letter, the focused one included: jumping to where you
 already are is a no-op, and leaving it out would mean the letters move around
 depending on where you are, which is exactly what a label is supposed not to do.
 
+The letter is drawn as a block in the middle of the pane rather than at its
+top-left, for the reason above. Centred on the middle of what the pane is
+*showing*, and a row of the block that falls past the end of the file is not
+drawn — a two-line file gets less of a block, which still reads, rather than
+one painted over the `~`s where there is no line to decorate. The core knows
+where the middle is because it knows the gutter width, which moved out of the
+frontend for exactly this: how many digits the last line number needs is a
+fact about the file and the options, not about a terminal.
+
 ## Tests
 
 - The first labels are `f`, `j`, `d` — the hand, not the alphabet.
@@ -103,8 +120,9 @@ depending on where you are, which is exactly what a label is supposed not to do.
 - Two labels at one column are two cells, in the order they were produced.
 - Zero targets is no labels; more targets than two characters can name is as
   many as can be named, and it says so rather than losing them silently.
-- `Ctrl-W f` labels every window including the focused one, and the letter
-  lands at the top-left of each.
+- `Ctrl-W f` labels every window including the focused one, as a three-row
+  block in the middle of each with the letter in its centre.
+- A file shorter than the block keeps the rows it has.
 - Pressing a label focuses that window; pressing a key that is no label
   cancels; `Esc` cancels.
 - A two-character label takes two presses and nothing in between.

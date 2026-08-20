@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use bi::buffer::Cursor;
 use bi::config::Options;
 use bi::decoration::{Decoration, Layer};
-use bi::editor::{Editor, LineNumbers, Mode, Pane, VisualKind};
+use bi::editor::{Editor, Mode, Pane, VisualKind};
 use bi::indent::{display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
 use bi::selection::Selections;
@@ -375,10 +375,7 @@ fn styled_line(
 /// would make the gutter change width as the cursor moves, sliding every line
 /// of the file sideways while you scroll.
 fn gutter_width(options: &Options, buffer: &bi::buffer::Buffer) -> usize {
-    match options.number {
-        LineNumbers::Off => 0,
-        _ => format!("{}", buffer.line_count()).len() + 1,
-    }
+    options.gutter_width(buffer.line_count())
 }
 
 /// One column between panes that sit side by side; no rows between stacked
@@ -871,6 +868,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             PickerKind::Register { .. } => " registers ",
             PickerKind::Buffer => " buffers ",
             PickerKind::File => " files ",
+            PickerKind::TreeRow => " tree ",
             PickerKind::History => " history ",
         });
     let inner = outer.inner(rect);
@@ -1038,6 +1036,7 @@ fn status_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bi::editor::LineNumbers;
 
     /// Any background will do for the padding tests below — they are about
     /// geometry, not colour.

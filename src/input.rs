@@ -594,9 +594,12 @@ impl Input {
             // A count, on the same terms the dispatcher takes one: a leading
             // `0` is not a count, it is a key the tree does not have.
             KeyCode::Char(c) if c.is_ascii_digit() => !(c == '0' && self.count.is_none()),
-            // The window prefix, the two half-page keys, and the three that
-            // ask to see a buffer.
-            KeyCode::Char('w' | 'u' | 'i' | 'o' | '^') if ctrl => true,
+            // The window prefix, the two half-page keys, the three that ask to
+            // see a buffer, and the file picker.
+            KeyCode::Char('w' | 'u' | 'i' | 'o' | 'p' | '^') if ctrl => true,
+            // The second half of `gf`, and only while the `g` is armed: a bare
+            // `f` is not a tree key, so a `[keys.normal]` binding may have it.
+            KeyCode::Char('f') if self.g_pending => true,
             // Movement, marks, the two prompts, the command line, and `g` and
             // `d`, which are prefixes rather than keys.
             KeyCode::Char(
@@ -635,6 +638,12 @@ impl Input {
             // The `g` prefix resolves first, or `gh` would read as `h`.
             KeyCode::Char('g') if g => TreeCmd::First,
             KeyCode::Char('h') if g => TreeCmd::ToggleHidden,
+            // `gf` is "go to a thing by name" in both maps. In a text window
+            // the things are buffers; here they are the rows on this pane, and
+            // taking one moves the cursor to it rather than opening it.
+            KeyCode::Char('f') if g => {
+                return self.plain(Action::OpenPicker(PickerKind::TreeRow));
+            }
             KeyCode::Char('g') => {
                 self.g_pending = true;
                 return None;
@@ -1727,6 +1736,15 @@ leader = \" \"
                 let acted =
                     input.tree(key).is_some() || input.mid_command() || input.count.is_some();
                 assert_eq!(claimed, acted, "{}", crate::config::spell(&[key]));
+
+                // And again with the `g` armed, which claims one more key and
+                // is the state a fresh `Input` cannot show.
+                let mut input = Input::default();
+                input.tree(Key::char('g'));
+                let claimed = input.tree_claims(key);
+                let acted =
+                    input.tree(key).is_some() || input.mid_command() || input.count.is_some();
+                assert_eq!(claimed, acted, "after g: {}", crate::config::spell(&[key]));
             }
         }
     }
