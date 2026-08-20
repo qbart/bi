@@ -43,6 +43,15 @@ pub fn swatches(line: &str) -> Vec<Swatch> {
 ///
 /// Longest first, and the run has to end where the form does: `#fb4934ff` is
 /// one eight-digit colour, never a six-digit one with `ff` after it.
+///
+/// **And the form has to end at a word boundary.** `#define` is `d`, `e`, `f`
+/// — three hex digits — followed by a letter that is not one, so without this
+/// every C and C++ file in the world has a swatch on its include guards. It is
+/// the only preprocessor directive that collides (`#if`, `#include`, `#endif`
+/// and the rest all break on a non-hex letter in the first three characters),
+/// but the rule is written as a boundary rather than as a list of words: a
+/// colour is a whole token, `#abcdefg` is not a six-digit colour with a `g`
+/// after it, and neither of those facts is about C.
 fn hex(chars: &[char], at: usize) -> Option<Swatch> {
     let digits = chars[at + 1..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
     let len = match digits {
@@ -51,6 +60,12 @@ fn hex(chars: &[char], at: usize) -> Option<Swatch> {
         3 => 3,
         _ => return None,
     };
+    // What follows the digits must not be able to be part of a word. A
+    // non-hex *letter* is what gives `#define` away; `_` counts too, since
+    // `#abc_def` is an identifier in every language that allows one.
+    if chars.get(at + 1 + len).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+        return None;
+    }
     let value = |i: usize| chars[at + 1 + i].to_digit(16).unwrap_or(0) as u8;
     let rgb = match len {
         3 => (value(0) * 17, value(1) * 17, value(2) * 17),
@@ -213,6 +228,28 @@ mod tests {
     #[test]
     fn out_of_range_clamps_rather_than_refusing() {
         assert_eq!(found("rgb(300,-5,0)").first().unwrap().1, (255, 0, 0));
+    }
+
+    #[test]
+    fn a_colour_is_a_whole_token() {
+        // The one that sent us here: `#def` is three hex digits, and every C
+        // and C++ file in the world starts with three of them.
+        assert!(found("#define MAX 10").is_empty());
+        assert!(found("#define FB4934").is_empty());
+        assert!(found("#ifdef GUARD_H").is_empty());
+        // Six digits with a letter after them are not six digits.
+        assert!(found("#abcdefg").is_empty());
+        assert!(found("#abc_def").is_empty(), "an identifier, not a colour and a word");
+        // And the boundary is only about what a word can contain, so every
+        // way a colour actually gets written still lands.
+        assert_eq!(found("#def").len(), 1);
+        assert_eq!(found("#def;").len(), 1);
+        assert_eq!(found("color: #def }").len(), 1);
+        assert_eq!(found("\"#def\"").len(), 1);
+        assert_eq!(found("#define C 0xff  // #def").len(), 1, "the comment, not the directive");
+        // `#deadbeef` is eight hex digits and a boundary — a colour by every
+        // rule bi has, and the rule does not get to be surprised by it.
+        assert_eq!(found("#deadbeef").len(), 1);
     }
 
     #[test]

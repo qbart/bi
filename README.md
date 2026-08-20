@@ -725,8 +725,12 @@ in the text. See [docs/specs/flash.md](docs/specs/flash.md).
 `#fb4934`, `#f94`, `rgb(251,73,52)`, `rgba(...)` and the shader spelling
 `rgb(0.5f,0.1f,0.1)` are drawn in the colour they name, with black or white
 text over them — whichever can actually be read, by WCAG luminance rather than
-a brightness average, which is the rule that gets saturated green right. `:set
-color_swatches false` turns it off. See
+a brightness average, which is the rule that gets saturated green right.
+
+A colour has to be a whole token, so `#define` is not one — `d`, `e` and `f`
+are three hex digits, and without that rule every C file carries a swatch on
+its include guards. `#abcdefg` and `#abc_def` are not colours either, for the
+same reason. `:set color_swatches false` turns the whole thing off. See
 [docs/specs/colors.md](docs/specs/colors.md).
 
 #### Trimming

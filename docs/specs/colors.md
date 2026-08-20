@@ -47,6 +47,26 @@ Hex is matched with the longest form first — eight digits, then six, then thre
 — and the run has to *end* there: `#fb4934ff` is one eight-digit colour, never a
 six-digit one with `ff` after it.
 
+**And it has to end at a word boundary.** `#define` is `d`, `e`, `f` followed by
+a letter that is not a hex digit, so the three-digit form matched it and every
+C and C++ file in the world had a swatch on its include guards. It is the only
+preprocessor directive that collides — `#if`, `#ifdef`, `#include`, `#endif`,
+`#pragma`, `#error` and `#undef` all break on a non-hex letter inside the first
+three characters, which is why this went unnoticed until someone opened a C
+file.
+
+The rule is written as a boundary rather than as a list of words bi refuses,
+and the difference matters: a colour is a whole token, `#abcdefg` is not a
+six-digit colour with a `g` after it, and `#abc_def` is an identifier. None of
+those three facts is about C, and a `#define` exclusion keyed off the filetype
+would have fixed one of them while leaving the parser wrong about the other two
+— and would have needed the swatch scanner to know what language it was
+reading, which it does not and should not.
+
+`_` counts as a word character alongside the alphanumerics, because every
+language that allows an identifier allows one in it. `#deadbeef` is still a
+colour: eight hex digits, boundary after, correct by every rule bi has.
+
 ## The text colour
 
 The swatch paints the background; the foreground has to stay readable on it, so
@@ -88,6 +108,9 @@ is why decorations carry a resolved style rather than a theme key.
   white, and `rgb(1,1,1)` is not.
 - The alpha does not decide the space: `rgba(255,153,68,0.5)` is still orange.
 - Eight hex digits are one match, not a six and a leftover.
+- A colour is a whole token: `#define MAX 10` and `#ifdef GUARD_H` produce
+  nothing, `#abcdefg` and `#abc_def` produce nothing, and `#def`, `#def;`,
+  `"#def"` and `#deadbeef` all still produce one.
 - Out of range clamps.
 - Black text on a light swatch, white on a dark one, and the green that a
   brightness average gets wrong gets black.
