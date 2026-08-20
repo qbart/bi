@@ -92,7 +92,7 @@ gutter_current = "#ffffff"
 rule           = "#00aaaa"
 filler         = "#5555ff"
 indent_guide   = "#00aaaa"
-context        = "#000080"                           # the cursor line's blue
+context        = "#005555"                           # the cursor line's blue
 # The IDE's menu bar: black on light gray, across the top of the screen.
 context_header = { fg = "#000000", bg = "#aaaaaa" }
 

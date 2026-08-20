@@ -11,7 +11,7 @@
 # config.toml. See docs/specs/theme.md.
 
 [syntax]
-keyword     = "#9d0006"                              # red
+keyword     = { fg = "#9d0006", bold = true }        # red
 function    = { fg = "#79740e", bold = true }        # green, bold
 constructor = { fg = "#79740e", bold = true }
 type        = "#b57614"                              # yellow
@@ -70,7 +70,7 @@ gutter_current = "#b57614"
 rule           = "#d5c4a1"
 filler         = "#d5c4a1"
 indent_guide   = "#d5c4a1"
-context        = "#ebdbb2"                           # bg1
+context        = "#79740e"                           # bg1
 context_header = { fg = "#7c6f64", bg = "#ebdbb2" }
 
 # TODO: and friends. See docs/specs/todo-comments.md.
