@@ -13,7 +13,8 @@ one place.
 
 ## Status
 
-**Built.** `:m` and the bare address use it; `:s` is what it was built for.
+**Built.** `:m`, the bare address and `:s` use it — `:s` is what it was built
+for, and [substitute.md](substitute.md) is where it landed.
 
 ## The language
 

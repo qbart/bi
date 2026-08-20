@@ -1809,10 +1809,27 @@ impl Buffer {
         needle: &str,
         whole_word: bool,
     ) -> Vec<(usize, usize)> {
+        self.matches_in_cased(start, end, needle, whole_word, None)
+    }
+
+    /// The same, with the case rule handed in rather than derived.
+    ///
+    /// `None` is smartcase, which is what `/` and everything built on it want.
+    /// `:s`'s `i` and `I` flags are the one caller that knows better — they
+    /// exist for when the guess is wrong, which is the only reason vim's `\c`
+    /// and `\C` exist either. See `docs/specs/substitute.md`.
+    pub fn matches_in_cased(
+        &self,
+        start: usize,
+        end: usize,
+        needle: &str,
+        whole_word: bool,
+        case: Option<bool>,
+    ) -> Vec<(usize, usize)> {
         if needle.is_empty() {
             return Vec::new();
         }
-        let cased = needle.chars().any(char::is_uppercase);
+        let cased = case.unwrap_or_else(|| needle.chars().any(char::is_uppercase));
         let fold = |c: char| if cased { c } else { c.to_ascii_lowercase() };
 
         let raw: Vec<char> = self.rope.chars().collect();

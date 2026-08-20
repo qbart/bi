@@ -9,8 +9,10 @@
 **Built.**
 
 Covers literal matching with smartcase, the status line's echo and match
-count, and opt-in highlighting. Regular expressions and `:s` are deferred; both
-build on what is here.
+count, and opt-in highlighting. Regular expressions are deferred. `:s` is not:
+it is built, on this same literal matcher, and has its own spec at
+[substitute.md](substitute.md) — the pattern language and "replace this across
+these lines" turned out to be two questions rather than one.
 
 ## The commands
 

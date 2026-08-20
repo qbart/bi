@@ -40,6 +40,7 @@ pub mod picker;
 pub mod range;
 pub mod registers;
 pub mod selection;
+pub mod substitute;
 pub mod surround;
 pub mod syntax;
 pub mod theme;

@@ -1242,6 +1242,12 @@ enum ExLine {
         lines: Option<LineRange>,
         to: Address,
     },
+    /// `:%s/old/new/g`. `lines` is `None` when nobody wrote a range, and `:s`'s
+    /// own default is the cursor's line — see `docs/specs/substitute.md`.
+    Substitute {
+        lines: Option<LineRange>,
+        how: crate::substitute::Substitute,
+    },
     /// `:case snake` — respell what is selected, or the word under the cursor.
     Case(crate::case::Style),
     /// `:alt` — the other file: the test beside the implementation, the
@@ -1277,6 +1283,19 @@ fn parse_move(arg: &str) -> Option<Address> {
     let range = range?;
     // One address, not a span: `:m 2,5` names two lines to land after.
     (rest.is_empty() && range.first == range.last).then_some(range.first)
+}
+
+/// `s/a/b/g` as `("s", "/a/b/g")` — the delimiter vim lets touch the name.
+///
+/// Without it `:%s/2024/2025/g` is a command called `s/2024/2025/g`, and the
+/// message says so instead of substituting. The name ends at the first
+/// character that cannot be part of one, which is what keeps `:set`, `:sp` and
+/// `:split` themselves: their next character is a letter, and a letter is
+/// never a delimiter. See `docs/specs/substitute.md`.
+fn split_glued_substitute(cmd: &str) -> Option<(&str, &str)> {
+    let rest = cmd.strip_prefix("substitute").or_else(|| cmd.strip_prefix('s'))?;
+    let delimited = rest.starts_with(crate::substitute::is_delimiter);
+    delimited.then(|| cmd.split_at(cmd.len() - rest.len()))
 }
 
 /// `m+1` as `("m", "+1")` — the address vim lets touch the command name.
@@ -1318,10 +1337,20 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         None => (line, ""),
     };
     // Nothing after a space, so the argument may be stuck to the name.
-    let (cmd, arg) = match arg.is_empty() {
-        true => split_glued_move(cmd).unwrap_or((cmd, arg)),
-        false => (cmd, arg),
+    // `:s/a/b/ g` is not a thing anyone types, so the substitute split runs
+    // whether or not a space was found — unlike `:m`'s, which only has to
+    // catch a bare `:m+1`.
+    let (cmd, arg) = match split_glued_substitute(cmd) {
+        Some((name, glued)) => (name, format!("{glued}{arg}")),
+        None => match arg.is_empty() {
+            true => {
+                let (name, glued) = split_glued_move(cmd).unwrap_or((cmd, arg));
+                (name, glued.to_string())
+            }
+            false => (cmd, arg.to_string()),
+        },
     };
+    let arg = arg.as_str();
     let force = cmd.ends_with('!');
     let name = cmd.trim_end_matches('!');
     let split = |dir| {
@@ -1332,7 +1361,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // than a range quietly dropped: vim writes part of a file for `:1,5w` and
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
-    if range.is_some() && !matches!(name, "m" | "move") {
+    if range.is_some() && !matches!(name, "m" | "move" | "s" | "substitute") {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
     }
 
@@ -1391,6 +1420,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "m" | "move" => match parse_move(arg) {
             Some(to) => ExLine::Move { lines: range, to },
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
+        },
+        "s" | "substitute" => match crate::substitute::parse(arg) {
+            Ok(how) => ExLine::Substitute { lines: range, how },
+            Err(message) => ExLine::Error(message),
         },
         "alt" | "alternate" => ExLine::Alternate,
         "case" => match crate::case::Style::parse(arg) {
@@ -3981,6 +4014,16 @@ impl Editor {
             ExLine::Case(style) => {
                 self.in_view(|view| view.recase(style));
             }
+            ExLine::Substitute { lines, how } => {
+                // The last search is the session's, and an empty pattern means
+                // it — so it is read here, where both are in reach.
+                let last = self.session.last_search.as_ref().map(|s| s.pattern.clone());
+                let found = self.in_view(|view| view.substitute(lines, &how, last));
+                if let Some(Some(pattern)) = found {
+                    self.session.last_search =
+                        Some(Search { pattern, whole_word: false, forward: true });
+                }
+            }
             ExLine::Alternate => self.open_alternate(),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
@@ -5759,6 +5802,106 @@ impl View<'_> {
         self.session.mode = Mode::Normal;
     }
 
+    /// `:[range]s/old/new/flags`.
+    ///
+    /// Hands back the pattern that ran, so the caller can make it the last
+    /// search — `None` when nothing was replaced and there is nothing to
+    /// repeat. See `docs/specs/substitute.md`.
+    fn substitute(
+        &mut self,
+        lines: Option<LineRange>,
+        how: &crate::substitute::Substitute,
+        last_search: Option<String>,
+    ) -> Option<String> {
+        // An empty pattern is the last thing you searched for, which is what
+        // makes `/foo` then `:%s//bar/g` the pair everyone uses.
+        let pattern = match how.pattern.is_empty() {
+            false => how.pattern.clone(),
+            true => match last_search {
+                Some(pattern) if !pattern.is_empty() => pattern,
+                _ => {
+                    self.session.status = "no previous search".into();
+                    return None;
+                }
+            },
+        };
+
+        // No range is the cursor's line, which is vim and is why `%` is the
+        // most typed character in the command.
+        let at = self.line_numbers();
+        let (first, last) = match lines {
+            Some(range) => match range.rows(at) {
+                Ok(rows) => rows,
+                Err(message) => {
+                    self.session.status = message;
+                    return None;
+                }
+            },
+            None => {
+                let row = self.buffer.row_at(self.selections.cursor());
+                (row, row)
+            }
+        };
+
+        // Every match first, then the writes: a replacement must not be
+        // searched for the pattern it just produced, so `:%s/a/aa/g` doubles
+        // each `a` and stops rather than chasing its own output.
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        let mut rows = 0usize;
+        let mut end_row = first;
+        for row in first..=last.min(self.buffer.line_count().saturating_sub(1)) {
+            let start = self.buffer.rope().line_to_char(row);
+            let stop = start + self.buffer.line_len(row);
+            let found = self.buffer.matches_in_cased(start, stop, &pattern, false, how.case);
+            let found = match how.all {
+                true => found,
+                false => found.into_iter().take(1).collect(),
+            };
+            if found.is_empty() {
+                continue;
+            }
+            rows += 1;
+            end_row = row;
+            hits.extend(found);
+        }
+
+        if hits.is_empty() {
+            self.session.status = format!("pattern not found: {pattern}");
+            return None;
+        }
+        let report = format!(
+            "{} substitution{} on {} line{}",
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" },
+            rows,
+            if rows == 1 { "" } else { "s" },
+        );
+
+        // `n` answers "how many are there" without running the thing and
+        // pressing `u`.
+        if how.count_only {
+            self.session.status = report;
+            return Some(pattern);
+        }
+
+        let before = self.selections.as_pairs();
+        // Back to front, so an earlier replacement cannot move a later one's
+        // offsets.
+        for &(start, stop) in hits.iter().rev() {
+            self.buffer.replace_range(start, stop, &how.replacement);
+        }
+        // On the first column of the last line changed, which is vim.
+        let landing =
+            self.buffer.clamped(Cursor::at(self.buffer.rope().line_to_char(end_row)), false);
+        *self.selections = Selections::single(landing);
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        self.session.status = report;
+        // A selection that has been rewritten under you is not a selection.
+        self.session.mode = Mode::Normal;
+        Some(pattern)
+    }
+
     /// Where a block starts once it is put *after* one-based line `address` —
     /// vim's `:m {number}`, arithmetic and all.
     ///
@@ -7484,6 +7627,170 @@ mod tests {
 
         assert!(ed.window().buffer().is_some(), "a buffer is showing");
         assert!(matches!(ed.window().alt, Some(Content::Tree(_))), "the tree is the alternate");
+    }
+
+    // ---- `:s` ---------------------------------------------------------------
+
+    fn rope_of(ed: &Editor) -> String {
+        ed.buffer().unwrap().rope().to_string()
+    }
+
+    /// The line that started this: `:%s/2024/2025/g` used to say
+    /// "`:%s/2024/2025/g` takes no range", because there was no `:s` for the
+    /// range to belong to. See `docs/specs/substitute.md`.
+    #[test]
+    fn a_whole_file_substitution_rewrites_every_occurrence() {
+        let mut ed = editor("(c) 2024\nbuilt 2024, shipped 2024\n");
+
+        ex(&mut ed, "%s/2024/2025/g");
+
+        assert_eq!(rope_of(&ed), "(c) 2025\nbuilt 2025, shipped 2025\n");
+        assert_eq!(ed.session.status, "3 substitutions on 2 lines");
+    }
+
+    #[test]
+    fn no_range_is_the_cursors_line_and_a_range_is_its_lines() {
+        let mut ed = editor("a\na\na\n");
+        ed.set_cursor(Cursor::at(2));
+        ex(&mut ed, "s/a/b/");
+        assert_eq!(rope_of(&ed), "a\nb\na\n", "the line the cursor was on");
+
+        let mut ed = editor("a\na\na\n");
+        ex(&mut ed, "2,3s/a/b/");
+        assert_eq!(rope_of(&ed), "a\nb\nb\n");
+    }
+
+    /// Without `g` it is the first match on each line, which is vim and is why
+    /// `g` is typed as often as it is.
+    #[test]
+    fn without_g_only_the_first_match_on_a_line_goes() {
+        let mut ed = editor("a a a\na a\n");
+
+        ex(&mut ed, "%s/a/b/");
+
+        assert_eq!(rope_of(&ed), "b a a\nb a\n");
+        assert_eq!(ed.session.status, "2 substitutions on 2 lines");
+    }
+
+    /// Applied back to front, so an earlier replacement cannot shift a later
+    /// one's offsets — and matching happens before any of them, so a
+    /// replacement is never searched for the pattern it just made.
+    #[test]
+    fn replacements_do_not_move_or_chase_each_other() {
+        let mut ed = editor("a-a\n");
+        ex(&mut ed, "%s/a/LONGER/g");
+        assert_eq!(rope_of(&ed), "LONGER-LONGER\n");
+
+        let mut ed = editor("aaa\n");
+        ex(&mut ed, "%s/a/aa/g");
+        assert_eq!(rope_of(&ed), "aaaaaa\n", "each `a` doubled once, not forever");
+    }
+
+    #[test]
+    fn the_whole_command_is_one_undo_step() {
+        let mut ed = editor("a\na\na\n");
+        ex(&mut ed, "%s/a/b/g");
+        assert_eq!(rope_of(&ed), "b\nb\nb\n");
+
+        ed.apply(cmd(Action::Undo));
+
+        assert_eq!(rope_of(&ed), "a\na\na\n", "one `u`, not three");
+    }
+
+    /// Smartcase is the default, as it is for `/`; the flags are for when that
+    /// guess is wrong.
+    #[test]
+    fn the_case_flags_override_smartcase_in_both_directions() {
+        let mut ed = editor("Foo foo\n");
+        ex(&mut ed, "%s/Foo/x/g");
+        assert_eq!(rope_of(&ed), "x foo\n", "an uppercase pattern is case-sensitive");
+
+        let mut ed = editor("Foo foo\n");
+        ex(&mut ed, "%s/Foo/x/gi");
+        assert_eq!(rope_of(&ed), "x x\n", "`i` matches both");
+
+        let mut ed = editor("Foo foo\n");
+        ex(&mut ed, "%s/foo/x/gI");
+        assert_eq!(rope_of(&ed), "Foo x\n", "`I` matches only the one that is spelled that way");
+    }
+
+    #[test]
+    fn n_counts_and_changes_nothing() {
+        let mut ed = editor("a a\na\n");
+
+        ex(&mut ed, "%s/a/b/gn");
+
+        assert_eq!(rope_of(&ed), "a a\na\n");
+        assert_eq!(ed.session.status, "3 substitutions on 2 lines");
+    }
+
+    /// A `:s` that quietly does nothing is one you assume worked.
+    #[test]
+    fn nothing_matched_says_so_and_changes_nothing() {
+        let mut ed = editor("alpha\n");
+
+        ex(&mut ed, "%s/zebra/x/g");
+
+        assert_eq!(rope_of(&ed), "alpha\n");
+        assert_eq!(ed.session.status, "pattern not found: zebra");
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_last_line_changed_and_n_walks_what_it_did() {
+        let mut ed = editor("a\nfiller\na\nfiller\n");
+
+        ex(&mut ed, "%s/a/b/g");
+
+        let row = ed.buffer().unwrap().row_at(ed.cursor().unwrap());
+        assert_eq!(row, 2, "the last line it touched");
+        assert_eq!(
+            ed.session.last_search.as_ref().map(|s| s.pattern.as_str()),
+            Some("a"),
+            "and `n` looks for what was replaced",
+        );
+    }
+
+    /// `/foo` then `:%s//bar/g` is the pair everyone uses.
+    #[test]
+    fn an_empty_pattern_is_the_last_search() {
+        let mut ed = editor("one two\n");
+        ed.session.last_search =
+            Some(Search { pattern: "two".into(), whole_word: false, forward: true });
+
+        ex(&mut ed, "%s//2/g");
+
+        assert_eq!(rope_of(&ed), "one 2\n");
+    }
+
+    #[test]
+    fn a_delimiter_that_is_not_a_slash_keeps_a_path_readable() {
+        let mut ed = editor("/usr/local/bin\n");
+
+        ex(&mut ed, "%s#/usr/local#/opt#");
+
+        assert_eq!(rope_of(&ed), "/opt/bin\n");
+    }
+
+    /// The range rules are `ranges.md`'s and are not re-implemented here.
+    #[test]
+    fn a_range_naming_a_line_that_is_not_there_is_refused() {
+        let mut ed = editor("a\nb\n");
+
+        ex(&mut ed, "2,99s/a/b/");
+
+        assert_eq!(rope_of(&ed), "a\nb\n");
+        assert_eq!(ed.session.status, "no line 99");
+    }
+
+    /// `:set` and `:sp` start with an `s` and are not substitutions, because a
+    /// letter is never a delimiter.
+    #[test]
+    fn the_other_s_commands_are_still_themselves() {
+        let mut ed = editor("hello");
+
+        ex(&mut ed, "set number 0");
+
+        assert_eq!(ed.session.options.number, LineNumbers::Off);
     }
 
     // ---- file operations ----------------------------------------------------
