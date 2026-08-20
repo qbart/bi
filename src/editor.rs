@@ -2463,14 +2463,20 @@ impl Editor {
                 &mut out,
             );
         }
-        if options.indent_guides {
+        // The guides stand down while the blanks are on show. On a line with
+        // text a bullet would win the column anyway, but a guide at column 0
+        // of an *empty* line has no character under it to be won by, and one
+        // inside a wide tab has none either — so it survives, and reads as a
+        // space that is not there. That is the exact opposite of what this
+        // mode is for. The two answer different questions, and nobody needs
+        // both answers at once: guides are for reading structure, this is for
+        // auditing what the file actually contains.
+        if options.indent_guides && !options.whitespace {
             indent_guides(buffer, options, &self.theme, rows.clone(), &mut out);
         }
-        // After the guides, so a bullet wins the column a guide wanted: with
-        // this on you asked to see every space, and a guide hiding one of them
-        // is the mode failing at its only job. Before the context marks, so the
-        // pilcrow sits at the true end of the line and the `} // if ...` that
-        // follows it reads as being past the line rather than inside it.
+        // Before the context marks, so the pilcrow sits at the true end of the
+        // line and the `} // if ...` that follows it reads as being past the
+        // line rather than inside it.
         if options.whitespace {
             whitespace(buffer, options, &self.theme, rows.clone(), &mut out);
         }
@@ -12071,10 +12077,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bullet_wins_the_column_a_guide_wanted() {
-        // Both are `Under` overlays at column 0 of an indented row, so the one
-        // pushed later is the one you see — and with this mode on, that has to
-        // be the space.
+    fn the_guides_stand_down_while_the_blanks_are_on_show() {
         let mut ed = editor("    x\n");
         ex(&mut ed, "whitespace");
 
@@ -12087,7 +12090,47 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(at_zero, [GUIDE, WS_SPACE], "the guide first, the bullet over it");
+        assert_eq!(at_zero, [WS_SPACE], "the bullet, and no guide under it");
+    }
+
+    #[test]
+    fn a_blank_line_shows_nothing_that_is_not_there() {
+        // The bug this rule exists for: a guide at column 0 of an empty line
+        // has no character under it to be overwritten by, so it survived and
+        // read as a space the file does not contain.
+        let mut ed = editor("    a\n\n    b\n");
+        ex(&mut ed, "whitespace");
+
+        assert_eq!(
+            marks(&ed).iter().filter(|(row, ..)| *row == 1).collect::<Vec<_>>(),
+            [&(1, None, WS_EOL.to_string())],
+            "one pilcrow, and not one mark before it"
+        );
+        assert!(
+            !ed.decorations(ed.focus(), 1..2).iter().any(|d| matches!(
+                d,
+                Decoration::Overlay { text, .. } if text == GUIDE
+            )),
+            "and no guide either"
+        );
+    }
+
+    #[test]
+    fn the_guides_come_back_when_the_blanks_go_away() {
+        let mut ed = editor("    x\n");
+        ex(&mut ed, "whitespace on");
+        ex(&mut ed, "whitespace off");
+
+        let at_zero: Vec<String> = ed
+            .decorations(ed.focus(), 0..1)
+            .into_iter()
+            .filter_map(|d| match d {
+                Decoration::Overlay { col: 0, text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(at_zero, [GUIDE], "standing down is not the same as being turned off");
     }
 
     #[test]

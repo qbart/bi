@@ -696,6 +696,13 @@ line moves and one tab does not read as four spaces. And the pilcrow only
 appears where there is actually a newline, which means a file with no final
 newline says so on its last row; nothing else on screen ever does.
 
+**The indent guides stand down while it is on.** On a line with text a bullet
+wins the column anyway, but a guide at column 0 of an *empty* line has no
+character under it to be overwritten by, so it survived and read as a space the
+file does not contain — the exact opposite of what this mode is for. The two
+answer different questions: guides are for reading structure, this is for
+auditing what is actually in the file.
+
 It is an option like any other underneath — `:set whitespace true`, or
 `whitespace = true` under `[filetype.<name>]` for a kind of file that has
 earned it. The colour is the theme's `whitespace`.
