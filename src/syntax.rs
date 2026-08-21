@@ -447,6 +447,86 @@ fn specificity(name: &str) -> u8 {
     name.matches('.').count() as u8 + 1
 }
 
+/// One thing `:symbols` can jump to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    /// The grammar's own word for it — `function_item`, `class_definition`.
+    /// Shown beside the name, so two `new`s are told apart by what they are.
+    pub kind: String,
+    /// Char offset of the name, which is where the cursor lands: the row alone
+    /// would put you at column zero of a line you can already see.
+    pub start: usize,
+    pub row: usize,
+}
+
+/// Whether a node kind names something worth jumping to.
+///
+/// **Two tests, and it needs both.** The suffix says the node *declares*
+/// something; the word says the something is worth a row in the list. Either
+/// alone is useless, and both failures are worth remembering:
+///
+/// - Suffix only listed every `parameter_declaration`, `field_declaration` and
+///   `let_declaration` in the file, and still missed C3's `func_definition`.
+/// - Word only listed C3's `module_resolution` — the `os::` in front of every
+///   call — along with `func_header`, `func_param_list` and `defer_stmt`.
+///
+/// Together they land on module and function level in every grammar tried.
+/// `mod` covers `module` and Rust's `mod_item`; `def` as a suffix reaches C's
+/// `preproc_def` without reaching `defer_stmt`, which ends in `stmt`.
+fn is_symbol_kind(kind: &str) -> bool {
+    const DECLARES: [&str; 6] = ["item", "definition", "declaration", "specifier", "spec", "def"];
+    const WORTH: [&str; 15] = [
+        "func",
+        "method",
+        "class",
+        "struct",
+        "enum",
+        "interface",
+        "trait",
+        "impl",
+        "mod",
+        "namespace",
+        "type",
+        "macro",
+        "union",
+        "constructor",
+        "def",
+    ];
+    DECLARES.iter().any(|end| kind.ends_with(end)) && WORTH.iter().any(|word| kind.contains(word))
+}
+
+/// The first identifier anywhere under `node`, in source order.
+///
+/// C's route to a function name: `function_definition` has a `declarator`
+/// rather than a `name`, and the identifier is under that.
+///
+/// `contains` rather than a suffix, because the grammars disagree on the word:
+/// C says `identifier`, C3 says `ident`, and Rust says `field_identifier` and
+/// `type_identifier`. A suffix test for `ident` silently loses every language
+/// that spells it the long way, which is most of them.
+fn first_identifier(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cursor = node.walk();
+    let mut recurse = true;
+    loop {
+        let at = cursor.node();
+        if at != node && at.is_named() && at.kind().contains("ident") {
+            return Some(at);
+        }
+        if recurse && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            recurse = true;
+            continue;
+        }
+        if !cursor.goto_parent() || cursor.node() == node {
+            return None;
+        }
+        recurse = false;
+    }
+}
+
 impl Syntax {
     /// Parses `rope` for the grammar matching `file` — a file name, or a bare
     /// extension. `None` when no grammar is known: an unrecognised file is
@@ -516,6 +596,68 @@ impl Syntax {
                 None => break,
             }
         }
+        out
+    }
+
+    /// What `:symbols` navigates: the declarations in the file, in the order
+    /// they appear.
+    ///
+    /// A walk of the tree rather than a `symbols.scm` per grammar, because
+    /// only some of the thirty-odd grammars bi ships have a tags query, and
+    /// writing the rest here would be thirty files to maintain for a list you
+    /// fuzzy-search anyway.
+    ///
+    /// **The rule is one line and it is about words, not shapes.** A node is a
+    /// symbol if its kind *contains* one of the words grammars agree on for a
+    /// thing worth jumping to. An earlier draft matched on the suffix instead
+    /// — `_declaration`, `_definition`, `_item` — and drowned: every function
+    /// parameter is a `parameter_declaration`, every local is a
+    /// `let_declaration`, and C3's `func_definition` was missed anyway. Words
+    /// land on module and function level, which is what the list is for.
+    ///
+    /// The name is the `name` field where there is one, and otherwise the
+    /// first identifier under it. That second route is what reaches C, whose
+    /// `function_definition` has a `declarator` rather than a name, and C3,
+    /// whose `func_definition` keeps it in a `func_header`.
+    pub fn symbols(&self, rope: &Rope) -> Vec<Symbol> {
+        let mut out = Vec::new();
+        let mut cursor = self.tree.root_node().walk();
+        let mut down = true;
+        loop {
+            let node = cursor.node();
+            // Only on the way down. Coming back up past a node is not a second
+            // sighting of it, and treating it as one listed every symbol twice.
+            if down && node.is_named() && is_symbol_kind(node.kind()) {
+                let named = node
+                    .child_by_field_name("name")
+                    .or_else(|| first_identifier(node))
+                    .map(|n| n.byte_range());
+                if let Some(range) = named {
+                    let start = rope.byte_to_char(range.start.min(rope.len_bytes()));
+                    out.push(Symbol {
+                        name: rope.byte_slice(range).to_string(),
+                        kind: node.kind().to_string(),
+                        row: rope.char_to_line(start),
+                        start,
+                    });
+                }
+            }
+            if down && cursor.goto_first_child() {
+                continue;
+            }
+            if cursor.goto_next_sibling() {
+                down = true;
+                continue;
+            }
+            if !cursor.goto_parent() {
+                break;
+            }
+            down = false;
+        }
+        // Go names one type twice — a `type_declaration` wrapping a
+        // `type_spec` — and two identical rows are one row that wastes a
+        // keystroke. The name and the row together are the identity.
+        out.dedup_by(|a, b| a.row == b.row && a.name == b.name);
         out
     }
 

@@ -656,6 +656,13 @@ pub struct Session {
     /// so a value left behind here cannot paint a rectangle over a later
     /// normal mode.
     interrupted_visual: Option<VisualKind>,
+    /// Where each row of a [`PickerKind::Symbol`] list goes, by the same index
+    /// the picker holds its items at.
+    ///
+    /// Beside the picker rather than inside it: a `picker::Item` is a string,
+    /// which is all every other kind needs, and giving one an optional char
+    /// offset would put a field on four lists that have no use for it.
+    symbol_targets: Vec<usize>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -1376,6 +1383,8 @@ enum ExLine {
     /// `:alt` — the other file: the test beside the implementation, the
     /// header beside the source.
     Alternate,
+    /// `:symbols` — the declarations in this file, to jump to one.
+    Symbols,
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -1560,6 +1569,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             Err(message) => ExLine::Error(message),
         },
         "alt" | "alternate" => ExLine::Alternate,
+        // Plural, because the command shows a list. `:sym` is the short form;
+        // `:s` is taken by substitute and always will be.
+        "sym" | "symbols" => ExLine::Symbols,
         "case" => match crate::case::Style::parse(arg) {
             Some(style) => ExLine::Case { lines: range, style },
             None => {
@@ -3046,6 +3058,38 @@ impl Editor {
     }
 
     /// `Ctrl-P` — the picker over every file under the session's root.
+    /// `:symbols` — every declaration tree-sitter found, to jump to one.
+    ///
+    /// Derived from the parse tree that is already there, so it costs a walk
+    /// and nothing else: no index, no cache, nothing to invalidate on an edit.
+    /// See `docs/specs/symbols.md`.
+    fn open_symbol_picker(&mut self) {
+        let Some(id) = self.window().buffer() else {
+            self.session.status = "no file here".into();
+            return;
+        };
+        let entry = self.entry(id);
+        let Some(syntax) = &entry.syntax else {
+            // Said rather than shown empty: "no symbols" and "bi cannot read
+            // this language" are different answers and only one is your fault.
+            self.session.status = "no grammar for this file".into();
+            return;
+        };
+        let found = syntax.symbols(entry.buffer.rope());
+        if found.is_empty() {
+            self.session.status = "no symbols in this file".into();
+            return;
+        }
+
+        self.session.symbol_targets = found.iter().map(|s| s.start).collect();
+        let items = found
+            .into_iter()
+            .map(|s| Item { text: format!("{}  {}  {}", s.name, s.kind, s.row + 1), badge: None })
+            .collect();
+        self.session.picker = Some(Picker::new(PickerKind::Symbol, items, 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
     fn open_file_picker(&mut self) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
         let files = crate::files::walk(&root, crate::files::LIMIT, self.options().gitignore);
@@ -3625,6 +3669,7 @@ impl Editor {
             // is no rope to run anything against.
             Action::OpenPicker(PickerKind::History) => self.open_history_picker(),
             Action::OpenPicker(PickerKind::File) => self.open_file_picker(),
+            Action::OpenPicker(PickerKind::Symbol) => self.open_symbol_picker(),
 
             // The same reason again: a letter can be sitting on a tree pane,
             // and pressing it changes which window is focused — which is a
@@ -3716,6 +3761,16 @@ impl Editor {
             PickerKind::TreeRow => {
                 let path = picker.items()[chosen].text.clone();
                 self.select_tree_row(path);
+            }
+            // Also a row rather than a file, and for the same reason: the list
+            // came out of the buffer already in front of you.
+            PickerKind::Symbol => {
+                // Bounds-checked rather than indexed: the list is rebuilt on
+                // every `:symbols`, and a stale index is a panic where a
+                // no-op will do.
+                if let Some(&at) = self.session.symbol_targets.get(chosen) {
+                    self.in_view(|view| view.goto_char(at));
+                }
             }
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
@@ -4225,6 +4280,7 @@ impl Editor {
                 }
             }
             ExLine::Alternate => self.open_alternate(),
+            ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -6236,6 +6292,14 @@ impl View<'_> {
     fn goto(&mut self, address: Address) {
         let row = address.resolve(self.line_numbers()).max(1) as usize;
         self.goto_row(row);
+    }
+
+    /// Puts the cursor on a char offset.
+    ///
+    /// On the character rather than the row, which is what `:symbols` wants:
+    /// column zero of a line you can already see is not where the name is.
+    fn goto_char(&mut self, at: usize) {
+        *self.selections = Selections::single(self.buffer.clamped(Cursor::at(at), false));
     }
 
     /// Puts the cursor on a one-based row.
@@ -11817,6 +11881,102 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- :symbols -----------------------------------------------------------
+
+    /// The rows `:symbols` is offering.
+    fn symbol_rows(ed: &Editor) -> Vec<String> {
+        ed.session
+            .picker
+            .as_ref()
+            .expect("the picker is up")
+            .items()
+            .iter()
+            .map(|i| i.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn symbols_lists_what_you_would_navigate_to() {
+        let d = ScratchDir::new("symbols-rust").written(
+            "a.rs",
+            "mod inner {\n    pub struct S { a: u32 }\n}\nfn main() {\n    let x = 1;\n}\n",
+        );
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+
+        ex(&mut ed, "symbols");
+
+        assert_eq!(
+            symbol_rows(&ed),
+            ["inner  mod_item  1", "S  struct_item  2", "main  function_item  4"],
+            "the module, the struct and the function — and not the field or the let"
+        );
+    }
+
+    #[test]
+    fn symbols_reaches_a_language_that_has_no_name_field() {
+        // C hides the function name under a `declarator`, and C3 under a
+        // `func_header`. Both are why the walk falls back to the first
+        // identifier rather than trusting the field.
+        let d =
+            ScratchDir::new("symbols-c").written("a.c", "int add(int a, int b) { return a; }\n");
+        let mut ed = Editor::open(format!("{}/a.c", d.path())).unwrap();
+
+        ex(&mut ed, "symbols");
+
+        assert_eq!(symbol_rows(&ed), ["add  function_definition  1"]);
+    }
+
+    #[test]
+    fn choosing_a_symbol_lands_on_its_name() {
+        let text = "fn alpha() {}\nfn beta() {}\n";
+        let d = ScratchDir::new("symbols-jump").written("a.rs", text);
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+
+        ex(&mut ed, "symbols");
+        ed.apply(cmd(Action::PickNext));
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(
+            ed.cursor().unwrap().at,
+            text.find("beta").unwrap(),
+            "on the name, not on column zero of the line it is on"
+        );
+        assert_eq!(ed.session.mode, Mode::Normal, "and the overlay is gone");
+    }
+
+    #[test]
+    fn symbols_says_so_when_there_is_nothing_to_show() {
+        let d = ScratchDir::new("symbols-empty").written("a.rs", "let x = 1;\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        ex(&mut ed, "symbols");
+        assert_eq!(ed.session.status, "no symbols in this file");
+        assert!(ed.session.picker.is_none(), "an empty overlay is a worse answer");
+    }
+
+    #[test]
+    fn symbols_says_so_when_bi_cannot_read_the_language() {
+        let d = ScratchDir::new("symbols-plain").written("notes.txt", "just words\n");
+        let mut ed = Editor::open(format!("{}/notes.txt", d.path())).unwrap();
+
+        ex(&mut ed, "symbols");
+
+        assert_eq!(ed.session.status, "no grammar for this file");
+    }
+
+    #[test]
+    fn set_syntax_gives_symbols_to_a_file_that_had_none() {
+        // The two features meeting: name the language, and the list appears.
+        let d = ScratchDir::new("symbols-set-syntax").written("script", "def go():\n    pass\n");
+        let mut ed = Editor::open(format!("{}/script", d.path())).unwrap();
+        ex(&mut ed, "symbols");
+        assert_eq!(ed.session.status, "no grammar for this file");
+
+        ex(&mut ed, "set syntax python");
+        ex(&mut ed, "symbols");
+
+        assert_eq!(symbol_rows(&ed), ["go  function_definition  1"]);
     }
 
     // ---- :set syntax --------------------------------------------------------

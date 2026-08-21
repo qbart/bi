@@ -683,6 +683,22 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### `:symbols`
+
+`:symbols` (or `:sym`) lists what tree-sitter found to navigate to — modules,
+functions, types, methods — and the usual fuzzy filter narrows it. Choosing one
+puts the cursor **on the name**, not at column zero of the line it is on.
+
+The list is a walk of the parse tree that is already there: no index, no cache,
+nothing to invalidate on an edit. A node counts when its kind both ends in a
+word that declares (`_item`, `_definition`, `_declaration`, …) and contains a
+word worth jumping to (`func`, `class`, `struct`, `mod`, …) — it needs both,
+because either alone is useless in a way that is only obvious once you run it.
+See [docs/specs/symbols.md](docs/specs/symbols.md).
+
+A file with no declarations says so, and one bi has no grammar for says *that*
+instead — which is what `:set syntax` below is for.
+
 #### `:set syntax`
 
 `:set syntax bash` reads the buffer with a grammar its file name did not ask

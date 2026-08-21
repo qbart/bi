@@ -910,6 +910,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             PickerKind::Buffer => " buffers ",
             PickerKind::File => " files ",
             PickerKind::TreeRow => " tree ",
+            PickerKind::Symbol => " symbols ",
             PickerKind::History => " history ",
         });
     let inner = outer.inner(rect);

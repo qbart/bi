@@ -50,6 +50,14 @@ pub enum PickerKind {
     /// included — a directory is a tree item, and `Ctrl-P` cannot reach one.
     /// See `docs/specs/tree.md`.
     TreeRow,
+    /// `:symbols` — the declarations tree-sitter found in this file, to jump
+    /// to one.
+    ///
+    /// Like [`PickerKind::TreeRow`] and unlike [`PickerKind::File`], it moves
+    /// the cursor inside the pane you are looking at and opens nothing: the
+    /// list is derived from the parse tree of the buffer already in front of
+    /// you. See `docs/specs/symbols.md`.
+    Symbol,
     /// `Ctrl-R` on the `:` line, over the lines you have run.
     ///
     /// The one kind that does not act on what you choose: it puts the line back
