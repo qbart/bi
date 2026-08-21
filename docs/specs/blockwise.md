@@ -20,12 +20,16 @@ blockwise register kind so `p` puts a rectangle back, and `.`.
 ## The model
 
 ```rust
-pub enum VisualKind {
-    Char,
-    Line,
+pub enum Shape {
+    Chars,
+    Lines,
     Block,   // new
 }
 ```
+
+*(Named `VisualKind` when this was written; it is [regions.md](regions.md)'s
+`Shape` now — one enum for what is selected, what is in a register, and what
+`.` repeats.)*
 
 The mode is the flag. The primary selection's `anchor` and `head` are opposite
 corners of the rectangle, and every column span is worked out on demand:
@@ -216,11 +220,28 @@ The cases worth having there: `d` and `y`+`p` over a plain block, a block that
 overhangs short lines, `$A`, `I` where a row is too short, `r`, and `.` after a
 block delete.
 
+## What moved afterwards
+
+The per-row spans are no longer derived here. `Region::of` derives them, and
+the rest of the editor asks it rather than asking the mode — see
+[regions.md](regions.md). Three things fell out:
+
+- **`S(` over a rectangle** wraps each row's columns. It used to wrap
+  everything between the two corners, because `SurroundSelection` had no
+  blockwise arm and a charwise range was the only thing it could build.
+- **`:'v case` and `:'v s`** act on the columns. `:case` had a blockwise arm
+  that could never run: `CommandExecute` takes the mode out of the session
+  before dispatching, so the accessor that knew about the rectangle answered
+  "no selection" to the only caller that asked.
+- **Blockwise `~`, `u`, `U`** are no longer a design question — a rewrite over
+  a region is one loop, and the rectangle is one kind of region. They are still
+  not bound to keys.
+
 ## Deferred
 
 **`gv`** still applies here — reselecting a block needs the corners kept, not a
 range, which is one more reason it wants doing once rather than per kind.
 
-**Blockwise `~`, `u`, `U`** — case operators over a rectangle. Nothing about
-the design blocks them; they are just not the reason anyone reaches for
-`Ctrl-V`.
+**Blockwise `~`, `u`, `U`** — case operators over a rectangle, on the keys
+rather than through `:case`. Nothing blocks them; they are just not the reason
+anyone reaches for `Ctrl-V`.

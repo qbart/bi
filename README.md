@@ -216,9 +216,9 @@ the same two addresses, and so are `:m+1` and `:m-2` with nothing in between.
 A range in front of the command says *which* lines: `:2,3m 4`, `:%m 0`,
 `:'<,'>m $`. With none written the selection does. Ranges are their own small
 language — `%`, `.`, `$`, a line number, `'<` and `'>`, each with `+N`/`-N`
-offsets — shared by every command that takes one; see
-[docs/specs/ranges.md](docs/specs/ranges.md). A range with no command after it
-goes to its last line, which is what `:42` has always been.
+offsets, plus `'v` for the selection itself — shared by every command that
+takes one; see [docs/specs/ranges.md](docs/specs/ranges.md). A range with no
+command after it goes to its last line, which is what `:42` has always been.
 
 Being an address is also why it is direction-dependent: coming from above line
 12 the line becomes line 12, coming from below it becomes line 13. And an
@@ -304,10 +304,17 @@ which is vim's rule and the reason the kinds are worth keeping apart.
 | `$` | ragged right edge — every row to its own end |
 | `O` | swap the columns and keep the rows (`o` swaps corners diagonally) |
 | `p` `P` | replace the rectangle — a charwise entry lands on every row |
+| `S{char}` | wrap every row's columns |
 
 Rows too short to reach the block are skipped rather than mangled — except by
 `A`, which pads them out so what you append lines up. A block yanks as one
 register entry (`▚` in the picker) that remembers it was a rectangle.
+
+The rectangle survives the `:` line too. Pressing `:` prefills `'v` — *the
+selection itself*, whatever shape it has — so `:'v case snake` respells the
+columns and `:'v s/a/b/g` substitutes inside them. `'<,'>` is still there and
+still means the *rows*, which is the difference the prefill exists to make
+visible. See [docs/specs/regions.md](docs/specs/regions.md).
 
 `c` and `I`/`A` leave a cursor on every row, so the text appears on all of them
 as you type. Vim replicates it when you press `Esc` instead; the file ends up
@@ -453,7 +460,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:m .+1` `:m+1` | the `.` written out, or the space left off. Both are the address above |
 | `:2,5m 0` `:%m $` | a range says *which* lines; with none, the selection does |
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
-| `:case <style>` | respell the selection, or the word under the cursor |
+| `:case <style>` | respell what the scope names, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
@@ -883,7 +890,7 @@ is the conversion:
 ```
 :retab            the whole file
 :10,20retab       a range
-:'<,'>retab       what is selected
+:'v retab         what is selected — widened to whole rows, and it says so
 ```
 
 It rewrites each line's indentation to what the options in force say — the
@@ -1128,6 +1135,10 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   and `Buffer` is a text store with no notion of where anyone is looking. Normal
   mode is every selection collapsed, visual is one with room in it, multi-cursor
   is several. See [docs/specs/selections.md](docs/specs/selections.md).
+- ~~**Every command works out for itself what a selection covers.**~~ Fixed:
+  one `Region` says which characters, built in one place and passed down, so a
+  rectangle is a rectangle to `:case`, `:s` and `S{char}` alike. See
+  [docs/specs/regions.md](docs/specs/regions.md).
 - **`Editor::scroll` is a row index** and `scroll_to_cursor` takes a height in
   rows, which bakes in "the viewport is N whole lines". Soft wrap breaks that
   assumption, and so does any pixel-scrolling frontend.

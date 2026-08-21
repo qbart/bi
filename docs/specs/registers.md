@@ -31,20 +31,22 @@ rather than being decided at paste time.
 ```rust
 pub struct Entry {
     pub text: String,
-    pub kind: EntryKind,
-}
-
-pub enum EntryKind {
-    /// Taken as a span within a line. Pastes inline.
-    Charwise,
-    /// Taken as whole lines. Pastes as new lines.
-    Linewise,
+    pub kind: Shape,
 }
 ```
 
-`kind` is `Linewise` exactly when the motion that produced it was linewise —
-`Motion::kind() == Kind::Linewise`. No blockwise: there is no visual block mode
-to produce it.
+`Shape` is [regions.md](regions.md)'s — `Chars`, `Lines`, `Block` — and it is
+the same enum a selection and a region are shaped by rather than a second
+spelling of the same three answers. It used to be `EntryKind`, with
+`Charwise` / `Linewise` / `Blockwise`, kept in step with `VisualKind` by hand.
+
+`kind` is `Lines` exactly when the motion that produced it was linewise —
+`Motion::kind() == Kind::Linewise`. Blockwise arrived with `Ctrl-V`; see
+[blockwise.md](blockwise.md).
+
+The text is spelled by `Region::text`, which is the one place the shape decides
+whether it ends in a newline — so an entry and the region it came from cannot
+disagree about what a rectangle is.
 
 ## The ring
 

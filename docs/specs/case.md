@@ -23,18 +23,31 @@ languages that want it call it.
 
 ## What it acts on
 
-**The selection**, if there is one — including every selection, so a column of
-cursors respells a column of names.
+**Whatever the scope on the `:` line names**, and the line says which — see
+[ranges.md](ranges.md). Pressing `:` with a selection up prefills `'v`, so the
+common case is "the selection" and it is visible before you press Enter:
 
-**The word under the cursor**, if there is not. Renaming one is what this is
-for, and selecting it first would be a keystroke that says nothing new. A
-cursor on whitespace has no word: `iw` there is the run of blanks, which is
-right for `diw` and is not a name, so `:case` says so rather than quietly
-doing nothing.
+| | |
+|---|---|
+| `:'v case snake` | exactly what is selected — a rectangle's columns, a charwise selection's characters, every cursor's own |
+| `:'<,'>case snake` | the *rows* the selection touches, whole |
+| `:2,5case snake` | lines 2 to 5, whole |
+| `:case snake` | the word under each cursor |
 
-Whichever it is, the cursor lands on the first character of what was respelled.
-The text under where it was is a different length now, and the start is the one
-position that means the same thing before and after.
+**The word under the cursor is the no-scope default.** Renaming one is what
+this is for, and selecting it first would be a keystroke that says nothing new.
+A cursor on whitespace has no word: `iw` there is the run of blanks, which is
+right for `diw` and is not a name, so `:case` says so rather than quietly doing
+nothing.
+
+There is no shape arm here at all. `:case` walks a region a row at a time —
+never across a line terminator — and a rectangle is simply a region whose rows
+are five columns wide. See [regions.md](regions.md).
+
+The cursors are **carried across** the edit rather than replaced: they were
+where you put them, and respelling the text under one is not a reason to move
+it somewhere else. That is `Edit::map`, the same carry `:retab` and the
+trimmer use.
 
 ## What it does to the text
 

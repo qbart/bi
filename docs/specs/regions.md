@@ -10,8 +10,8 @@ This is the spec for making that one value, computed once, passed down.
 
 ## Status
 
-**Proposed.** Written after `:'<,'>case` over a rectangle was found to act on
-whole lines.
+**Built.** Written after `:'<,'>case` over a rectangle was found to act on
+whole lines, and then built out to the shape below.
 
 ## The bug that started it
 
@@ -114,69 +114,87 @@ One type. Computed at the boundary, passed everywhere, never re-derived.
 /// How a region was meant. Survives so that yank, paste and `.` can ask.
 pub enum Shape { Chars, Lines, Block }
 
-/// One span of one row. Never crosses a line terminator.
+/// One contiguous stretch of the buffer. Runs through line terminators.
+pub struct Part { pub start: usize, pub end: usize }
+
+/// One row's worth of a region. Never crosses a line terminator.
 pub struct Span { pub row: usize, pub start: usize, pub end: usize }
 
 /// What an operation applies to.
-///
-/// Spans are sorted, disjoint, and each lies inside a single row — so
-/// charwise, linewise and blockwise are the same data, and differ only in how
-/// they were built.
-pub struct Region { shape: Shape, spans: Vec<Span> }
+pub struct Region { shape: Shape, parts: Vec<Part> }
 ```
 
-The row-clipping is the load-bearing decision. It is what makes
-`case`, `s`, `r`, `retab`, `trim`, `~`, `u`, `U` and `surround` **all the same
-operation**: for each span, back to front, replace the slice. A rectangle stops
-being a special case and becomes a different list of spans.
+**Two views, because operations genuinely ask two questions.**
 
-It is also why `Region` is not `Selections`. `Selections` sorts and merges
-(`selection.rs:170`) — two rows whose spans meet at a line end would silently
-weld together, which is exactly why `blockwise.md` derives the rectangle
-instead of storing it. `Region` has no merge invariant, because a region is
-not a set of cursors; it is the answer to one question, thrown away afterwards.
+- `parts()` is contiguous stretches, one per selection — what an operator that
+  takes text *away* works on. `d` over two selected lines takes one range with
+  the newline in the middle of it, and a row-clipped list could not say that.
+- `spans(buffer)` is those parts cut at every row boundary and clipped to each
+  row's content — what a rewrite that must not touch a line terminator works
+  on. `r`, `:case` and `:s` are all this.
+
+A rectangle's parts are already one per row, so for a block the two views are
+the same list. That is the whole of what "blockwise" means here, and it is why
+`case`, `s`, `r` and `surround` stop having a blockwise arm: they ask for the
+view they need and a rectangle is already in it.
+
+`Region` is not `Selections`, which sorts *and merges* (`selection.rs:170`):
+two rows whose spans meet at a line end would silently weld together, which is
+exactly why `blockwise.md` derives the rectangle instead of storing it. A
+region has no merge invariant, because it is not a set of cursors — it is the
+answer to one question, thrown away afterwards.
 
 ### Building one
 
-Two constructors, and they are the only places intent becomes spans:
+Three constructors, and they are the only places intent becomes characters:
 
 ```rust
 impl Region {
-    /// From what is on screen: every selection, shaped by `kind`.
-    pub fn of(buffer: &Buffer, sels: &Selections, kind: Option<VisualKind>,
-              to_eol: bool) -> Region;
+    /// From what is on screen: every selection, shaped by `shape`.
+    pub fn of(buffer: &Buffer, sels: &Selections, shape: Shape, to_eol: bool) -> Region;
 
-    /// From a `:` line's addresses. Always whole rows.
-    pub fn rows(buffer: &Buffer, range: LineRange) -> Result<Region, String>;
+    /// Whole rows — what a `:` line's addresses name.
+    pub fn of_rows(buffer: &Buffer, first: usize, last: usize) -> Region;
+
+    /// From explicit char ranges — what a text object gives.
+    pub fn spanning(shape: Shape, ranges: impl IntoIterator<Item = (usize, usize)>) -> Region;
 }
 ```
 
-`Region::of` absorbs `block_spans`, `selection_spans`, `rows_of` and
-`block_columns`. Multi-cursor needs no arm: three collapsed selections are
-three one-char spans, and `:case` over them is the same loop as everything
-else. `for_each_selection` stops being the multi-cursor path and becomes an
-implementation detail of one method.
+`Region::of` absorbs `spans_of_block`, `block_columns_of`, `selection_spans`
+and `rows_of`, which are all gone. Multi-cursor needs no arm: three selections
+are three parts, and every operation over them is the same loop as everything
+else.
+
+`Region::part_of` is the same question for one selection at a time, for the
+operators that walk their selections capturing a register entry each. It is
+what keeps `line_range` from being spelled out again at every such loop.
 
 ### Applying one
 
 ```rust
 impl Region {
-    /// Rewrites every span, last first, and reports the edits.
+    /// Rewrites every part, last first, and reports the edits.
     pub fn rewrite(&self, buf: &mut Buffer, f: impl Fn(&str) -> String) -> Vec<Edit>;
-
-    /// Cuts every span and returns the register entry, shape included.
-    pub fn take(&self, buf: &mut Buffer, op: Operator) -> (Entry, Vec<Edit>);
+    /// The same, a row at a time.
+    pub fn rewrite_rows(&self, buf: &mut Buffer, f: impl Fn(&str) -> String) -> Vec<Edit>;
+    /// Applies an operator over every part.
+    pub fn cut(&self, buf: &mut Buffer, op: Operator);
+    /// The whole region as one string, spelled the way its shape pastes back.
+    pub fn text(&self, buf: &Buffer) -> String;
 }
 ```
 
-Back-to-front ordering is written once, here, with the comment it has been
-given four times already. The `Vec<Edit>` is the existing `Edit::map`
-(`buffer.rs:61`), so carrying selections across an edit becomes one line at
-every call site and the three fixup strategies collapse to one.
+Back-to-front ordering is written once, here, with the comment it had been
+given four times. The `Vec<Edit>` is the existing `Edit::map` (`buffer.rs:61`),
+so carrying selections across an edit is one line at every call site.
 
-`Shape` replaces `EntryKind` outright — one enum for "this text is a
-rectangle", not two that must be kept in step. `Extent` keeps its counts but
-takes its shape from the same enum.
+`Region::text` is the one place a shape decides how text is spelled — a
+rectangle joins its rows with `\n` and stops, lines always end in one — so a
+register entry and the region it came from cannot disagree.
+
+`Shape` replaces `EntryKind` and `VisualKind` outright: one enum for "this text
+is a rectangle", not three that must be kept in step.
 
 ## Where the intent is said
 
@@ -212,66 +230,77 @@ the resolved `Region` is snapshotted into `Mode::Command` when the line opens.
 
 ### What a command does with one
 
-Each command declares what it can take, once, in the table where it is named
-— instead of every command re-deciding:
+A command that can only work in whole lines — `:m` cannot move half a row,
+`:retab` cannot indent half a line — calls `View::whole_rows`, which **widens
+to the rows the region touches and says so** in the status (`whole lines`).
+One rule, in one place, visible when it fires, rather than each command
+inventing an answer.
+
+A command with no scope written names its own default, and the four defaults
+that exist are one enum where the commands are dispatched:
 
 ```rust
-enum Takes {
-    Spans,   // any region: case, s, retab, trim, surround, r, ~, u, U
-    Rows,    // whole lines only: m, sort, >, <, J
-    Nothing, // w, q, e — a range is an error, as it already is
+enum Fallback {
+    Words,          // the word under each cursor — `:case`
+    CursorRow,      // `:s`
+    File,           // `:retab`
+    SelectionRows,  // `:m`
 }
 ```
 
-A `Rows` command handed a block or charwise region **widens to the rows it
-touches and says so** in the status (`"whole lines"`), rather than each command
-inventing an answer. One rule, written down, visible when it fires.
+A range handed to a command that takes none is still an error, as it was.
 
 ## Where it lives
 
-`src/region.rs`. `Shape`, `Span`, `Region`, the two constructors and the two
+`src/region.rs`. `Shape`, `Part`, `Span`, `Region`, the constructors and the
 appliers — no `Editor`, the same way `range.rs` never learns what a `Buffer`
-is. It takes `&Buffer` because spans are char offsets into a rope and there is
-no honest way around that, but it holds no editor state and its tests build a
-rope and assert on spans.
+is. It takes `&Buffer` because a span is a char offset into a rope and there is
+no honest way around that, but it holds no editor state, and its tests build a
+rope and assert on text.
 
 `docs/specs/scopes.md` is `S` and tree-sitter nodes; the name `Region` avoids
 the collision.
 
-## Migration
+## What changed, in order
 
-Each step leaves the tree green and is a commit.
+1. **`Shape`.** `VisualKind` and `EntryKind` become one enum, in `region.rs`.
+2. **`Region`,** with both views and the appliers.
+3. **`Scope` in `range.rs`,** the `'v` spelling, and the prefill.
+4. **The `:` commands** — `:case`, `:s`, `:retab`, `:m` — resolve a scope
+   through `View::region` and work on what they get. The shape rides in as an
+   argument to `run_ex_over`, taken out of the session together with the `:`
+   line, so it can neither go stale nor be missing.
+5. **The visual operators** — `d` `y` `c` `r` `p` `S` — ask `View::selected`.
+   `SurroundSelection` gained the blockwise arm it never had.
+6. **The duplicates deleted**: `spans_of_block`, `block_columns_of`,
+   `span_of_block_at`, `selection_spans`, `rows_of`, `cut_spans`,
+   `replace_spans`.
 
-1. `src/region.rs` with `Shape`, `Span`, `Region`, `Region::of`,
-   `Region::rows`, and unit tests. Nothing calls it.
-2. `Region::rewrite` / `Region::take` with the edit map. Still nothing calls it.
-3. **Fix the test helper first.** `ex()` becomes `EnterCommandMode` +
-   `CommandChar`s + `CommandExecute`, i.e. the path a keystroke takes. The two
-   blockwise `:case` tests go red, and stay red until step 5 — that is the
-   point of doing this before any of the rest.
-4. Rewrite the ten call sites in the table to build a `Region` and hand it on.
-   `SurroundSelection` gains its missing arm for free; `substitute` and
-   `retab` take a `Region` instead of `(first, last)`.
-5. `'v` in `range.rs`, the prefill, the `Takes` table, and delete
-   `interrupted_visual`.
-6. `EntryKind` → `Shape`; `Extent` takes its shape from `Shape`.
-7. `for_each_selection` becomes private to `Region`; the shift-by-delta loop
-   and the two hand-written back-to-front loops are deleted.
+`for_each_selection` stays. It is not scope machinery — it is what keeps a set
+of selections valid across an edit, which is a different job and the only one
+it does now.
 
 ## Tests
 
-- **The path is the product.** Every `:` test goes through `CommandExecute`.
-  A helper that calls `run_ex` directly is how this bug lived; it does not come
-  back.
-- `:case upper` over a rectangle takes the columns and leaves `let` alone —
-  `upper`, not `lower`, so whole-line and column answers differ.
+- **The path is the product.** The `ex()` helper now goes through
+  `EnterCommandMode`, `CommandChar` and `CommandExecute` — the path a keystroke
+  takes. A helper that called `run_ex` directly is how this bug lived through
+  two passing tests; it does not come back.
+- `:'v case upper` over a rectangle takes the columns and leaves `let` alone.
+  `upper`, not `lower`, so the whole-line and column answers differ — the old
+  test could not have failed.
 - `:'<,'>case upper` over the same rectangle takes the rows, because that is
-  what the user typed.
-- `:'v s/…` over a rectangle substitutes inside the columns only.
-- `S(` over a rectangle wraps each row's span.
-- `:'v case snake` with three cursors respells three names.
-- `:'v m +1` reports `whole lines` and moves the rows.
+  what was typed.
+- **The prefill alone does it**: `:` then `case upper` over a rectangle, with
+  nothing typed in front of the command.
+- `:'v s/a/X/g` over a rectangle substitutes inside the columns only.
+- `S"` over a rectangle wraps each row's span, and one `u` takes it all back.
+- `:'v case camel` over three cursors with a row between them respells the
+  three and not the row.
+- `:'v m 0` reports `whole lines`.
 - `Region::of` on a rectangle overhanging a short row yields an empty span for
   it, and the span stays in the list.
-- A region built from `n` selections, rewritten with a function that lengthens
-  the text, leaves all `n` selections on the right characters.
+- A charwise part runs through a line end and its spans do not — the two views,
+  and the one test that says why there are two.
+- A rewrite that lengthens the text still lands every part, and a position is
+  carried across it.

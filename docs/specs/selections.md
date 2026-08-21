@@ -143,8 +143,11 @@ there would tie the undo tree to the editor's idea of what a cursor is.
 ### Visual
 
 ```rust
-Mode::Visual(VisualKind)   // Char | Line
+Mode::Visual(Shape)   // Chars | Lines — and Block, once Ctrl-V landed
 ```
+
+*(`VisualKind` when this was written. It is [regions.md](regions.md)'s `Shape`
+now, shared with registers and with `.`.)*
 
 - `v` starts charwise from the cursor; `V` linewise. Pressing the same key
   again, or `Esc`, collapses back to normal mode.

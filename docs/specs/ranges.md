@@ -13,8 +13,9 @@ one place.
 
 ## Status
 
-**Built.** `:m`, the bare address and `:s` use it — `:s` is what it was built
-for, and [substitute.md](substitute.md) is where it landed.
+**Built.** `:m`, `:s`, `:case`, `:retab` and the bare address use it. What a
+scope *becomes* — which characters, in what shape — is
+[regions.md](regions.md); this file is the language it is written in.
 
 ## The language
 
@@ -24,6 +25,7 @@ for, and [substitute.md](substitute.md) is where it landed.
 $           the last line
 12          line 12, counting from one
 '<   '>     the first and last line of the selection
+'v          the selection itself, whatever shape it has
 +3   -2     `.+3` and `.-2`, because a bare offset is measured from `.`
 $-1         any address, plus or minus a count
 2,5         from line 2 to line 5
@@ -47,10 +49,11 @@ Three cases, and they are the whole policy:
 - **A range and no command** — `:12`, `:$`, `:%` — moves the cursor to the
   range's *last* line. `:12` was a special case in the parser before this and
   is now the general rule falling out.
-- **A command that takes a range** — `:m` today, `:s` next. It gets an
-  `Option<LineRange>`: `None` is "the caller said nothing", which is where the
+- **A command that takes a range** — `:m`, `:s`, `:case`, `:retab`. It gets an
+  `Option<Scope>`: `None` is "the caller said nothing", which is where the
   command's own default lives. `:m`'s default is the selection, which is what
-  makes `Shift-Down` and a bare `:m +1` agree about what they are moving.
+  makes `Shift-Down` and a bare `:m +1` agree about what they are moving; the
+  four defaults are named in one place, as `Fallback`.
 - **A command that does not** — `:1,5w`, `:2q` — is an **error that says so**,
   not a range quietly dropped. Vim writes part of a file for the first of
   those; bi does not, and a command that ignores half of what you typed is the
@@ -77,32 +80,54 @@ about to delete something. bi's answer is that `:5,2` and `:2,5` are the same
 four lines, that nobody types the first on purpose, and that a prompt is a
 worse interruption than the thing it is guarding against.
 
-**The `:` line prefills `'<,'>` when a selection is up.** Vim does, and the
-prefill is the whole of why the answer to "does a command act on my selection"
-is *yes, and it says so*: the rows about to be acted on are on screen before
-you press Enter, they are editable when you meant something else, and there is
-no second invisible rule about which commands quietly mean the selection. A
-command that takes no range still refuses one — `:'<,'>w` cannot write part of
-a file just because the range arrived for free.
+**The `:` line prefills `'v` when a selection is up**, which is bi's own
+spelling and not vim's — see *The selection, as itself* below. The prefill is
+the whole of why the answer to "does a command act on my selection" is *yes,
+and it says so*: what is about to be acted on is on screen before you press
+Enter, it is editable when you meant something else, and there is no second
+invisible rule about which commands quietly mean the selection. A command that
+takes no range still refuses one — `:'v w` cannot write part of a file just
+because the scope arrived for free.
 
-**The range names rows; the selection's kind names what within one.** A
-blockwise selection carries its rectangle across, and `:'<,'>case` respells the
-columns it covers and nothing else. Anything else — a charwise selection
-included — is whole lines, because `'<,'>` is a *line* range here as it is in
-vim, and the prefill is what makes that visible rather than surprising.
+## The selection, as itself
 
-Carrying the shape across took a field: `Mode::Command` *replaces*
-`Mode::Visual`, so the flag saying "this is a rectangle" — which lives in the
-mode and nowhere else — was destroyed by the keystroke that opens the command
-about to act on it. [`Session::interrupted_visual`](../../src/editor.rs) holds
-it, and `Session::visual()` is the one accessor; every mode that is not
-`Command` answers from the mode itself, so a leftover cannot paint.
+`'<,'>` can only name **rows**. That is what it means in vim and what it means
+here, and for a rectangle it is the wrong answer: `:'<,'>case` over a block
+respells whole lines, brackets and keywords included, when what was selected
+was five columns of three names.
+
+So there is a second spelling, and it names the selection rather than the lines
+under it:
+
+```
+'v      the selection itself, whatever shape it has
+```
+
+- **Charwise** — exactly the characters highlighted.
+- **Linewise** — the rows, which is `'<,'>` again, and that agreement is the
+  point rather than a redundancy.
+- **Blockwise** — the columns, one span per row.
+- **Multi-cursor** — every selection, and nothing in the gaps between them.
+
+`'v` takes no offset and no comma: there is nothing to count from. It is the
+whole scope or it is not written.
+
+The two spellings are how the prefill can be honest. `'v` is what you get,
+`'<,'>` is one edit away, and neither is a hidden rule — see
+[regions.md](regions.md) for the machinery underneath and for the bug that
+made the case: the shape used to live in the mode, and `CommandExecute` takes
+the mode out of the session before the command runs.
+
+**A command that can only work in whole lines widens, and says so.** `:m`
+cannot move half a row and `:retab` cannot indent half a line, so `:'v m 0`
+over a rectangle moves the three rows it touches and prints `whole lines`. One
+rule, in one place, visible when it fires.
 
 **`'<` and `'>` are the primary selection**, first and last row. bi does not
 prefill them the way vim does when you press `:` in visual mode, and it does
 not need to: a command that acts on the selection already sees it. They are
 here because someone with the muscle memory will type them, and because `:s`
-wants a spelling for "the block I had" that is not "the block I have".
+wants a spelling for "the rows I had" that is not "the rows I have".
 
 ## What is deliberately not here
 
@@ -130,8 +155,11 @@ pub struct Address { pub base: Base, pub offset: isize }
 pub enum Base { Current, Last, Row(usize), SelectionFirst, SelectionLast }
 pub struct LineRange { pub first: Address, pub last: Address }
 
-/// Reads a range off the front of a `:` line, and hands back what is left.
-pub fn parse(line: &str) -> (Option<LineRange>, &str);
+/// What a `:` command acts on, as written on the line.
+pub enum Scope { Selection, Lines(LineRange) }
+
+/// Reads a scope off the front of a `:` line, and hands back what is left.
+pub fn parse(line: &str) -> (Option<Scope>, &str);
 
 impl Address  { pub fn resolve(&self, lines: usize, at: Where) -> isize; }
 impl LineRange { pub fn rows(&self, lines: usize, at: Where) -> Result<(usize, usize), String>; }

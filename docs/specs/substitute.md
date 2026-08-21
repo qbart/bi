@@ -27,13 +27,19 @@ at the bottom.
 | `:s/a/b/g` | every `a` on it |
 | `:%s/a/b/g` | every `a` in the file |
 | `:2,5s/a/b/g` | every `a` in lines 2 to 5 |
-| `:'<,'>s/a/b/g` | every `a` in what was selected |
+| `:'v s/a/b/g` | every `a` in what is selected — a rectangle's columns included |
+| `:'<,'>s/a/b/g` | every `a` in the rows the selection touches |
 | `:s#/usr#/opt#` | any delimiter, so a path needs no escaping |
 | `:%s//new/g` | the pattern is the last thing you searched for |
 
 The range language is [ranges.md](ranges.md) entire, which was built for this.
 **No range means the cursor's line**, which is vim and is why `%` is the most
 typed character in the command.
+
+`:s` walks a [region](regions.md) a row at a time, and "the first match on a
+line" means the first match *in that row's span* — which is what makes
+`:'v s/a/b/` inside a rectangle stay inside the columns instead of reaching out
+to the rest of the line.
 
 ## Flags
 
