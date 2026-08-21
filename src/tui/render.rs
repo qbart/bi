@@ -380,12 +380,14 @@ fn styled_line(
     out
 }
 
-/// Columns the gutter takes: the widest line number plus a space, or none at
-/// all when it is off.
+/// Columns to the left of the text: the sign column, then the widest line
+/// number plus a space.
 ///
-/// Fixed across modes on purpose — sizing it to the largest *relative* label
-/// would make the gutter change width as the cursor moves, sliding every line
-/// of the file sideways while you scroll.
+/// Fixed across modes on purpose — sizing the numbers to the largest *relative*
+/// label would make the gutter change width as the cursor moves, sliding every
+/// line of the file sideways while you scroll. The sign column is fixed for the
+/// same reason at a longer timescale: reserved whether or not anything is in
+/// it, so the first git sign of the session does not move the file.
 fn gutter_width(options: &Options, buffer: &bi::buffer::Buffer) -> usize {
     options.gutter_width(buffer.line_count())
 }
@@ -608,6 +610,7 @@ fn render_window(
     let tab = options.tab_width;
     let total = buffer.line_count();
     let gutter = gutter_width(options, buffer);
+    let numbers = options.number_width(total);
     let cursor = selections.cursor();
     let cursor_row = buffer.row_at(cursor);
 
@@ -635,19 +638,26 @@ fn render_window(
             cursor_screen_col = col + inline_shift(&decorations, row, col);
         }
 
-        // A blank cell where a number is not due, so the text stays put.
-        let mut spans = match options.number.label_for(row, cursor_row) {
-            _ if gutter == 0 => Vec::new(),
-            Some(n) => vec![Span::styled(
-                format!("{n:>width$} ", width = gutter - 1),
+        // The sign column first, blank until something produces a sign — it is
+        // held open so that the day one arrives the file does not shift. Then
+        // the number, or a blank cell where one is not due so the text stays
+        // put.
+        let mut spans = Vec::new();
+        if options.gutter > 0 {
+            spans.push(Span::raw(" ".repeat(options.gutter)));
+        }
+        match options.number.label_for(row, cursor_row) {
+            _ if numbers == 0 => {}
+            Some(n) => spans.push(Span::styled(
+                format!("{n:>width$} ", width = numbers - 1),
                 tui(if row == cursor_row {
                     ed.theme().ui.gutter_current
                 } else {
                     ed.theme().ui.gutter
                 }),
-            )],
-            None => vec![Span::raw(" ".repeat(gutter))],
-        };
+            )),
+            None => spans.push(Span::raw(" ".repeat(numbers))),
+        }
         match &highlights {
             Some((syntax, all)) => {
                 let line_start = buffer.rope().line_to_byte(row);
@@ -1225,7 +1235,12 @@ mod tests {
         ed.buffer_mut().unwrap().insert_str(Cursor::at(0), &"x\n".repeat(120));
         let mut options = ed.session.options.clone();
         let numbered = gutter_width(&options, ed.buffer().unwrap());
-        assert_eq!(numbered, 4, "121 lines, so three digits and a space");
+        assert_eq!(
+            options.number_width(ed.buffer().unwrap().line_count()),
+            4,
+            "121 lines, so three digits and a space"
+        );
+        assert_eq!(numbered, 5, "and the sign column in front of them");
 
         options.number = LineNumbers::Relative;
         assert_eq!(
@@ -1238,10 +1253,18 @@ mod tests {
 
         options.number = LineNumbers::Off;
         assert_eq!(
-            gutter_width(&options, ed.buffer().unwrap()),
+            options.number_width(ed.buffer().unwrap().line_count()),
             0,
-            "the column is gone, not blank"
+            "the number column is gone, not blank"
         );
+        assert_eq!(
+            gutter_width(&options, ed.buffer().unwrap()),
+            options.gutter,
+            "and the sign column is the only thing left in front of the text"
+        );
+
+        options.gutter = 0;
+        assert_eq!(gutter_width(&options, ed.buffer().unwrap()), 0, "both off is nothing at all");
     }
 
     /// The whole pipeline, on a real frame: core answers what to draw, this
@@ -1277,7 +1300,39 @@ mod tests {
         // The gutter comes too, because a guide's column is a column of the
         // *text*, and getting that offset wrong is the other thing this test
         // is here to catch.
-        assert_eq!(rows, ["1 fn main() {", "2 │   let x = 1;", "3 │   │   deep();", "4 }",]);
+        // One leading cell everywhere: the sign column, reserved and empty.
+        assert_eq!(rows, [" 1 fn main() {", " 2 │   let x = 1;", " 3 │   │   deep();", " 4 }",]);
+    }
+
+    /// The reserved column, on a real frame: nothing draws a sign yet, so the
+    /// only observable effect is that the text does not start at column zero —
+    /// and that is exactly the property being bought.
+    #[test]
+    fn the_sign_column_is_held_open_and_can_be_given_back() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let row = |gutter: usize| {
+            let mut ed = Editor::empty();
+            ed.buffer_mut().unwrap().insert_str(
+                Cursor::at(0),
+                "code
+",
+            );
+            ed.set_cursor(Cursor::at(0));
+            ed.run_ex(&format!("set gutter {gutter}"));
+            let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
+            terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+            (0..12)
+                .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        assert_eq!(row(1), " 1 code", "one cell in front of the numbers");
+        assert_eq!(row(0), "1 code", "and `:set gutter 0` gives it back");
+        assert_eq!(row(3), "   1 code", "it is a width, not a switch");
     }
 
     /// `:whitespace` on a real frame — the same argument as the test above,
@@ -1309,13 +1364,13 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "1 a·b¶",
+                " 1 a·b¶",
                 // The arrow at the tab's own column; the three cells it still
                 // spans stay blank, so `c` is where it was.
-                "2 →   c¶",
+                " 2 →   c¶",
                 // No pilcrow: the file does not end in a newline, which is the
                 // one thing only this mode says out loud.
-                "3 d␣e",
+                " 3 d␣e",
             ]
         );
     }
@@ -1368,11 +1423,11 @@ mod tests {
         let selection = Some(color(ed.theme().ui.selection.bg.unwrap()));
         let cursorline = Some(color(ed.theme().ui.cursorline.bg.unwrap()));
 
-        assert_eq!(bg(2, 0), selection, "the first character of the line");
-        assert_eq!(bg(6, 0), selection, "past its last character");
+        assert_eq!(bg(3, 0), selection, "the first character of the line");
+        assert_eq!(bg(7, 0), selection, "past its last character");
         assert_eq!(bg(19, 0), selection, "and all the way to the edge");
         assert_eq!(bg(0, 0), cursorline, "but not the gutter, which is not selected");
-        assert_ne!(bg(2, 1), selection, "and the row below is not in it");
+        assert_ne!(bg(3, 1), selection, "and the row below is not in it");
     }
 
     /// The same pipeline for `Eol`, which needs a file on disk rather than a
@@ -1403,8 +1458,8 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(rows[3], "4 │   } // if (v == 0) {", "past the brace that closes it");
-        assert_eq!(rows[2], "3 │   │   go();", "and no other row grew");
+        assert_eq!(rows[3], " 4 │   } // if (v == 0) {", "past the brace that closes it");
+        assert_eq!(rows[2], " 3 │   │   go();", "and no other row grew");
     }
 
     /// And the header at the other end of the block: over the top row's text,
@@ -1444,8 +1499,8 @@ int main(void) {
 
         // The pane scrolled to row 3, whose number is still 4 — the header
         // covers the text area and the gutter is the frontend's.
-        assert_eq!(row(0), "4 int main(void) {", "the header, over the top row's text");
-        assert_eq!(row(1), "5 │   │   c();", "and the row below is the file's own");
+        assert_eq!(row(0), " 4 int main(void) {", "the header, over the top row's text");
+        assert_eq!(row(1), " 5 │   │   c();", "and the row below is the file's own");
 
         let header = terminal.backend().buffer()[(3, 0)].style();
         assert_eq!(header.bg, Some(color(ed.theme().ui.context_header.bg.unwrap())));
@@ -1483,7 +1538,7 @@ int main(void) {
             .trim_end()
             .to_string();
 
-        assert_eq!(row, "1 alpha betaf gamma", "the space after `beta` is still a space");
+        assert_eq!(row, " 1 alpha betaf gamma", "the space after `beta` is still a space");
     }
 
     fn line_of(spans: &[Span<'static>]) -> String {

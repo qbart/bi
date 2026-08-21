@@ -116,6 +116,13 @@ pub struct Options {
     pub autoindent: bool,
     /// Whether each level of indentation gets a vertical line down it.
     pub indent_guides: bool,
+    /// Cells reserved to the left of the line numbers, for a mark about the
+    /// line rather than in it: a git sign, a diagnostic, a breakpoint.
+    ///
+    /// Reserved rather than grown on demand, which is the whole point of it —
+    /// a column that appears when the first sign does would shift every line
+    /// of the file sideways at the moment you most want to read it.
+    pub gutter: usize,
     /// Whether every space, tab, newline and non-breaking space is drawn as a
     /// visible mark. A debugging mode rather than a way to live: `:whitespace`
     /// turns it on when a line is not doing what it looks like it should.
@@ -171,6 +178,7 @@ impl Default for Options {
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
             indent_guides: true,
+            gutter: 1,
             whitespace: false,
             todo_comments: true,
             color_swatches: true,
@@ -218,6 +226,8 @@ impl Options {
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
             ("indent_guides", OptionValue::Bool(on)) => self.indent_guides = on,
             ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
+            ("gutter", OptionValue::Int(n)) if n >= 0 => self.gutter = n as usize,
+            ("gutter", _) => return Err("gutter takes a count of cells, or 0 for none".into()),
             ("whitespace", OptionValue::Bool(on)) => self.whitespace = on,
             ("whitespace", _) => return Err("whitespace takes true or false".into()),
             ("todo_comments", OptionValue::Bool(on)) => self.todo_comments = on,
@@ -281,6 +291,7 @@ impl Options {
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
             "indent_guides" => OptionValue::Bool(self.indent_guides),
+            "gutter" => OptionValue::Int(self.gutter as i64),
             "whitespace" => OptionValue::Bool(self.whitespace),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
@@ -300,17 +311,28 @@ impl Options {
 
     /// How many cells the line-number column takes for a file of `lines`
     /// lines: the digits of the last number, and one space after them.
-    ///
-    /// In the core rather than the frontend, where it started, because it is a
-    /// fact about the options and the file and not about a terminal — and
-    /// because the core has to know it to put anything in the *middle* of a
-    /// pane. The frontend still draws the column; it no longer decides how
-    /// wide it is on its own.
-    pub fn gutter_width(&self, lines: usize) -> usize {
+    pub fn number_width(&self, lines: usize) -> usize {
         match self.number {
             crate::editor::LineNumbers::Off => 0,
             _ => lines.to_string().len() + 1,
         }
+    }
+
+    /// Everything to the left of the text: the sign column, then the numbers.
+    ///
+    /// In the core rather than the frontend, where it started, because it is a
+    /// fact about the options and the file and not about a terminal — and
+    /// because the core has to know it to put anything in the *middle* of a
+    /// pane. The frontend still draws the columns; it no longer decides how
+    /// wide they are on its own.
+    ///
+    /// One number rather than two, because every caller wants the total: a
+    /// decoration's column, the cursor's screen position and the width left
+    /// for text are all measured from where the text starts. Only the code
+    /// that paints the two columns needs to tell them apart, and it asks for
+    /// the parts.
+    pub fn gutter_width(&self, lines: usize) -> usize {
+        self.gutter + self.number_width(lines)
     }
 
     /// The indentation settings, bundled for the code that edits text.

@@ -23,6 +23,12 @@ autoindent = true
 # `indent_guide`. See docs/specs/indent.md.
 indent_guides = true
 
+# Cells to the left of the line numbers, held for a mark about the line rather
+# than in it — a git sign, a diagnostic, a breakpoint. Nothing draws one yet;
+# the column is reserved now so that the day something does, the file does not
+# shift sideways under you. 0 gives the cell back.
+gutter = 1
+
 # Every space as `·`, every tab as `→`, every newline as `¶`, and a
 # non-breaking space as `␣` so it stops looking like a space. A debugging mode
 # — `:whitespace` toggles it where you are, and it can be turned on for one

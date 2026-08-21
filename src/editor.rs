@@ -13010,13 +13010,13 @@ int main(void) {
         // Three rows tall, the letter in the middle one, every row the same
         // width and the same column — a block, not three loose strings.
         //
-        // Row 2 of 0..5, and column 8: the pane is 21 wide with a two-cell
-        // gutter for a five-line file, so the three-wide block starts at
-        // (19 - 3) / 2.
+        // Row 2 of 0..5, and column 7: the pane is 21 wide with a three-cell
+        // gutter for a five-line file — one reserved for signs and two for the
+        // numbers — so the three-wide block starts at (18 - 3) / 2.
         let letter = label_of_window(&ed, focus);
         assert_eq!(
             box_of,
-            [(1, 8, "   ".into()), (2, 8, format!(" {letter} ")), (3, 8, "   ".into())],
+            [(1, 7, "   ".into()), (2, 7, format!(" {letter} ")), (3, 7, "   ".into())],
             "the letter is not a block in the middle"
         );
     }

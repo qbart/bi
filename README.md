@@ -683,6 +683,18 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### The sign column
+
+One cell to the left of the line numbers, held open whether or not there is
+anything in it. `:set gutter 0` gives it back, and a larger number reserves
+more — it is a width, not a switch.
+
+Nothing draws a sign yet. Reserving it now is the whole feature: a column that
+appeared the first time a git hunk or a diagnostic wanted one would shift every
+line of the file sideways at the moment you most wanted to read it. The theme's
+`gutter` and `gutter_current` are still the *numbers*' colours; a sign will
+bring its own.
+
 #### Showing the whitespace
 
 `:whitespace` draws every blank in the file: a space as `·`, a tab as `→` at
