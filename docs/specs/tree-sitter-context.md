@@ -217,15 +217,23 @@ background, in whichever direction recedes there:
 
 | theme | value | |
 |---|---|---|
-| `main` | `#0d0d0d` | below the frame — Carbon has nothing darker than gray100 |
+| `main` | `#00d2ff` | cyan — the one built-in that reads this the other way |
 | `gruvbox-dark` | `#1d2021` | bg0_h — gruvbox's black, *below* the background |
 | `gruvbox-light` | `#ebdbb2` | bg1 — just above the background |
 | `pascal` | `#000080` | the darker blue the cursor line uses |
 | `ansi` | `darkgray` | the tier `indent_guide` and `dim` already share |
 
-`main`'s and `gruvbox-dark`'s are both deliberately near-invisible: they were
-asked for as black, and black against a near-black frame is a shape you notice
-when you look for it and not before. `:set` it or override `context` in a theme file to make it louder.
+`gruvbox-dark`'s is deliberately near-invisible: it was asked for as black, and
+black against `#282828` is a shape you notice when you look for it and not
+before.
+
+`main` goes the other way, and the disagreement is worth recording rather than
+resolving. Its frame is `#161616`, and one step below that is `#0d0d0d` — past
+"notice it when you look for it" and into "cannot find it when you do", which
+answers the question the annotation exists to answer with nothing. So `main`
+spends a saturated colour here. Both readings are defensible and neither is
+the rule; the rule is that the theme decides, which is why this is a `[ui]`
+key rather than a constant. `:set` it or override `context` in a theme file to make it louder.
 
 `context_header` is the opposite job and needs the opposite treatment: it
 replaces a row of code, so it has to be legible and it has to read as chrome.

@@ -320,10 +320,21 @@ rather than six separately chosen darks.
 **Two colours are outside oxocarbon's sixteen, and both earn it.** `todo_warn`
 is Carbon's yellow30 `#f1c21b`: the five TODO badges are the one place on
 screen where the colour *is* the meaning, and a `WARN:` that is not warm reads
-as a different word. `context` is `#0d0d0d`, below the frame rather than on
-the ramp, for the reason `gruvbox-dark` gives its own — the annotation for the
-block you are in is something you glance down at, and Carbon has nothing
-darker than gray100 to glance down at.
+as a different word. `context` is cyan `#00d2ff`, and it breaks the furniture
+rule on purpose — see below.
+
+**`context` is loud here, and every other built-in's is quiet.** The rule in
+`docs/specs/tree-sitter-context.md` is that the annotation marks structure
+rather than naming anything, so it should be a shape you notice when you look
+for it and not before. `gruvbox-dark` reads that as "one step below the
+frame"; on a `#161616` frame the same reading gives `#0d0d0d`, which is not a
+shape you notice when you look for it — it is one you cannot find when you go
+looking, and an annotation that answers "what does this brace close" with
+nothing may as well not be drawn. So `main` takes the other side of that
+trade. Cyan rather than a Carbon value because it has to clear two bars at
+once: legible against the frame, and not a colour a capture already owns —
+`#33b1ff` is `property`, `#3ddbd9` is `type`, `#82cfff` is `attribute`, and an
+annotation wearing any of them reads as code. A test pins both.
 
 Unlike `pascal`, no test fences this theme into a palette. `pascal`'s
 constraint *is* the theme; `main` is a theme that happens to have been drawn

@@ -598,8 +598,7 @@ mod tests {
         assert_eq!(theme.ui.foreground, Some(Color::Rgb(0xdd, 0xe1, 0xe6)));
         assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xff, 0x7e, 0xb6))));
 
-        // Carbon's grey ramp, and `context`, which is deliberately below the
-        // frame because Carbon has nothing darker than gray100 to recede into.
+        // Carbon's grey ramp. `context` is deliberately not on it — see below.
         const RAMP: &[(u8, u8, u8)] = &[
             (0x16, 0x16, 0x16),
             (0x26, 0x26, 0x26),
@@ -610,7 +609,6 @@ mod tests {
             (0xa8, 0xa8, 0xa8),
             (0xdd, 0xe1, 0xe6),
             (0xf2, 0xf4, 0xf8),
-            (0x0d, 0x0d, 0x0d),
         ];
         let ui = &theme.ui;
         for (role, style) in [
@@ -622,11 +620,25 @@ mod tests {
             ("filler", ui.filler),
             ("indent_guide", ui.indent_guide),
             ("whitespace", ui.whitespace),
-            ("context", ui.context),
         ] {
             let colour = style.fg.or(style.bg).expect("a grey is a colour");
             let Color::Rgb(r, g, b) = colour else { panic!("{role} is not 24-bit") };
             assert!(RAMP.contains(&(r, g, b)), "{role} left the grey ramp: {colour:?}");
+        }
+
+        // `context` is the deliberate exception, and the exception is the
+        // point: a near-black annotation on a near-black frame is a shape you
+        // cannot find when you go looking for it, which is the failure mode
+        // opposite to the one the other built-ins guard against. It has to be
+        // legible, and it has to not be a colour a capture already owns.
+        let context = theme.ui.context.fg.expect("context is a foreground");
+        assert_eq!(context, Color::Rgb(0x00, 0xd2, 0xff));
+        for role in ["property", "type", "attribute", "operator", "keyword"] {
+            assert_ne!(
+                theme.style(role).and_then(|s| s.fg),
+                Some(context),
+                "context reads as a {role}"
+            );
         }
     }
 

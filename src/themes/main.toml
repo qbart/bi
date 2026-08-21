@@ -104,10 +104,15 @@ indent_guide   = "#262626"
 # gray60, three steps up from the guides and level with the comments: you
 # turn these on to read them, and one you have to squint at answers nothing.
 whitespace     = "#6f6f6f"
-# Below the frame rather than on the ramp, and deliberately near-invisible:
-# the block you are in is something you glance down at, not something that
-# should catch your eye. Carbon has nothing darker than gray100 to use here.
-context        = "#0d0d0d"
+# The one piece of furniture that is not a grey, and the one that is not quiet.
+# The reasoning everywhere else is that the annotation for the block you are in
+# should be a shape you notice when you look for it and not before — but a
+# near-black on a near-black frame is a shape you cannot find when you DO look
+# for it, which answers the question the annotation exists to answer with
+# nothing. Cyan is the compromise: brighter than Carbon's own #33b1ff so it
+# does not read as a `property`, and the only saturated colour on screen that
+# is not already carrying a syntax role.
+context        = "#00d2ff"
 # The other half, which replaces a row of code and so has to be read: gray90
 # behind gray40, a step off the frame in both directions.
 context_header = { fg = "#a8a8a8", bg = "#262626" }
