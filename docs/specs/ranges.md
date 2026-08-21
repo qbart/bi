@@ -77,6 +77,27 @@ about to delete something. bi's answer is that `:5,2` and `:2,5` are the same
 four lines, that nobody types the first on purpose, and that a prompt is a
 worse interruption than the thing it is guarding against.
 
+**The `:` line prefills `'<,'>` when a selection is up.** Vim does, and the
+prefill is the whole of why the answer to "does a command act on my selection"
+is *yes, and it says so*: the rows about to be acted on are on screen before
+you press Enter, they are editable when you meant something else, and there is
+no second invisible rule about which commands quietly mean the selection. A
+command that takes no range still refuses one — `:'<,'>w` cannot write part of
+a file just because the range arrived for free.
+
+**The range names rows; the selection's kind names what within one.** A
+blockwise selection carries its rectangle across, and `:'<,'>case` respells the
+columns it covers and nothing else. Anything else — a charwise selection
+included — is whole lines, because `'<,'>` is a *line* range here as it is in
+vim, and the prefill is what makes that visible rather than surprising.
+
+Carrying the shape across took a field: `Mode::Command` *replaces*
+`Mode::Visual`, so the flag saying "this is a rectangle" — which lives in the
+mode and nowhere else — was destroyed by the keystroke that opens the command
+about to act on it. [`Session::interrupted_visual`](../../src/editor.rs) holds
+it, and `Session::visual()` is the one accessor; every mode that is not
+`Command` answers from the mode itself, so a leftover cannot paint.
+
 **`'<` and `'>` are the primary selection**, first and last row. bi does not
 prefill them the way vim does when you press `:` in visual mode, and it does
 not need to: a command that acts on the selection already sees it. They are

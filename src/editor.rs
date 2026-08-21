@@ -644,6 +644,18 @@ pub struct Session {
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
     pub mode: Mode,
+    /// The kind of selection the `:` line interrupted.
+    ///
+    /// `Mode::Command` *replaces* `Mode::Visual`, so without this the rectangle
+    /// flag — which lives in the mode and nowhere else — is destroyed the
+    /// moment you press `:`, and a block selection is drawn and acted on as a
+    /// plain char range. The selections themselves were never lost; only the
+    /// word for what shape they are.
+    ///
+    /// Only ever read while the mode is `Command` (see [`Session::visual`]),
+    /// so a value left behind here cannot paint a rectangle over a later
+    /// normal mode.
+    interrupted_visual: Option<VisualKind>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -710,6 +722,21 @@ pub struct Session {
 }
 
 impl Session {
+    /// What kind of selection is on screen, if any.
+    ///
+    /// Not `Mode::visual()`, because two modes can have one: the `:` line
+    /// inherits the selection it interrupted, so a rectangle is still a
+    /// rectangle while you type the command that is about to act on it. Every
+    /// other mode answers `None` whatever [`Session::interrupted_visual`]
+    /// happens to hold, which is what keeps a stale value from painting.
+    pub fn visual(&self) -> Option<VisualKind> {
+        match &self.mode {
+            Mode::Visual(kind) => Some(*kind),
+            Mode::Command(_) => self.interrupted_visual,
+            _ => None,
+        }
+    }
+
     /// Where an operator's text goes.
     ///
     /// The one place a `Sink` is spent, so a new register is a new arm here
@@ -1330,8 +1357,15 @@ enum ExLine {
         lines: Option<LineRange>,
         how: crate::substitute::Substitute,
     },
-    /// `:case snake` — respell what is selected, or the word under the cursor.
-    Case(crate::case::Style),
+    /// `:[range]case snake` — respell what is selected, or the word under the
+    /// cursor.
+    ///
+    /// The range names *rows*; what within a row is the selection's business.
+    /// See [`View::recase`].
+    Case {
+        lines: Option<LineRange>,
+        style: crate::case::Style,
+    },
     /// `:retab` — rewrite the indentation to the options in force.
     ///
     /// `None` is the whole file, which is what "convert this file" means and
@@ -1450,7 +1484,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // than a range quietly dropped: vim writes part of a file for `:1,5w` and
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
-    if range.is_some() && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab") {
+    if range.is_some()
+        && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case")
+    {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
     }
 
@@ -1525,7 +1561,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         },
         "alt" | "alternate" => ExLine::Alternate,
         "case" => match crate::case::Style::parse(arg) {
-            Some(style) => ExLine::Case(style),
+            Some(style) => ExLine::Case { lines: range, style },
             None => {
                 ExLine::Error(format!("case what? one of {}", crate::case::Style::NAMES.join(", ")))
             }
@@ -2607,6 +2643,17 @@ impl Editor {
         span_of_block_at(buffer, &text.selections, self.session.block_to_eol, row)
     }
 
+    /// What kind of selection is on screen, if any.
+    ///
+    /// Not `Mode::visual()`, because two modes can have one: the `:` line
+    /// inherits the selection it interrupted, so that a rectangle is still a
+    /// rectangle while you type the command that is about to act on it. Every
+    /// other mode answers `None` whatever [`Session::visual`] happens to hold,
+    /// which is what keeps a stale value from painting.
+    pub fn visual(&self) -> Option<VisualKind> {
+        self.session.visual()
+    }
+
     /// First visible row of the focused window.
     pub fn scroll(&self) -> usize {
         self.window().text().map_or(0, |text| text.scroll)
@@ -3482,7 +3529,19 @@ impl Editor {
         match action {
             Action::EnterCommandMode => {
                 self.session.status.clear();
-                self.session.mode = Mode::Command(CmdLine::default());
+                // The selection comes with you, and says so. Vim opens the
+                // line already reading `:'<,'>`, and the prefill is the whole
+                // of why that is right: the lines about to be acted on are
+                // visible before you commit, they are editable when you meant
+                // something else, and it is the range language you already
+                // have rather than a second invisible rule about when a
+                // command silently means the selection.
+                self.session.interrupted_visual = self.session.mode.visual();
+                let line = match self.session.interrupted_visual {
+                    Some(_) => CmdLine::from("'<,'>"),
+                    None => CmdLine::default(),
+                };
+                self.session.mode = Mode::Command(line);
             }
             Action::CommandChar(c) => {
                 if let Mode::Command(line) = &mut self.session.mode {
@@ -4131,8 +4190,8 @@ impl Editor {
             ExLine::Move { lines, to } => {
                 self.in_view(|view| view.move_to(lines, to));
             }
-            ExLine::Case(style) => {
-                self.in_view(|view| view.recase(style));
+            ExLine::Case { lines, style } => {
+                self.in_view(|view| view.recase(lines, style));
             }
             ExLine::Retab(lines) => {
                 self.in_view(|view| view.retab(lines));
@@ -5899,13 +5958,84 @@ impl View<'_> {
         self.move_lines(first, last, row);
     }
 
-    /// `:case {style}` — respells what is selected, or the word under the
-    /// cursor when nothing is.
+    /// `:[range]case {style}` — respells what is selected, or the word under
+    /// the cursor when nothing is.
     ///
     /// The word is the fallback because renaming one is what this is for, and
     /// selecting it first is a keystroke that says nothing new. Every
     /// selection gets it, so a column of cursors respells a column of names.
-    fn recase(&mut self, style: crate::case::Style) {
+    ///
+    /// **The range names rows; the selection's kind names what within one.**
+    /// A rectangle respells its columns and nothing else, and that is the only
+    /// thing keeping the block shape alive across `:` buys. Anything else —
+    /// including a charwise selection — respells the whole of every row the
+    /// range covers, which is what `'<,'>` means everywhere else in bi and in
+    /// vim: it is a *line* range, and the prefill on the `:` line is there so
+    /// that this is visible before you press Enter rather than surprising
+    /// afterwards.
+    fn recase(&mut self, lines: Option<LineRange>, style: crate::case::Style) {
+        // A rectangle is not a char range, so it cannot go through the walk
+        // below: the selection's two corners span every character between
+        // them, and what was selected is the columns on each row. This is the
+        // only reason keeping the block shape alive across `:` is worth
+        // anything — a rectangle that survives to the command line and then
+        // acts on whole lines would be a worse lie than losing it.
+        if self.session.visual() == Some(VisualKind::Block) {
+            let spans = self.block_spans();
+            let before = self.selections.as_pairs();
+            // Back to front: recasing one row must not move the rows above it,
+            // and `snake` makes text longer.
+            let mut top = usize::MAX;
+            for &(start, end) in spans.iter().rev() {
+                if start == end {
+                    continue;
+                }
+                let text = crate::case::convert(&self.buffer.slice(start, end), style);
+                self.buffer.replace_range(start, end, &text);
+                top = top.min(start);
+            }
+            if top == usize::MAX {
+                self.session.status = "nothing selected".into();
+                return;
+            }
+            let landing = self.buffer.clamped(Cursor::at(top), false);
+            *self.selections = Selections::single(landing);
+            self.buffer.commit_undo(before, self.selections.as_pairs());
+            self.session.mode = Mode::Normal;
+            return;
+        }
+
+        // A range that is not a rectangle is rows, and rows are whole lines.
+        if let Some(range) = lines {
+            let (first, last) = match range.rows(self.line_numbers()) {
+                Ok(rows) => rows,
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            };
+            let before = self.selections.as_pairs();
+            let mut done = 0;
+            for row in (first..=last.min(self.buffer.line_count().saturating_sub(1))).rev() {
+                let start = self.buffer.rope().line_to_char(row);
+                let end = start + self.buffer.line_len(row);
+                if start == end {
+                    continue;
+                }
+                let text = crate::case::convert(&self.buffer.slice(start, end), style);
+                self.buffer.replace_range(start, end, &text);
+                done += 1;
+            }
+            let landing =
+                self.buffer.clamped(Cursor::at(self.buffer.rope().line_to_char(first)), false);
+            *self.selections = Selections::single(landing);
+            self.buffer.commit_undo(before, self.selections.as_pairs());
+            self.session.status =
+                format!("{done} line{} recased", if done == 1 { "" } else { "s" });
+            self.session.mode = Mode::Normal;
+            return;
+        }
+
         let mut missed = false;
         self.for_each_selection(|ed, sel| {
             let len = ed.buffer.rope().len_chars();
@@ -8260,7 +8390,10 @@ mod tests {
     #[test]
     fn a_command_that_takes_no_range_says_so_rather_than_ignoring_it() {
         let mut ed = editor("a\nb\nc\n");
-        for line in ["1,5w out.txt", "2q", "%case snake"] {
+        // Writing part of a file is the example: vim does it, and a `:w` that
+        // silently wrote all of it would be the worse of the two ways to not
+        // support a range.
+        for line in ["1,5w out.txt", "2q", "'<,'>e other.txt", "1,2reload"] {
             ex(&mut ed, line);
             assert!(ed.session.status.ends_with("takes no range"), "{line}: {}", ed.session.status);
         }
@@ -11654,6 +11787,121 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- a selection on the `:` line ----------------------------------------
+
+    #[test]
+    fn colon_with_a_selection_says_which_lines_it_is_about() {
+        let mut ed = visual("a\nb\nc\nd\n", 2, VisualKind::Char);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        assert_eq!(
+            cmdline(&ed),
+            ("'<,'>".to_string(), 5),
+            "vim's prefill, with the cursor past it so the command is what you type next"
+        );
+    }
+
+    #[test]
+    fn colon_with_no_selection_opens_empty() {
+        let mut ed = editor("a\nb\n");
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        assert_eq!(cmdline(&ed).0, "", "nothing selected, nothing to say about lines");
+    }
+
+    #[test]
+    fn a_rectangle_is_still_a_rectangle_on_the_colon_line() {
+        // The bug: `Mode::Command` replaces `Mode::Visual`, so the flag saying
+        // "this is a block" was destroyed by the keystroke that opens the
+        // command that was going to act on it.
+        let mut ed = visual("abcd\nefgh\nijkl\n", 1, VisualKind::Block);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        assert_eq!(ed.visual(), Some(VisualKind::Block));
+
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        assert_eq!(ed.visual(), Some(VisualKind::Block), "and it survives the colon");
+    }
+
+    #[test]
+    fn a_stale_shape_cannot_paint_a_later_normal_mode() {
+        let mut ed = visual("abcd\nefgh\n", 1, VisualKind::Block);
+        ed.apply(cmd(Action::EnterCommandMode));
+        ed.apply(cmd(Action::CommandCancel));
+
+        assert_eq!(ed.visual(), None, "the mode decides, not the leftover");
+    }
+
+    #[test]
+    fn case_over_a_rectangle_takes_the_columns_and_not_the_lines() {
+        // Columns 4..=8 of three rows — the names, and not the `let` or the
+        // `= 1;` on either side of them.
+        let text = "let ALPHA = 1;\nlet BETA  = 2;\nlet GAMMA = 3;\n";
+        let mut ed = visual(text, 4, VisualKind::Block);
+        for _ in 0..4 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Move(Motion::Down)));
+        }
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        ex(&mut ed, "'<,'>case lower");
+
+        assert_eq!(whole(&ed), "let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n");
+    }
+
+    #[test]
+    fn case_over_a_rectangle_is_one_undo_step() {
+        let text = "AB\nCD\nEF\n";
+        let mut ed = visual(text, 0, VisualKind::Block);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        ex(&mut ed, "'<,'>case lower");
+        assert_eq!(whole(&ed), "aB\ncD\neF\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), text, "three rows back in one press");
+    }
+
+    #[test]
+    fn case_over_a_range_takes_whole_lines() {
+        let mut ed = editor("ONE\nTWO\nTHREE\n");
+
+        ex(&mut ed, "2,3case lower");
+
+        assert_eq!(whole(&ed), "ONE\ntwo\nthree\n");
+        assert_eq!(ed.session.status, "2 lines recased");
+    }
+
+    #[test]
+    fn case_with_no_range_is_still_the_word_under_the_cursor() {
+        let mut ed = editor("let someName = 1;\n");
+        ed.set_cursor(Cursor::at(4));
+
+        ex(&mut ed, "case snake");
+
+        assert_eq!(whole(&ed), "let some_name = 1;\n", "unchanged by any of this");
+    }
+
+    #[test]
+    fn a_write_still_refuses_the_range_the_colon_line_offered_it() {
+        // The prefill is not a licence: `:w` cannot write part of a file, and
+        // the selection arriving for free must not turn that into a partial
+        // write done quietly.
+        let mut ed = visual("a\nb\nc\n", 0, VisualKind::Line);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        ex(&mut ed, "'<,'>w out.txt");
+
+        assert_eq!(ed.session.status, "`:w` takes no range");
     }
 
     // ---- retab --------------------------------------------------------------

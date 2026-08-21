@@ -697,7 +697,7 @@ fn render_window(
             // A collapsed selection still covers something in visual mode — one
             // character for `v`, the whole line for `V` — so only skip it
             // outside visual, where it is a plain cursor.
-            if selection.is_collapsed() && ed.session.mode.visual().is_none() {
+            if selection.is_collapsed() && ed.visual().is_none() {
                 continue;
             }
             let (lo, hi) = selection.range();
@@ -705,7 +705,7 @@ fn render_window(
             if row < first || row > last {
                 continue;
             }
-            let cols = match ed.session.mode.visual() {
+            let cols = match ed.visual() {
                 Some(VisualKind::Line) => {
                     linewise = true;
                     0..display_col(raw, raw.chars().count(), tab).max(1)
