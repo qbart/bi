@@ -16,8 +16,8 @@ use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, 
 use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
-use crate::range::{Address, LineRange, Where};
-use crate::region::Shape;
+use crate::range::{Address, Scope, Where};
+use crate::region::{Region, Shape};
 use crate::registers::{Entry, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
@@ -26,6 +26,23 @@ use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
     Chrome, Content, ContentKind, Dir, Layout, Place, Rect, Side, Text, Window, WindowId,
 };
+
+/// What a `:` command with no scope of its own acts on.
+///
+/// One value per default that exists, named where the command is dispatched,
+/// so that "no range means the cursor's line" is a decision written down once
+/// rather than four private ones that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// The word under each cursor. `:case`.
+    Words,
+    /// The cursor's line. `:s`.
+    CursorRow,
+    /// Every line. `:retab`.
+    File,
+    /// The rows the selection covers. `:m`.
+    SelectionRows,
+}
 
 /// Where a key moves the cursor on the `:` line.
 ///
@@ -1346,22 +1363,22 @@ enum ExLine {
     /// what it says when nobody wrote one — where `:m`'s own default lives,
     /// which is the selection. See `docs/specs/ranges.md`.
     Move {
-        lines: Option<LineRange>,
+        scope: Option<Scope>,
         to: Address,
     },
-    /// `:%s/old/new/g`. `lines` is `None` when nobody wrote a range, and `:s`'s
+    /// `:%s/old/new/g`. `scope` is `None` when nobody wrote one, and `:s`'s
     /// own default is the cursor's line — see `docs/specs/substitute.md`.
     Substitute {
-        lines: Option<LineRange>,
+        scope: Option<Scope>,
         how: crate::substitute::Substitute,
     },
-    /// `:[range]case snake` — respell what is selected, or the word under the
-    /// cursor.
+    /// `:[scope]case snake` — respell what is named, or the word under each
+    /// cursor when nothing is.
     ///
-    /// The range names *rows*; what within a row is the selection's business.
-    /// See [`View::recase`].
+    /// `'v` is the selection itself, columns and all; an address names rows.
+    /// See [`View::recase`] and `docs/specs/regions.md`.
     Case {
-        lines: Option<LineRange>,
+        scope: Option<Scope>,
         style: crate::case::Style,
     },
     /// `:retab` — rewrite the indentation to the options in force.
@@ -1370,7 +1387,7 @@ enum ExLine {
     /// what vim's `:retab` does. Unlike `:s`, whose no-range default is the
     /// cursor's line: a one-line substitute is a thing people want, and a
     /// one-line retab is not.
-    Retab(Option<LineRange>),
+    Retab(Option<Scope>),
     /// `:alt` — the other file: the test beside the implementation, the
     /// header beside the source.
     Alternate,
@@ -1411,9 +1428,10 @@ enum ExLine {
 /// longer knows the rules for. Trailing anything is refused, so `:m 3 4` is a
 /// message rather than a silent `:m 3`.
 fn parse_move(arg: &str) -> Option<Address> {
-    let (range, rest) = crate::range::parse(arg.trim());
-    let range = range?;
-    // One address, not a span: `:m 2,5` names two lines to land after.
+    let (scope, rest) = crate::range::parse(arg.trim());
+    // One address, not a span and not the selection: `:m 2,5` names two lines
+    // to land after, and `:m 'v` names no line at all.
+    let Some(Scope::Lines(range)) = scope else { return None };
     (rest.is_empty() && range.first == range.last).then_some(range.first)
 }
 
@@ -1455,13 +1473,16 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // no address has no range and comes back whole, which is what lets every
     // command below read it exactly as it always did. See
     // `docs/specs/ranges.md`.
-    let (range, line) = crate::range::parse(line);
+    let (scope, line) = crate::range::parse(line);
     if line.is_empty() {
         // A range and no command goes to its last line: `:42`, `:$`, `:%`.
-        return Some(match range {
-            Some(range) => ExLine::Goto(range.last),
-            None => return None,
-        });
+        // Bare `'v` is the exception, and does nothing: it names where you
+        // already are, and the prefill puts it there for you — so `:` then
+        // Enter must not jump.
+        return match scope {
+            Some(Scope::Lines(range)) => Some(ExLine::Goto(range.last)),
+            Some(Scope::Selection) | None => None,
+        };
     }
 
     let (cmd, arg) = match line.split_once(char::is_whitespace) {
@@ -1493,7 +1514,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // than a range quietly dropped: vim writes part of a file for `:1,5w` and
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
-    if range.is_some()
+    if scope.is_some()
         && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case")
     {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
@@ -1561,11 +1582,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "paste-as" if !arg.is_empty() => ExLine::PasteAs(arg.into()),
         "paste-as" => ExLine::Error("paste it as what?".into()),
         "m" | "move" => match parse_move(arg) {
-            Some(to) => ExLine::Move { lines: range, to },
+            Some(to) => ExLine::Move { scope, to },
             None => ExLine::Error("move where? `:m +3`, `:m -2`, `:m 0`, `:m $`".into()),
         },
         "s" | "substitute" => match crate::substitute::parse(arg) {
-            Ok(how) => ExLine::Substitute { lines: range, how },
+            Ok(how) => ExLine::Substitute { scope, how },
             Err(message) => ExLine::Error(message),
         },
         "alt" | "alternate" => ExLine::Alternate,
@@ -1588,7 +1609,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             Err(message) => ExLine::Error(message),
         },
         "case" => match crate::case::Style::parse(arg) {
-            Some(style) => ExLine::Case { lines: range, style },
+            Some(style) => ExLine::Case { scope, style },
             None => {
                 ExLine::Error(format!("case what? one of {}", crate::case::Style::NAMES.join(", ")))
             }
@@ -1596,7 +1617,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // No argument: what it converts to is what the options already say,
         // and a `:retab 8` that disagreed with `tab_width` would be a second
         // place to set the same number.
-        "ret" | "retab" if arg.is_empty() => ExLine::Retab(range),
+        "ret" | "retab" if arg.is_empty() => ExLine::Retab(scope),
         "ret" | "retab" => {
             ExLine::Error("retab takes no argument — it follows tab_width and expandtab".into())
         }
@@ -3907,16 +3928,20 @@ impl Editor {
         match action {
             Action::EnterCommandMode => {
                 self.session.status.clear();
-                // The selection comes with you, and says so. Vim opens the
-                // line already reading `:'<,'>`, and the prefill is the whole
-                // of why that is right: the lines about to be acted on are
-                // visible before you commit, they are editable when you meant
-                // something else, and it is the range language you already
+                // The selection comes with you, and says so. The prefill is
+                // the whole of why that is right: what is about to be acted on
+                // is visible before you commit, it is editable when you meant
+                // something else, and it is the scope language you already
                 // have rather than a second invisible rule about when a
                 // command silently means the selection.
-                self.session.interrupted_visual = self.session.mode.visual();
+                //
+                // `'v` rather than vim's `'<,'>`, because `'<,'>` can only say
+                // *rows* — and a rectangle acted on as rows is the surprise
+                // the prefill exists to prevent. `'<,'>` still parses, and
+                // typing it over the prefill is how you ask for the rows.
+                self.session.interrupted_visual = self.session.visual();
                 let line = match self.session.interrupted_visual {
-                    Some(_) => CmdLine::from("'<,'>"),
+                    Some(_) => CmdLine::from("'v "),
                     None => CmdLine::default(),
                 };
                 self.session.mode = Mode::Command(line);
@@ -3964,13 +3989,17 @@ impl Editor {
                 let Mode::Command(line) = std::mem::take(&mut self.session.mode) else {
                     return true;
                 };
+                // Taken with the line, and handed to the command as an
+                // argument. Both die here together, so neither can go stale
+                // and neither can be missing.
+                let shape = self.session.interrupted_visual.take();
                 // Before running it, so a command that failed is the one you
                 // can recall and fix — which is most of what a history is for.
                 // Only what was typed here: an `Ex` action is a keybinding or
                 // an internal caller, and a history of lines you never typed is
                 // noise in the list that exists to give your own back.
                 self.session.cmd_history.push(&line);
-                self.run_ex(&line);
+                self.run_ex_over(&line, shape);
             }
             Action::Ex { line, run } => {
                 let line = line.clone();
@@ -4557,6 +4586,19 @@ impl Editor {
     /// window and buffer commands no longer have to travel back out as
     /// escalations to reach the lists they change. See `docs/specs/tree.md`.
     pub fn run_ex(&mut self, line: &str) {
+        self.run_ex_over(line, self.session.mode.visual());
+    }
+
+    /// The same, over a selection whose shape is named rather than looked up.
+    ///
+    /// The shape is an argument because the mode that held it is gone by the
+    /// time a command runs: [`Action::CommandExecute`] takes the `:` line out
+    /// of the session before dispatching, and a command that asked the mode
+    /// afterwards would be told there is no selection. That is exactly how a
+    /// rectangle used to reach `:case` as a set of whole lines.
+    ///
+    /// See `docs/specs/regions.md`.
+    fn run_ex_over(&mut self, line: &str, shape: Option<Shape>) {
         let Some(parsed) = parse_ex(line) else { return };
         match parsed {
             ExLine::Window(cmd) => self.run_window_cmd(cmd),
@@ -4576,20 +4618,20 @@ impl Editor {
                 None => self.paste_into_selected(),
             },
             ExLine::PasteAs(path) => self.run_paste(Some(path.into())),
-            ExLine::Move { lines, to } => {
-                self.in_view(|view| view.move_to(lines, to));
+            ExLine::Move { scope, to } => {
+                self.in_view(|view| view.move_to(scope, shape, to));
             }
-            ExLine::Case { lines, style } => {
-                self.in_view(|view| view.recase(lines, style));
+            ExLine::Case { scope, style } => {
+                self.in_view(|view| view.recase(scope, shape, style));
             }
-            ExLine::Retab(lines) => {
-                self.in_view(|view| view.retab(lines));
+            ExLine::Retab(scope) => {
+                self.in_view(|view| view.retab(scope, shape));
             }
-            ExLine::Substitute { lines, how } => {
+            ExLine::Substitute { scope, how } => {
                 // The last search is the session's, and an empty pattern means
                 // it — so it is read here, where both are in reach.
                 let last = self.session.last_search.as_ref().map(|s| s.pattern.clone());
-                let found = self.in_view(|view| view.substitute(lines, &how, last));
+                let found = self.in_view(|view| view.substitute(scope, shape, &how, last));
                 if let Some(Some(pattern)) = found {
                     self.session.last_search =
                         Some(Search { pattern, whole_word: false, forward: true });
@@ -6302,6 +6344,81 @@ impl View<'_> {
     /// The `:` commands. Deliberately tiny — this is not where the editor gets
     /// interesting, and a real command table wants the config layer first.
     /// The rows the move acts on: the selected block, or the cursor's line.
+    /// What a `:` command with no scope of its own acts on.
+    ///
+    /// Beside the commands rather than inside each one: "no range means the
+    /// cursor's line" is a decision, and four commands making it privately is
+    /// four places to look when they disagree.
+    fn fallback_region(&self, fallback: Fallback) -> Region {
+        match fallback {
+            // Renaming a name is what `:case` is for, and selecting it first
+            // is a keystroke that says nothing new. Every cursor gets one, so
+            // a column of cursors respells a column of names.
+            Fallback::Words => Region::spanning(
+                self.buffer,
+                Shape::Chars,
+                self.selections.all().iter().filter_map(|selection| {
+                    self.buffer
+                        .word_at(selection.head)
+                        // `iw` on whitespace is the run of whitespace, which is
+                        // right for `diw` and is not a word to respell.
+                        .filter(|&(a, b)| {
+                            self.buffer.slice(a, b).chars().any(char::is_alphanumeric)
+                        })
+                }),
+            ),
+            Fallback::CursorRow => {
+                let row = self.buffer.row_at(self.selections.cursor());
+                Region::rows(self.buffer, row, row)
+            }
+            Fallback::File => {
+                Region::rows(self.buffer, 0, self.buffer.line_count().saturating_sub(1))
+            }
+            Fallback::SelectionRows => {
+                let (first, last) = self.selected_rows();
+                Region::rows(self.buffer, first, last)
+            }
+        }
+    }
+
+    /// The region a `:` command acts on — the one place a scope becomes spans.
+    ///
+    /// `shape` is the selection's shape when the `:` line was opened, passed
+    /// in rather than read off the mode. The mode is gone by the time a
+    /// command runs — `CommandExecute` takes it out of the session before
+    /// dispatching — and reading it here is exactly how a rectangle used to
+    /// arrive at `:case` as a set of whole lines.
+    fn region(
+        &self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        fallback: Fallback,
+    ) -> Result<Region, String> {
+        match scope {
+            Some(Scope::Selection) => Ok(Region::of(
+                self.buffer,
+                self.selections,
+                shape.unwrap_or(Shape::Chars),
+                self.session.block_to_eol,
+            )),
+            Some(Scope::Lines(range)) => {
+                let (first, last) = range.rows(self.line_numbers())?;
+                Ok(Region::rows(self.buffer, first, last))
+            }
+            None => Ok(self.fallback_region(fallback)),
+        }
+    }
+
+    /// The rows a region covers, for a command that can only work in whole
+    /// lines. Says so when it had to widen, rather than doing it quietly.
+    fn whole_rows(&mut self, region: Region) -> Option<(usize, usize)> {
+        let (first, last) = region.row_range()?;
+        if !region.is_rows(self.buffer) {
+            self.session.status = "whole lines".into();
+        }
+        Some((first, last))
+    }
+
     fn selected_rows(&self) -> (usize, usize) {
         let (lo, hi) = self.selections.primary().range();
         (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi)))
@@ -6330,23 +6447,22 @@ impl View<'_> {
         }]);
     }
 
-    /// `:[range]m {address}` — vim's move, arithmetic and all.
+    /// `:[scope]m {address}` — vim's move, arithmetic and all.
     ///
-    /// The range says which lines; with none written, the selection does,
+    /// The scope says which lines; with none written, the selection does,
     /// which is what makes `Shift-Down` and a bare `:m +1` agree about what
-    /// they are moving.
-    fn move_to(&mut self, lines_named: Option<LineRange>, to: Address) {
+    /// they are moving. A scope that is not whole lines is widened to the rows
+    /// it touches and says so: there is no moving half a row.
+    fn move_to(&mut self, scope: Option<Scope>, shape: Option<Shape>, to: Address) {
         let at = self.line_numbers();
-        let (first, last) = match lines_named {
-            Some(range) => match range.rows(at) {
-                Ok(rows) => rows,
-                Err(message) => {
-                    self.session.status = message;
-                    return;
-                }
-            },
-            None => self.selected_rows(),
+        let region = match self.region(scope, shape, Fallback::SelectionRows) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
         };
+        let Some((first, last)) = self.whole_rows(region) else { return };
         let lines = self.buffer.line_count() as isize;
         // `.` is still the cursor's line even with a range in front of the
         // command — a range does not move the cursor, which is why `:m +1`
@@ -6366,112 +6482,55 @@ impl View<'_> {
         self.move_lines(first, last, row);
     }
 
-    /// `:[range]case {style}` — respells what is selected, or the word under
-    /// the cursor when nothing is.
+    /// `:[scope]case {style}` — respells what the scope names, or the word
+    /// under each cursor when nothing does.
     ///
     /// The word is the fallback because renaming one is what this is for, and
-    /// selecting it first is a keystroke that says nothing new. Every
-    /// selection gets it, so a column of cursors respells a column of names.
+    /// selecting it first is a keystroke that says nothing new.
     ///
-    /// **The range names rows; the selection's kind names what within one.**
-    /// A rectangle respells its columns and nothing else, and that is the only
-    /// thing keeping the block shape alive across `:` buys. Anything else —
-    /// including a charwise selection — respells the whole of every row the
-    /// range covers, which is what `'<,'>` means everywhere else in bi and in
-    /// vim: it is a *line* range, and the prefill on the `:` line is there so
-    /// that this is visible before you press Enter rather than surprising
-    /// afterwards.
-    fn recase(&mut self, lines: Option<LineRange>, style: crate::case::Style) {
-        // A rectangle is not a char range, so it cannot go through the walk
-        // below: the selection's two corners span every character between
-        // them, and what was selected is the columns on each row. This is the
-        // only reason keeping the block shape alive across `:` is worth
-        // anything — a rectangle that survives to the command line and then
-        // acts on whole lines would be a worse lie than losing it.
-        if self.session.visual() == Some(Shape::Block) {
-            let spans = self.block_spans();
-            let before = self.selections.as_pairs();
-            // Back to front: recasing one row must not move the rows above it,
-            // and `snake` makes text longer.
-            let mut top = usize::MAX;
-            for &(start, end) in spans.iter().rev() {
-                if start == end {
-                    continue;
-                }
-                let text = crate::case::convert(&self.buffer.slice(start, end), style);
-                self.buffer.replace_range(start, end, &text);
-                top = top.min(start);
-            }
-            if top == usize::MAX {
-                self.session.status = "nothing selected".into();
+    /// One walk over one region, whatever shape it has: `'v` over a rectangle
+    /// respells its columns, `'v` over a charwise selection respells exactly
+    /// what is highlighted, and an address names whole rows. The shape is not
+    /// consulted here at all — [`View::region`] already spent it.
+    fn recase(&mut self, scope: Option<Scope>, shape: Option<Shape>, style: crate::case::Style) {
+        let region = match self.region(scope, shape, Fallback::Words) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
                 return;
             }
-            let landing = self.buffer.clamped(Cursor::at(top), false);
-            *self.selections = Selections::single(landing);
-            self.buffer.commit_undo(before, self.selections.as_pairs());
-            self.session.mode = Mode::Normal;
+        };
+        if region.is_empty() {
+            self.session.status = match scope {
+                None => "no word under the cursor".into(),
+                Some(_) => "nothing to respell".into(),
+            };
             return;
         }
 
-        // A range that is not a rectangle is rows, and rows are whole lines.
-        if let Some(range) = lines {
-            let (first, last) = match range.rows(self.line_numbers()) {
-                Ok(rows) => rows,
-                Err(message) => {
-                    self.session.status = message;
-                    return;
-                }
-            };
-            let before = self.selections.as_pairs();
-            let mut done = 0;
-            for row in (first..=last.min(self.buffer.line_count().saturating_sub(1))).rev() {
-                let start = self.buffer.rope().line_to_char(row);
-                let end = start + self.buffer.line_len(row);
-                if start == end {
-                    continue;
-                }
-                let text = crate::case::convert(&self.buffer.slice(start, end), style);
-                self.buffer.replace_range(start, end, &text);
-                done += 1;
-            }
-            let landing =
-                self.buffer.clamped(Cursor::at(self.buffer.rope().line_to_char(first)), false);
-            *self.selections = Selections::single(landing);
-            self.buffer.commit_undo(before, self.selections.as_pairs());
+        let before = self.selections.as_pairs();
+        let rows = region.filled_rows();
+        let edits = region.rewrite(self.buffer, |text| crate::case::convert(text, style));
+
+        // Carried across the edits rather than replaced: the cursors were
+        // where you put them, and respelling the text under one is not a
+        // reason to move it somewhere else. `Edit::map` is the same carry
+        // `retab` and the trimmer use.
+        let carried: Vec<Selection> = self
+            .selections
+            .all()
+            .iter()
+            .map(|selection| {
+                let head = Region::carry(&edits, selection.head.at);
+                Selection::collapsed(self.buffer.clamped(Cursor::at(head), false))
+            })
+            .collect();
+        self.selections.set(carried);
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        if matches!(scope, Some(Scope::Lines(_))) {
             self.session.status =
-                format!("{done} line{} recased", if done == 1 { "" } else { "s" });
-            self.session.mode = Mode::Normal;
-            return;
-        }
-
-        let mut missed = false;
-        self.for_each_selection(|ed, sel| {
-            let len = ed.buffer.rope().len_chars();
-            let (start, end) = match sel.is_collapsed() {
-                false => sel.inclusive_range(len),
-                // `iw` on whitespace is the run of whitespace, which is
-                // right for `diw` and is not a word to respell.
-                true => match ed
-                    .buffer
-                    .word_at(sel.head)
-                    .filter(|&(a, b)| ed.buffer.slice(a, b).chars().any(char::is_alphanumeric))
-                {
-                    Some(range) => range,
-                    None => {
-                        missed = true;
-                        return sel;
-                    }
-                },
-            };
-            let text = crate::case::convert(&ed.buffer.slice(start, end), style);
-            ed.buffer.replace_range(start, end, &text);
-            // On the first character of what was respelled: the text under the
-            // old position is a different length now, and the start is the one
-            // place that means the same thing either way.
-            Selection::collapsed(ed.buffer.clamped(Cursor::at(start), false))
-        });
-        if missed {
-            self.session.status = "no word under the cursor".into();
+                format!("{rows} line{} recased", if rows == 1 { "" } else { "s" });
         }
         // A selection that has been rewritten is not a selection any more.
         self.session.mode = Mode::Normal;
@@ -6484,7 +6543,8 @@ impl View<'_> {
     /// repeat. See `docs/specs/substitute.md`.
     fn substitute(
         &mut self,
-        lines: Option<LineRange>,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
         how: &crate::substitute::Substitute,
         last_search: Option<String>,
     ) -> Option<String> {
@@ -6501,33 +6561,29 @@ impl View<'_> {
             },
         };
 
-        // No range is the cursor's line, which is vim and is why `%` is the
+        // No scope is the cursor's line, which is vim and is why `%` is the
         // most typed character in the command.
-        let at = self.line_numbers();
-        let (first, last) = match lines {
-            Some(range) => match range.rows(at) {
-                Ok(rows) => rows,
-                Err(message) => {
-                    self.session.status = message;
-                    return None;
-                }
-            },
-            None => {
-                let row = self.buffer.row_at(self.selections.cursor());
-                (row, row)
+        let region = match self.region(scope, shape, Fallback::CursorRow) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return None;
             }
         };
 
         // Every match first, then the writes: a replacement must not be
         // searched for the pattern it just produced, so `:%s/a/aa/g` doubles
         // each `a` and stops rather than chasing its own output.
+        //
+        // Per span rather than per row, which is what makes `:'v s/…` over a
+        // rectangle stay inside the columns: a span is a row's worth of the
+        // region, and searching it is the same search either way.
         let mut hits: Vec<(usize, usize)> = Vec::new();
         let mut rows = 0usize;
-        let mut end_row = first;
-        for row in first..=last.min(self.buffer.line_count().saturating_sub(1)) {
-            let start = self.buffer.rope().line_to_char(row);
-            let stop = start + self.buffer.line_len(row);
-            let found = self.buffer.matches_in_cased(start, stop, &pattern, false, how.case);
+        let mut end_row = region.spans().first().map_or(0, |span| span.row);
+        for span in region.spans() {
+            let found =
+                self.buffer.matches_in_cased(span.start, span.end, &pattern, false, how.case);
             let found = match how.all {
                 true => found,
                 false => found.into_iter().take(1).collect(),
@@ -6536,9 +6592,10 @@ impl View<'_> {
                 continue;
             }
             rows += 1;
-            end_row = row;
+            end_row = span.row;
             hits.extend(found);
         }
+        hits.sort_unstable();
 
         if hits.is_empty() {
             self.session.status = format!("pattern not found: {pattern}");
@@ -6691,19 +6748,18 @@ impl View<'_> {
     /// **Not on write.** Trimming touches the lines you edited; this touches
     /// every indented line in the file, and turning a one-line fix into a
     /// whole-file diff is not a thing a save should do behind you.
-    fn retab(&mut self, lines: Option<LineRange>) {
-        let at = self.line_numbers();
-        // No range is the whole file — see [`ExLine::Retab`].
-        let (first, last) = match lines {
-            Some(range) => match range.rows(at) {
-                Ok(rows) => rows,
-                Err(message) => {
-                    self.session.status = message;
-                    return;
-                }
-            },
-            None => (0, self.buffer.line_count().saturating_sub(1)),
+    fn retab(&mut self, scope: Option<Scope>, shape: Option<Shape>) {
+        // No scope is the whole file — see [`ExLine::Retab`]. Indentation is
+        // a property of a line, so a scope that is not made of whole lines is
+        // widened to the rows it touches and says so.
+        let region = match self.region(scope, shape, Fallback::File) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
         };
+        let Some((first, last)) = self.whole_rows(region) else { return };
 
         let before = self.selections.as_pairs();
         let (rows, edits) = self.buffer.retab(first, last, &self.options.indent());
@@ -7485,8 +7541,22 @@ mod tests {
         Editor::open(f.path()).unwrap()
     }
 
+    /// Runs a `:` line the way a keystroke does.
+    ///
+    /// Through `EnterCommandMode` and `CommandExecute` rather than straight
+    /// into `run_ex`, because the two are not the same path: `CommandExecute`
+    /// takes the mode out of the session before dispatching, and a helper that
+    /// skipped it tested a route no key can reach. That is how `:case` over a
+    /// rectangle came to act on whole lines with two passing tests over it.
     fn ex(ed: &mut Editor, line: &str) {
-        ed.run_ex(line);
+        ed.apply(cmd(Action::EnterCommandMode));
+        if let Mode::Command(prefilled) = &mut ed.session.mode {
+            *prefilled = CmdLine::default();
+        }
+        for c in line.chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+        ed.apply(cmd(Action::CommandExecute));
     }
 
     /// Out of the box, before any config is loaded.
@@ -12719,15 +12789,15 @@ mod tests {
     // ---- a selection on the `:` line ----------------------------------------
 
     #[test]
-    fn colon_with_a_selection_says_which_lines_it_is_about() {
+    fn colon_with_a_selection_says_what_it_is_about() {
         let mut ed = visual("a\nb\nc\nd\n", 2, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::EnterCommandMode));
 
         assert_eq!(
             cmdline(&ed),
-            ("'<,'>".to_string(), 5),
-            "vim's prefill, with the cursor past it so the command is what you type next"
+            ("'v ".to_string(), 3),
+            "the scope, with the cursor past it so the command is what you type next"
         );
     }
 
@@ -12763,11 +12833,11 @@ mod tests {
         assert_eq!(ed.visual(), None, "the mode decides, not the leftover");
     }
 
-    #[test]
-    fn case_over_a_rectangle_takes_the_columns_and_not_the_lines() {
-        // Columns 4..=8 of three rows — the names, and not the `let` or the
-        // `= 1;` on either side of them.
-        let text = "let ALPHA = 1;\nlet BETA  = 2;\nlet GAMMA = 3;\n";
+    /// Columns 4..=8 of three rows — the names, and not the `let` or the
+    /// `= 1;` on either side of them. `upper`, not `lower`: over this text the
+    /// whole-line answer and the column answer differ, which is the only way
+    /// the assertion says anything.
+    fn block_over_the_names(text: &str) -> Editor {
         let mut ed = visual(text, 4, Shape::Block);
         for _ in 0..4 {
             ed.apply(cmd(Action::Move(Motion::Right)));
@@ -12775,11 +12845,43 @@ mod tests {
         for _ in 0..2 {
             ed.apply(cmd(Action::Move(Motion::Down)));
         }
+        ed
+    }
+
+    const NAMES: &str = "let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n";
+
+    #[test]
+    fn case_over_a_rectangle_takes_the_columns_and_not_the_lines() {
+        let mut ed = block_over_the_names(NAMES);
+
+        ex(&mut ed, "'v case upper");
+
+        assert_eq!(whole(&ed), "let ALPHA = 1;\nlet BETA  = 2;\nlet GAMMA = 3;\n");
+    }
+
+    /// The other half of the same rule: `'<,'>` is rows, in bi as in vim, and
+    /// typing it over the prefill is how you ask for them.
+    #[test]
+    fn the_row_spelling_over_a_rectangle_takes_the_rows() {
+        let mut ed = block_over_the_names(NAMES);
+
+        ex(&mut ed, "'<,'>case upper");
+
+        assert_eq!(whole(&ed), "LET ALPHA = 1;\nLET BETA  = 2;\nLET GAMMA = 3;\n");
+    }
+
+    /// What the `:` line prefills is what it does, without a keystroke of
+    /// help — the whole point of putting the scope in text you can see.
+    #[test]
+    fn the_prefill_is_what_the_command_acts_on() {
+        let mut ed = block_over_the_names(NAMES);
         ed.apply(cmd(Action::EnterCommandMode));
+        for c in "case upper".chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+        ed.apply(cmd(Action::CommandExecute));
 
-        ex(&mut ed, "'<,'>case lower");
-
-        assert_eq!(whole(&ed), "let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n");
+        assert_eq!(whole(&ed), "let ALPHA = 1;\nlet BETA  = 2;\nlet GAMMA = 3;\n");
     }
 
     #[test]
@@ -12788,13 +12890,26 @@ mod tests {
         let mut ed = visual(text, 0, Shape::Block);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::Move(Motion::Down)));
-        ed.apply(cmd(Action::EnterCommandMode));
 
-        ex(&mut ed, "'<,'>case lower");
+        ex(&mut ed, "'v case lower");
         assert_eq!(whole(&ed), "aB\ncD\neF\n");
 
         ed.apply(cmd(Action::Undo));
         assert_eq!(whole(&ed), text, "three rows back in one press");
+    }
+
+    /// A charwise selection is its characters, not the rows they sit on —
+    /// which is the thing `'<,'>` could not say and the reason `'v` exists.
+    #[test]
+    fn case_over_a_charwise_selection_takes_what_is_highlighted() {
+        let mut ed = visual("let someName = 1;\n", 4, Shape::Chars);
+        for _ in 0..7 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v case snake");
+
+        assert_eq!(whole(&ed), "let some_name = 1;\n", "and not the `let` in front of it");
     }
 
     #[test]

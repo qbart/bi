@@ -55,6 +55,28 @@ pub struct LineRange {
     pub last: Address,
 }
 
+/// What a `:` command acts on, as written on the line.
+///
+/// Two spellings, because there are two questions and they have different
+/// answers over a rectangle or a charwise selection:
+///
+/// - `'v` is **the selection itself**, whatever shape it has — the columns of
+///   a block, the characters of a charwise selection, the rows of a linewise
+///   one, and every selection when there are several.
+/// - `'<,'>`, like every other address, names **rows**.
+///
+/// The `:` line prefills `'v` when a selection is up, so the scope is in text
+/// you can see and edit before you press Enter. That is the whole of why it
+/// cannot be lost on the way to the command: it is not a hidden flag that one
+/// accessor reads under one mode, it is the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `'v`
+    Selection,
+    /// `%`, `2,5`, `'<,'>`, `$-1` — rows.
+    Lines(LineRange),
+}
+
 impl Address {
     pub fn at(base: Base) -> Self {
         Self { base, offset: 0 }
@@ -110,10 +132,15 @@ impl LineRange {
 /// back whole so the command table reads it exactly as it always did. Nothing
 /// bi calls a command starts with `%`, `.`, `$`, `'`, a digit or a sign, which
 /// is what makes that safe.
-pub fn parse(line: &str) -> (Option<LineRange>, &str) {
+pub fn parse(line: &str) -> (Option<Scope>, &str) {
     let line = line.trim_start();
+    // `'v` is the whole scope rather than an address, so it takes no offset
+    // and no comma: a rectangle has no first and last line to count from.
+    if let Some(rest) = line.strip_prefix("'v") {
+        return (Some(Scope::Selection), rest.trim_start());
+    }
     if let Some(rest) = line.strip_prefix('%') {
-        return (Some(LineRange::whole()), rest.trim_start());
+        return (Some(Scope::Lines(LineRange::whole())), rest.trim_start());
     }
 
     let (first, rest) = match address(line) {
@@ -123,7 +150,9 @@ pub fn parse(line: &str) -> (Option<LineRange>, &str) {
     let Some(after_comma) = rest.trim_start().strip_prefix(',') else {
         // One address is the one line, and no address at all is no range.
         return match first {
-            Some(one) => (Some(LineRange { first: one, last: one }), rest.trim_start()),
+            Some(one) => {
+                (Some(Scope::Lines(LineRange { first: one, last: one })), rest.trim_start())
+            }
             None => (None, line),
         };
     };
@@ -135,7 +164,7 @@ pub fn parse(line: &str) -> (Option<LineRange>, &str) {
         Some((address, rest)) => (address, rest),
         None => (here, after_comma),
     };
-    (Some(LineRange { first: first.unwrap_or(here), last }), rest.trim_start())
+    (Some(Scope::Lines(LineRange { first: first.unwrap_or(here), last })), rest.trim_start())
 }
 
 /// One address off the front of `s`, and what follows it.
@@ -186,8 +215,10 @@ mod tests {
     }
 
     fn one(line: &str) -> (LineRange, &str) {
-        let (range, rest) = parse(line);
-        (range.unwrap_or_else(|| panic!("{line:?} has no range")), rest)
+        match parse(line) {
+            (Some(Scope::Lines(range)), rest) => (range, rest),
+            _ => panic!("{line:?} has no line range"),
+        }
     }
 
     #[test]
@@ -253,6 +284,21 @@ mod tests {
         for line in ["w file.txt", "m+1", "case snake", "e", "noh"] {
             assert_eq!(parse(line), (None, line), "{line}");
         }
+    }
+
+    /// `'v` is the selection itself, whatever shape it has — the one thing
+    /// `'<,'>` cannot say, because a rectangle has no first and last line.
+    #[test]
+    fn the_selection_can_be_named_as_itself() {
+        assert_eq!(parse("'v case lower"), (Some(Scope::Selection), "case lower"));
+        assert_eq!(parse("'vcase lower"), (Some(Scope::Selection), "case lower"));
+        assert_eq!(parse("'v"), (Some(Scope::Selection), ""));
+    }
+
+    /// It takes no offset and no comma: there is nothing to count from.
+    #[test]
+    fn the_selection_scope_is_the_whole_of_what_it_says() {
+        assert_eq!(parse("'v+1s/a/b/"), (Some(Scope::Selection), "+1s/a/b/"));
     }
 
     #[test]

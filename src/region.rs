@@ -110,9 +110,48 @@ impl Region {
         Self { shape: Shape::Lines, spans }
     }
 
+    /// From explicit char ranges — what a text object or a search gives.
+    ///
+    /// Each range is split at row boundaries, so the result obeys the same
+    /// one-span-per-row rule as everything else here.
+    pub fn spanning(
+        buffer: &Buffer,
+        shape: Shape,
+        ranges: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Self {
+        let mut spans: Vec<Span> = ranges
+            .into_iter()
+            .flat_map(|(start, end)| split_rows(buffer, start, end.max(start)))
+            .collect();
+        spans.sort_by_key(|span| (span.start, span.end));
+        Self { shape, spans }
+    }
+
     /// A region covering nothing. What a command with nothing to act on gets.
     pub fn empty(shape: Shape) -> Self {
         Self { shape, spans: Vec::new() }
+    }
+
+    /// The same rows, whole.
+    ///
+    /// What a command that can only work in whole lines does with a region
+    /// that is not made of them — `:m` cannot move half a row. One widening,
+    /// in one place, so that a command handed a shape it cannot use says so
+    /// rather than inventing an answer.
+    pub fn to_rows(&self, buffer: &Buffer) -> Self {
+        match self.row_range() {
+            Some((first, last)) => Self::rows(buffer, first, last),
+            None => Self::empty(Shape::Lines),
+        }
+    }
+
+    /// Whether [`Region::to_rows`] would change anything.
+    pub fn is_rows(&self, buffer: &Buffer) -> bool {
+        self.shape == Shape::Lines
+            && self.spans.iter().all(|span| {
+                let start = buffer.rope().line_to_char(span.row);
+                span.start == start && span.end == start + buffer.line_len(span.row)
+            })
     }
 
     pub fn shape(&self) -> Shape {
