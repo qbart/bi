@@ -1193,9 +1193,9 @@ mod tests {
     /// not is invisible here, and the terminal's own shows through.
     #[test]
     fn only_a_theme_that_names_a_background_paints_one() {
-        let gruvbox = Theme::default();
-        assert_ne!(base_style(&gruvbox.ui), Style::default());
-        assert_eq!(base_style(&gruvbox.ui).bg, Some(Color::Rgb(0x28, 0x28, 0x28)));
+        let main = Theme::default();
+        assert_ne!(base_style(&main.ui), Style::default());
+        assert_eq!(base_style(&main.ui).bg, Some(Color::Rgb(0x16, 0x16, 0x16)));
 
         let (ansi, problems) = Theme::resolve("ansi", None);
         assert_eq!(problems, []);

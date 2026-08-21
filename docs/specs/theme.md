@@ -13,14 +13,21 @@ One thing config.md decided is reversed on purpose:
 > The shipped `default` theme is ANSI, and reproduces today's colours exactly
 > — installing this step changes nothing on screen until a theme is chosen.
 
-The default is now **`gruvbox-dark`**, and installing this step does change
-what you see. Today's ANSI colours survive as the `ansi` built-in, one
+The default is now **`main`**, and installing this step does change what you
+see. Today's ANSI colours survive as the `ansi` built-in, one
 `:set theme ansi` away. The argument for ANSI-by-default was that it respects
 a carefully-tuned terminal palette; the argument against is that an editor
 with no opinion about its own colours has to be configured before it looks
 like anything, and "looks right out of the box" is worth more than "matches
 your terminal out of the box". Both are still available. Only the default
 moved.
+
+It moved twice. `gruvbox-dark` held it first and still ships unchanged; `main`
+took it later and is described below. What that swap cost is one line in
+`theme.rs` and one in `default.toml`, which is the point of the name being an
+ordinary option — and every test that says "the default" says `DEFAULT_THEME`
+rather than a colour, so the ones that had to change are exactly the handful
+that pin what the default *looks* like.
 
 ## The shape
 
@@ -91,9 +98,9 @@ so leaving it to fall through put 59% of a Ruby file in one green, alongside
 the string literals, the regexes and the class names. That is exactly the
 failure `docs/specs/tree-sitter.md` names for JSON keys, arriving at the other
 end of the same pipeline: there the *query* had to be told the two captures
-differ, here the *theme* has to be told the two colours do. Both gruvbox
-themes therefore carry `string.special.symbol` and `string.special.regex`
-explicitly, and a test asserts neither equals `string`.
+differ, here the *theme* has to be told the two colours do. `main` and both
+gruvbox themes therefore carry `string.special.symbol` and
+`string.special.regex` explicitly, and a test asserts neither equals `string`.
 
 `ansi` deliberately does not. It promises the colours bi had before it had
 themes, and before it had themes these fell through.
@@ -182,7 +189,7 @@ the whole point of naming `green` is to get the terminal's green, and the
 terminal's background comes with it. Neither is the "right" answer, so the
 theme says which it is rather than a flag elsewhere deciding for it.
 
-`ansi` omits it. `gruvbox-dark` sets `#282828`.
+`ansi` omits it. `main` sets `#161616`, `gruvbox-dark` `#282828`.
 
 ## Two names, and which one is live
 
@@ -223,9 +230,9 @@ The theme name in force — `theme`, or `ssh_theme` when remote. In order:
 
 1. `<config dir>/themes/<name>.toml`
 2. a built-in of the same name
-3. `gruvbox-dark`, with a diagnostic saying the named one was not found
+3. `main`, with a diagnostic saying the named one was not found
 
-A user file wins over a built-in of the same name so that `themes/gruvbox-dark.toml`
+A user file wins over a built-in of the same name so that `themes/main.toml`
 is how you adjust one colour of a shipped theme without forking it.
 
 Reading it needs a second method on the trait a frontend already implements:
@@ -263,14 +270,71 @@ without changing the type.
 
 ## The built-ins
 
-Four, compiled in with `include_str!`, and parsed through the same parser a
+Five, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
+### `main`
+
+**The default.** A near-black frame with cool, desaturated accents, built out
+of [IBM's Carbon](https://carbondesignsystem.com/guidelines/color/overview/)
+palette — the colours behind the Nyoom.nvim screenshot this theme was asked
+for. Two greys and eight accents, and nothing warm in it except the one place
+warmth carries meaning.
+
+| | |
+|---|---|
+| keyword | pink `#ff7eb6` |
+| function, constructor | blue `#78a9ff` bold |
+| type, module, tag | teal `#3ddbd9` |
+| string, escape, character | green `#42be65` |
+| comment | gray60 `#6f6f6f` italic |
+| constant, number, float, boolean | purple `#be95ff` |
+| attribute, label | light cyan `#82cfff` |
+| operator, `string.special.regex` | magenta `#ee5396` |
+| punctuation, delimiter | gray50 `#8d8d8d` |
+| property, `string.special.key`, `.symbol` | cyan `#33b1ff` |
+| background / foreground | gray100 `#161616` / gray20 `#dde1e6` |
+| cursorline / selection | gray90 `#262626` / gray80 `#393939` |
+| search | gray100 `#161616` on cyan `#33b1ff` |
+
+**Why this is the default and gruvbox is not.** Nothing is wrong with gruvbox;
+what changed is which look bi wants to be *its* look rather than a borrowed
+one. gruvbox is a warm, high-chroma palette where the accents compete with
+each other for attention — that is its charm, and it is also why a dense file
+in it reads as colour first and structure second. Carbon was drawn for
+interfaces rather than for terminals: it is a systematic ramp, the accents sit
+at a similar lightness so no single role shouts, and the near-black frame
+gives them all the same amount of room. An editor's default should be the one
+you stop noticing.
+
+**The frame is `#161616`, not the tint the screenshot shows.** A compressed
+screenshot of a terminal over a dark page carries a blue cast that is not in
+anybody's palette, and matching it would mean inventing a colour and then
+being unable to say where it came from. Carbon's own gray100 is what the
+screenshot is *of*, so that is what this theme takes. The rest of the
+furniture walks the same ramp — `#262626`, `#393939`, `#525252`, `#6f6f6f`,
+`#8d8d8d`, `#a8a8a8` — so every grey on screen is one step of one scale
+rather than six separately chosen darks.
+
+**Two colours are outside oxocarbon's sixteen, and both earn it.** `todo_warn`
+is Carbon's yellow30 `#f1c21b`: the five TODO badges are the one place on
+screen where the colour *is* the meaning, and a `WARN:` that is not warm reads
+as a different word. `context` is `#0d0d0d`, below the frame rather than on
+the ramp, for the reason `gruvbox-dark` gives its own — the annotation for the
+block you are in is something you glance down at, and Carbon has nothing
+darker than gray100 to glance down at.
+
+Unlike `pascal`, no test fences this theme into a palette. `pascal`'s
+constraint *is* the theme; `main` is a theme that happens to have been drawn
+from one, and pinning it would only make the next adjustment a fight.
+
 ### `gruvbox-dark`
 
-The default. From the palette in
+From the palette in
 [morhetz/gruvbox](https://github.com/morhetz/gruvbox), dark, medium contrast.
+It was the default before `main` and is unchanged by having stopped being it —
+one `:set theme gruvbox-dark` away, the same way `ansi` is.
 
 | | |
 |---|---|
@@ -326,8 +390,9 @@ asserts exactly that, by requiring each role to differ from its dark
 counterpart. Comments are the one deliberate exception: gruvbox uses the same
 neutral `#928374` at both ends.
 
-**It is shipped and it is not the default**, which were always two decisions
-rather than one. bi has no way to ask the terminal whether it is light —
+**It is shipped and it is not the default**, and it is what a remote session
+gets — see `ssh_theme` above. bi has no way to ask the terminal whether it is
+light —
 there is no portable query for it, and guessing wrong is worse than not
 guessing — so the light theme is one `:set theme gruvbox-light` away and the
 dark one stays the thing you get.
@@ -368,9 +433,10 @@ It sets no `background`.
 
 ## Testing
 
-- every key in `Ui::REQUIRED` is set by both built-ins — a theme that forgets
+- every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
   one is a hole on the screen, and the compiler cannot see it. This is the
-  test that makes "twenty-five" a checkable number rather than a claim.
+  test that makes "twenty-five" a checkable number rather than a claim, and
+  the one that a new built-in has to satisfy before it is a built-in.
   `background` and `foreground` are excluded: they are exactly the two a theme
   is allowed to decline, and `ansi` declines both.
 - the `ansi` built-in round-trips to the styles `render.rs` uses today. This
@@ -386,7 +452,7 @@ It sets no `background`.
   does *not* find `string`, an unknown name finds nothing
 - a theme naming a colour that will not parse loses that key, keeps the rest,
   and reports the line
-- an unknown `theme` name falls back to `gruvbox-dark` and says so
+- an unknown `theme` name falls back to `main` and says so
 - a user `themes/<name>.toml` beats a built-in of the same name, and patches
   it rather than replacing it
 - a theme name cannot escape the themes directory — it reaches the filesystem,
@@ -394,9 +460,12 @@ It sets no `background`.
 - `:set theme ansi` re-resolves rather than only moving the string: a name is
   not a palette, and a `:set` that reports success and changes nothing on
   screen is the failure worth engineering against
-- both built-ins parse — via `Theme::default()` being the parsed default, the
-  same trick `Config::default()` uses so the shipped file is exercised on
+- every built-in parses — via `Theme::default()` being the parsed default,
+  the same trick `Config::default()` uses so the shipped file is exercised on
   every run rather than only in a test
+- `main` is the default, claims `#161616`, and keeps its greys on Carbon's own
+  ramp — the theme-identity test each built-in gets, and the same shape as
+  `pascal`'s
 
 ## Deferred
 

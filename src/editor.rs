@@ -7510,11 +7510,11 @@ mod tests {
 
     /// Out of the box, before any config is loaded.
     #[test]
-    fn the_default_theme_is_gruvbox_dark() {
+    fn the_default_theme_is_main() {
         let ed = Editor::empty();
         assert_eq!(ed.session.options.theme, crate::theme::DEFAULT_THEME);
         assert_eq!(ed.theme(), &Theme::default());
-        assert!(ed.theme().ui.background.is_some(), "gruvbox claims the background");
+        assert!(ed.theme().ui.background.is_some(), "main claims the background");
     }
 
     /// A name is not a palette. `:set theme ansi` that moved the string and
@@ -7532,7 +7532,7 @@ mod tests {
         assert_eq!(ed.theme().ui.background, None);
         assert_eq!(ed.session.status, "theme=ansi");
 
-        ex(&mut ed, "set theme gruvbox-dark");
+        ex(&mut ed, "set theme main");
         assert_eq!(ed.theme(), &before, "and back again");
     }
 

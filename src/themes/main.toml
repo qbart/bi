@@ -1,0 +1,145 @@
+# main — bi's default theme.
+#
+# A near-black frame with cool, desaturated accents, drawn from IBM's Carbon
+# palette: the colours behind the Nyoom.nvim screenshot this theme was asked
+# for. Compiled into the binary; a file at <config dir>/themes/main.toml is a
+# PATCH over this one, so changing a single colour does not mean copying the
+# rest. See docs/specs/theme.md.
+#
+# The greys are one ramp, so every neutral on screen is a step of one scale
+# rather than six separately chosen darks:
+#
+#   #161616 gray100   the frame        #6f6f6f gray60    quiet text
+#   #262626 gray90    one step up      #8d8d8d gray50    punctuation
+#   #393939 gray80    two steps up     #a8a8a8 gray40    preview text
+#   #525252 gray70    furniture        #dde1e6 gray20    the text itself
+#
+# The accents sit at a similar lightness on purpose. gruvbox's charm is that
+# its colours compete; this one's is that they do not, so a dense file reads as
+# structure first and colour second.
+
+[syntax]
+# Pink for the words that are the language rather than the program.
+keyword     = "#ff7eb6"
+function    = { fg = "#78a9ff", bold = true }        # blue
+constructor = { fg = "#78a9ff", bold = true }
+
+type        = "#3ddbd9"                              # teal
+module      = "#3ddbd9"
+
+# An element name names a kind of node, which is what a type is — XML's own
+# vocabulary calls them element types. Without this every `<div>` in an HTML
+# file is captured and then painted plain foreground, which on screen is
+# indistinguishable from a grammar that never matched.
+tag         = "#3ddbd9"
+
+string      = "#42be65"                              # green
+escape      = "#42be65"
+character   = "#42be65"
+
+# gray60 rather than gray70: a comment is meant to recede, not to need
+# squinting at, and #525252 on #161616 is under three to one.
+comment     = { fg = "#6f6f6f", italic = true }
+
+constant    = "#be95ff"                              # purple
+number      = "#be95ff"
+float       = "#be95ff"
+boolean     = "#be95ff"
+
+attribute   = "#82cfff"                              # light cyan
+label       = "#82cfff"
+
+# Magenta, and deliberately not the foreground: `&x` and `x` are different
+# programs, and painting the `&` the colour of the text around it is the
+# failure docs/specs/tree-sitter.md names as "a capture styled the colour of
+# nothing".
+operator    = "#ee5396"
+
+# Brackets and separators stay quiet on purpose — structure, not meaning, and
+# on every line.
+punctuation = "#8d8d8d"                              # gray50
+delimiter   = "#8d8d8d"
+
+# The key side of a config format. Without this the whole left-hand column of
+# a TOML or JSON file reads as ordinary string values.
+property             = "#33b1ff"                     # cyan
+"string.special.key" = "#33b1ff"
+
+# A Ruby symbol is a key, not a string, and Ruby is dense with them. Left to
+# the fallback walk both of these land on `string`: `:phases`, `class_name:`
+# and `/\A[a-z_]+\z/` all come out the same green as `'Time & Material'`, and
+# the file reads as one green wall.
+"string.special.symbol" = "#33b1ff"                  # cyan, as a key is
+"string.special.regex"  = "#ee5396"                  # magenta, not a literal
+
+# Markdown, whose captures are all text.*
+"text.title"     = { fg = "#78a9ff", bold = true }
+"text.literal"   = "#42be65"
+"text.uri"       = { fg = "#82cfff", underline = true }
+"text.reference" = "#be95ff"
+
+[ui]
+# These accents were chosen against a near-black frame and drift on anything
+# else, so this theme claims it. A theme that omits both of these leaves the
+# terminal's own alone — see `ansi`.
+background = "#161616"                               # gray100
+foreground = "#dde1e6"                               # gray20
+
+cursorline = { bg = "#262626" }                      # gray90
+selection  = { bg = "#393939" }                      # gray80
+# Both halves: a match has to be legible against whatever it lands on, and
+# while `s` is aiming that is dimmed text. A background alone would leave
+# `dim`'s foreground sitting on it.
+search     = { fg = "#161616", bg = "#33b1ff" }      # gray100 on cyan
+cursor_alt = { bg = "#6929c4" }                      # purple70, dim
+flash      = { bg = "#005d5d" }                      # teal70
+label      = { fg = "#161616", bg = "#ee5396", bold = true }
+dim        = "#525252"                               # gray70
+
+gutter         = "#525252"                           # gray70
+gutter_current = "#f2f4f8"                           # gray10, the one bright
+rule           = "#393939"
+filler         = "#393939"
+indent_guide   = "#262626"
+# gray60, three steps up from the guides and level with the comments: you
+# turn these on to read them, and one you have to squint at answers nothing.
+whitespace     = "#6f6f6f"
+# Below the frame rather than on the ramp, and deliberately near-invisible:
+# the block you are in is something you glance down at, not something that
+# should catch your eye. Carbon has nothing darker than gray100 to use here.
+context        = "#0d0d0d"
+# The other half, which replaces a row of code and so has to be read: gray90
+# behind gray40, a step off the frame in both directions.
+context_header = { fg = "#a8a8a8", bg = "#262626" }
+
+# TODO: and friends. Loud on purpose — the point is that they stop reading as
+# ordinary comment-grey. `todo_warn` is Carbon's yellow30 and the one warm
+# colour in the theme: this is the one place where the colour *is* the
+# meaning, and a `WARN:` that is not warm reads as a different word.
+# See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#161616", bg = "#ee5396", bold = true }
+todo_todo  = { fg = "#161616", bg = "#33b1ff", bold = true }
+todo_warn  = { fg = "#161616", bg = "#f1c21b", bold = true }
+todo_perf  = { fg = "#161616", bg = "#be95ff", bold = true }
+todo_note  = { fg = "#161616", bg = "#42be65", bold = true }
+
+mode_normal = { fg = "#161616", bg = "#78a9ff", bold = true }
+mode_insert = { fg = "#161616", bg = "#42be65", bold = true }
+mode_pick   = { fg = "#161616", bg = "#ee5396", bold = true }
+
+status          = "#3ddbd9"
+status_muted    = "#6f6f6f"
+status_inactive = "#525252"
+statusline      = { fg = "#dde1e6", bg = "#262626" }  # gray90
+
+tree_dir  = "#78a9ff"
+tree_link = "#3ddbd9"
+mark_copy = "#42be65"
+mark_cut  = "#ee5396"
+
+picker_border   = "#ee5396"
+picker_prompt   = "#ee5396"
+picker_selected = { fg = "#ff7eb6", bold = true }
+picker_badge    = "#6f6f6f"
+picker_divider  = "#393939"
+picker_preview  = "#a8a8a8"                          # gray40

@@ -616,18 +616,19 @@ The `theme` option names a theme; **what a theme *is* moved to
 resolution order, and the two built-ins.
 
 What stays here is the decision that put it in `[options]` at all. `theme` is
-an ordinary option, so `:set theme gruvbox-dark` and `theme = "gruvbox-dark"`
-are two ways to reach one setting, exactly as `:set number 5` and
-`number = 5` are. It also *removes* a feature rather than adding one: with
+an ordinary option, so `:set theme main` and `theme = "main"` are two ways to
+reach one setting, exactly as `:set number 5` and `number = 5` are. It also *removes* a feature rather than adding one: with
 `theme` an ordinary option there is no `:theme` command to design.
 
 Two things the theme spec settled that contradict what this file used to say,
 recorded here so the difference is not a surprise:
 
-- **The default is `gruvbox-dark`, not `ansi`.** This file argued the shipped
-  default should reproduce today's colours exactly so that installing the
-  step changed nothing on screen. It does change what you see now. Today's
-  colours survive as the `ansi` built-in.
+- **The default is `main`, not `ansi`.** This file argued the shipped default
+  should reproduce today's colours exactly so that installing the step changed
+  nothing on screen. It does change what you see now. Today's colours survive
+  as the `ansi` built-in. (`gruvbox-dark` held the default first and still
+  ships; the swap to `main` cost one line, which is the point of the name
+  being an option.)
 - **`[ui]` has twenty-five required keys, not eight**, plus `background` and
   `foreground`, which a theme may decline. The eight named here were the
   constants at the top of `tui/render.rs`; the rest of the screen — the mode
@@ -647,7 +648,7 @@ compiling and gets the built-ins. See `### ConfigSource` below.
 [options]
 number    = 5      # 0 off, -1 relative, N every Nth — see docs/specs/number.md
 hlsearch  = false
-theme     = "gruvbox-dark"
+theme     = "main"
 ssh_theme = "gruvbox-light"   # used instead when SSH_CONNECTION is set
 ```
 

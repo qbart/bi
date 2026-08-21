@@ -217,14 +217,15 @@ background, in whichever direction recedes there:
 
 | theme | value | |
 |---|---|---|
+| `main` | `#0d0d0d` | below the frame — Carbon has nothing darker than gray100 |
 | `gruvbox-dark` | `#1d2021` | bg0_h — gruvbox's black, *below* the background |
 | `gruvbox-light` | `#ebdbb2` | bg1 — just above the background |
 | `pascal` | `#000080` | the darker blue the cursor line uses |
 | `ansi` | `darkgray` | the tier `indent_guide` and `dim` already share |
 
-`gruvbox-dark`'s is deliberately near-invisible: it was asked for as black, and
-black against `#282828` is a shape you notice when you look for it and not
-before. `:set` it or override `context` in a theme file to make it louder.
+`main`'s and `gruvbox-dark`'s are both deliberately near-invisible: they were
+asked for as black, and black against a near-black frame is a shape you notice
+when you look for it and not before. `:set` it or override `context` in a theme file to make it louder.
 
 `context_header` is the opposite job and needs the opposite treatment: it
 replaces a row of code, so it has to be legible and it has to read as chrome.
@@ -233,6 +234,7 @@ quieter than the body text:
 
 | theme | value |
 |---|---|
+| `main` | `{ fg = "#a8a8a8", bg = "#262626" }` — gray40 on gray90 |
 | `gruvbox-dark` | `{ fg = "#a89984", bg = "#3c3836" }` |
 | `gruvbox-light` | `{ fg = "#7c6f64", bg = "#ebdbb2" }` |
 | `pascal` | `{ fg = "#000000", bg = "#aaaaaa" }` — the IDE's menu bar |

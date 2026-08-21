@@ -307,21 +307,22 @@ pub struct Theme {
 }
 
 /// The default, and the one every unknown name falls back to.
-pub const DEFAULT_THEME: &str = "gruvbox-dark";
+pub const DEFAULT_THEME: &str = "main";
 
+const MAIN: &str = include_str!("themes/main.toml");
 const GRUVBOX_DARK: &str = include_str!("themes/gruvbox-dark.toml");
 const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
 const PASCAL: &str = include_str!("themes/pascal.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
 
 impl Default for Theme {
-    /// The shipped `gruvbox-dark`, parsed.
+    /// The shipped `main`, parsed.
     ///
     /// Parsed rather than constructed so the file is exercised on every run —
     /// if it stops parsing, nothing starts, and no test has to be the one that
     /// notices. `Config::default()` uses the same trick for `default.toml`.
     fn default() -> Self {
-        Theme::parse(GRUVBOX_DARK, Theme::empty()).expect("bi's own gruvbox-dark.toml must parse").0
+        Theme::parse(MAIN, Theme::empty()).expect("bi's own main.toml must parse").0
     }
 }
 
@@ -334,7 +335,8 @@ impl Theme {
     /// The source of a built-in theme, or `None` if there is no such name.
     pub fn builtin(name: &str) -> Option<&'static str> {
         match name {
-            DEFAULT_THEME => Some(GRUVBOX_DARK),
+            DEFAULT_THEME => Some(MAIN),
+            "gruvbox-dark" => Some(GRUVBOX_DARK),
             "gruvbox-light" => Some(GRUVBOX_LIGHT),
             "pascal" => Some(PASCAL),
             "ansi" => Some(ANSI),
@@ -347,7 +349,10 @@ impl Theme {
     /// `gruvbox-light` is here and is not the default, because bi has no way
     /// to ask the terminal whether it is light. Shipping it and defaulting to
     /// it are different decisions, and only the first one is available.
-    pub const BUILTINS: &'static [&'static str] = &[DEFAULT_THEME, "gruvbox-light", "ansi"];
+    /// `gruvbox-dark` is here for a different reason: it *was* the default,
+    /// and a theme losing that job is not a theme being withdrawn.
+    pub const BUILTINS: &'static [&'static str] =
+        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi"];
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -374,7 +379,7 @@ impl Theme {
 
     /// Parses `src` as a patch over `base`.
     ///
-    /// A user's `themes/gruvbox-dark.toml` is therefore how you change one
+    /// A user's `themes/main.toml` is therefore how you change one
     /// colour of a shipped theme without copying the rest.
     ///
     /// `Err` is the one unsalvageable case: the document is not TOML at all.
@@ -552,7 +557,7 @@ mod tests {
     /// background `search` painted. The match was there and invisible.
     #[test]
     fn a_search_match_names_both_halves_and_neither_is_the_dim() {
-        for name in Theme::BUILTINS.iter().chain(std::iter::once(&"pascal")) {
+        for name in Theme::BUILTINS {
             let ui = parsed(name).ui;
             assert!(ui.search.fg.is_some(), "{name}: a match with no foreground of its own");
             assert!(ui.search.bg.is_some(), "{name}: a match with no background of its own");
@@ -583,17 +588,52 @@ mod tests {
         assert_eq!(ansi.ui.foreground, None);
     }
 
+    /// The theme identity test `pascal` gets, for the one that is the default:
+    /// what it claims, and that its neutrals stayed on Carbon's own ramp
+    /// rather than becoming six separately chosen darks.
     #[test]
-    fn the_default_is_gruvbox_and_it_claims_the_background() {
+    fn main_is_the_default_and_claims_a_near_black_frame() {
         let theme = Theme::default();
-        assert_eq!(theme.ui.background, Some(Color::Rgb(0x28, 0x28, 0x28)));
-        assert_eq!(theme.ui.foreground, Some(Color::Rgb(0xeb, 0xdb, 0xb2)));
-        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xfb, 0x49, 0x34))));
+        assert_eq!(theme.ui.background, Some(Color::Rgb(0x16, 0x16, 0x16)));
+        assert_eq!(theme.ui.foreground, Some(Color::Rgb(0xdd, 0xe1, 0xe6)));
+        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xff, 0x7e, 0xb6))));
+
+        // Carbon's grey ramp, and `context`, which is deliberately below the
+        // frame because Carbon has nothing darker than gray100 to recede into.
+        const RAMP: &[(u8, u8, u8)] = &[
+            (0x16, 0x16, 0x16),
+            (0x26, 0x26, 0x26),
+            (0x39, 0x39, 0x39),
+            (0x52, 0x52, 0x52),
+            (0x6f, 0x6f, 0x6f),
+            (0x8d, 0x8d, 0x8d),
+            (0xa8, 0xa8, 0xa8),
+            (0xdd, 0xe1, 0xe6),
+            (0xf2, 0xf4, 0xf8),
+            (0x0d, 0x0d, 0x0d),
+        ];
+        let ui = &theme.ui;
+        for (role, style) in [
+            ("cursorline", ui.cursorline),
+            ("selection", ui.selection),
+            ("dim", ui.dim),
+            ("gutter", ui.gutter),
+            ("rule", ui.rule),
+            ("filler", ui.filler),
+            ("indent_guide", ui.indent_guide),
+            ("whitespace", ui.whitespace),
+            ("context", ui.context),
+        ] {
+            let colour = style.fg.or(style.bg).expect("a grey is a colour");
+            let Color::Rgb(r, g, b) = colour else { panic!("{role} is not 24-bit") };
+            assert!(RAMP.contains(&(r, g, b)), "{role} left the grey ramp: {colour:?}");
+        }
     }
 
     /// Painting `&` the colour of the text around it is the failure
-    /// tree-sitter.md names. gruvbox.vim links `Operator` to plain foreground;
-    /// this theme deliberately does not.
+    /// tree-sitter.md names, and a theme is free to depart from its source
+    /// palette to avoid it — gruvbox.vim links `Operator` to plain foreground
+    /// and neither built-in dark theme does.
     #[test]
     fn an_operator_is_not_the_foreground_colour() {
         let theme = Theme::default();
@@ -653,9 +693,9 @@ mod tests {
 
     #[test]
     fn a_theme_file_is_a_patch_over_the_builtin_it_shadows() {
-        // One key, and everything else still comes from gruvbox-dark.
+        // One key, and everything else still comes from the built-in.
         let (theme, problems) =
-            Theme::resolve(DEFAULT_THEME, Some("[syntax]\nkeyword = \"#ffffff\"\n"));
+            Theme::resolve("gruvbox-dark", Some("[syntax]\nkeyword = \"#ffffff\"\n"));
         assert_eq!(problems, []);
         assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(255, 255, 255))));
         assert_eq!(theme.ui.background, Some(Color::Rgb(0x28, 0x28, 0x28)));
@@ -667,8 +707,8 @@ mod tests {
             Theme::resolve("mine", Some("[ui]\nselection = { bg = \"red\" }\n"));
         assert_eq!(problems, []);
         assert_eq!(theme.ui.selection.bg, Some(Color::Ansi(Ansi::Red)));
-        // Everything it did not mention still comes from gruvbox-dark.
-        assert_eq!(theme.ui.background, Some(Color::Rgb(0x28, 0x28, 0x28)));
+        // Everything it did not mention still comes from the default.
+        assert_eq!(theme.ui.background, Some(Color::Rgb(0x16, 0x16, 0x16)));
     }
 
     #[test]
@@ -686,7 +726,9 @@ mod tests {
     #[test]
     fn gruvbox_light_is_light_and_still_gruvbox() {
         let light = parsed("gruvbox-light");
-        let dark = Theme::default();
+        // Its own counterpart, which is no longer the default — the pair is
+        // two ends of one palette, and the default moving does not change that.
+        let dark = parsed("gruvbox-dark");
 
         assert_eq!(light.ui.background, Some(Color::Rgb(0xfb, 0xf1, 0xc7)));
         assert_eq!(light.ui.foreground, Some(Color::Rgb(0x3c, 0x38, 0x36)));
@@ -720,7 +762,7 @@ mod tests {
     /// whose files render blank.
     #[test]
     fn every_builtin_fills_the_roles_that_carry_a_file() {
-        for name in ["gruvbox-dark", "gruvbox-light", "pascal", "ansi"] {
+        for name in ["main", "gruvbox-dark", "gruvbox-light", "pascal", "ansi"] {
             let theme = parsed(name);
             for role in ["keyword", "string", "comment", "type", "property", "tag"] {
                 assert!(theme.style(role).is_some(), "{name} leaves {role} unpainted");
@@ -739,7 +781,7 @@ mod tests {
     /// had themes, and before it had themes these fell through to `string`.
     #[test]
     fn a_symbol_and_a_regex_are_not_just_strings() {
-        for name in [DEFAULT_THEME, "gruvbox-light"] {
+        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light"] {
             let theme = parsed(name);
             let string = theme.style("string");
             for special in ["string.special.symbol", "string.special.regex"] {

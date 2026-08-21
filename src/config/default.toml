@@ -81,14 +81,18 @@ yank_flash = 150
 gitignore = true
 
 # The palette. A name in themes/ beside this file wins, then a built-in of the
-# same name, then this one. Built in: gruvbox-dark, gruvbox-light, ansi.
+# same name, then this one. Built in: main, gruvbox-dark, gruvbox-light,
+# pascal, ansi.
 #
-# `gruvbox-light` is the same theme at the other end of the palette; it is not
-# the default because bi cannot ask the terminal whether it is light.
+# `main` is the default: a near-black frame with cool accents, from IBM Carbon.
+# `gruvbox-dark` was the default before it and is unchanged.
+# `gruvbox-light` is that theme at the other end of its palette; it is not the
+# default because bi cannot ask the terminal whether it is light.
+# `pascal` is Borland Turbo Pascal 7, in the sixteen EGA colours.
 # `ansi` is bi's pre-theme colours in the sixteen ANSI names, so it uses YOUR
 # terminal palette and its background rather than bringing its own.
 # See docs/specs/theme.md.
-theme = "gruvbox-dark"
+theme = "main"
 
 # The theme for a session that is editing from somewhere else — bi uses this
 # instead of `theme` when SSH_CONNECTION is set. A second name rather than a
