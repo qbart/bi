@@ -20,31 +20,34 @@
 
 [syntax]
 # Pink for the words that are the language rather than the program.
-keyword     = "#ff7eb6"
-function    = { fg = "#78a9ff", bold = true }        # blue
-constructor = { fg = "#78a9ff", bold = true }
+keyword     = "#ee5396"
+function    = { fg = "#5FDFDF", bold = true }        # blue
+constructor = { fg = "#5FDFDF", bold = true }
+#constructor = { fg = "#78a9ff", bold = true }
 
-type        = "#3ddbd9"                              # teal
-module      = "#3ddbd9"
+type        = "#00D3D0"                              # teal
+module      = "#00D3D0"
+
 
 # An element name names a kind of node, which is what a type is — XML's own
 # vocabulary calls them element types. Without this every `<div>` in an HTML
 # file is captured and then painted plain foreground, which on screen is
 # indistinguishable from a grammar that never matched.
-tag         = "#3ddbd9"
+tag         = "#00D3D0"
 
-string      = "#42be65"                              # green
-escape      = "#42be65"
-character   = "#42be65"
+
+string      = "#B6A0FF"                              # green
+escape      = "#B6A0FF"
+character   = "#B6A0FF"
 
 # gray60 rather than gray70: a comment is meant to recede, not to need
 # squinting at, and #525252 on #161616 is under three to one.
 comment     = { fg = "#6f6f6f", italic = true }
 
-constant    = "#be95ff"                              # purple
-number      = "#be95ff"
-float       = "#be95ff"
-boolean     = "#be95ff"
+constant    = "#FFC799"                              # purple
+number      = "#FFC799"
+float       = "#FFC799"
+boolean     = "#FFC799"
 
 attribute   = "#82cfff"                              # light cyan
 label       = "#82cfff"
@@ -53,7 +56,7 @@ label       = "#82cfff"
 # programs, and painting the `&` the colour of the text around it is the
 # failure docs/specs/tree-sitter.md names as "a capture styled the colour of
 # nothing".
-operator    = "#ee5396"
+operator    = "#ff7eb6"
 
 # Brackets and separators stay quiet on purpose — structure, not meaning, and
 # on every line.
@@ -62,7 +65,8 @@ delimiter   = "#8d8d8d"
 
 # The key side of a config format. Without this the whole left-hand column of
 # a TOML or JSON file reads as ordinary string values.
-property             = "#33b1ff"                     # cyan
+#property             = "#33b1ff"                     # cyan
+property             = "#FFFF5F"                     # cyan
 "string.special.key" = "#33b1ff"
 
 # A Ruby symbol is a key, not a string, and Ruby is dense with them. Left to
@@ -70,11 +74,11 @@ property             = "#33b1ff"                     # cyan
 # and `/\A[a-z_]+\z/` all come out the same green as `'Time & Material'`, and
 # the file reads as one green wall.
 "string.special.symbol" = "#33b1ff"                  # cyan, as a key is
-"string.special.regex"  = "#ee5396"                  # magenta, not a literal
+"string.special.regex"  = "#FFC799"                  # magenta, not a literal
 
 # Markdown, whose captures are all text.*
 "text.title"     = { fg = "#78a9ff", bold = true }
-"text.literal"   = "#42be65"
+"text.literal"   = "#ff7eb6"
 "text.uri"       = { fg = "#82cfff", underline = true }
 "text.reference" = "#be95ff"
 
@@ -126,25 +130,25 @@ todo_fix   = { fg = "#161616", bg = "#ee5396", bold = true }
 todo_todo  = { fg = "#161616", bg = "#33b1ff", bold = true }
 todo_warn  = { fg = "#161616", bg = "#f1c21b", bold = true }
 todo_perf  = { fg = "#161616", bg = "#be95ff", bold = true }
-todo_note  = { fg = "#161616", bg = "#42be65", bold = true }
+todo_note  = { fg = "#161616", bg = "#ff7eb6", bold = true }
 
-mode_normal = { fg = "#161616", bg = "#78a9ff", bold = true }
-mode_insert = { fg = "#161616", bg = "#42be65", bold = true }
+mode_normal = { fg = "#161616", bg = "#00D3D0", bold = true }
+mode_insert = { fg = "#161616", bg = "#ff7eb6", bold = true }
 mode_pick   = { fg = "#161616", bg = "#ee5396", bold = true }
 
-status          = "#3ddbd9"
+status          = "#B6A0FF"
 status_muted    = "#6f6f6f"
 status_inactive = "#525252"
 statusline      = { fg = "#dde1e6", bg = "#262626" }  # gray90
 
 tree_dir  = "#78a9ff"
-tree_link = "#3ddbd9"
-mark_copy = "#42be65"
+tree_link = "#B6A0FF"
+mark_copy = "#ff7eb6"
 mark_cut  = "#ee5396"
 
 picker_border   = "#ee5396"
 picker_prompt   = "#ee5396"
-picker_selected = { fg = "#ff7eb6", bold = true }
+picker_selected = { fg = "#B6A0FF", bold = true }
 picker_badge    = "#6f6f6f"
 picker_divider  = "#393939"
 picker_preview  = "#a8a8a8"                          # gray40
