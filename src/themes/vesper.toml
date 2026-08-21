@@ -1,0 +1,132 @@
+# vesper — a near-black, warm-accented theme, after
+# https://github.com/nexxeln/vesper.nvim.
+#
+# Compiled into the binary; a file at <config dir>/themes/vesper.toml is a
+# PATCH over this one, so changing a single colour does not mean copying the
+# rest. `:set theme vesper`. See docs/specs/theme.md.
+#
+# The source is flat almost everywhere on purpose: one warm accent
+# (`#FFC799`) carries function, type, constant, number, boolean, tag and
+# label; one cool accent (`#99FFE4`) carries strings; everything else —
+# keywords, operators, punctuation, attributes — is a single muted gray
+# (`#A0A0A0`). Vesper's own highlights.lua defines no bold, no italic and no
+# underline anywhere outside markdown markup, and this file keeps that: the
+# hierarchy is colour and nothing else. Two source facts easy to miss and
+# both kept here: `Property` is plain foreground, not a colour of its own,
+# and `@string.escape` is the *warm* accent rather than a shade of the
+# string colour it sits inside.
+
+[syntax]
+keyword     = "#A0A0A0"                              # fg_muted
+function    = "#FFC799"                              # accent
+constructor = "#FFC799"
+type        = "#FFC799"
+module      = "#FFC799"
+tag         = "#FFC799"
+
+string      = "#99FFE4"                              # the cool accent
+character   = "#99FFE4"
+# The warm accent, not a shade of string — vesper's own @string.escape, so an
+# escape sequence stands out from the text around it rather than blending in.
+escape      = "#FFC799"
+
+comment     = "#5C5C5C"
+
+constant    = "#FFC799"
+number      = "#FFC799"
+float       = "#FFC799"
+boolean     = "#FFC799"
+
+attribute   = "#A0A0A0"                              # fg_muted, source's own
+label       = "#FFC799"                              # accent, source's own
+
+operator    = "#A0A0A0"                              # fg_muted, not plain fg
+punctuation = "#A0A0A0"
+delimiter   = "#A0A0A0"
+
+# Property is plain foreground in the source — not a colour of its own, and
+# kept that way rather than invented.
+property                = "#FFFFFF"
+# The source has no JSON/Ruby-symbol distinction to draw from, so these take
+# the muted gray keywords use: a key or a symbol is closer to a keyword than
+# to prose, and either reads clearly next to mint `string` and white `fg`.
+"string.special.key"    = "#A0A0A0"
+"string.special.symbol" = "#A0A0A0"
+"string.special.regex"  = "#FFC799"                  # warm, like an escape
+
+"text.title"     = { fg = "#FFC799", bold = true }
+"text.literal"   = "#99FFE4"
+"text.uri"       = { fg = "#FFC799", underline = true }
+"text.reference" = "#FFD1A8"                         # accent_bright
+
+[ui]
+background = "#101010"                               # bg
+foreground = "#FFFFFF"                                # fg
+
+cursorline = { bg = "#1A1A1A" }                      # bg_elevated
+selection  = { bg = "#282828" }                      # bg_hover — source's own Visual
+# Both halves, as `theme.md` requires: fg white, bg the source's own Search
+# gray, so a match reads clearly against dimmed text without borrowing a
+# colour a capture already owns.
+search     = { fg = "#FFFFFF", bg = "#575757" }
+cursor_alt = { bg = "#5C5C5C" }                      # comment's gray, a third tier
+# The source's own IncSearch: background flips to the warm accent, text to
+# the editor's own background — vesper's one "look here" moment, reused for
+# the yank flash and the pick-a-letter label alike.
+flash      = { bg = "#FFC799" }
+label      = { fg = "#101010", bg = "#FFC799", bold = true }
+dim        = "#7E7E7E"                               # fg_dim
+
+gutter         = "#505050"                           # line_nr, source's own
+gutter_current = "#FFFFFF"                           # source's own CursorLineNr
+rule           = "#282828"                           # border
+filler         = "#101010"                           # source hides the `~` entirely
+indent_guide   = "#282828"
+whitespace     = "#7E7E7E"                           # fg_dim, source's own
+# One step up from the frame, quiet like gruvbox-dark's: furniture recedes
+# until you go looking for it.
+context        = "#1A1A1A"
+context_header = { fg = "#A0A0A0", bg = "#1A1A1A" }
+
+# The source has no five-way TODO vocabulary to draw from — it is a
+# three-colour palette (warm accent, cool accent, red) plus two brighter
+# variants of the first two. Fix takes the source's `error` red; warn takes
+# its own `warning`, which the source already sets to the same accent as
+# everything else; the other three borrow the brighter variants so five
+# badges stay five distinguishable colours rather than three repeated twice.
+todo_fix   = { fg = "#101010", bg = "#FF8080", bold = true }   # error
+todo_todo  = { fg = "#101010", bg = "#99FFE4", bold = true }   # string
+todo_warn  = { fg = "#101010", bg = "#FFC799", bold = true }   # accent / warning
+todo_perf  = { fg = "#101010", bg = "#FFD1A8", bold = true }   # accent_bright
+todo_note  = { fg = "#101010", bg = "#B3FFE4", bold = true }   # string_bright
+
+# The source has no mode-badge concept of its own — this is bi's furniture,
+# not vesper's — so these three borrow the roles nearest in spirit: neutral
+# for normal, the cool accent for insert (new text, same hue as an addition),
+# the warm accent for pick (the same colour a jump target and a directory
+# entry already wear).
+mode_normal = { fg = "#101010", bg = "#A0A0A0", bold = true }
+mode_insert = { fg = "#101010", bg = "#99FFE4", bold = true }
+mode_pick   = { fg = "#101010", bg = "#FFC799", bold = true }
+
+status          = "#FFFFFF"
+status_muted    = "#7E7E7E"                          # fg_dim
+status_inactive = "#7E7E7E"                          # source's own StatusLineNC
+# One step off the frame rather than flush with it — the source paints its
+# own statusline the same colour as the background, which cannot survive
+# bi's furniture rule that a role you are meant to see must not disappear
+# into the one behind it.
+statusline      = { fg = "#A0A0A0", bg = "#1A1A1A" }
+
+tree_dir  = "#FFC799"                                # source's own Directory
+tree_link = "#FFD1A8"                                # accent_bright
+mark_copy = "#99FFE4"                                # string, like an addition
+mark_cut  = "#FF8080"                                # error, like a deletion
+
+picker_border   = "#FFC799"
+picker_prompt   = "#FFC799"
+# The source's own PmenuSel, verbatim: fg the foreground, bg the selected tier.
+picker_selected = { fg = "#FFFFFF", bg = "#232323", bold = true }
+picker_badge    = "#7E7E7E"
+picker_divider  = "#282828"
+picker_preview  = "#A0A0A0"

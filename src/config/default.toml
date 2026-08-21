@@ -82,7 +82,7 @@ gitignore = true
 
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Built in: main, gruvbox-dark, gruvbox-light,
-# pascal, ansi.
+# pascal, ansi, vesper.
 #
 # `main` is the default: a near-black frame with cool accents, from IBM Carbon.
 # `gruvbox-dark` was the default before it and is unchanged.
@@ -91,6 +91,8 @@ gitignore = true
 # `pascal` is Borland Turbo Pascal 7, in the sixteen EGA colours.
 # `ansi` is bi's pre-theme colours in the sixteen ANSI names, so it uses YOUR
 # terminal palette and its background rather than bringing its own.
+# `vesper` is near-black with one warm and one cool accent, after
+# github.com/nexxeln/vesper.nvim.
 # See docs/specs/theme.md.
 theme = "main"
 

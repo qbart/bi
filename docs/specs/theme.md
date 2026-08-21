@@ -270,7 +270,7 @@ without changing the type.
 
 ## The built-ins
 
-Five, compiled in with `include_str!`, and parsed through the same parser a
+Six, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
@@ -442,6 +442,45 @@ what `render.rs` hardcoded, the type is missing something, and that is how
 
 It sets no `background`.
 
+### `vesper`
+
+A near-black theme after [nexxeln/vesper.nvim](https://github.com/nexxeln/vesper.nvim),
+sourced from that project's own `palette.lua` and `highlights.lua` rather than
+approximated by eye.
+
+**One warm accent and one cool accent carry almost everything.** `#FFC799`
+(warm) is function, constructor, type, module, tag, constant, number, float,
+boolean and label; `#99FFE4` (cool) is string and character. Keyword,
+operator, punctuation, delimiter and attribute share a single muted gray,
+`#A0A0A0` — which is not `foreground` (`#FFFFFF`), so it still clears the
+operator test, but it is one flat gray doing five jobs where the other
+built-ins spend five.
+
+**No built-in styles bold or italic except this one's absence of both.** The
+source's own `Comment` and `Function` definitions carry no attributes at all,
+and neither does any other syntax group outside markdown markup — checked
+directly against the file rather than assumed. Every other built-in here
+bolds `function` and italicises `comment`; `vesper` does neither, on purpose,
+because the source draws its hierarchy from colour alone.
+
+**`escape` is the warm accent, not a shade of `string`.** That is the
+source's own `@string.escape`, and it is easy to miss reading the palette
+table alone: an escape sequence inside a string is meant to interrupt it, not
+blend into the color around it.
+
+**`property` is plain foreground**, because that is what the source's own
+`Property` and `@property` groups are — not translated into a colour of its
+own, which every other built-in here gives it.
+
+Two adaptations depart from a literal reading, and both are called out in the
+file: `filler` matches the source's choice to hide `~` entirely (painted the
+background's own colour), but `statusline` does not — the source paints its
+statusline the same colour as the background, and a role meant to be seen
+cannot disappear into the one behind it, so this file lifts it one step. Where
+the source has no equivalent at all — the mode badge, the five-way TODO
+palette, a second cursor's colour — those roles are built from the same six
+colours rather than introducing new ones.
+
 ## Testing
 
 - every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
@@ -477,6 +516,9 @@ It sets no `background`.
 - `main` is the default, claims `#161616`, and keeps its greys on Carbon's own
   ramp — the theme-identity test each built-in gets, and the same shape as
   `pascal`'s
+- `vesper`'s `string.special.symbol` and `string.special.regex` are not just
+  `string` either, alongside `main` and both gruvbox themes — sourced from a
+  different palette, held to the same rule
 
 ## Deferred
 

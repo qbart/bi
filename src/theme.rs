@@ -314,6 +314,7 @@ const GRUVBOX_DARK: &str = include_str!("themes/gruvbox-dark.toml");
 const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
 const PASCAL: &str = include_str!("themes/pascal.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
+const VESPER: &str = include_str!("themes/vesper.toml");
 
 impl Default for Theme {
     /// The shipped `main`, parsed.
@@ -340,6 +341,7 @@ impl Theme {
             "gruvbox-light" => Some(GRUVBOX_LIGHT),
             "pascal" => Some(PASCAL),
             "ansi" => Some(ANSI),
+            "vesper" => Some(VESPER),
             _ => None,
         }
     }
@@ -352,7 +354,7 @@ impl Theme {
     /// `gruvbox-dark` is here for a different reason: it *was* the default,
     /// and a theme losing that job is not a theme being withdrawn.
     pub const BUILTINS: &'static [&'static str] =
-        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi"];
+        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi", "vesper"];
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -774,7 +776,7 @@ mod tests {
     /// whose files render blank.
     #[test]
     fn every_builtin_fills_the_roles_that_carry_a_file() {
-        for name in ["main", "gruvbox-dark", "gruvbox-light", "pascal", "ansi"] {
+        for name in Theme::BUILTINS {
             let theme = parsed(name);
             for role in ["keyword", "string", "comment", "type", "property", "tag"] {
                 assert!(theme.style(role).is_some(), "{name} leaves {role} unpainted");
@@ -793,7 +795,7 @@ mod tests {
     /// had themes, and before it had themes these fell through to `string`.
     #[test]
     fn a_symbol_and_a_regex_are_not_just_strings() {
-        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light"] {
+        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper"] {
             let theme = parsed(name);
             let string = theme.style("string");
             for special in ["string.special.symbol", "string.special.regex"] {
