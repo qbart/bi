@@ -21,12 +21,13 @@
 [syntax]
 # Pink for the words that are the language rather than the program.
 keyword     = "#ee5396"
-function    = { fg = "#5FDFDF", bold = true }        # blue
-constructor = { fg = "#5FDFDF", bold = true }
+function    = { fg = "#dde1e6", bold = true }        # blue
+constructor = { fg = "#dde1e6", bold = true }
 #constructor = { fg = "#78a9ff", bold = true }
 
 type        = "#00D3D0"                              # teal
 module      = "#00D3D0"
+
 
 
 # An element name names a kind of node, which is what a type is — XML's own
@@ -57,6 +58,7 @@ label       = "#82cfff"
 # failure docs/specs/tree-sitter.md names as "a capture styled the colour of
 # nothing".
 operator    = "#ff7eb6"
+#operator    = "#FFC799"
 
 # Brackets and separators stay quiet on purpose — structure, not meaning, and
 # on every line.
@@ -66,7 +68,7 @@ delimiter   = "#8d8d8d"
 # The key side of a config format. Without this the whole left-hand column of
 # a TOML or JSON file reads as ordinary string values.
 #property             = "#33b1ff"                     # cyan
-property             = "#FFFF5F"                     # cyan
+property             = "#5FDFDF"                     # cyan
 "string.special.key" = "#33b1ff"
 
 # A Ruby symbol is a key, not a string, and Ruby is dense with them. Left to
