@@ -1849,47 +1849,6 @@ pub struct View<'a> {
     pub session: &'a mut Session,
 }
 
-/// The block's left and right columns, from the corners of the primary
-/// selection. Inclusive of the right, as charwise visual is.
-///
-/// Free functions rather than methods because the renderer asks these of a
-/// window it is not editing, and building a `View` to answer would mean
-/// borrowing the session mutably to read two columns.
-fn block_columns_of(buffer: &Buffer, selections: &Selections) -> (usize, usize) {
-    let selection = selections.primary();
-    let a = buffer.col_at(selection.anchor);
-    let b = buffer.col_at(selection.head);
-    (a.min(b), a.max(b))
-}
-
-/// One `(start, end)` char range per row the block covers, top to bottom.
-///
-/// Rows too short to reach the left edge come back empty and stay in the list:
-/// a block is a rectangle even where the text is not, and dropping them would
-/// lose the shape a yanked block has to keep.
-fn spans_of_block(buffer: &Buffer, selections: &Selections, to_eol: bool) -> Vec<(usize, usize)> {
-    let (lo, hi) = selections.primary().range();
-    let (first, last) = (buffer.row_at(Cursor::at(lo)), buffer.row_at(Cursor::at(hi)));
-    (first..=last).map(|row| span_of_block_at(buffer, selections, to_eol, row)).collect()
-}
-
-/// The block's span on one row. What the renderer asks, a row at a time —
-/// building the whole list per visible row would put the block's height into
-/// the cost of a frame, which is the one thing rendering here avoids.
-fn span_of_block_at(
-    buffer: &Buffer,
-    selections: &Selections,
-    to_eol: bool,
-    row: usize,
-) -> (usize, usize) {
-    let (left, right) = block_columns_of(buffer, selections);
-    let start = buffer.rope().line_to_char(row);
-    let len = buffer.line_len(row);
-    let from = left.min(len);
-    let to = if to_eol { len } else { (right + 1).min(len) };
-    (start + from, start + to.max(from))
-}
-
 /// Picks a grammar from the file's name. An unknown one yields `None`, which
 /// renders as plain text.
 ///
@@ -2728,7 +2687,9 @@ impl Editor {
         else {
             return (0, 0);
         };
-        span_of_block_at(buffer, &text.selections, self.session.block_to_eol, row)
+        let span =
+            crate::region::block_span_at(buffer, &text.selections, self.session.block_to_eol, row);
+        (span.start, span.end)
     }
 
     /// What kind of selection is on screen, if any.
@@ -4954,14 +4915,19 @@ impl Editor {
         let (Some(buffer), Some(selections)) = (self.buffer(), self.selections()) else {
             return Vec::new();
         };
-        spans_of_block(buffer, selections, self.session.block_to_eol)
+        Region::of(buffer, selections, Shape::Block, self.session.block_to_eol)
+            .parts()
+            .iter()
+            .map(|part| (part.start, part.end))
+            .collect()
     }
 
     pub fn block_span_at(&self, row: usize) -> (usize, usize) {
         let (Some(buffer), Some(selections)) = (self.buffer(), self.selections()) else {
             return (0, 0);
         };
-        span_of_block_at(buffer, selections, self.session.block_to_eol, row)
+        let span = crate::region::block_span_at(buffer, selections, self.session.block_to_eol, row);
+        (span.start, span.end)
     }
 
     pub fn search_count(&mut self) -> Option<(usize, usize)> {
@@ -5086,15 +5052,36 @@ impl View<'_> {
     }
 
     fn block_columns(&self) -> (usize, usize) {
-        block_columns_of(self.buffer, self.selections)
+        crate::region::block_columns(self.buffer, self.selections)
+    }
+
+    /// What is selected, as a region.
+    ///
+    /// The one place the mode's shape becomes characters. Every operator over
+    /// a selection asks this and then works on what it gets, rather than
+    /// re-deriving "what does blockwise mean here" for itself — which is what
+    /// left `S(` over a rectangle wrapping everything between the corners.
+    fn selected(&self) -> Region {
+        Region::of(
+            self.buffer,
+            self.selections,
+            self.session.mode.visual().unwrap_or(Shape::Chars),
+            self.session.block_to_eol,
+        )
     }
 
     pub fn block_spans(&self) -> Vec<(usize, usize)> {
-        spans_of_block(self.buffer, self.selections, self.session.block_to_eol)
+        self.selected().parts().iter().map(|part| (part.start, part.end)).collect()
     }
 
     pub fn block_span_at(&self, row: usize) -> (usize, usize) {
-        span_of_block_at(self.buffer, self.selections, self.session.block_to_eol, row)
+        let span = crate::region::block_span_at(
+            self.buffer,
+            self.selections,
+            self.session.block_to_eol,
+            row,
+        );
+        (span.start, span.end)
     }
 
     /// The char at `(row, col)`, clamped to the row.
@@ -5104,52 +5091,21 @@ impl View<'_> {
         Cursor::at(start + col.min(self.buffer.line_len(row).saturating_sub(1)))
     }
 
-    /// What is selected, as one span per row and never crossing a terminator.
-    ///
-    /// `r` is the caller: it overwrites characters, and a newline is not one it
-    /// may overwrite. Blockwise is the interesting case — and it is the only
-    /// one that is a single selection, so the others fold over the whole set.
-    fn selection_spans(&self) -> Vec<(usize, usize)> {
-        if self.session.mode.visual() == Some(Shape::Block) {
-            return self.block_spans();
-        }
-        self.selections.all().iter().flat_map(|selection| self.rows_of(*selection)).collect()
-    }
-
-    /// One span per row a selection touches, clipped to that row's content.
-    fn rows_of(&self, selection: Selection) -> Vec<(usize, usize)> {
-        let (lo, hi) = match self.session.mode.visual() {
-            Some(Shape::Lines) => {
-                self.buffer.line_range(selection.range().0, selection.range().1, false)
-            }
-            _ => selection.inclusive_range(self.buffer.rope().len_chars()),
-        };
-        let (first, last) =
-            (self.buffer.row_at(Cursor::at(lo)), self.buffer.row_at(Cursor::at(hi.max(lo))));
-
-        (first..=last)
-            .map(|row| {
-                let start = self.buffer.rope().line_to_char(row);
-                let end = start + self.buffer.line_len(row);
-                (start.max(lo), end.min(hi))
-            })
-            .filter(|(start, end)| end > start)
-            .collect()
-    }
-
     /// Cuts or copies the rectangle.
     ///
     /// Not routed through `for_each_selection`, because the selections it would
     /// iterate do not exist yet — the block is derived, and this is the moment
     /// it becomes real.
     fn operate_block(&mut self, op: Operator, sink: Sink) {
-        let spans = self.block_spans();
+        let region = self.selected();
+        let spans: Vec<(usize, usize)> =
+            region.parts().iter().map(|part| (part.start, part.end)).collect();
         if sink != Sink::BlackHole {
-            let rows: Vec<String> =
-                spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
             // One entry, not one per row: what was taken is a rectangle, and
-            // pasting it back has to know that.
-            self.session.capture(Entry { text: rows.join("\n"), kind: Shape::Block }, sink);
+            // pasting it back has to know that. The shape spells the text —
+            // see [`Region::text`].
+            let entry = Entry { text: region.text(self.buffer), kind: region.shape() };
+            self.session.capture(entry, sink);
         }
 
         if op == Operator::Yank {
@@ -5160,16 +5116,9 @@ impl View<'_> {
             }
         }
 
-        let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
+        let top_left = region.start();
         if op != Operator::Yank {
-            // Bottom to top: a cut shifts everything below it and nothing
-            // above, so descending order keeps every span's position valid
-            // without a correction pass.
-            for &(start, end) in spans.iter().rev() {
-                if end > start {
-                    self.buffer.operate_range(Cursor::at(start), op, start, end, false);
-                }
-            }
+            region.cut(self.buffer, op);
         }
 
         if op == Operator::Change {
@@ -5257,31 +5206,35 @@ impl View<'_> {
     /// kinds cut the rectangle out first and then paste as they always do:
     /// lines below the block, a rectangle at its corner.
     fn paste_over_block(&mut self, entry: &Entry, capture: bool, count: usize) {
-        let spans = self.block_spans();
+        let region = self.selected();
         if capture {
-            let rows: Vec<String> =
-                spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
             // One entry, not one per row: what was taken is a rectangle, and
             // pasting it back has to know that.
-            self.session.registers.push(Entry { text: rows.join("\n"), kind: Shape::Block });
+            let taken = Entry { text: region.text(self.buffer), kind: region.shape() };
+            self.session.registers.push(taken);
         }
 
-        let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
-        let bottom = spans.last().map(|&(start, _)| start).unwrap_or(0);
+        let top_left = region.start();
+        let bottom = region.parts().last().map_or(0, |part| part.start);
         let last_row = self.buffer.row_at(Cursor::at(bottom));
 
         let landed = match entry.kind {
             Shape::Chars => {
-                self.replace_spans(&spans, entry, count);
+                // Each part is a range in its own right, and replacing them one
+                // by one is what "paste over this rectangle" means when the
+                // thing being pasted is not one.
+                for part in region.parts().iter().rev() {
+                    self.buffer.paste_over(part.start, part.end, false, entry, count);
+                }
                 self.buffer.clamped(Cursor::at(top_left), false)
             }
             Shape::Lines => {
-                self.cut_spans(&spans);
+                region.cut(self.buffer, Operator::Delete);
                 let at = self.buffer.at_row(last_row, false);
                 self.buffer.paste(at, entry, false, count)
             }
             Shape::Block => {
-                self.cut_spans(&spans);
+                region.cut(self.buffer, Operator::Delete);
                 let at = self.buffer.clamped(Cursor::at(top_left), true);
                 self.buffer.paste(at, entry, true, count)
             }
@@ -5289,23 +5242,6 @@ impl View<'_> {
 
         self.session.mode = Mode::Normal;
         *self.selections = Selections::single(landed);
-    }
-
-    /// Cuts every span, bottom to top: a cut shifts everything below it and
-    /// nothing above, so descending order keeps the rest valid.
-    fn cut_spans(&mut self, spans: &[(usize, usize)]) {
-        for &(start, end) in spans.iter().rev() {
-            if end > start {
-                self.buffer.operate_range(Cursor::at(start), Operator::Delete, start, end, false);
-            }
-        }
-    }
-
-    /// The same walk, replacing each span with `entry` rather than emptying it.
-    fn replace_spans(&mut self, spans: &[(usize, usize)], entry: &Entry, count: usize) {
-        for &(start, end) in spans.iter().rev() {
-            self.buffer.paste_over(start, end, false, entry, count);
-        }
     }
 
     /// Where the block's cursors go for `I` and `A`.
@@ -5774,11 +5710,13 @@ impl View<'_> {
             }
             Action::ReplaceSelection(ch) => {
                 let ch = *ch;
-                let spans = self.selection_spans();
+                // A row at a time: `r` overwrites characters, and a newline is
+                // not one it may overwrite.
+                let spans = self.selected().spans(self.buffer);
                 // Length-preserving, so the order does not matter and no shift
                 // correction is needed — unlike every other edit here.
-                for (start, end) in spans {
-                    self.buffer.replace_chars(Cursor::at(start), ch, end - start);
+                for span in spans {
+                    self.buffer.replace_chars(Cursor::at(span.start), ch, span.end - span.start);
                 }
                 // Every selection collapses onto its own start, which keeps a
                 // multi-cursor visual `r` multi-cursor.
@@ -5822,18 +5760,17 @@ impl View<'_> {
             }
             Action::OperateSelection { op, sink } => {
                 let (op, sink) = (*op, *sink);
-                let linewise = self.session.mode.visual() == Some(Shape::Lines);
+                let shape = self.session.mode.visual().unwrap_or(Shape::Chars);
+                let linewise = shape == Shape::Lines;
                 self.for_each_selection(|ed, sel| {
-                    let len = ed.buffer.rope().len_chars();
-                    let (start, end) = if linewise {
-                        // Change keeps the line for insert mode to sit on, the
-                        // same rule `cc` follows.
-                        let (lo, hi) = sel.range();
-                        ed.buffer.line_range(lo, hi, op != Operator::Change)
-                    } else {
-                        // Charwise visual includes the character under the head.
-                        sel.inclusive_range(len)
+                    let part = Region::part_of(ed.buffer, sel, shape);
+                    // Change keeps the line for insert mode to sit on, the same
+                    // rule `cc` follows; delete and yank take the terminator.
+                    let part = match linewise && op != Operator::Change {
+                        true => part.terminated(ed.buffer),
+                        false => part,
                     };
+                    let (start, end) = (part.start, part.end);
                     match ed.buffer.operate_range(sel.head, op, start, end, linewise) {
                         Some((entry, landed, range)) => {
                             ed.session.capture(entry, sink);
@@ -5865,24 +5802,33 @@ impl View<'_> {
                     }
                 });
             }
+            // Every part of what is selected, whatever shape it has. A
+            // rectangle wraps each row's columns — it used to wrap everything
+            // between the two corners, brackets and line ends included, which
+            // is what a charwise range means and a rectangle never did.
             Action::SurroundSelection { with } => {
                 let with = *with;
                 let Some(pair) = crate::surround::pair_for(with) else {
                     self.session.status = format!("nothing surrounds with {with}");
                     return;
                 };
-                let linewise = self.session.mode.visual() == Some(Shape::Lines);
-                self.for_each_selection(|ed, sel| {
-                    let len = ed.buffer.rope().len_chars();
-                    let (start, end) = match linewise {
-                        true => {
-                            let (lo, hi) = sel.range();
-                            ed.buffer.line_range(lo, hi, false)
-                        }
-                        false => sel.inclusive_range(len),
-                    };
-                    Selection::collapsed(ed.buffer.surround(sel.head, start, end, &pair))
-                });
+                let region = self.selected();
+                let before = self.selections.as_pairs();
+                // Back to front: an insertion shifts everything below it.
+                let mut heads = Vec::new();
+                for part in region.parts().iter().rev() {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let at = Cursor::at(part.start);
+                    heads.push(self.buffer.surround(at, part.start, part.end, &pair));
+                }
+                if heads.is_empty() {
+                    self.session.status = "nothing selected".into();
+                    return;
+                }
+                self.selections.set(heads.into_iter().map(Selection::collapsed).collect());
+                self.buffer.commit_undo(before, self.selections.as_pairs());
                 self.session.mode = Mode::Normal;
             }
             Action::Unsurround { of } => {
@@ -6355,7 +6301,6 @@ impl View<'_> {
             // is a keystroke that says nothing new. Every cursor gets one, so
             // a column of cursors respells a column of names.
             Fallback::Words => Region::spanning(
-                self.buffer,
                 Shape::Chars,
                 self.selections.all().iter().filter_map(|selection| {
                     self.buffer
@@ -6369,14 +6314,14 @@ impl View<'_> {
             ),
             Fallback::CursorRow => {
                 let row = self.buffer.row_at(self.selections.cursor());
-                Region::rows(self.buffer, row, row)
+                Region::of_rows(self.buffer, row, row)
             }
             Fallback::File => {
-                Region::rows(self.buffer, 0, self.buffer.line_count().saturating_sub(1))
+                Region::of_rows(self.buffer, 0, self.buffer.line_count().saturating_sub(1))
             }
             Fallback::SelectionRows => {
                 let (first, last) = self.selected_rows();
-                Region::rows(self.buffer, first, last)
+                Region::of_rows(self.buffer, first, last)
             }
         }
     }
@@ -6403,7 +6348,7 @@ impl View<'_> {
             )),
             Some(Scope::Lines(range)) => {
                 let (first, last) = range.rows(self.line_numbers())?;
-                Ok(Region::rows(self.buffer, first, last))
+                Ok(Region::of_rows(self.buffer, first, last))
             }
             None => Ok(self.fallback_region(fallback)),
         }
@@ -6412,8 +6357,10 @@ impl View<'_> {
     /// The rows a region covers, for a command that can only work in whole
     /// lines. Says so when it had to widen, rather than doing it quietly.
     fn whole_rows(&mut self, region: Region) -> Option<(usize, usize)> {
-        let (first, last) = region.row_range()?;
-        if !region.is_rows(self.buffer) {
+        let (first, last) = region.row_range(self.buffer)?;
+        // Said out loud rather than done quietly: a command that can only work
+        // in whole lines, handed a rectangle, has widened what you asked for.
+        if region != Region::of_rows(self.buffer, first, last) {
             self.session.status = "whole lines".into();
         }
         Some((first, last))
@@ -6509,8 +6456,8 @@ impl View<'_> {
         }
 
         let before = self.selections.as_pairs();
-        let rows = region.filled_rows();
-        let edits = region.rewrite(self.buffer, |text| crate::case::convert(text, style));
+        let rows = region.filled_rows(self.buffer);
+        let edits = region.rewrite_rows(self.buffer, |text| crate::case::convert(text, style));
 
         // Carried across the edits rather than replaced: the cursors were
         // where you put them, and respelling the text under one is not a
@@ -6580,8 +6527,9 @@ impl View<'_> {
         // region, and searching it is the same search either way.
         let mut hits: Vec<(usize, usize)> = Vec::new();
         let mut rows = 0usize;
-        let mut end_row = region.spans().first().map_or(0, |span| span.row);
-        for span in region.spans() {
+        let spans = region.spans(self.buffer);
+        let mut end_row = spans.first().map_or(0, |span| span.row);
+        for span in &spans {
             let found =
                 self.buffer.matches_in_cased(span.start, span.end, &pattern, false, how.case);
             let found = match how.all {
@@ -12912,6 +12860,55 @@ mod tests {
         assert_eq!(whole(&ed), "let some_name = 1;\n", "and not the `let` in front of it");
     }
 
+    /// `:s` inside a rectangle stays inside it. The columns are the scope,
+    /// and the same walk that respells them substitutes in them.
+    #[test]
+    fn substitute_over_a_rectangle_stays_in_the_columns() {
+        let mut ed = block_over_the_names("let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n");
+
+        ex(&mut ed, "'v s/a/X/g");
+
+        assert_eq!(
+            whole(&ed),
+            "let XlphX = 1;\nlet betX  = 2;\nlet gXmmX = 3;\n",
+            "and never the `a` in the text on either side"
+        );
+    }
+
+    /// A command that can only work in whole lines, handed a rectangle,
+    /// widens to the rows and says so rather than doing it quietly.
+    #[test]
+    fn a_command_that_needs_rows_widens_and_says_so() {
+        let mut ed = block_over_the_names("let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n");
+
+        ex(&mut ed, "'v m 0");
+
+        assert_eq!(ed.session.status, "whole lines");
+        assert_eq!(
+            whole(&ed),
+            "let alpha = 1;\nlet beta  = 2;\nlet gamma = 3;\n",
+            "already at the top, so the rows are the same three"
+        );
+    }
+
+    /// Every cursor's own selection, not the span between the first and the
+    /// last — which is what a line range would have made of them.
+    #[test]
+    fn the_selection_scope_reaches_every_cursor_and_nothing_between_them() {
+        let mut ed = editor("foo_bar\nzzz\nfoo_bar\n");
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        for _ in 0..6 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v case camel");
+
+        assert_eq!(whole(&ed), "fooBar\nzzz\nfooBar\n", "the middle row is not selected");
+    }
+
     #[test]
     fn case_over_a_range_takes_whole_lines() {
         let mut ed = editor("ONE\nTWO\nTHREE\n");
@@ -13897,6 +13894,37 @@ int main(void) {
         ed.apply(cmd(Action::Undo));
 
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello", "both edits, one step");
+    }
+
+    /// A rectangle wraps each row's columns. It used to wrap everything
+    /// between the two corners — brackets, line ends and all — because
+    /// `SurroundSelection` had no blockwise arm and a charwise range was the
+    /// only thing it knew how to build.
+    #[test]
+    fn visual_s_over_a_rectangle_wraps_every_row() {
+        let mut ed = visual("let alpha = 1;\nlet beta  = 2;\n", 4, Shape::Block);
+        for _ in 0..4 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ed.apply(cmd(Action::SurroundSelection { with: '"' }));
+
+        assert_eq!(whole(&ed), "let \"alpha\" = 1;\nlet \"beta \" = 2;\n");
+    }
+
+    /// And one `u` takes the whole rectangle back.
+    #[test]
+    fn visual_s_over_a_rectangle_is_one_undo_step() {
+        let text = "ab\ncd\n";
+        let mut ed = visual(text, 0, Shape::Block);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ed.apply(cmd(Action::SurroundSelection { with: '"' }));
+        assert_eq!(whole(&ed), "\"a\"b\n\"c\"d\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), text);
     }
 
     #[test]
