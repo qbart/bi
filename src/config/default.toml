@@ -23,6 +23,12 @@ autoindent = true
 # `indent_guide`. See docs/specs/indent.md.
 indent_guides = true
 
+# The grammar to read a buffer with, overriding what its file name says —
+# `:set syntax bash` for a script with no extension, `:set syntax auto` to hand
+# the decision back. It changes what bi parses, not which [filetype.<name>]
+# block applies: the file is still called what it is called.
+syntax = "auto"
+
 # Cells to the left of the line numbers, held for a mark about the line rather
 # than in it — a git sign, a diagnostic, a breakpoint. Nothing draws one yet;
 # the column is reserved now so that the day something does, the file does not

@@ -129,6 +129,59 @@ pub fn filetype(file: &str) -> Option<&'static str> {
     })
 }
 
+/// Every file type bi ships a grammar for, in [`filetype`]'s spelling.
+///
+/// A list beside [`grammar`] rather than derived from it, because a `match`
+/// cannot be enumerated — and it earns the duplication twice over: it is what
+/// `:set syntax` validates a typed name against, and what its error message
+/// prints. `every_name_has_a_grammar` keeps the two in step.
+pub const NAMES: &[&str] = &[
+    "bash",
+    "c",
+    "c3",
+    "cmake",
+    "cpp",
+    "crystal",
+    "csharp",
+    "css",
+    "dockerfile",
+    "dtd",
+    "glsl",
+    "go",
+    "hcl",
+    "hlsl",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "lua",
+    "make",
+    "markdown",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scss",
+    "slang",
+    "swift",
+    "templ",
+    "toml",
+    "tsx",
+    "typescript",
+    "xml",
+    "yaml",
+];
+
+/// The canonical spelling of `name`, if bi has a grammar for it.
+///
+/// A `&'static str` because that is what [`Syntax`] stores, and what a name
+/// typed on the `:` line can never be on its own.
+pub fn canonical(name: &str) -> Option<&'static str> {
+    NAMES.iter().find(|known| **known == name).copied()
+}
+
 /// Grammar for a file type, or `None` when bi names the type but ships no
 /// parser for it.
 fn grammar(filetype: &str) -> Option<(Language, &'static str)> {
@@ -399,7 +452,15 @@ impl Syntax {
     /// extension. `None` when no grammar is known: an unrecognised file is
     /// plain text, never an error.
     pub fn new(file: &str, rope: &Rope) -> Option<Self> {
-        let filetype = filetype(file)?;
+        Self::for_filetype(filetype(file)?, rope)
+    }
+
+    /// Parses `rope` as `filetype`, whatever the file is called.
+    ///
+    /// What `:set syntax` reaches for: the name has already been decided by
+    /// something other than the path, and re-deriving it from a file name that
+    /// says otherwise is the one thing this must not do.
+    pub fn for_filetype(filetype: &'static str, rope: &Rope) -> Option<Self> {
         let (language, highlights) = grammar(filetype)?;
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
@@ -568,6 +629,39 @@ fn input_edit(edit: &Edit) -> InputEdit {
 
 fn point(p: crate::buffer::Point) -> TsPoint {
     TsPoint { row: p.row, column: p.col }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// The list and the `match` are two hands on the same fact, so they get a
+    /// test that they still agree.
+    #[test]
+    fn every_name_has_a_grammar() {
+        for name in NAMES {
+            assert!(grammar(name).is_some(), "{name} is listed and has no parser");
+        }
+    }
+
+    /// And the other direction, as far as it can be checked: every filetype
+    /// `filetype()` can produce for a file bi claims must be sayable to
+    /// `:set syntax`.
+    #[test]
+    fn a_detected_filetype_can_be_asked_for_by_name() {
+        for file in ["a.rs", "Makefile", "a.py", "a.c3", "CMakeLists.txt", "a.tsx", "a.rb"] {
+            let detected = filetype(file).expect("bi claims this file");
+            assert_eq!(canonical(detected), Some(detected), "{file} -> {detected} is not listed");
+        }
+    }
+
+    #[test]
+    fn canonical_refuses_what_bi_cannot_parse() {
+        assert_eq!(canonical("rust"), Some("rust"));
+        assert_eq!(canonical("Rust"), None, "the spelling is the one bi uses");
+        assert_eq!(canonical("cobol"), None);
+        assert_eq!(canonical(""), None);
+    }
 }
 
 #[cfg(test)]

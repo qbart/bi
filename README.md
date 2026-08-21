@@ -683,6 +683,23 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### `:set syntax`
+
+`:set syntax bash` reads the buffer with a grammar its file name did not ask
+for — a script with no extension, a `.txt` that is really JSON, a config file
+whose extension lies. `:set syntax auto` hands the decision back to the name,
+and a bare `:set syntax` reports what is actually in force rather than the
+override, which is empty in the normal case.
+
+It changes what bi *parses* — highlighting, `S`, the context annotations — and
+not which `[filetype.<name>]` block applies: the file is still called what it
+is called, and its indentation policy follows the name. That also keeps option
+resolution a single pass, since an option that decided which options applied
+would have to be resolved before itself.
+
+A name bi has no parser for is refused by name rather than silently leaving the
+buffer as plain text.
+
 #### The sign column
 
 One cell to the left of the line numbers, held open whether or not there is

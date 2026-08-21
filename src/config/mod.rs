@@ -104,6 +104,15 @@ pub struct Options {
     /// `/`, and the status line's `[3/17]` says how many matches there are
     /// without painting them.
     pub hlsearch: bool,
+    /// The grammar to read this buffer with, overriding what its name says.
+    /// Empty is the honest spelling of "whatever the file is called".
+    ///
+    /// It changes what bi *parses*, not which `[filetype.<name>]` block
+    /// applies: the file is still called what it is called, and its
+    /// indentation policy follows the name. That also keeps the resolution a
+    /// single pass — an option that decided which options applied would have
+    /// to be resolved before itself.
+    pub syntax: String,
 
     /// How wide a `\t` is drawn.
     pub tab_width: usize,
@@ -171,6 +180,7 @@ impl Default for Options {
         Options {
             number: LineNumbers::default(),
             hlsearch: false,
+            syntax: String::new(),
             theme: crate::theme::DEFAULT_THEME.to_string(),
             ssh_theme: "gruvbox-light".to_string(),
             tab_width: indent.tab_width,
@@ -205,6 +215,14 @@ impl Options {
             ("number", _) => return Err("number takes 0 (off), -1 (relative) or a count".into()),
             ("hlsearch", OptionValue::Bool(on)) => self.hlsearch = on,
             ("hlsearch", _) => return Err("hlsearch takes true or false".into()),
+            // `auto` and the empty string both mean "ask the file name", which
+            // is the only way back once you have overridden it.
+            ("syntax", OptionValue::Str(name)) if name == "auto" => self.syntax = String::new(),
+            ("syntax", OptionValue::Str(name)) => match crate::syntax::canonical(&name) {
+                Some(known) => self.syntax = known.to_string(),
+                None => return Err(format!("no grammar for {name}")),
+            },
+            ("syntax", _) => return Err("syntax takes the name of a language".into()),
             ("theme", OptionValue::Str(name)) => self.theme = name,
             ("theme", _) => return Err("theme takes the name of a theme, in quotes".into()),
             ("ssh_theme", OptionValue::Str(name)) => self.ssh_theme = name,
@@ -284,6 +302,7 @@ impl Options {
         Some(match name {
             "number" => OptionValue::Int(self.number.setting()),
             "hlsearch" => OptionValue::Bool(self.hlsearch),
+            "syntax" => OptionValue::Str(self.syntax.clone()),
             "theme" => OptionValue::Str(self.theme.clone()),
             "ssh_theme" => OptionValue::Str(self.ssh_theme.clone()),
             "tab_width" => OptionValue::Int(self.tab_width as i64),

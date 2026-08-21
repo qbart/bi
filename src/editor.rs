@@ -889,7 +889,7 @@ impl BufferEntry {
         Self {
             id,
             filetype: filetype_of(&buffer),
-            syntax: syntax_for(&buffer),
+            syntax: syntax_for(&buffer, &Options::default()),
             buffer,
             options: Options::default(),
             last: Vec::new(),
@@ -1827,15 +1827,24 @@ fn span_of_block_at(
 /// The whole name rather than the extension, so a grammar can claim
 /// `CMakeLists.txt`. Which key wins is `syntax.rs`'s business, not this
 /// function's.
-fn syntax_for(buffer: &Buffer) -> Option<Syntax> {
-    let name = buffer
-        .path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_string();
-    Syntax::new(&name, buffer.rope())
+fn syntax_for(buffer: &Buffer, options: &Options) -> Option<Syntax> {
+    wanted_syntax(buffer, options).and_then(|name| Syntax::for_filetype(name, buffer.rope()))
+}
+
+/// Which grammar this buffer should be read with, without parsing anything.
+///
+/// Split out so `resolve_options` can ask the question — every `:set` of every
+/// option runs through there, and the answer decides whether a reparse is owed
+/// at all.
+///
+/// `:set syntax` wins over the name, which is the whole of what it is for: a
+/// file with no extension, or one whose extension lies.
+fn wanted_syntax(buffer: &Buffer, options: &Options) -> Option<&'static str> {
+    if let Some(named) = crate::syntax::canonical(&options.syntax) {
+        return Some(named);
+    }
+    let name = buffer.path.as_ref()?.file_name()?.to_str()?;
+    crate::syntax::filetype(name)
 }
 
 impl Editor {
@@ -1968,6 +1977,15 @@ impl Editor {
             let options =
                 resolve_options(&self.session, entry.filetype, entry.buffer.path.as_deref());
             entry.options = options;
+            // A `:set syntax` that left the parse tree alone would be a
+            // setting that changed nothing on screen. Compared rather than
+            // rebuilt every time: this runs on every `:set` of anything, and
+            // reparsing every open buffer to find out that none of them
+            // changed language is the wrong price for `:set number 3`.
+            let wanted = wanted_syntax(&entry.buffer, &entry.options);
+            if entry.syntax.as_ref().map(Syntax::filetype) != wanted {
+                entry.syntax = syntax_for(&entry.buffer, &entry.options);
+            }
         }
     }
 
@@ -3962,7 +3980,7 @@ impl Editor {
             if entry.buffer.path.as_deref() == Some(source) {
                 entry.buffer.path = Some(target.to_path_buf());
                 // The extension may have changed, and with it the grammar.
-                entry.syntax = syntax_for(&entry.buffer);
+                entry.syntax = syntax_for(&entry.buffer, &entry.options);
             }
         }
         self.report(Ok(()), format!("\"{from}\" → \"{to}\""));
@@ -4261,6 +4279,18 @@ impl Editor {
         }
 
         if value.is_empty() {
+            // `syntax` reports what is *in force*, not the override, because
+            // the override is empty in the normal case and "syntax=" answers
+            // the question nobody asked. The buffer is in reach here, which is
+            // the only place it is.
+            if name == "syntax" {
+                let effective = match self.buffer() {
+                    Some(buffer) => wanted_syntax(buffer, self.options()).unwrap_or("none"),
+                    None => "none",
+                };
+                self.session.status = format!("syntax={effective}");
+                return;
+            }
             self.session.status = match self.session.options.get(name) {
                 Some(OptionValue::Int(n)) => format!("{name}={n}"),
                 Some(OptionValue::Bool(on)) => format!("{name}={on}"),
@@ -4528,7 +4558,7 @@ impl View<'_> {
     /// Rebuilds the parse tree from scratch. The old one belongs to text that
     /// no longer exists, and a new path can change the language outright.
     fn reload_syntax(&mut self) {
-        *self.syntax = syntax_for(self.buffer);
+        *self.syntax = syntax_for(self.buffer, self.options);
         // A new path is a new file type, and a new file type is new options:
         // `:w Makefile` has to bring a Makefile's tabs with it.
         *self.filetype = filetype_of(self.buffer);
@@ -11787,6 +11817,77 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- :set syntax --------------------------------------------------------
+
+    /// The grammar a buffer is actually being read with.
+    fn parsed_as(ed: &Editor) -> Option<&'static str> {
+        ed.buffers
+            .iter()
+            .find(|b| Some(b.id) == ed.window().buffer())
+            .unwrap()
+            .syntax
+            .as_ref()
+            .map(|s| s.filetype())
+    }
+
+    #[test]
+    fn set_syntax_reads_a_file_as_something_its_name_does_not_say() {
+        let d = ScratchDir::new("set-syntax").written("script", "echo $HOME\n");
+        let mut ed = Editor::open(format!("{}/script", d.path())).unwrap();
+        assert_eq!(parsed_as(&ed), None, "no extension, so nothing to go on");
+
+        ex(&mut ed, "set syntax bash");
+
+        assert_eq!(parsed_as(&ed), Some("bash"), "and now it is a shell script");
+    }
+
+    #[test]
+    fn set_syntax_auto_hands_the_decision_back() {
+        let d = ScratchDir::new("set-syntax-auto").written("a.rs", "fn main() {}\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+
+        ex(&mut ed, "set syntax python");
+        assert_eq!(parsed_as(&ed), Some("python"), "an extension can be overruled");
+
+        ex(&mut ed, "set syntax auto");
+        assert_eq!(parsed_as(&ed), Some("rust"), "and the name gets its say back");
+    }
+
+    #[test]
+    fn set_syntax_refuses_a_language_bi_cannot_parse() {
+        let mut ed = editor("x\n");
+
+        ex(&mut ed, "set syntax cobol");
+
+        assert_eq!(ed.session.status, "no grammar for cobol: cobol");
+        assert_eq!(ed.session.options.syntax, "", "and nothing was set");
+    }
+
+    #[test]
+    fn set_syntax_with_no_value_reports_what_is_in_force() {
+        let d = ScratchDir::new("set-syntax-report").written("a.rs", "fn main() {}\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+
+        ex(&mut ed, "set syntax");
+        assert_eq!(ed.session.status, "syntax=rust", "the file's own, not the empty override");
+
+        ex(&mut ed, "set syntax toml");
+        ex(&mut ed, "set syntax");
+        assert_eq!(ed.session.status, "syntax=toml");
+    }
+
+    #[test]
+    fn setting_something_else_does_not_reparse_the_world() {
+        // `resolve_options` runs on every `:set`, and it compares before it
+        // rebuilds — this pins that the grammar survives an unrelated one.
+        let d = ScratchDir::new("set-syntax-stable").written("a.rs", "fn main() {}\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+
+        ex(&mut ed, "set number 3");
+
+        assert_eq!(parsed_as(&ed), Some("rust"));
     }
 
     // ---- a selection on the `:` line ----------------------------------------
