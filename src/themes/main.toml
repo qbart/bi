@@ -112,7 +112,7 @@ whitespace     = "#6f6f6f"
 # nothing. Cyan is the compromise: brighter than Carbon's own #33b1ff so it
 # does not read as a `property`, and the only saturated colour on screen that
 # is not already carrying a syntax role.
-context        = "#00d2ff"
+context = { fg = "#6f6f6f", italic = true }
 # The other half, which replaces a row of code and so has to be read: gray90
 # behind gray40, a step off the frame in both directions.
 context_header = { fg = "#a8a8a8", bg = "#262626" }
