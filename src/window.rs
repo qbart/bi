@@ -491,6 +491,24 @@ impl Layout {
         matches!(adjust(&mut self.root, area, chrome, id, axis, cells), Adjust::Done)
     }
 
+    /// Divides the split `id` sits in along `axis` into `shares`.
+    ///
+    /// The same target [`Layout::resize`] uses — the deepest ancestor split
+    /// that runs along `axis`, which is the divider you would be pushing.
+    /// `shares` must have one term per child of that split: `1:2` on a
+    /// three-way split is a message rather than a guess, because there is no
+    /// non-arbitrary rule for which pane the missing term belonged to.
+    ///
+    /// `Err` carries how many children there were, so the message can say.
+    pub fn ratio(&mut self, id: WindowId, axis: Dir, shares: &[u32]) -> Result<(), Option<usize>> {
+        match ratio(&mut self.root, id, axis, shares) {
+            Ratio::Done => Ok(()),
+            Ratio::Mismatch(children) => Err(Some(children)),
+            // At the top level there is no ancestor split along that axis.
+            Ratio::Found | Ratio::NotFound => Err(None),
+        }
+    }
+
     /// Gives every split's children equal weight. `Ctrl-W =`.
     pub fn equalize(&mut self) {
         equalize(&mut self.root);
@@ -720,6 +738,54 @@ fn adjust(
         }
     }
     Adjust::NotFound
+}
+
+enum Ratio {
+    NotFound,
+    /// The window is in here somewhere; the caller decides whether it is the
+    /// split being divided.
+    Found,
+    Done,
+    /// Reached the right split and it has this many children, which is not how
+    /// many shares were given.
+    Mismatch(usize),
+}
+
+fn ratio(node: &mut Node, target: WindowId, axis: Dir, shares: &[u32]) -> Ratio {
+    let (dir, children) = match node {
+        Node::Leaf(id) => {
+            return if *id == target { Ratio::Found } else { Ratio::NotFound };
+        }
+        Node::Split { dir, children } => (*dir, children),
+    };
+
+    for i in 0..children.len() {
+        match ratio(&mut children[i].node, target, axis, shares) {
+            Ratio::NotFound => continue,
+            Ratio::Done => return Ratio::Done,
+            Ratio::Mismatch(n) => return Ratio::Mismatch(n),
+            Ratio::Found => {
+                // Not this split's axis — keep looking further out, which is
+                // what makes `:resize 1:2` inside a vertical stack reach the
+                // horizontal split containing it.
+                if dir != axis {
+                    return Ratio::Found;
+                }
+                if shares.len() != children.len() {
+                    return Ratio::Mismatch(children.len());
+                }
+                // Normalised here rather than at the parser, so `2:4` and
+                // `1:2` are the same thing and neither has to be written in
+                // lowest terms.
+                let total: u32 = shares.iter().sum();
+                for (child, share) in children.iter_mut().zip(shares) {
+                    child.weight = *share as f32 / total as f32;
+                }
+                return Ratio::Done;
+            }
+        }
+    }
+    Ratio::NotFound
 }
 
 fn equalize(node: &mut Node) {

@@ -39,6 +39,7 @@ pub mod motion;
 pub mod picker;
 pub mod range;
 pub mod registers;
+pub mod resize;
 pub mod selection;
 pub mod substitute;
 pub mod surround;

@@ -182,6 +182,7 @@ const LIB_MODULES: &[&str] = &[
     "picker.rs",
     "range.rs",
     "registers.rs",
+    "resize.rs",
     "selection.rs",
     "surround.rs",
     "substitute.rs",

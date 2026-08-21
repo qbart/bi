@@ -683,6 +683,29 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### `:resize`
+
+`Ctrl-W +` moves a divider one cell; `:resize` says how far in one go.
+
+```
+:resize 30       the width, in cells      :resize 1:2      divide one to two
+:resize 30y      the height               :resize 1:2:1    three panes
+:resize +3  -3   relative                 :resize 1:2y     vertically
+:resize +3,-3    both axes                :resize 1:2,1:2  both
+```
+
+A `y` suffix names the axis; otherwise a comma decides by position, across then
+down. It acts on the deepest split running along that axis — the divider you
+would be pushing with `Ctrl-W +`, so there is no second rule to learn.
+
+A ratio needs one term per pane in that split: `1:2` on a three-way split says
+how many it wanted rather than guessing which pane the missing term was for.
+Shares are whole numbers and normalised, so `20:40` and `1:2` are the same.
+
+Both axes are attempted independently — `:resize +6,+3` widens the pane even
+when nothing can make it taller, and reports only the half that could not move.
+See [docs/specs/resize.md](docs/specs/resize.md).
+
 #### `:symbols`
 
 `:symbols` (or `:sym`) lists what tree-sitter found to navigate to — modules,

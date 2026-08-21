@@ -1385,6 +1385,9 @@ enum ExLine {
     Alternate,
     /// `:symbols` — the declarations in this file, to jump to one.
     Symbols,
+    /// `:resize 30`, `:resize +3,-3`, `:resize 1:2` — see
+    /// `docs/specs/resize.md`.
+    Resize(crate::resize::Resize),
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -1572,6 +1575,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // Plural, because the command shows a list. `:sym` is the short form;
         // `:s` is taken by substitute and always will be.
         "sym" | "symbols" => ExLine::Symbols,
+        "res" | "resize" => match crate::resize::parse(arg) {
+            Ok(how) => ExLine::Resize(how),
+            Err(message) => ExLine::Error(message),
+        },
         "case" => match crate::case::Style::parse(arg) {
             Some(style) => ExLine::Case { lines: range, style },
             None => {
@@ -3058,6 +3065,77 @@ impl Editor {
     }
 
     /// `Ctrl-P` — the picker over every file under the session's root.
+    /// `:resize` — one amount per axis, applied to the divider you would be
+    /// pushing with `Ctrl-W +`.
+    ///
+    /// Across first and then down, so `:resize 30,10` reports on the width
+    /// before the height and a failure names which one could not move. Both
+    /// axes are attempted whatever the other did: a layout where the pane can
+    /// widen but not grow taller should widen.
+    fn run_resize(&mut self, how: crate::resize::Resize) {
+        let mut said: Vec<String> = Vec::new();
+        // Width is the extent a *vertical* split divides — `:vs` puts panes
+        // side by side — and height is a horizontal one's. The names read
+        // backwards exactly once, here, and everything downstream is in terms
+        // of the split rather than the extent.
+        for (amount, axis, name) in
+            [(how.x, Dir::Vertical, "width"), (how.y, Dir::Horizontal, "height")]
+        {
+            let Some(amount) = amount else { continue };
+            if let Err(message) = self.resize_axis(amount, axis, name) {
+                said.push(message);
+            }
+        }
+        if !said.is_empty() {
+            self.session.status = said.join("; ");
+        }
+    }
+
+    fn resize_axis(
+        &mut self,
+        amount: crate::resize::Amount,
+        axis: Dir,
+        name: &str,
+    ) -> Result<(), String> {
+        use crate::resize::Amount;
+
+        let focus = self.focus;
+        let (area, chrome) = (self.area, self.chrome);
+
+        let cells = match amount {
+            Amount::By(cells) => cells,
+            Amount::Cells(want) => {
+                // The pane's own extent, as the frontend last reported it, so
+                // `:resize 30` means thirty cells of *text* — the number you
+                // can count on screen rather than one that silently includes
+                // a border you did not draw.
+                let now = match self.window_of(focus) {
+                    Some(window) if axis == Dir::Vertical => window.width,
+                    Some(window) => window.height,
+                    None => return Err(format!("no {name} here")),
+                };
+                want as i32 - now as i32
+            }
+            Amount::Ratio(shares) => {
+                return match self.layout.ratio(focus, axis, &shares) {
+                    Ok(()) => Ok(()),
+                    Err(Some(children)) => {
+                        Err(format!("{children} panes across that split, so {children} shares"))
+                    }
+                    Err(None) => Err(format!("nothing to divide the {name} with")),
+                };
+            }
+        };
+
+        if cells == 0 {
+            return Ok(());
+        }
+        match self.layout.resize(focus, axis, cells, area, &chrome) {
+            true => Ok(()),
+            false => Err(format!("no room to change the {name}")),
+        }
+    }
+
     /// `:symbols` — every declaration tree-sitter found, to jump to one.
     ///
     /// Derived from the parse tree that is already there, so it costs a walk
@@ -4281,6 +4359,7 @@ impl Editor {
             }
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
+            ExLine::Resize(how) => self.run_resize(how),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -11881,6 +11960,140 @@ mod tests {
         ex(&mut ed, "wa");
 
         assert_eq!(f.read(), "xalpha\n");
+    }
+
+    // ---- :resize ------------------------------------------------------------
+
+    /// Lays the tree out in a fixed area and reports the focused pane's rect.
+    fn pane(ed: &mut Editor) -> Rect {
+        let focus = ed.focus();
+        ed.layout(Rect::new(0, 0, 80, 24), TEST_CHROME)
+            .into_iter()
+            .find(|&(id, _)| id == focus)
+            .map(|(_, r)| r)
+            .unwrap()
+    }
+
+    /// Two panes side by side, focused on one of them.
+    fn side_by_side() -> Editor {
+        let mut ed = editor("text\n");
+        split(&mut ed, Dir::Vertical);
+        ed
+    }
+
+    #[test]
+    fn resize_by_a_signed_amount_moves_the_divider() {
+        let mut ed = side_by_side();
+        let before = pane(&mut ed).width;
+
+        ex(&mut ed, "resize +6");
+        assert_eq!(pane(&mut ed).width, before + 6);
+
+        ex(&mut ed, "resize -6");
+        assert_eq!(pane(&mut ed).width, before, "and back");
+    }
+
+    #[test]
+    fn resize_to_a_number_of_cells_lands_on_it() {
+        let mut ed = side_by_side();
+        let focus = ed.focus();
+        // The pane has to have been told its size, since an absolute resize is
+        // a delta from what it is now.
+        let now = pane(&mut ed);
+        ed.size_window(focus, now.width as usize, now.height as usize);
+
+        ex(&mut ed, "resize 30");
+
+        assert_eq!(pane(&mut ed).width, 30);
+    }
+
+    #[test]
+    fn a_ratio_divides_the_split_the_window_is_in() {
+        let mut ed = side_by_side();
+
+        ex(&mut ed, "resize 1:2");
+
+        // Both panes, left to right, so the ratio is read off the pair rather
+        // than guessed from one. A split leaves the focus on the *new* window,
+        // which is the second child — so the focused pane is the `2`.
+        let mut widths: Vec<u16> = ed
+            .layout(Rect::new(0, 0, 80, 24), TEST_CHROME)
+            .into_iter()
+            .map(|(_, r)| (r.x, r.width))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        widths.sort_by_key(|w| *w);
+
+        assert_eq!(widths.len(), 2);
+        assert_eq!(widths[1] / widths[0], 2, "{widths:?} is not two to one");
+        assert_eq!(pane(&mut ed).width, widths[1], "and the focused pane has the larger share");
+        assert_eq!(ed.session.status, "", "nothing to report");
+    }
+
+    #[test]
+    fn a_ratio_is_normalised_so_it_need_not_be_in_lowest_terms() {
+        let mut ed = side_by_side();
+        ex(&mut ed, "resize 1:2");
+        let thirds = pane(&mut ed).width;
+
+        ex(&mut ed, "resize 20:40");
+
+        assert_eq!(pane(&mut ed).width, thirds, "20:40 is 1:2");
+    }
+
+    #[test]
+    fn a_ratio_with_the_wrong_number_of_shares_says_how_many_it_wanted() {
+        let mut ed = side_by_side();
+
+        ex(&mut ed, "resize 1:2:1");
+
+        assert_eq!(ed.session.status, "2 panes across that split, so 2 shares");
+    }
+
+    #[test]
+    fn a_ratio_with_no_split_to_divide_says_so() {
+        let mut ed = editor("text\n");
+
+        ex(&mut ed, "resize 1:2");
+
+        assert_eq!(ed.session.status, "nothing to divide the width with");
+    }
+
+    #[test]
+    fn resizing_the_axis_a_window_does_not_split_on_says_so() {
+        // Two panes side by side have no horizontal divider between them, so
+        // there is no height to change.
+        let mut ed = side_by_side();
+
+        ex(&mut ed, "resize +3y");
+
+        assert_eq!(ed.session.status, "no room to change the height");
+    }
+
+    #[test]
+    fn both_axes_are_attempted_and_the_one_that_worked_still_works() {
+        let mut ed = side_by_side();
+        let before = pane(&mut ed).width;
+
+        ex(&mut ed, "resize +6,+3");
+
+        assert_eq!(pane(&mut ed).width, before + 6, "the width moved");
+        assert_eq!(
+            ed.session.status, "no room to change the height",
+            "and only the half that could not is reported"
+        );
+    }
+
+    #[test]
+    fn a_resize_that_makes_no_sense_says_so_before_moving_anything() {
+        let mut ed = side_by_side();
+        let before = pane(&mut ed).width;
+
+        ex(&mut ed, "resize wide");
+
+        assert_eq!(ed.session.status, "`wide` is not a number of cells");
+        assert_eq!(pane(&mut ed).width, before);
     }
 
     // ---- :symbols -----------------------------------------------------------
