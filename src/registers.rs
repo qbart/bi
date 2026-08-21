@@ -12,24 +12,14 @@ use std::collections::VecDeque;
 /// How text was taken, which decides how it goes back in.
 ///
 /// It travels with the text because that is what makes `yy` then `p` open a new
-/// line while `yw` then `p` splices inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    /// A span within a line. Pastes inline.
-    Charwise,
-    /// Whole lines. Always stored with a trailing newline, even when it came
-    /// from a final line that had none.
-    Linewise,
-    /// A rectangle. Rows are joined with `\n` and there is no trailing one —
-    /// the newlines separate the rows of the block rather than terminating
-    /// lines of the buffer, which is what makes it go back in as a rectangle.
-    Blockwise,
-}
+/// line while `yw` then `p` splices inline. The same enum a selection and a
+/// region are shaped by — see [`crate::region::Shape`].
+pub use crate::region::Shape;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub text: String,
-    pub kind: EntryKind,
+    pub kind: Shape,
 }
 
 /// Where an operator's text goes.
@@ -122,11 +112,11 @@ mod tests {
     use super::*;
 
     fn chars(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Charwise }
+        Entry { text: text.into(), kind: Shape::Chars }
     }
 
     fn lines(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Linewise }
+        Entry { text: text.into(), kind: Shape::Lines }
     }
 
     fn small(capacity: usize, byte_budget: usize) -> Registers {

@@ -17,7 +17,8 @@ use crate::history::Cursors;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
 use crate::range::{Address, LineRange, Where};
-use crate::registers::{Entry, EntryKind, Registers, Sink};
+use crate::region::Shape;
+use crate::registers::{Entry, Registers, Sink};
 use crate::selection::{Selection, Selections};
 use crate::syntax::Syntax;
 use crate::theme::Theme;
@@ -25,18 +26,6 @@ use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
     Chrome, Content, ContentKind, Dir, Layout, Place, Rect, Side, Text, Window, WindowId,
 };
-
-/// Charwise, linewise or blockwise.
-///
-/// Blockwise is a rectangle rather than a range: the mode is the flag, the
-/// primary selection's two corners are the rectangle, and the per-row spans
-/// are derived on demand. See `docs/specs/blockwise.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VisualKind {
-    Char,
-    Line,
-    Block,
-}
 
 /// Where a key moves the cursor on the `:` line.
 ///
@@ -112,7 +101,7 @@ pub enum Mode {
     /// Overwrites rather than inserts. `R`.
     Replace,
     /// Selections have room in them and motions move the head.
-    Visual(VisualKind),
+    Visual(Shape),
     /// The `:` line being typed, without the leading colon. Its cursor rides
     /// with it — see `docs/specs/cmdline.md`.
     Command(crate::cmdline::CmdLine),
@@ -138,9 +127,9 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Replace => "REPLACE",
-            Mode::Visual(VisualKind::Char) => "VISUAL",
-            Mode::Visual(VisualKind::Line) => "V-LINE",
-            Mode::Visual(VisualKind::Block) => "V-BLOCK",
+            Mode::Visual(Shape::Chars) => "VISUAL",
+            Mode::Visual(Shape::Lines) => "V-LINE",
+            Mode::Visual(Shape::Block) => "V-BLOCK",
             Mode::Command(_) => "COMMAND",
             Mode::Search { .. } => "SEARCH",
             Mode::Pick => "PICK",
@@ -154,7 +143,7 @@ impl Mode {
         matches!(self, Mode::Insert | Mode::Replace)
     }
 
-    pub fn visual(&self) -> Option<VisualKind> {
+    pub fn visual(&self) -> Option<Shape> {
         match self {
             Mode::Visual(kind) => Some(*kind),
             _ => None,
@@ -217,7 +206,7 @@ pub enum Action {
     EnterInsertLineEnd,
     EnterNormal,
     /// `v` / `V`. The same key again leaves, as in vim.
-    EnterVisual(VisualKind),
+    EnterVisual(Shape),
     /// A key in a results pane — see `docs/specs/find-in-files.md`.
     Results(ResultsCmd),
     /// `o` — swap which end of the selection the motions move.
@@ -657,7 +646,7 @@ pub struct Session {
     /// Only ever read while the mode is `Command` (see [`Session::visual`]),
     /// so a value left behind here cannot paint a rectangle over a later
     /// normal mode.
-    interrupted_visual: Option<VisualKind>,
+    interrupted_visual: Option<Shape>,
     /// Where each row of a [`PickerKind::Symbol`] list goes, by the same index
     /// the picker holds its items at.
     ///
@@ -738,7 +727,7 @@ impl Session {
     /// rectangle while you type the command that is about to act on it. Every
     /// other mode answers `None` whatever [`Session::interrupted_visual`]
     /// happens to hold, which is what keeps a stale value from painting.
-    pub fn visual(&self) -> Option<VisualKind> {
+    pub fn visual(&self) -> Option<Shape> {
         match &self.mode {
             Mode::Visual(kind) => Some(*kind),
             Mode::Command(_) => self.interrupted_visual,
@@ -790,7 +779,7 @@ impl Session {
                 return None;
             }
         };
-        let kind = if text.ends_with('\n') { EntryKind::Linewise } else { EntryKind::Charwise };
+        let kind = if text.ends_with('\n') { Shape::Lines } else { Shape::Chars };
         Some(Entry { text, kind })
     }
 }
@@ -2465,7 +2454,7 @@ impl Editor {
                                 head: Cursor::at(end.saturating_sub(1).max(start)),
                             }]);
                         }
-                        self.session.mode = Mode::Visual(VisualKind::Char);
+                        self.session.mode = Mode::Visual(Shape::Chars);
                     }
                 }
             }
@@ -2728,7 +2717,7 @@ impl Editor {
     /// rectangle while you type the command that is about to act on it. Every
     /// other mode answers `None` whatever [`Session::visual`] happens to hold,
     /// which is what keeps a stale value from painting.
-    pub fn visual(&self) -> Option<VisualKind> {
+    pub fn visual(&self) -> Option<Shape> {
         self.session.visual()
     }
 
@@ -4418,7 +4407,7 @@ impl Editor {
     fn yank_selected_path(&mut self) {
         let Some(row) = self.window().tree().and_then(Tree::selected_row) else { return };
         let path = row.path.display().to_string();
-        self.session.registers.push(Entry { text: path.clone(), kind: EntryKind::Charwise });
+        self.session.registers.push(Entry { text: path.clone(), kind: Shape::Chars });
         self.session.status = format!("yanked {path}");
     }
 
@@ -5041,11 +5030,11 @@ impl View<'_> {
         let selection = self.selections.primary();
         let (lo, hi) = selection.range();
         match self.session.mode.visual() {
-            Some(VisualKind::Line) => {
+            Some(Shape::Lines) => {
                 let rows = self.buffer.row_at(Cursor::at(hi)) - self.buffer.row_at(Cursor::at(lo));
                 Extent::Lines(rows + 1)
             }
-            Some(VisualKind::Block) => {
+            Some(Shape::Block) => {
                 let rows = self.buffer.row_at(Cursor::at(hi)) - self.buffer.row_at(Cursor::at(lo));
                 let (left, right) = self.block_columns();
                 Extent::Block { rows: rows + 1, cols: right + 1 - left }
@@ -5079,7 +5068,7 @@ impl View<'_> {
     /// may overwrite. Blockwise is the interesting case — and it is the only
     /// one that is a single selection, so the others fold over the whole set.
     fn selection_spans(&self) -> Vec<(usize, usize)> {
-        if self.session.mode.visual() == Some(VisualKind::Block) {
+        if self.session.mode.visual() == Some(Shape::Block) {
             return self.block_spans();
         }
         self.selections.all().iter().flat_map(|selection| self.rows_of(*selection)).collect()
@@ -5088,7 +5077,7 @@ impl View<'_> {
     /// One span per row a selection touches, clipped to that row's content.
     fn rows_of(&self, selection: Selection) -> Vec<(usize, usize)> {
         let (lo, hi) = match self.session.mode.visual() {
-            Some(VisualKind::Line) => {
+            Some(Shape::Lines) => {
                 self.buffer.line_range(selection.range().0, selection.range().1, false)
             }
             _ => selection.inclusive_range(self.buffer.rope().len_chars()),
@@ -5118,7 +5107,7 @@ impl View<'_> {
                 spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
             // One entry, not one per row: what was taken is a rectangle, and
             // pasting it back has to know that.
-            self.session.capture(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise }, sink);
+            self.session.capture(Entry { text: rows.join("\n"), kind: Shape::Block }, sink);
         }
 
         if op == Operator::Yank {
@@ -5195,11 +5184,11 @@ impl View<'_> {
     ///
     /// See `docs/specs/registers.md`.
     fn paste_over_selection(&mut self, entry: &Entry, capture: bool, count: usize) {
-        if self.session.mode.visual() == Some(VisualKind::Block) {
+        if self.session.mode.visual() == Some(Shape::Block) {
             self.paste_over_block(entry, capture, count);
             return;
         }
-        let linewise = self.session.mode.visual() == Some(VisualKind::Line);
+        let linewise = self.session.mode.visual() == Some(Shape::Lines);
         self.for_each_selection(|ed, sel| {
             let len = ed.buffer.rope().len_chars();
             let (start, end) = if linewise {
@@ -5232,9 +5221,7 @@ impl View<'_> {
                 spans.iter().map(|&(start, end)| self.buffer.slice(start, end)).collect();
             // One entry, not one per row: what was taken is a rectangle, and
             // pasting it back has to know that.
-            self.session
-                .registers
-                .push(Entry { text: rows.join("\n"), kind: EntryKind::Blockwise });
+            self.session.registers.push(Entry { text: rows.join("\n"), kind: Shape::Block });
         }
 
         let top_left = spans.first().map(|&(start, _)| start).unwrap_or(0);
@@ -5242,16 +5229,16 @@ impl View<'_> {
         let last_row = self.buffer.row_at(Cursor::at(bottom));
 
         let landed = match entry.kind {
-            EntryKind::Charwise => {
+            Shape::Chars => {
                 self.replace_spans(&spans, entry, count);
                 self.buffer.clamped(Cursor::at(top_left), false)
             }
-            EntryKind::Linewise => {
+            Shape::Lines => {
                 self.cut_spans(&spans);
                 let at = self.buffer.at_row(last_row, false);
                 self.buffer.paste(at, entry, false, count)
             }
-            EntryKind::Blockwise => {
+            Shape::Block => {
                 self.cut_spans(&spans);
                 let at = self.buffer.clamped(Cursor::at(top_left), true);
                 self.buffer.paste(at, entry, true, count)
@@ -5352,9 +5339,9 @@ impl View<'_> {
             return;
         }
         let kind = match extent {
-            Extent::Chars(_) => VisualKind::Char,
-            Extent::Lines(_) => VisualKind::Line,
-            Extent::Block { .. } => VisualKind::Block,
+            Extent::Chars(_) => Shape::Chars,
+            Extent::Lines(_) => Shape::Lines,
+            Extent::Block { .. } => Shape::Block,
         };
         self.session.mode = Mode::Visual(kind);
         self.for_each_selection(|ed, sel| {
@@ -5496,7 +5483,7 @@ impl View<'_> {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // `$` in a block is a ragged right edge rather than a column,
                 // and any other motion gives the edge back to the head.
-                if self.session.mode.visual() == Some(VisualKind::Block) {
+                if self.session.mode.visual() == Some(Shape::Block) {
                     self.session.block_to_eol = m == Motion::LineEnd;
                 }
                 let visual = self.session.mode.visual().is_some();
@@ -5710,7 +5697,7 @@ impl View<'_> {
                 } else {
                     Mode::Visual(*kind)
                 };
-                if *kind == VisualKind::Block {
+                if *kind == Shape::Block {
                     // The rectangle is derived from one selection's corners,
                     // so a block is single-selection by construction.
                     self.selections.collapse_to_primary();
@@ -5787,13 +5774,13 @@ impl View<'_> {
                 });
             }
             Action::OperateSelection { op, sink }
-                if self.session.mode.visual() == Some(VisualKind::Block) =>
+                if self.session.mode.visual() == Some(Shape::Block) =>
             {
                 self.operate_block(*op, *sink);
             }
             Action::OperateSelection { op, sink } => {
                 let (op, sink) = (*op, *sink);
-                let linewise = self.session.mode.visual() == Some(VisualKind::Line);
+                let linewise = self.session.mode.visual() == Some(Shape::Lines);
                 self.for_each_selection(|ed, sel| {
                     let len = ed.buffer.rope().len_chars();
                     let (start, end) = if linewise {
@@ -5842,7 +5829,7 @@ impl View<'_> {
                     self.session.status = format!("nothing surrounds with {with}");
                     return;
                 };
-                let linewise = self.session.mode.visual() == Some(VisualKind::Line);
+                let linewise = self.session.mode.visual() == Some(Shape::Lines);
                 self.for_each_selection(|ed, sel| {
                     let len = ed.buffer.rope().len_chars();
                     let (start, end) = match linewise {
@@ -6281,9 +6268,9 @@ impl View<'_> {
             .map(|e| Item {
                 text: e.text.clone(),
                 badge: match e.kind {
-                    EntryKind::Linewise => Some('¶'),
-                    EntryKind::Blockwise => Some('▚'),
-                    EntryKind::Charwise => None,
+                    Shape::Lines => Some('¶'),
+                    Shape::Block => Some('▚'),
+                    Shape::Chars => None,
                 },
             })
             .collect();
@@ -6401,7 +6388,7 @@ impl View<'_> {
         // only reason keeping the block shape alive across `:` is worth
         // anything — a rectangle that survives to the command line and then
         // acts on whole lines would be a worse lie than losing it.
-        if self.session.visual() == Some(VisualKind::Block) {
+        if self.session.visual() == Some(Shape::Block) {
             let spans = self.block_spans();
             let before = self.selections.as_pairs();
             // Back to front: recasing one row must not move the rows above it,
@@ -8791,7 +8778,7 @@ mod tests {
         // The same command with no range moves what is selected.
         let mut ed = editor("a\nb\nc\nd\ne\n");
         ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
         ed.apply(cmd(Action::Move(Motion::Down)));
         ex(&mut ed, "m $");
         assert_eq!(whole(&ed), "a\nd\ne\nb\nc\n");
@@ -8872,7 +8859,7 @@ mod tests {
         let at = |arg: &str| {
             let mut ed = editor("a\nb\nc\nd\ne\n");
             ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
-            ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
             ed.apply(cmd(Action::Move(Motion::Down)));
             ex(&mut ed, arg);
             whole(&ed)
@@ -8908,7 +8895,7 @@ mod tests {
     fn a_visual_block_moves_as_one_and_stays_selected() {
         let mut ed = editor("a\nb\nc\nd\n");
         ed.set_cursor(ed.buffer().unwrap().at_row(0, false));
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
         ed.apply(cmd(Action::Move(Motion::Down)));
 
         move_key(&mut ed, true, 1);
@@ -10509,7 +10496,7 @@ mod tests {
 
     // ---- visual mode -------------------------------------------------------
 
-    fn visual(text: &str, at: usize, kind: VisualKind) -> Editor {
+    fn visual(text: &str, at: usize, kind: Shape) -> Editor {
         let mut ed = editor(text);
         ed.set_cursor(Cursor::at(at));
         ed.apply(cmd(Action::EnterVisual(kind)));
@@ -10518,7 +10505,7 @@ mod tests {
 
     #[test]
     fn v_starts_a_selection_and_motions_move_only_the_head() {
-        let mut ed = visual("hello world", 0, VisualKind::Char);
+        let mut ed = visual("hello world", 0, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         let sel = ed.selections().unwrap().primary();
@@ -10528,23 +10515,23 @@ mod tests {
 
     #[test]
     fn the_same_key_again_leaves_visual_mode() {
-        let mut ed = visual("hello", 0, VisualKind::Char);
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        let mut ed = visual("hello", 0, Shape::Chars);
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         assert_eq!(ed.session.mode, Mode::Normal);
         assert!(ed.selections().unwrap().primary().is_collapsed());
     }
 
     #[test]
     fn v_then_big_v_switches_kind_rather_than_leaving() {
-        let mut ed = visual("hello", 0, VisualKind::Char);
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Line));
+        let mut ed = visual("hello", 0, Shape::Chars);
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Lines));
     }
 
     #[test]
     fn o_swaps_the_ends_so_the_other_one_can_be_adjusted() {
-        let mut ed = visual("hello world", 2, VisualKind::Char);
+        let mut ed = visual("hello world", 2, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         let before = ed.selections().unwrap().primary();
@@ -10558,7 +10545,7 @@ mod tests {
     /// Charwise visual includes the character under the head, as in vim.
     #[test]
     fn a_charwise_operator_takes_the_character_under_the_head() {
-        let mut ed = visual("hello", 0, VisualKind::Char);
+        let mut ed = visual("hello", 0, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "llo", "both h and e");
@@ -10567,14 +10554,14 @@ mod tests {
 
     #[test]
     fn a_linewise_operator_takes_whole_lines_whatever_the_columns() {
-        let mut ed = visual("one\ntwo\nthree", 5, VisualKind::Line);
+        let mut ed = visual("one\ntwo\nthree", 5, Shape::Lines);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nthree");
     }
 
     #[test]
     fn a_visual_change_leaves_you_in_insert_mode() {
-        let mut ed = visual("hello", 0, VisualKind::Char);
+        let mut ed = visual("hello", 0, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Change, sink: Sink::Ring }));
         assert_eq!(ed.session.mode, Mode::Insert);
@@ -10582,7 +10569,7 @@ mod tests {
 
     #[test]
     fn a_visual_yank_captures_without_changing_the_text() {
-        let mut ed = visual("hello", 0, VisualKind::Char);
+        let mut ed = visual("hello", 0, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "hello");
@@ -10591,16 +10578,16 @@ mod tests {
 
     #[test]
     fn a_linewise_yank_is_a_linewise_entry() {
-        let mut ed = visual("one\ntwo", 0, VisualKind::Line);
+        let mut ed = visual("one\ntwo", 0, Shape::Lines);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
         let entry = ed.session.registers.front().unwrap();
-        assert_eq!(entry.kind, EntryKind::Linewise);
+        assert_eq!(entry.kind, Shape::Lines);
         assert!(entry.text.ends_with('\n'), "or pasting it could not open a line");
     }
 
     #[test]
     fn viw_makes_the_object_the_selection() {
-        let mut ed = visual("foo bar baz", 5, VisualKind::Char);
+        let mut ed = visual("foo bar baz", 5, Shape::Chars);
         ed.apply(cmd(Action::SelectObject {
             object: TextObject::Word { big: false },
             around: false,
@@ -10617,7 +10604,7 @@ mod tests {
     /// A block from `at`, extended `rows` down and `cols` right — the two
     /// motions a `Ctrl-V` selection is made of.
     fn block(text: &str, at: usize, rows: usize, cols: usize) -> Editor {
-        let mut ed = visual(text, at, VisualKind::Block);
+        let mut ed = visual(text, at, Shape::Block);
         for _ in 0..rows {
             ed.apply(cmd(Action::Move(Motion::Down)));
         }
@@ -10639,7 +10626,7 @@ mod tests {
 
     #[test]
     fn a_block_drawn_upwards_and_leftwards_is_the_same_rectangle() {
-        let mut ed = visual(GRID, 19, VisualKind::Block); // 'r', bottom right
+        let mut ed = visual(GRID, 19, Shape::Block); // 'r', bottom right
         for _ in 0..2 {
             ed.apply(cmd(Action::Move(Motion::Up)));
             ed.apply(cmd(Action::Move(Motion::Left)));
@@ -10663,7 +10650,7 @@ mod tests {
         let mut ed = block(GRID, 1, 2, 1);
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
         let entry = ed.session.registers.front().unwrap();
-        assert_eq!(entry.kind, EntryKind::Blockwise);
+        assert_eq!(entry.kind, Shape::Block);
         assert_eq!(entry.text, "bc\nhi\nno", "rows joined, no terminator");
         assert_eq!(ed.buffer().unwrap().rope().to_string(), GRID);
     }
@@ -10774,7 +10761,7 @@ mod tests {
 
     #[test]
     fn r_over_a_charwise_selection_spans_lines_without_eating_the_newline() {
-        let mut ed = visual("abc\ndef", 1, VisualKind::Char);
+        let mut ed = visual("abc\ndef", 1, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::ReplaceSelection('.')));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "a..\n..f");
@@ -10811,7 +10798,7 @@ mod tests {
 
     #[test]
     fn r_reaches_every_selection_when_there_is_more_than_one() {
-        let mut ed = visual("foo bar foo", 0, VisualKind::Char);
+        let mut ed = visual("foo bar foo", 0, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::AddCursorNextMatch));
@@ -10826,7 +10813,7 @@ mod tests {
         let mut ed = editor(GRID);
         ed.apply(cmd(Action::AddCursorLine { below: true }));
         assert_eq!(ed.selections().unwrap().len(), 2);
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Block)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Block)));
         assert_eq!(ed.selections().unwrap().len(), 1);
     }
 
@@ -10842,7 +10829,7 @@ mod tests {
     #[test]
     fn pasting_a_block_pads_short_rows_and_grows_the_buffer() {
         let mut ed = editor("xy");
-        ed.session.registers.push(Entry { text: "bc\nhi\nno".into(), kind: EntryKind::Blockwise });
+        ed.session.registers.push(Entry { text: "bc\nhi\nno".into(), kind: Shape::Block });
         ed.set_cursor(Cursor::at(1));
         ed.apply(cmd(Action::Paste { before: true, count: 1, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "xbcy\n hi\n no");
@@ -10872,7 +10859,7 @@ mod tests {
 
     /// A selection of `chars` characters from `at`, with `text` on the ring.
     fn ready(text: &str, at: usize, chars: usize, entry: Entry) -> Editor {
-        let mut ed = visual(text, at, VisualKind::Char);
+        let mut ed = visual(text, at, Shape::Chars);
         for _ in 1..chars {
             ed.apply(cmd(Action::Move(Motion::Right)));
         }
@@ -10881,11 +10868,11 @@ mod tests {
     }
 
     fn charwise(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Charwise }
+        Entry { text: text.into(), kind: Shape::Chars }
     }
 
     fn linewise(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Linewise }
+        Entry { text: text.into(), kind: Shape::Lines }
     }
 
     #[test]
@@ -10929,7 +10916,7 @@ mod tests {
 
     #[test]
     fn a_charwise_entry_over_a_linewise_selection_becomes_one_line() {
-        let mut ed = visual("one two\nthree\nfour", 8, VisualKind::Line);
+        let mut ed = visual("one two\nthree\nfour", 8, Shape::Lines);
         ed.session.registers.push(charwise("one"));
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two\none\nfour");
@@ -10938,7 +10925,7 @@ mod tests {
 
     #[test]
     fn a_linewise_entry_over_a_linewise_selection_replaces_the_lines() {
-        let mut ed = visual("one\ntwo\nthree", 4, VisualKind::Line);
+        let mut ed = visual("one\ntwo\nthree", 4, Shape::Lines);
         ed.session.registers.push(linewise("one\n"));
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\none\nthree");
@@ -10948,7 +10935,7 @@ mod tests {
     /// A file that ended without a newline still does.
     #[test]
     fn pasting_over_the_last_line_invents_no_terminator() {
-        let mut ed = visual("one\ntwo", 4, VisualKind::Line);
+        let mut ed = visual("one\ntwo", 4, Shape::Lines);
         ed.session.registers.push(linewise("three\n"));
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nthree");
@@ -10968,11 +10955,11 @@ mod tests {
     /// stops being true the moment the register is empty.
     #[test]
     fn an_empty_ring_leaves_the_selection_alone() {
-        let mut ed = visual("one two", 4, VisualKind::Char);
+        let mut ed = visual("one two", 4, Shape::Chars);
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "one two");
         assert_eq!(ed.session.status, "nothing to paste");
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char), "still selecting");
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars), "still selecting");
     }
 
     #[test]
@@ -10988,7 +10975,7 @@ mod tests {
     fn a_clipboard_paste_over_a_selection_leaves_the_removed_text_on_the_ring() {
         let clipboard = FakeClipboard::default();
         *clipboard.0.borrow_mut() = Some("zzz".into());
-        let mut ed = visual("one two", 4, VisualKind::Char);
+        let mut ed = visual("one two", 4, Shape::Chars);
         ed.set_clipboard(clipboard.clone());
         for _ in 0..2 {
             ed.apply(cmd(Action::Move(Motion::Right)));
@@ -11003,8 +10990,7 @@ mod tests {
 
     #[test]
     fn a_blockwise_entry_over_a_charwise_selection_goes_in_as_a_rectangle() {
-        let mut ed =
-            ready("ab\ncd\nefgh", 6, 2, Entry { text: "a\nc".into(), kind: EntryKind::Blockwise });
+        let mut ed = ready("ab\ncd\nefgh", 6, 2, Entry { text: "a\nc".into(), kind: Shape::Block });
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "ab\ncd\nagh\nc");
     }
@@ -11017,7 +11003,7 @@ mod tests {
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "abc\nabcf\nabci");
         assert_eq!(
             ed.session.registers.front().unwrap().kind,
-            EntryKind::Blockwise,
+            Shape::Block,
             "and the rectangle it replaced comes back as one"
         );
     }
@@ -11033,7 +11019,7 @@ mod tests {
     #[test]
     fn a_blockwise_entry_over_a_block_replaces_the_rectangle() {
         let mut ed = block("abcd\nefgh\nijkl", 10, 0, 1);
-        ed.session.registers.push(Entry { text: "ab\nef".into(), kind: EntryKind::Blockwise });
+        ed.session.registers.push(Entry { text: "ab\nef".into(), kind: Shape::Block });
         ed.apply(paste_over(true, 1));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "abcd\nefgh\nabkl\nef");
     }
@@ -11053,7 +11039,7 @@ mod tests {
 
     #[test]
     fn the_register_picker_over_a_selection_replaces_it_too() {
-        let mut ed = visual("one two", 4, VisualKind::Char);
+        let mut ed = visual("one two", 4, Shape::Chars);
         ed.session.registers.push(charwise("one"));
         for _ in 0..2 {
             ed.apply(cmd(Action::Move(Motion::Right)));
@@ -11066,11 +11052,11 @@ mod tests {
 
     #[test]
     fn cancelling_the_picker_goes_back_to_the_selection_it_was_opened_from() {
-        let mut ed = visual("one two", 4, VisualKind::Char);
+        let mut ed = visual("one two", 4, Shape::Chars);
         ed.session.registers.push(charwise("one"));
         ed.apply(cmd(Action::OpenPicker(PickerKind::Register { before: false })));
         ed.apply(cmd(Action::PickCancel));
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
     }
 
     // ---- replace mode ------------------------------------------------------
@@ -11274,7 +11260,7 @@ mod tests {
     #[test]
     fn ctrl_n_in_visual_mode_selects_the_next_occurrence_of_the_selection() {
         let mut ed = editor("abc abc");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::AddCursorNextMatch));
@@ -11419,7 +11405,7 @@ mod tests {
     #[test]
     fn dot_after_a_charwise_visual_delete_repeats_the_extent() {
         let mut ed = editor("abcdefgh");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
@@ -11432,7 +11418,7 @@ mod tests {
     #[test]
     fn dot_after_a_linewise_visual_delete_repeats_the_line_count() {
         let mut ed = editor("1\n2\n3\n4\n5");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Delete, sink: Sink::Ring }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "3\n4\n5");
@@ -11489,7 +11475,7 @@ mod tests {
     fn leaving_visual_mode_does_not_step_the_cursor() {
         let mut ed = editor("hello");
         ed.set_cursor(Cursor::at(3));
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         ed.apply(cmd(Action::EnterNormal));
         assert_eq!(ed.cursor_col().unwrap(), 3, "only insert steps back");
     }
@@ -11865,7 +11851,7 @@ mod tests {
     #[test]
     fn a_visual_indent_takes_steps_and_keeps_the_selection() {
         let mut ed = editor("alpha\nbeta\n");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Line)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
         ed.apply(cmd(Action::Move(Motion::Down)));
 
         ed.apply(Command {
@@ -11880,7 +11866,7 @@ mod tests {
             ed.buffer().unwrap().rope().to_string(),
             "            alpha\n            beta\n"
         );
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Line), "still selecting");
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Lines), "still selecting");
         let selection = ed.selections().unwrap().primary();
         let buffer = ed.buffer().unwrap();
         assert_eq!(buffer.row_at(Cursor::at(selection.range().0)), 0);
@@ -12734,7 +12720,7 @@ mod tests {
 
     #[test]
     fn colon_with_a_selection_says_which_lines_it_is_about() {
-        let mut ed = visual("a\nb\nc\nd\n", 2, VisualKind::Char);
+        let mut ed = visual("a\nb\nc\nd\n", 2, Shape::Chars);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::EnterCommandMode));
 
@@ -12758,19 +12744,19 @@ mod tests {
         // The bug: `Mode::Command` replaces `Mode::Visual`, so the flag saying
         // "this is a block" was destroyed by the keystroke that opens the
         // command that was going to act on it.
-        let mut ed = visual("abcd\nefgh\nijkl\n", 1, VisualKind::Block);
+        let mut ed = visual("abcd\nefgh\nijkl\n", 1, Shape::Block);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::Move(Motion::Right)));
-        assert_eq!(ed.visual(), Some(VisualKind::Block));
+        assert_eq!(ed.visual(), Some(Shape::Block));
 
         ed.apply(cmd(Action::EnterCommandMode));
 
-        assert_eq!(ed.visual(), Some(VisualKind::Block), "and it survives the colon");
+        assert_eq!(ed.visual(), Some(Shape::Block), "and it survives the colon");
     }
 
     #[test]
     fn a_stale_shape_cannot_paint_a_later_normal_mode() {
-        let mut ed = visual("abcd\nefgh\n", 1, VisualKind::Block);
+        let mut ed = visual("abcd\nefgh\n", 1, Shape::Block);
         ed.apply(cmd(Action::EnterCommandMode));
         ed.apply(cmd(Action::CommandCancel));
 
@@ -12782,7 +12768,7 @@ mod tests {
         // Columns 4..=8 of three rows — the names, and not the `let` or the
         // `= 1;` on either side of them.
         let text = "let ALPHA = 1;\nlet BETA  = 2;\nlet GAMMA = 3;\n";
-        let mut ed = visual(text, 4, VisualKind::Block);
+        let mut ed = visual(text, 4, Shape::Block);
         for _ in 0..4 {
             ed.apply(cmd(Action::Move(Motion::Right)));
         }
@@ -12799,7 +12785,7 @@ mod tests {
     #[test]
     fn case_over_a_rectangle_is_one_undo_step() {
         let text = "AB\nCD\nEF\n";
-        let mut ed = visual(text, 0, VisualKind::Block);
+        let mut ed = visual(text, 0, Shape::Block);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::EnterCommandMode));
@@ -12836,7 +12822,7 @@ mod tests {
         // The prefill is not a licence: `:w` cannot write part of a file, and
         // the selection arriving for free must not turn that into a partial
         // write done quietly.
-        let mut ed = visual("a\nb\nc\n", 0, VisualKind::Line);
+        let mut ed = visual("a\nb\nc\n", 0, Shape::Lines);
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::EnterCommandMode));
 
@@ -13635,7 +13621,7 @@ int main(void) {
         assert_eq!(lit(&ed), vec![0..6], "the row, terminator and all");
 
         let mut ed = editor("alpha\nbeta\n");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Block)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Block)));
         ed.apply(cmd(Action::Move(Motion::Down)));
         ed.apply(cmd(Action::Move(Motion::Right)));
         ed.apply(cmd(Action::OperateSelection { op: Operator::Yank, sink: Sink::Ring }));
@@ -13801,7 +13787,7 @@ int main(void) {
     #[test]
     fn visual_s_wraps_the_selection_and_leaves_visual_mode() {
         let mut ed = editor("hello there");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         for _ in 0..4 {
             ed.apply(cmd(Action::Move(Motion::Right)));
         }
@@ -13827,7 +13813,7 @@ int main(void) {
     #[test]
     fn case_respells_a_selection_and_leaves_visual_mode() {
         let mut ed = editor("one_two three_four\n");
-        ed.apply(cmd(Action::EnterVisual(VisualKind::Char)));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
         for _ in 0..6 {
             ed.apply(cmd(Action::Move(Motion::Right)));
         }
@@ -14361,7 +14347,7 @@ int main(void) {
 
         ed.apply(cmd(Action::LabelChar(label.chars().next().unwrap())));
 
-        assert_eq!(ed.session.mode, Mode::Visual(VisualKind::Char));
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
         let selection = ed.selections().unwrap().primary();
         assert_eq!(selection.anchor.at, start);
         assert_eq!(selection.head.at, end - 1, "charwise visual sits *on* the last character");

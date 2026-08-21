@@ -12,9 +12,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use bi::buffer::Cursor;
 use bi::config::Options;
 use bi::decoration::{Decoration, Layer};
-use bi::editor::{Editor, Mode, Pane, VisualKind};
+use bi::editor::{Editor, Mode, Pane};
 use bi::indent::{display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
+use bi::region::Shape;
 use bi::selection::Selections;
 use bi::syntax::{Span as HlSpan, Syntax};
 use bi::theme::{Ansi, Color as ThemeColor, Style as ThemeStyle, Theme, Ui};
@@ -781,13 +782,13 @@ fn render_window(
                 continue;
             }
             let cols = match ed.visual() {
-                Some(VisualKind::Line) => {
+                Some(Shape::Lines) => {
                     linewise = true;
                     0..display_col(raw, raw.chars().count(), tab).max(1)
                 }
                 // A rectangle says nothing about char ranges, so the block
                 // reads its own spans rather than the selection's range.
-                Some(VisualKind::Block) => {
+                Some(Shape::Block) => {
                     let line_start = buffer.rope().line_to_char(row);
                     let (start, end) = ed.block_span_in(id, row);
                     let (from, to) = (start - line_start, end - line_start);
@@ -1477,7 +1478,8 @@ mod tests {
     /// on trust. See `docs/specs/selections.md`.
     #[test]
     fn a_linewise_selection_reaches_the_edge_of_the_pane() {
-        use bi::editor::{Action, Command, VisualKind};
+        use bi::editor::{Action, Command};
+        use bi::region::Shape;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1487,7 +1489,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
         terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
-        ed.apply(Command { count: 1, action: Action::EnterVisual(VisualKind::Line) });
+        ed.apply(Command { count: 1, action: Action::EnterVisual(Shape::Lines) });
         terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
 
         let bg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].style().bg;

@@ -17,7 +17,7 @@ use ropey::Rope;
 use crate::history::{Change, Cursors, History};
 use crate::indent::{self, Indent};
 use crate::motion::{Kind, Motion, Operator, Target, TextObject};
-use crate::registers::{Entry, EntryKind};
+use crate::registers::{Entry, Shape};
 use crate::trim::Trim;
 
 /// A position as (row, byte-column-within-row).
@@ -1401,7 +1401,7 @@ impl Buffer {
         text: String,
         linewise: bool,
     ) -> (Entry, Cursor, std::ops::Range<usize>) {
-        let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
+        let kind = if linewise { Shape::Lines } else { Shape::Chars };
 
         let landed = if op == Operator::Yank {
             // Yank moves the cursor to the start of what it took, and nowhere
@@ -1505,7 +1505,7 @@ impl Buffer {
     pub fn paste(&mut self, at: Cursor, entry: &Entry, before: bool, count: usize) -> Cursor {
         let count = count.max(1);
         match entry.kind {
-            EntryKind::Charwise => {
+            Shape::Chars => {
                 let row = self.row_at(at);
                 let line_end = self.rope.line_to_char(row) + self.line_len(row);
                 // `p` goes after the char under the cursor — but an empty line
@@ -1516,7 +1516,7 @@ impl Buffer {
                 self.apply_edit(start, start, &text);
                 self.clamped(Cursor::at(start + len.saturating_sub(1)), false)
             }
-            EntryKind::Linewise => {
+            Shape::Lines => {
                 let row = self.row_at(at);
                 let start = if before {
                     self.rope.line_to_char(row)
@@ -1544,7 +1544,7 @@ impl Buffer {
                 // first-non-blank motion existed; `^` is now one.
                 self.first_non_blank(self.at_row(landed, false))
             }
-            EntryKind::Blockwise => {
+            Shape::Block => {
                 let row = self.row_at(at);
                 let col = self.col_at(at);
                 // `p` goes after the char under the cursor, as charwise does.
@@ -1605,18 +1605,18 @@ impl Buffer {
         if linewise && !terminated {
             text.push('\n');
         }
-        let kind = if linewise { EntryKind::Linewise } else { EntryKind::Charwise };
+        let kind = if linewise { Shape::Lines } else { Shape::Chars };
         let removed = Entry { text, kind };
 
         let landed = match (linewise, entry.kind) {
             // A rectangle goes back where the range was, so the range goes
             // first and the block paste does the rest.
-            (_, EntryKind::Blockwise) => {
+            (_, Shape::Block) => {
                 self.apply_edit(start, end, "");
                 let at = self.clamped(Cursor::at(start), true);
                 self.paste(at, entry, true, count)
             }
-            (false, EntryKind::Charwise) => {
+            (false, Shape::Chars) => {
                 let text = entry.text.repeat(count);
                 let len = text.chars().count();
                 self.apply_edit(start, end, &text);
@@ -1624,7 +1624,7 @@ impl Buffer {
             }
             // Lines cannot sit inside a line, so the line splits where the
             // selection was and they land between the halves.
-            (false, EntryKind::Linewise) => {
+            (false, Shape::Lines) => {
                 self.apply_edit(start, end, &format!("\n{}", entry.text.repeat(count)));
                 let row = self.row_at(Cursor::at(start)) + 1;
                 self.first_non_blank(self.at_row(row, false))
@@ -1634,7 +1634,7 @@ impl Buffer {
             // range took one, so a file that ended without one still does.
             (true, kind) => {
                 let mut text = entry.text.repeat(count);
-                if kind == EntryKind::Charwise {
+                if kind == Shape::Chars {
                     text.push('\n');
                 }
                 // One newline, not every trailing one: an entry of blank lines
@@ -3215,7 +3215,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(e.text, "foo ");
-        assert_eq!(e.kind, EntryKind::Charwise);
+        assert_eq!(e.kind, Shape::Chars);
     }
 
     #[test]
@@ -3223,7 +3223,7 @@ mod tests {
         let mut b = buf("one\ntwo");
         let e = b.operate(Operator::Delete, Target::Motion(Motion::CurrentLine), 1).unwrap();
         assert_eq!(e.text, "one\n");
-        assert_eq!(e.kind, EntryKind::Linewise);
+        assert_eq!(e.kind, Shape::Lines);
     }
 
     /// Even from a final line that has no newline of its own — a linewise entry
@@ -3276,11 +3276,11 @@ mod tests {
     }
 
     fn chars(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Charwise }
+        Entry { text: text.into(), kind: Shape::Chars }
     }
 
     fn lines(text: &str) -> Entry {
-        Entry { text: text.into(), kind: EntryKind::Linewise }
+        Entry { text: text.into(), kind: Shape::Lines }
     }
 
     #[test]
@@ -3723,7 +3723,7 @@ mod tests {
         let target = Target::Object { object: WORD, around: false };
         let e = b.operate(Operator::Yank, target, 1).unwrap();
         assert_eq!(e.text, "bar");
-        assert_eq!(e.kind, EntryKind::Charwise);
+        assert_eq!(e.kind, Shape::Chars);
         assert_eq!(b.rope().to_string(), "foo bar");
     }
 
@@ -3736,7 +3736,7 @@ mod tests {
         b.cursor = Cursor::at(0);
         let target = Target::Object { object: TextObject::Paragraph, around: false };
         let e = b.operate(Operator::Delete, target, 1).unwrap();
-        assert_eq!(e.kind, EntryKind::Linewise);
+        assert_eq!(e.kind, Shape::Lines);
         assert_eq!(e.text, "one\ntwo\n");
         assert_eq!(b.rope().to_string(), "\nthree\n", "no empty line left over");
     }

@@ -11,11 +11,12 @@
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{
-    Action, BufferCmd, CmdMove, Command, FileOp, Mode, ResultsCmd, TreeCmd, VisualKind, WindowCmd,
+    Action, BufferCmd, CmdMove, Command, FileOp, Mode, ResultsCmd, TreeCmd, WindowCmd,
 };
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
+use crate::region::Shape;
 use crate::registers::Sink;
 use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
@@ -809,7 +810,7 @@ impl Input {
             KeyCode::Char('p') if ctrl => self.plain(Action::OpenPicker(PickerKind::File)),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
             KeyCode::Char('x') if ctrl => self.plain(Action::SkipCursorToNextMatch),
-            KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(VisualKind::Block)),
+            KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(Shape::Block)),
             KeyCode::Char('e') if ctrl => self.plain(Action::ScrollLine { down: true }),
             KeyCode::Char('y') if ctrl => self.plain(Action::ScrollLine { down: false }),
             KeyCode::Char('d') if ctrl => self.plain(Action::ScrollHalfPage { down: true }),
@@ -1108,8 +1109,8 @@ impl Input {
             'N' => return self.resolve(Motion::Search { reverse: true }),
             '*' => return self.plain(Action::SearchWord { forward: true }),
             '#' => return self.plain(Action::SearchWord { forward: false }),
-            'v' => return self.plain(Action::EnterVisual(VisualKind::Char)),
-            'V' => return self.plain(Action::EnterVisual(VisualKind::Line)),
+            'v' => return self.plain(Action::EnterVisual(Shape::Chars)),
+            'V' => return self.plain(Action::EnterVisual(Shape::Lines)),
             'R' => return self.plain(Action::EnterReplace),
             'f' | 'F' | 't' | 'T' => {
                 self.find_pending = find_key(c);
@@ -1178,9 +1179,9 @@ impl Input {
 
     /// Visual mode. Falls through to `normal` for everything it does not
     /// claim, so every motion and text object works unchanged.
-    fn visual(&mut self, key: Key, kind: VisualKind) -> Option<Command> {
+    fn visual(&mut self, key: Key, kind: Shape) -> Option<Command> {
         let ctrl = key.mods.ctrl;
-        let block = kind == VisualKind::Block;
+        let block = kind == Shape::Block;
 
         // Esc has to be claimed here. Normal mode's Esc only clears the pending
         // keymap state and resolves to no command at all, which would leave
@@ -1316,8 +1317,8 @@ impl Input {
             // they are normal mode's, which is what vim does too.
             'I' if block => self.plain(Action::BlockInsert { append: false }),
             'A' if block => self.plain(Action::BlockInsert { append: true }),
-            'v' => self.plain(Action::EnterVisual(VisualKind::Char)),
-            'V' => self.plain(Action::EnterVisual(VisualKind::Line)),
+            'v' => self.plain(Action::EnterVisual(Shape::Chars)),
+            'V' => self.plain(Action::EnterVisual(Shape::Lines)),
             _ => self.normal(key),
         }
     }
@@ -1558,7 +1559,7 @@ number = 5
 
         // And in visual, which has no `[keys.visual]` of its own — it borrows
         // normal's, the same way `input.rs` falls through to it.
-        let visual = input.on_key(key('k'), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+        let visual = input.on_key(key('k'), &Mode::Visual(Shape::Chars), ContentKind::Text);
         assert_eq!(visual.expect("resolved").action, Action::Move(Motion::Down));
     }
 
@@ -1999,7 +2000,7 @@ leader = \" \"
     #[test]
     fn ctrl_x_skips_a_match_wherever_ctrl_n_takes_one() {
         let mut input = Input::default();
-        for mode in [Mode::Normal, Mode::Visual(VisualKind::Char)] {
+        for mode in [Mode::Normal, Mode::Visual(Shape::Chars)] {
             let take = input.on_key(ctrl('n'), &mode, ContentKind::Text).unwrap();
             assert_eq!(take.action, Action::AddCursorNextMatch, "{mode:?}");
 
@@ -2009,7 +2010,7 @@ leader = \" \"
 
         // Neither belongs in a block: the rectangle comes from one selection's
         // corners, so a second cursor has nothing to say about it.
-        let block = Mode::Visual(VisualKind::Block);
+        let block = Mode::Visual(Shape::Block);
         assert!(
             input.on_key(ctrl('x'), &block, ContentKind::Text).is_none(),
             "blockwise visual has no second selection to skip"
@@ -2202,7 +2203,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "3>".chars() {
-            last = input.on_key(key(c), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
         }
         let cmd = last.expect("indented");
         assert_eq!(
@@ -2286,7 +2287,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "S\"".chars() {
-            last = input.on_key(key(c), &Mode::Visual(VisualKind::Char), ContentKind::Text);
+            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
         }
         assert_eq!(last.unwrap().action, Action::SurroundSelection { with: '"' });
     }
@@ -2474,7 +2475,7 @@ leader = \" \"
     /// rather than falling through to normal mode's put.
     #[test]
     fn p_over_a_selection_is_a_paste_of_its_own() {
-        let visual = Mode::Visual(VisualKind::Char);
+        let visual = Mode::Visual(Shape::Chars);
         let ring = Sink::Ring;
         let mut input = Input::default();
 
@@ -2494,7 +2495,7 @@ leader = \" \"
     /// picker, and what it lands on is pasted over the selection anyway.
     #[test]
     fn quote_p_over_a_selection_still_opens_the_picker() {
-        let visual = Mode::Visual(VisualKind::Char);
+        let visual = Mode::Visual(Shape::Chars);
         let mut input = Input::default();
         assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none(), "armed");
         let cmd = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
@@ -2503,7 +2504,7 @@ leader = \" \"
 
     #[test]
     fn nothing_comes_out_of_the_black_hole_over_a_selection_either() {
-        let visual = Mode::Visual(VisualKind::Line);
+        let visual = Mode::Visual(Shape::Lines);
         let mut input = Input::default();
         assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none());
         assert!(input.on_key(key('_'), &visual, ContentKind::Text).is_none());

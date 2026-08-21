@@ -39,6 +39,7 @@ pub mod label;
 pub mod motion;
 pub mod picker;
 pub mod range;
+pub mod region;
 pub mod registers;
 pub mod resize;
 pub mod results;
