@@ -58,6 +58,10 @@ tree-sitter-templ = "2.2.0"
 # Two grammars in one crate, and its build.rs compiles both whether or not
 # either is referenced — so DTD costs nothing that XML has not already spent.
 tree-sitter-xml = "0.7"
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.9"
+ignore = "0.4.33"
 
 [profile.release]
 lto = true

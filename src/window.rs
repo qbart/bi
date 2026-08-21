@@ -29,6 +29,11 @@ pub struct WindowId(pub u32);
 pub enum Content {
     Text(Text),
     Tree(Tree),
+    /// What a search found — see `docs/specs/find-in-files.md`. Held whole in
+    /// the window for the same reason the tree is: two panes on one result set
+    /// would share a selection, and wanting a different one is why you opened
+    /// the second.
+    Results(Box<crate::results::Results>),
 }
 
 /// Which keymap a window wants, and which renderer.
@@ -39,6 +44,7 @@ pub enum Content {
 pub enum ContentKind {
     Text,
     Tree,
+    Results,
 }
 
 impl Content {
@@ -46,6 +52,7 @@ impl Content {
         match self {
             Content::Text(_) => ContentKind::Text,
             Content::Tree(_) => ContentKind::Tree,
+            Content::Results(_) => ContentKind::Results,
         }
     }
 
@@ -53,7 +60,7 @@ impl Content {
     pub fn buffer(&self) -> Option<BufferId> {
         match self {
             Content::Text(text) => Some(text.buffer),
-            Content::Tree(_) => None,
+            Content::Tree(_) | Content::Results(_) => None,
         }
     }
 }
@@ -115,28 +122,42 @@ impl Window {
     pub fn text(&self) -> Option<&Text> {
         match &self.content {
             Content::Text(text) => Some(text),
-            Content::Tree(_) => None,
+            _ => None,
         }
     }
 
     pub fn text_mut(&mut self) -> Option<&mut Text> {
         match &mut self.content {
             Content::Text(text) => Some(text),
-            Content::Tree(_) => None,
+            _ => None,
         }
     }
 
     pub fn tree(&self) -> Option<&Tree> {
         match &self.content {
             Content::Tree(tree) => Some(tree),
-            Content::Text(_) => None,
+            _ => None,
         }
     }
 
     pub fn tree_mut(&mut self) -> Option<&mut Tree> {
         match &mut self.content {
             Content::Tree(tree) => Some(tree),
-            Content::Text(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn results(&self) -> Option<&crate::results::Results> {
+        match &self.content {
+            Content::Results(results) => Some(results),
+            _ => None,
+        }
+    }
+
+    pub fn results_mut(&mut self) -> Option<&mut crate::results::Results> {
+        match &mut self.content {
+            Content::Results(results) => Some(results),
+            _ => None,
         }
     }
 

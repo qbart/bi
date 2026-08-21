@@ -580,6 +580,68 @@ fn render_tree(
     cursor_at
 }
 
+/// What a search found: a heading per file, its matching lines under it.
+///
+/// The same shape as [`render_tree`] and for the same reason — a list pane is
+/// a list of rows with one selected, and the selection is drawn in every such
+/// pane rather than only the focused one, because it is where the next Enter
+/// goes rather than where a text cursor is.
+fn render_results(
+    frame: &mut Frame,
+    results: &bi::results::Results,
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    use bi::results::Row;
+
+    let rows = results.rows();
+    let last = (results.scroll() + area.height as usize).min(rows.len());
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(area.height as usize);
+
+    for (index, row) in rows.iter().enumerate().take(last).skip(results.scroll()) {
+        let spans = match row {
+            // A file leads its group, bold and in the tree's directory colour:
+            // it is the same idea — a name with things under it.
+            Row::File { path, matches } => vec![
+                Span::styled(
+                    path.display().to_string(),
+                    tui(ui.tree_dir).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {matches}"), tui(ui.status_muted)),
+            ],
+            Row::Hit { index } => {
+                let m = &results.matches()[*index];
+                // The line number in the gutter's colour, so the eye can run
+                // down the numbers without the text getting in the way. The
+                // match itself is painted, which is what makes a row scannable
+                // when the line is long.
+                let mut out = vec![Span::styled(format!("{:>6}  ", m.line), tui(ui.gutter))];
+                let text: Vec<char> = m.text.chars().collect();
+                let (from, to) = (m.col.min(text.len()), (m.col + m.len).min(text.len()));
+                out.push(Span::raw(text[..from].iter().collect::<String>()));
+                out.push(Span::styled(text[from..to].iter().collect::<String>(), tui(ui.search)));
+                out.push(Span::raw(text[to..].iter().collect::<String>()));
+                out
+            }
+        };
+
+        if index != results.selected() {
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        if focused {
+            cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
 /// One window's text. Returns where the terminal cursor belongs, when this is
 /// the window that has it.
 fn render_window(
@@ -591,6 +653,9 @@ fn render_window(
 ) -> Option<(u16, u16)> {
     let (text, buffer, syntax, options) = match ed.pane(id)? {
         Pane::Text { text, buffer, syntax, options, .. } => (text, buffer, syntax, options),
+        Pane::Results { results, .. } => {
+            return render_results(frame, results, text_area, focused, &ed.theme().ui);
+        }
         Pane::Tree { tree, .. } => {
             return render_tree(
                 frame,
@@ -845,6 +910,11 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
     // it. See `render`, which gives a tree pane its whole rect.
     let (name, at) = match ed.pane(id) {
         None | Some(Pane::Tree { .. }) => return String::new(),
+        // A results pane says what it is and how much it found. It has no
+        // cursor position to report, so the left half carries the count.
+        Some(Pane::Results { results, .. }) => {
+            (results.title.clone(), format!("{} in {}", results.matches().len(), results.files()))
+        }
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
             // picker; a pane thirty columns wide has no room to say it twice.

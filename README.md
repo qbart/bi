@@ -683,6 +683,37 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 `TODO:` tags, colour swatches and jump labels will all arrive through. See
 [docs/specs/decorations.md](docs/specs/decorations.md).
 
+#### `:find` and `:replace`
+
+`/` searches the buffer; `:find` searches the project and puts what it found in
+a pane.
+
+```
+:find needle        every match under the project root
+:findre \bfn \w+    the same, as a regular expression
+:replace pin        rewrite every match the pane is showing
+```
+
+The whole argument is the pattern, so `:find fn main()` searches for exactly
+that — there are no flags on the line, because a `-r` would be a pattern you
+could not search for. Smart case: insensitive until you type a capital.
+
+Results are a **pane**, not an overlay — a third content kind beside text and
+the file tree. It stays open beside the file you are editing, `j`/`k` and
+`gg`/`G` move, Enter opens the file **at the match's column**, and `q` puts
+back whatever the pane displaced. Enter on a file heading opens the top of that
+file.
+
+`:replace` rewrites **into buffers, never straight to disk**: every affected
+file is opened, edited as one undo step and left modified, so `:wa` commits the
+lot and `u` takes any one of them back. That is the confirmation — the review
+happens in the editor, before the repository hears about it. A line that
+changed since the search is skipped and counted rather than silently rewritten.
+
+Searching is ripgrep's own crates — `grep-searcher`, `grep-regex`, `ignore` —
+not an `rg` subprocess, so the core stays a library that works wherever it is
+embedded. See [docs/specs/find-in-files.md](docs/specs/find-in-files.md).
+
 #### `:resize`
 
 `Ctrl-W +` moves a divider one cell; `:resize` says how far in one go.

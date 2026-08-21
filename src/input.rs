@@ -11,7 +11,7 @@
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{
-    Action, BufferCmd, CmdMove, Command, FileOp, Mode, TreeCmd, VisualKind, WindowCmd,
+    Action, BufferCmd, CmdMove, Command, FileOp, Mode, ResultsCmd, TreeCmd, VisualKind, WindowCmd,
 };
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -233,6 +233,10 @@ impl Input {
     fn remap(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Remapped {
         let mode = match mode {
             Mode::Normal if content == ContentKind::Tree => KeyMode::Tree,
+            // No overrides of its own yet. It borrows the tree's map rather
+            // than growing a third one for four keys that mean the same thing
+            // in both: a list is a list.
+            Mode::Normal if content == ContentKind::Results => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             _ => {
@@ -314,6 +318,7 @@ impl Input {
             // session — see `docs/specs/tree.md` on why `Mode::Tree` would be
             // a second copy of a fact the window already holds.
             Mode::Normal if content == ContentKind::Tree => self.tree(key),
+            Mode::Normal if content == ContentKind::Results => self.results(key),
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -616,6 +621,59 @@ impl Input {
 
     /// Nothing here enters insert or visual mode, and `Ctrl-W` is normal-mode
     /// only, so a tree can never be focused in either.
+    /// A results pane: a list you read, and take one row out of.
+    ///
+    /// Deliberately small. Everything a results pane cannot do — editing,
+    /// operators, insert mode — should keep meaning what it means everywhere
+    /// else rather than being quietly swallowed, so anything not named here
+    /// falls through to nothing. `Ctrl-W` still works, because moving between
+    /// windows is not a thing any pane gets to opt out of.
+    fn results(&mut self, key: Key) -> Option<Command> {
+        if self.window_pending {
+            return self.window_key(key);
+        }
+        let ctrl = key.mods.ctrl;
+        let count = self.count.unwrap_or(1).max(1);
+        let g = std::mem::take(&mut self.g_pending);
+
+        let cmd = match key.code {
+            KeyCode::Char('g') if g => ResultsCmd::First,
+            KeyCode::Char('g') => {
+                self.g_pending = true;
+                return None;
+            }
+            KeyCode::Char('G') => ResultsCmd::Last,
+            KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                self.count = Some(self.count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as usize);
+                return None;
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                return None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => ResultsCmd::Move(1),
+            KeyCode::Char('k') | KeyCode::Up => ResultsCmd::Move(-1),
+            KeyCode::Char('d') if ctrl => ResultsCmd::Move(10),
+            KeyCode::Char('u') if ctrl => ResultsCmd::Move(-10),
+            KeyCode::Enter | KeyCode::Char('o') => ResultsCmd::Open,
+            // The two ways out, and both are ways out of a *pane*: `q` because
+            // it is what closes a list everywhere, and `Ctrl-^` because the
+            // pane displaced something to be here.
+            KeyCode::Char('q') | KeyCode::Esc => ResultsCmd::Close,
+            KeyCode::Char('^') if ctrl => ResultsCmd::Close,
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        let count = match cmd {
+            ResultsCmd::Move(_) => count,
+            _ => 1,
+        };
+        self.reset();
+        Some(Command { count, action: Action::Results(cmd) })
+    }
+
     fn tree(&mut self, key: Key) -> Option<Command> {
         if self.window_pending {
             return self.window_key(key);
