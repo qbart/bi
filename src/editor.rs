@@ -5179,16 +5179,17 @@ impl View<'_> {
             self.paste_over_block(entry, capture, count);
             return;
         }
-        let linewise = self.session.mode.visual() == Some(Shape::Lines);
+        let shape = self.session.mode.visual().unwrap_or(Shape::Chars);
+        let linewise = shape == Shape::Lines;
         self.for_each_selection(|ed, sel| {
-            let len = ed.buffer.rope().len_chars();
-            let (start, end) = if linewise {
-                let (lo, hi) = sel.range();
-                ed.buffer.line_range(lo, hi, true)
-            } else {
-                // Charwise visual includes the character under the head.
-                sel.inclusive_range(len)
+            let part = Region::part_of(ed.buffer, sel, shape);
+            // What is displaced goes with its terminator, so the entry can put
+            // whole lines back in its place.
+            let part = match linewise {
+                true => part.terminated(ed.buffer),
+                false => part,
             };
+            let (start, end) = (part.start, part.end);
             let (removed, landed) = ed.buffer.paste_over(start, end, linewise, entry, count);
             if capture {
                 ed.session.registers.push(removed);

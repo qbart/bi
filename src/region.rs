@@ -54,10 +54,6 @@ impl Part {
         self.end <= self.start
     }
 
-    pub fn len(self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
     /// The same part, out to the line terminator after it.
     ///
     /// What a linewise cut needs and a linewise change does not: `dd` takes
