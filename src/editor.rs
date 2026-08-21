@@ -6484,7 +6484,7 @@ impl View<'_> {
         self.session.mode = Mode::Normal;
     }
 
-    /// `:[range]s/old/new/flags`.
+    /// `:[scope]s/old/new/flags`.
     ///
     /// Hands back the pattern that ran, so the caller can make it the last
     /// search — `None` when nothing was replaced and there is nothing to
