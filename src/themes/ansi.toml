@@ -86,6 +86,10 @@ diag_warning = { fg = "yellow", underline = true }
 diag_info    = { fg = "blue", underline = true }
 diag_hint    = { fg = "darkgray", underline = true }
 
+# The float surface — hover, and the completion menu. Selection and badges
+# inside it reuse the picker keys, so choosing looks the same everywhere.
+popup = { fg = "white", bg = "color236" }
+
 mode_normal = { fg = "black", bg = "blue", bold = true }
 mode_insert = { fg = "black", bg = "green", bold = true }
 mode_pick   = { fg = "black", bg = "magenta", bold = true }

@@ -360,6 +360,7 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Normal, "references", "gr"),
     (KeyMode::Normal, "diagnostic_next", "]d"),
     (KeyMode::Normal, "diagnostic_prev", "[d"),
+    (KeyMode::Normal, "hover", "K"),
     // The window prefix. Two keys each, and a name apiece so a leader binding
     // can reach them — `<leader>e` for the tree is the one everybody writes.
     (KeyMode::Normal, "window_split", "<C-w>s"),

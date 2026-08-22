@@ -64,11 +64,57 @@ pub struct LocationLink {
 }
 
 /// One edit from `textDocument/formatting`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TextEdit {
     pub range: Range,
     #[serde(rename = "newText")]
     pub new_text: String,
+}
+
+/// One offer from `textDocument/completion`. The fields bi reads; servers
+/// send a dozen more, ignored by serde as ever.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionItem {
+    pub label: String,
+    /// The LSP kind number — function, field, keyword. Drawn as a one-char
+    /// badge; unknown numbers draw as nothing.
+    #[serde(default)]
+    pub kind: Option<u8>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default, rename = "insertText")]
+    pub insert_text: Option<String>,
+    /// 2 is a snippet, which bi collapses to its plain text.
+    #[serde(default, rename = "insertTextFormat")]
+    pub insert_text_format: Option<u8>,
+    #[serde(default, rename = "filterText")]
+    pub filter_text: Option<String>,
+    #[serde(default, rename = "sortText")]
+    pub sort_text: Option<String>,
+    /// Servers that prefer `textEdit` put the text here instead of
+    /// `insertText`. bi takes the text and ignores the range — the word
+    /// being replaced is re-read from the buffer at accept, which no stale
+    /// range can get wrong.
+    #[serde(default, rename = "textEdit")]
+    pub text_edit: Option<Value>,
+    /// rust-analyzer's auto-imports live here.
+    #[serde(default, rename = "additionalTextEdits")]
+    pub additional_text_edits: Vec<TextEdit>,
+}
+
+impl CompletionItem {
+    /// What an accept inserts, before snippet stripping: `insertText`, the
+    /// `textEdit`'s text, or the label — the spec's own fallback order.
+    pub fn new_text(&self) -> &str {
+        if let Some(text) = &self.insert_text {
+            return text;
+        }
+        self.text_edit
+            .as_ref()
+            .and_then(|e| e.get("newText"))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.label)
+    }
 }
 
 /// What `initialize` answered with, reduced to the parts core reads.
@@ -105,6 +151,21 @@ pub struct Capabilities {
     pub references_provider: Option<Value>,
     #[serde(default, rename = "documentFormattingProvider")]
     pub formatting_provider: Option<Value>,
+    #[serde(default, rename = "hoverProvider")]
+    pub hover_provider: Option<Value>,
+    /// Always an object when present; its `triggerCharacters` are the keys
+    /// (`.`, `::`) that open the menu without a word being typed.
+    #[serde(default, rename = "completionProvider")]
+    pub completion_provider: Option<Value>,
+}
+
+/// The `triggerCharacters` of a `completionProvider`, empty when absent.
+pub fn trigger_characters(provider: Option<&Value>) -> Vec<String> {
+    provider
+        .and_then(|p| p.get("triggerCharacters"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// Whether a `*Provider` capability is on. The spec lets a server say `true`,

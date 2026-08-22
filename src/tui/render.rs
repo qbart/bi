@@ -867,12 +867,253 @@ fn render_window(
 
     frame.render_widget(Paragraph::new(lines), text_area);
 
+    // The floats, over the text they annotate: the hover at its anchor, the
+    // completion menu at the word's start. Both are core state already
+    // filled; geometry — measuring, flipping, clamping — is this side's job.
+    if let Some(hover) = &ed.session.hover
+        && hover.window == id
+    {
+        render_hover(frame, hover, buffer, ed.theme(), scroll, last_row, gutter, tab, text_area);
+    }
+    if focused && let Some(menu) = &ed.session.completion {
+        render_menu(frame, menu, buffer, &ed.theme().ui, scroll, last_row, gutter, tab, text_area);
+    }
+
     focused.then(|| {
         (
             text_area.x + (gutter + cursor_screen_col) as u16,
             text_area.y + (cursor_row.saturating_sub(scroll)) as u16,
         )
     })
+}
+
+/// The screen cell a char offset occupies, when it is on screen at all.
+fn anchor_cell(
+    buffer: &bi::buffer::Buffer,
+    anchor: usize,
+    scroll: usize,
+    last_row: usize,
+    gutter: usize,
+    tab: usize,
+    area: Rect,
+) -> Option<(u16, u16)> {
+    let at = Cursor::at(anchor.min(buffer.rope().len_chars()));
+    let row = buffer.row_at(at);
+    if !(scroll..last_row).contains(&row) {
+        return None;
+    }
+    let col = display_col(&buffer.line(row), buffer.col_at(at), tab) + gutter;
+    Some((
+        area.x + (col.min(area.width.saturating_sub(1) as usize)) as u16,
+        area.y + (row - scroll) as u16,
+    ))
+}
+
+/// Where a float goes: beside its anchor, on the preferred side, flipped when
+/// the room runs out, clamped to the pane. `None` when there is no room at
+/// all — a one-row pane owes nobody a float.
+fn float_rect(
+    anchor: (u16, u16),
+    want: (u16, u16),
+    area: Rect,
+    prefer_above: bool,
+) -> Option<Rect> {
+    let (ax, ay) = anchor;
+    let (want_w, want_h) = want;
+    let width = want_w.min(area.width).max(1);
+    let above = ay.saturating_sub(area.y);
+    let below = (area.y + area.height).saturating_sub(ay + 1);
+
+    let fits = |room: u16| want_h.min(room);
+    let up = prefer_above && (above >= want_h || above >= below);
+    let down_first = !prefer_above && (below >= want_h || below >= above);
+    let (top, height) = match up || (!down_first && above > below) {
+        true => (ay - fits(above), fits(above)),
+        false => (ay + 1, fits(below)),
+    };
+    if height == 0 {
+        return None;
+    }
+    let x = ax.min((area.x + area.width).saturating_sub(width)).max(area.x);
+    Some(Rect { x, y: top, width, height })
+}
+
+#[allow(clippy::too_many_arguments, reason = "a pane's geometry is this many facts")]
+fn render_hover(
+    frame: &mut Frame,
+    hover: &bi::editor::Hover,
+    buffer: &bi::buffer::Buffer,
+    theme: &Theme,
+    scroll: usize,
+    last_row: usize,
+    gutter: usize,
+    tab: usize,
+    area: Rect,
+) {
+    use bi::editor::HoverLine;
+
+    let Some(anchor) = anchor_cell(buffer, hover.anchor, scroll, last_row, gutter, tab, area)
+    else {
+        return;
+    };
+    let ui = &theme.ui;
+
+    // Code blocks highlight whole, not line by line — a signature split over
+    // lines is one parse. Contiguous `Code` lines are gathered first.
+    let mut lines: Vec<Line> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    let flush = |block: &mut Vec<&str>, lines: &mut Vec<Line>| {
+        if !block.is_empty() {
+            lines.extend(highlight_block(hover.language, block, theme, tab));
+            block.clear();
+        }
+    };
+    for line in &hover.lines {
+        match line {
+            HoverLine::Code(code) => block.push(code),
+            HoverLine::Text(text) => {
+                flush(&mut block, &mut lines);
+                lines.push(Line::raw(format!(" {text} ")));
+            }
+            HoverLine::Rule => {
+                flush(&mut block, &mut lines);
+                // Widened after measuring; a marker for now.
+                lines.push(Line::styled(String::new(), tui(ui.rule)));
+            }
+        }
+    }
+    flush(&mut block, &mut lines);
+
+    let width = lines.iter().map(Line::width).max().unwrap_or(1).max(4) as u16;
+    for line in &mut lines {
+        // The rules stretch to the box they ended up in.
+        if line.width() == 0 && line.style == tui(ui.rule) {
+            *line = Line::styled("─".repeat(width as usize), tui(ui.rule));
+        }
+    }
+
+    let Some(rect) = float_rect(anchor, (width, lines.len() as u16), area, true) else { return };
+    // The box may be shorter than the content; the top of a hover is the
+    // headline, so it is the part that survives.
+    lines.truncate(rect.height as usize);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).style(tui(ui.popup)), rect);
+}
+
+/// A fenced block through the grammar it names, split back into lines. The
+/// spans carry only foregrounds, so the popup's background shows through.
+fn highlight_block<'a>(
+    language: Option<&'static str>,
+    block: &[&str],
+    theme: &Theme,
+    tab: usize,
+) -> Vec<Line<'a>> {
+    let text = block.join("\n");
+    let rope = ropey::Rope::from_str(&text);
+    let Some(syntax) = language.and_then(|name| Syntax::for_filetype(name, &rope)) else {
+        return block.iter().map(|line| Line::raw(format!(" {line} "))).collect();
+    };
+    let spans = syntax.highlights(&rope, 0..text.len());
+    let mut out = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        let mine: Vec<HlSpan> = spans
+            .iter()
+            .copied()
+            .filter(|s| s.end_byte > start && s.start_byte < start + line.len())
+            .collect();
+        let mut cells = vec![Span::raw(" ")];
+        cells.extend(styled_line(line, start, &mine, &syntax, theme, tab));
+        cells.push(Span::raw(" "));
+        out.push(Line::from(cells));
+        start += line.len() + 1;
+    }
+    out
+}
+
+/// The completion menu: labels and kind badges below the word being typed.
+/// Selection wears `picker_selected`, so choosing looks the same everywhere.
+#[allow(clippy::too_many_arguments, reason = "a pane's geometry is this many facts")]
+fn render_menu(
+    frame: &mut Frame,
+    menu: &bi::complete::Completion,
+    buffer: &bi::buffer::Buffer,
+    ui: &Ui,
+    scroll: usize,
+    last_row: usize,
+    gutter: usize,
+    tab: usize,
+    area: Rect,
+) {
+    let Some(anchor) = anchor_cell(buffer, menu.replace.start, scroll, last_row, gutter, tab, area)
+    else {
+        return;
+    };
+
+    let total = menu.len();
+    if total == 0 {
+        return;
+    }
+    let label_width = menu.matches().take(100).map(|i| i.label.chars().count()).max().unwrap_or(0);
+    let width = (label_width + 4).clamp(8, area.width as usize) as u16;
+    let height = total.min(8) as u16;
+    let Some(rect) = float_rect(anchor, (width, height), area, false) else { return };
+
+    // Stateless scrolling: the selection pins to the bottom row once it
+    // walks past the box. Predictable, and it needs no mutation from here.
+    let visible = rect.height as usize;
+    let skip = (menu.selected() + 1).saturating_sub(visible);
+
+    let lines: Vec<Line> = menu
+        .matches()
+        .enumerate()
+        .skip(skip)
+        .take(visible)
+        .map(|(i, item)| {
+            let badge = item.kind.map(kind_char).unwrap_or(' ');
+            let text = format!(
+                " {:<w$} {badge} ",
+                truncate(&item.label, width as usize - 4),
+                w = width as usize - 4
+            );
+            match i == menu.selected() {
+                true => Line::styled(text, tui(ui.picker_selected)),
+                false => Line::raw(text),
+            }
+        })
+        .collect();
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).style(tui(ui.popup)), rect);
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    match text.chars().count() > width {
+        true => {
+            let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+        false => text.to_string(),
+    }
+}
+
+/// The LSP completion kind, as the one character there is room for. A number
+/// nobody recognises draws as nothing — the label still says what it is.
+fn kind_char(kind: u8) -> char {
+    match kind {
+        2 => 'm',               // method
+        3 | 4 => 'f',           // function, constructor
+        5 | 10 => 'p',          // field, property
+        6 => 'v',               // variable
+        7 | 8 | 22 | 25 => 't', // class, interface, struct, type parameter
+        9 => 'M',               // module
+        13 | 20 => 'e',         // enum, member
+        14 => 'k',              // keyword
+        15 => 's',              // snippet
+        21 => 'c',              // constant
+        _ => ' ',
+    }
 }
 
 /// One window's own status row: what it is showing, and where in it.

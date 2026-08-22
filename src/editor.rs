@@ -218,6 +218,12 @@ pub enum Action {
     PickCancel,
     PickToggleShort,
 
+    /// `Ctrl-N` / `Ctrl-P` in insert mode. With the menu open they move its
+    /// selection; with it closed, `Ctrl-N` summons one — vim's own key for
+    /// exactly this. Handled in `Editor::apply`, never in a view: the menu
+    /// is session state. See `docs/specs/complete.md`.
+    CompleteNext,
+    CompletePrev,
     EnterInsert,
     EnterInsertAfter,
     EnterInsertLineStart,
@@ -640,6 +646,12 @@ pub struct Session {
     /// `docs/specs/options.md`.
     /// What the last yank read, and until when — see `docs/specs/flash.md`.
     pub flash: Option<Flash>,
+    /// What `K` asked and the server answered, until the next command — the
+    /// flash's rule. State only; the frontend draws the float. See
+    /// `docs/specs/hover.md`.
+    pub hover: Option<Hover>,
+    /// The completion menu, while one is up. See `docs/specs/complete.md`.
+    pub completion: Option<crate::complete::Completion>,
     /// Buffers written since the last settle, for LSP `didSave` — recorded by
     /// the write paths, drained by `Editor::settle`, the same shape as
     /// `pending_edits` itself. On the session because a write can happen from
@@ -921,6 +933,42 @@ impl BufferEntry {
             lsp: lsp::Attach::Unresolved,
         }
     }
+}
+
+/// An identifier char, for the completion word — the same class `w` calls a
+/// word char.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Markdown to hover lines, minimally and honestly: fence lines drop and tag
+/// what sits between them as code, a horizontal rule becomes [`HoverLine::Rule`],
+/// everything else passes through untouched — stripping emphasis loses
+/// information and rendering it is a project. Blank edges go; a float has no
+/// room for air.
+fn hover_lines(markdown: &str) -> Vec<HoverLine> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        out.push(match () {
+            _ if in_fence => HoverLine::Code(line.to_string()),
+            _ if trimmed == "---" || trimmed == "***" => HoverLine::Rule,
+            _ => HoverLine::Text(line.to_string()),
+        });
+    }
+    let blank = |l: &HoverLine| matches!(l, HoverLine::Text(t) if t.trim().is_empty());
+    while out.first().is_some_and(blank) {
+        out.remove(0);
+    }
+    while out.last().is_some_and(blank) {
+        out.pop();
+    }
+    out
 }
 
 /// The options in force for a file of this type: the session's, with the
@@ -1418,6 +1466,8 @@ enum ExLine {
     DiagnosticJump {
         forward: bool,
     },
+    /// `:hover` — `K`, a float at the cursor. See `docs/specs/hover.md`.
+    Hover,
     /// `:resize 30`, `:resize +3,-3`, `:resize 1:2` — see
     /// `docs/specs/resize.md`.
     Resize(crate::resize::Resize),
@@ -1632,6 +1682,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         }
         "dn" | "dnext" => ExLine::DiagnosticJump { forward: true },
         "dp" | "dprev" => ExLine::DiagnosticJump { forward: false },
+        "hover" => ExLine::Hover,
         // The whole argument is the pattern, spaces and all: `:find fn main`
         // has to search for `fn main`. That is also why there are no flags on
         // this line and a second command name instead — a `-r` would be a
@@ -1666,6 +1717,44 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // command, and was handled before the table.
         _ => ExLine::Unknown(name.into()),
     })
+}
+
+/// What `K` brought back, anchored where the question was asked — the cursor
+/// may have moved on by the time the answer lands, and the float belongs to
+/// the spot it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hover {
+    pub window: WindowId,
+    /// Char offset the float hangs from.
+    pub anchor: usize,
+    pub lines: Vec<HoverLine>,
+    /// For highlighting the code lines — the buffer's filetype at request.
+    pub language: Option<&'static str>,
+}
+
+/// One line of a hover, already sorted by what the frontend does with it:
+/// code is highlighted through the grammar, a rule is drawn in the `rule`
+/// style, text passes through. See `docs/specs/hover.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoverLine {
+    Text(String),
+    Code(String),
+    Rule,
+}
+
+/// A completion ask, parked between `apply` and `settle`. A request filed
+/// during `apply` would reach the server *before* the `didChange` carrying
+/// the char that triggered it — so `apply` marks, and `settle` sends after
+/// the drain. See `docs/specs/complete.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteWant {
+    /// Typing an identifier char asked.
+    Word,
+    /// A server trigger character (`.`, `::`) asked; the char rides along
+    /// because the protocol wants servers told which one.
+    Char(char),
+    /// `Ctrl-N` asked, which is what earns failure a status line.
+    Manual,
 }
 
 /// What `:lsp` was asked to do. Three values because the core has three
@@ -1844,6 +1933,10 @@ pub struct Editor {
     /// The language servers: running clients, their inbox, and the routing.
     /// See `docs/specs/lsp.md`.
     lsp: lsp::Registry,
+    /// A completion ask parked until `settle` — see [`CompleteWant`].
+    complete_want: Option<CompleteWant>,
+    /// The newest completion request's number; only its answer is accepted.
+    complete_seq: u64,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2178,6 +2271,8 @@ impl Editor {
             config_source: None,
             config_epoch: 0,
             lsp: lsp::Registry::default(),
+            complete_want: None,
+            complete_seq: 0,
         };
         editor.resolve_options();
         editor
@@ -4721,6 +4816,7 @@ impl Editor {
             ExLine::References => self.lsp_references(),
             ExLine::Format => self.lsp_format(),
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
+            ExLine::Hover => self.lsp_hover(),
             ExLine::Resize(how) => self.run_resize(how),
             ExLine::Find(pattern) => self.run_find(&pattern, false),
             ExLine::FindRegex(pattern) => self.run_find(&pattern, true),
@@ -4895,22 +4991,35 @@ impl Editor {
     /// which hands back anything it discovered mid-flight — an ex line is only
     /// read once it is already running inside one.
     pub fn apply(&mut self, cmd: Command) {
-        match cmd.action {
-            Action::Buffer(buffer_cmd) => return self.run_buffer_cmd(buffer_cmd),
-            Action::Window(window_cmd) => return self.run_window_cmd(window_cmd),
-            Action::Tree(tree_cmd) => return self.run_tree_cmd(tree_cmd),
-            Action::Results(results_cmd) => {
-                return self.run_results_cmd(results_cmd, cmd.count.max(1));
-            }
-            _ => {}
-        }
-        if self.run_session_action(&cmd.action) {
+        // The hover goes out when you do the next thing — the flash's rule,
+        // and the same one keystroke.
+        self.session.hover = None;
+        // While the menu is up, a handful of insert keys mean the menu
+        // rather than the buffer — decided here, so `Input` never learns
+        // whether one is open.
+        if self.intercept_completion(&cmd.action) {
             return;
         }
-        // What is left needs the rope, and a tree window has none.
-        if let Some(mut view) = self.focused() {
-            view.apply(cmd);
+        let action = cmd.action.clone();
+        match cmd.action {
+            Action::Buffer(buffer_cmd) => self.run_buffer_cmd(buffer_cmd),
+            Action::Window(window_cmd) => self.run_window_cmd(window_cmd),
+            Action::Tree(tree_cmd) => self.run_tree_cmd(tree_cmd),
+            Action::Results(results_cmd) => {
+                self.run_results_cmd(results_cmd, cmd.count.max(1));
+            }
+            _ => {
+                // What is left needs the rope, and a tree window has none.
+                if !self.run_session_action(&cmd.action)
+                    && let Some(mut view) = self.focused()
+                {
+                    view.apply(cmd);
+                }
+            }
         }
+        // After, so the trigger logic reads the buffer the command left
+        // behind — the char is in, the cursor has moved.
+        self.sync_completion(&action);
     }
 
     /// Settles everything an edit leaves behind. Called once per key, after the
@@ -4966,6 +5075,10 @@ impl Editor {
     pub fn settle(&mut self) {
         self.attach_lsp();
         self.drain_edits();
+        // After the drain: a completion ask must trail the `didChange` that
+        // carries the char that triggered it, or the server completes
+        // yesterday's text.
+        self.flush_completion();
         self.flush_saves();
         self.pump_lsp();
         // The pump can itself edit — a `:format` answer — so the drain runs
@@ -5115,6 +5228,17 @@ impl Editor {
                 Some(lsp::Effect::Formatting { buffer, version, edits, encoding }) => {
                     self.apply_formatting(buffer, version, edits, encoding)
                 }
+                Some(lsp::Effect::Hover { window, anchor, markdown }) => {
+                    self.apply_hover(window, anchor, markdown)
+                }
+                Some(lsp::Effect::Completion {
+                    buffer,
+                    request,
+                    manual,
+                    incomplete,
+                    items,
+                    encoding,
+                }) => self.apply_completion(buffer, request, manual, incomplete, items, encoding),
                 None => {}
             }
         }
@@ -5484,6 +5608,313 @@ impl Editor {
         let (start, message) = (d.start, d.message.lines().next().unwrap_or("").to_string());
         self.session.status = format!("[{}/{}] {message}", index + 1, diagnostics.len());
         self.set_cursor(Cursor::at(start));
+    }
+
+    /// `:hover` — `K`. The answer floats at the char it was asked about.
+    fn lsp_hover(&mut self) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.hover {
+                return Err("hover: this server does not offer it".into());
+            }
+            let position = self.lsp_position(id, doc.server).ok_or("no cursor here")?;
+            let anchor = self.cursor().map(|c| c.at).ok_or("no cursor here")?;
+            self.lsp.hover(&doc, position, self.focus, anchor)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// A hover answer: processed to lines and parked on the session for the
+    /// frontend to float. Cleared by the next command, like the flash.
+    fn apply_hover(&mut self, window: WindowId, anchor: usize, markdown: Option<String>) {
+        let Some(markdown) = markdown else {
+            self.session.status = "no hover info here".into();
+            return;
+        };
+        if self.window_of(window).is_none() {
+            return;
+        }
+        let language = self.window_of(window).and_then(Window::buffer).and_then(|id| {
+            self.buffers.iter().find(|b| b.id == id).and_then(|entry| entry.filetype)
+        });
+        let lines = hover_lines(&markdown);
+        if lines.is_empty() {
+            self.session.status = "no hover info here".into();
+            return;
+        }
+        self.session.hover = Some(Hover { window, anchor, lines, language });
+    }
+
+    // ---- completion ---------------------------------------------------------
+
+    /// The insert keys that mean the menu while one is up — and `Ctrl-N` as
+    /// the manual summons while none is. `true` means the key is spent.
+    fn intercept_completion(&mut self, action: &Action) -> bool {
+        if self.session.completion.is_some() {
+            match action {
+                Action::CompleteNext => {
+                    if let Some(menu) = &mut self.session.completion {
+                        menu.shift(true);
+                    }
+                }
+                Action::CompletePrev | Action::InsertIndent { right: false } => {
+                    if let Some(menu) = &mut self.session.completion {
+                        menu.shift(false);
+                    }
+                }
+                Action::InsertIndent { right: true } | Action::InsertNewline => {
+                    self.complete_accept();
+                }
+                // Close and *stay in insert*: the menu was the thing being
+                // dismissed, not the typing.
+                Action::EnterNormal => self.close_completion(),
+                _ => return false,
+            }
+            return true;
+        }
+        match action {
+            Action::CompleteNext => {
+                self.complete_want = Some(CompleteWant::Manual);
+                true
+            }
+            Action::CompletePrev => true,
+            _ => false,
+        }
+    }
+
+    /// After a command: what the menu does about it — narrow, close, or open.
+    fn sync_completion(&mut self, action: &Action) {
+        if self.session.mode != Mode::Insert {
+            self.close_completion();
+            return;
+        }
+        // An accept would need one edit per cursor; half-applying is worse
+        // than none, so multi-cursor insert completes nothing for now.
+        if self.selections().is_none_or(|s| s.all().len() != 1) {
+            self.close_completion();
+            return;
+        }
+        match action {
+            Action::InsertChar(c) => match self.session.completion.is_some() {
+                true => {
+                    self.refilter_completion();
+                    // The server said local narrowing cannot be trusted.
+                    if self.session.completion.as_ref().is_some_and(|m| m.incomplete) {
+                        self.complete_want = Some(CompleteWant::Word);
+                    }
+                }
+                false => {
+                    if is_word_char(*c) {
+                        self.complete_want = Some(CompleteWant::Word);
+                    } else if self.is_trigger_char(*c) {
+                        self.complete_want = Some(CompleteWant::Char(*c));
+                    }
+                }
+            },
+            Action::Backspace => self.refilter_completion(),
+            // A motion is leaving the word; the menu does not follow.
+            Action::Move(_) => self.close_completion(),
+            _ => {}
+        }
+    }
+
+    fn close_completion(&mut self) {
+        self.session.completion = None;
+        self.complete_want = None;
+    }
+
+    /// Whether the focused buffer's server opens the menu on `c` — `.` and
+    /// `::` for rust-analyzer.
+    fn is_trigger_char(&self, c: char) -> bool {
+        let Some(id) = self.window().buffer() else { return false };
+        let lsp::Attach::Doc(doc) = &self.entry(id).lsp else { return false };
+        let Some(client) = self.lsp.instance(doc.server) else { return false };
+        let mut buf = [0u8; 4];
+        let c = &*c.encode_utf8(&mut buf);
+        client.trigger_chars.iter().any(|t| t == c)
+    }
+
+    /// Re-reads the word from the buffer and narrows the open menu — or
+    /// closes it when the cursor left the word or the word left the offers.
+    fn refilter_completion(&mut self) {
+        let Some(start) = self.session.completion.as_ref().map(|m| m.replace.start) else {
+            return;
+        };
+        let cursor =
+            self.window_of(self.focus).and_then(Window::text).map(|t| t.selections.cursor().at);
+        let shown = self.window_of(self.focus).and_then(Window::buffer);
+        let (Some(at), Some(id)) = (cursor, shown) else { return self.close_completion() };
+        if at < start {
+            return self.close_completion();
+        }
+        let word: String = {
+            let entry = self.buffers.iter().find(|b| b.id == id).expect("focused buffer exists");
+            entry.buffer.rope().slice(start..at).to_string()
+        };
+        if !word.chars().all(is_word_char) {
+            return self.close_completion();
+        }
+        let Some(menu) = &mut self.session.completion else { return };
+        menu.replace.end = at;
+        menu.refilter(&word);
+        if menu.is_empty() {
+            self.close_completion();
+        }
+    }
+
+    /// Sends the parked ask, from `settle`, *after* the drain — a request
+    /// filed in `apply` would outrun the `didChange` carrying the char that
+    /// triggered it, and the server would complete yesterday's text.
+    fn flush_completion(&mut self) {
+        let Some(want) = self.complete_want.take() else { return };
+        if self.session.mode != Mode::Insert {
+            return;
+        }
+        let manual = want == CompleteWant::Manual;
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.completion {
+                return Err("completion: this server does not offer it".into());
+            }
+            let position = self.lsp_position(id, doc.server).ok_or("no cursor here")?;
+            self.complete_seq += 1;
+            let trigger = match want {
+                CompleteWant::Char(c) => Some(c),
+                CompleteWant::Word | CompleteWant::Manual => None,
+            };
+            self.lsp.completion(&doc, position, id, self.complete_seq, manual, trigger)
+        });
+        // A summoned failure is told; an automatic one per keystroke would
+        // be status noise, so it is not.
+        if let Err(status) = sent
+            && manual
+        {
+            self.session.status = status;
+        }
+    }
+
+    /// A completion answer: opens the menu, unless the world moved on.
+    fn apply_completion(
+        &mut self,
+        buffer: BufferId,
+        request: u64,
+        manual: bool,
+        incomplete: bool,
+        items: Vec<lsp::types::CompletionItem>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        // Stale, or the moment has passed: a newer ask is in flight, insert
+        // mode ended, or the cursor is in a different buffer now.
+        if request != self.complete_seq
+            || self.session.mode != Mode::Insert
+            || self.window_of(self.focus).and_then(Window::buffer) != Some(buffer)
+        {
+            return;
+        }
+        let Some(at) = self.cursor().map(|c| c.at) else { return };
+        if items.is_empty() {
+            if manual {
+                self.session.status = "no completions here".into();
+            }
+            return;
+        }
+
+        // The word start: back over identifier chars from the cursor. bi's
+        // own range, recomputed again at accept — no stale server range can
+        // get it wrong.
+        let entry = self.buffers.iter().find(|b| b.id == buffer).expect("checked above");
+        let rope = entry.buffer.rope();
+        let mut start = at;
+        while start > 0 && is_word_char(rope.char(start - 1)) {
+            start -= 1;
+        }
+        let word: String = rope.slice(start..at).to_string();
+
+        let items: Vec<crate::complete::Item> = items
+            .into_iter()
+            .map(|item| {
+                let raw = item.new_text().to_string();
+                let insert = match item.insert_text_format {
+                    Some(2) => crate::complete::strip_snippet(&raw),
+                    _ => raw,
+                };
+                crate::complete::Item {
+                    filter: item.filter_text.clone().unwrap_or_else(|| item.label.clone()),
+                    sort: item.sort_text.clone().unwrap_or_else(|| item.label.clone()),
+                    label: item.label,
+                    insert,
+                    kind: item.kind,
+                    detail: item.detail,
+                    extra_edits: item.additional_text_edits,
+                }
+            })
+            .collect();
+
+        let mut menu =
+            crate::complete::Completion::new(items, start..at, incomplete, request, encoding);
+        menu.refilter(&word);
+        match menu.is_empty() {
+            true => {
+                if manual {
+                    self.session.status = "no completions here".into();
+                }
+                self.session.completion = None;
+            }
+            false => self.session.completion = Some(menu),
+        }
+    }
+
+    /// Tab or Enter: the selected offer replaces the word, auto-imports and
+    /// all, inside the still-open insert-mode undo group.
+    fn complete_accept(&mut self) {
+        let Some(menu) = self.session.completion.take() else { return };
+        let Some(item) = menu.selected_item().cloned() else { return };
+        let Some(at) = self.cursor().map(|c| c.at) else { return };
+        let Some(id) = self.window_of(self.focus).and_then(Window::buffer) else { return };
+        let start = menu.replace.start.min(at);
+
+        let focus = self.focus;
+        let entry = self.buffers.iter_mut().find(|b| b.id == id).expect("focused buffer exists");
+
+        // Auto-imports first, bottom-up, with the word range mapped through
+        // them — they are almost always far above the word, but "almost" is
+        // not an invariant to lean on.
+        let from = entry.buffer.pending_edits.len();
+        let mut extra: Vec<(usize, usize, String)> = item
+            .extra_edits
+            .iter()
+            .map(|e| {
+                let rope = entry.buffer.rope();
+                (
+                    lsp::pos::char_of(rope, e.range.start, menu.encoding),
+                    lsp::pos::char_of(rope, e.range.end, menu.encoding),
+                    e.new_text.clone(),
+                )
+            })
+            .collect();
+        extra.sort_by(|a, b| b.0.cmp(&a.0));
+        for (from_char, to, text) in &extra {
+            entry.buffer.replace_range(*from_char, *to, text);
+        }
+        // Mapped with insertions-at-the-boundary shifting the word right —
+        // the opposite of `Edit::map`'s cursor rule, and the right one here:
+        // an import inserted exactly at the word's start goes before it.
+        let applied = entry.buffer.pending_edits[from..].to_vec();
+        let across = |at: usize| {
+            applied.iter().fold(at, |at, e| match () {
+                _ if e.old_end_char <= at => at - e.old_end_char + e.new_end_char,
+                _ if e.start_char >= at => at,
+                _ => e.start_char,
+            })
+        };
+        let (start, at) = (across(start), across(at));
+
+        entry.buffer.replace_range(start, at, &item.insert);
+        let landed = start + item.insert.chars().count();
+        if let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) {
+            text.selections = Selections::from_pairs(vec![(landed, landed)]);
+        }
+        self.complete_want = None;
     }
 
     /// `:lsp`, `:lsp restart`, `:lsp stop` — all about the focused buffer.
@@ -6220,6 +6651,9 @@ impl View<'_> {
         let eol = self.session.mode.allows_eol();
 
         match action {
+            // Always intercepted by `Editor::apply` before a view exists —
+            // the menu is session state, and a view holds none.
+            Action::CompleteNext | Action::CompletePrev => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // `$` in a block is a ragged right edge rather than a column,
@@ -15531,7 +15965,9 @@ int main(void) {
                         "textDocumentSync": { "openClose": true, "change": 2, "save": true },
                         "definitionProvider": true,
                         "referencesProvider": true,
-                        "documentFormattingProvider": true }),
+                        "documentFormattingProvider": true,
+                        "hoverProvider": true,
+                        "completionProvider": { "triggerCharacters": ["."] } }),
             );
             ed.settle();
             id
@@ -15969,6 +16405,189 @@ int main(void) {
             assert!(ed.gutter_signs(ed.focus(), 0..2).is_empty());
             let buffer = ed.window().buffer().unwrap();
             assert_eq!(ed.diagnostics(buffer).len(), 1, "but not forgotten");
+        }
+
+        #[test]
+        fn hover_floats_at_its_anchor_and_the_next_command_clears_it() {
+            let (_dir, mut ed, fake) = project("hover");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "hover");
+            let sent = fake.last(id, "textDocument/hover").unwrap();
+            assert_eq!(sent["params"]["position"], json!({ "line": 0, "character": 0 }));
+
+            let answer = json!({ "contents": { "kind": "markdown",
+                "value": "```rust\nfn main()\n```\n---\nThe entry point." } });
+            respond(&mut ed, &fake, id, "textDocument/hover", answer);
+
+            let hover = ed.session.hover.as_ref().expect("a float");
+            assert_eq!(hover.anchor, 0);
+            assert_eq!(hover.language, Some("rust"));
+            assert_eq!(
+                hover.lines,
+                vec![
+                    HoverLine::Code("fn main()".into()),
+                    HoverLine::Rule,
+                    HoverLine::Text("The entry point.".into()),
+                ]
+            );
+
+            // The flash's rule: doing anything else dismisses it.
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            assert!(ed.session.hover.is_none());
+        }
+
+        #[test]
+        fn a_hover_with_nothing_to_say_says_so_on_the_status_line() {
+            let (_dir, mut ed, fake) = project("hover-none");
+            let id = handshake(&mut ed, &fake);
+            ex(&mut ed, "hover");
+            respond(&mut ed, &fake, id, "textDocument/hover", serde_json::Value::Null);
+            assert!(ed.session.hover.is_none());
+            assert_eq!(ed.session.status, "no hover info here");
+        }
+
+        /// Typing opens the menu, narrowing keeps it honest, Tab accepts —
+        /// the whole loop, driven by ordinary commands.
+        #[test]
+        fn typing_summons_the_menu_and_tab_accepts_into_the_buffer() {
+            let (_dir, mut ed, fake) = project("menu");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            for c in "po".chars() {
+                ed.apply(cmd(Action::InsertChar(c)));
+                ed.settle();
+            }
+            // Each closed-menu word char asked; only the newest ask counts.
+            let sent = fake.last(id, "textDocument/completion").unwrap();
+            assert_eq!(sent["params"]["position"], json!({ "line": 0, "character": 2 }));
+            assert_eq!(sent["params"]["context"]["triggerKind"], 1);
+
+            let answer = json!([
+                { "label": "pos", "sortText": "b" },
+                { "label": "position_of", "sortText": "a" },
+                { "label": "unrelated", "sortText": "c" },
+            ]);
+            respond(&mut ed, &fake, id, "textDocument/completion", answer);
+
+            let menu = ed.session.completion.as_ref().expect("open");
+            let labels: Vec<&str> = menu.matches().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, ["position_of", "pos"], "prefix bucket, by sortText");
+            assert_eq!(menu.replace, 0..2, "the word being typed");
+
+            // Typing narrows without asking again.
+            ed.apply(cmd(Action::InsertChar('s')));
+            ed.settle();
+            let menu = ed.session.completion.as_ref().unwrap();
+            assert_eq!(menu.replace, 0..3);
+            assert_eq!(menu.matches().count(), 2, "pos and position_of both match pos");
+
+            // Ctrl-N moves; Tab accepts the selection into the buffer.
+            ed.apply(cmd(Action::CompleteNext));
+            ed.apply(cmd(Action::InsertIndent { right: true }));
+            assert!(ed.session.completion.is_none());
+            assert_eq!(ed.session.mode, Mode::Insert, "still typing");
+            assert!(
+                ed.buffer().unwrap().rope().to_string().starts_with("posfn"),
+                "the second offer replaced the word: {}",
+                ed.buffer().unwrap().rope()
+            );
+            assert_eq!(ed.cursor().unwrap().at, 3, "after what was inserted");
+        }
+
+        #[test]
+        fn esc_closes_the_menu_and_stays_in_insert() {
+            let (_dir, mut ed, fake) = project("menu-esc");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('p')));
+            ed.settle();
+            respond(&mut ed, &fake, id, "textDocument/completion", json!([{ "label": "pos" }]));
+            assert!(ed.session.completion.is_some());
+
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(ed.session.completion.is_none());
+            assert_eq!(ed.session.mode, Mode::Insert, "the menu was dismissed, not the typing");
+
+            ed.apply(cmd(Action::EnterNormal));
+            assert_eq!(ed.session.mode, Mode::Normal, "and the second Esc leaves");
+        }
+
+        #[test]
+        fn a_stale_answer_is_dropped_and_a_trigger_char_carries_its_context() {
+            let (_dir, mut ed, fake) = project("menu-stale");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('p')));
+            ed.settle();
+            let first = fake.last(id, "textDocument/completion").unwrap()["id"].as_i64().unwrap();
+            ed.apply(cmd(Action::InsertChar('o')));
+            ed.settle();
+
+            // The first ask's answer arrives after the second ask went out.
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(
+                id,
+                Inbound::Response { id: first, result: Ok(json!([{ "label": "stale" }])) },
+            );
+            ed.settle();
+            assert!(ed.session.completion.is_none(), "yesterday's answer");
+
+            // `.` is a server trigger character and says so.
+            ed.apply(cmd(Action::InsertChar('.')));
+            ed.settle();
+            let sent = fake.last(id, "textDocument/completion").unwrap();
+            assert_eq!(sent["params"]["context"]["triggerKind"], 2);
+            assert_eq!(sent["params"]["context"]["triggerCharacter"], ".");
+        }
+
+        #[test]
+        fn accepting_applies_the_auto_import_and_lands_the_cursor() {
+            let (_dir, mut ed, fake) = project("menu-import");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('p')));
+            ed.settle();
+            let answer = json!([{
+                "label": "pos", "insertText": "pos()",
+                "additionalTextEdits": [{
+                    "range": { "start": { "line": 0, "character": 0 },
+                               "end": { "line": 0, "character": 0 } },
+                    "newText": "use x::pos;\n"
+                }]
+            }]);
+            respond(&mut ed, &fake, id, "textDocument/completion", answer);
+
+            ed.apply(cmd(Action::InsertIndent { right: true }));
+            ed.settle();
+            let text = ed.buffer().unwrap().rope().to_string();
+            assert!(text.starts_with("use x::pos;\npos()fn"), "{text}");
+            assert_eq!(ed.cursor().unwrap().at, 17, "after the insert, shifted by the import");
+        }
+
+        #[test]
+        fn a_manual_summons_reports_an_empty_answer_and_a_missing_capability() {
+            let (_dir, mut ed, fake) = project("menu-manual");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::CompleteNext));
+            ed.settle();
+            respond(&mut ed, &fake, id, "textDocument/completion", json!([]));
+            assert_eq!(ed.session.status, "no completions here");
+
+            // Snippets collapse to their text on the way into the menu.
+            ed.apply(cmd(Action::CompleteNext));
+            ed.settle();
+            let answer = json!([{ "label": "println!",
+                "insertText": "println!(\"$1\")$0", "insertTextFormat": 2 }]);
+            respond(&mut ed, &fake, id, "textDocument/completion", answer);
+            let menu = ed.session.completion.as_ref().expect("open");
+            assert_eq!(menu.selected_item().unwrap().insert, "println!(\"\")");
         }
 
         #[test]

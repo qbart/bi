@@ -1203,6 +1203,10 @@ impl Input {
                 self.reset();
                 return Some(Command { count: 1, action: Action::EnterCommandMode });
             }
+            // What is under the cursor, from the language server, floated
+            // beside it — vim's key for "look this up". See
+            // `docs/specs/hover.md`.
+            'K' => return self.plain(Action::Ex { line: "hover".into(), run: true }),
             _ => {
                 self.reset();
                 return None;
@@ -1384,6 +1388,10 @@ impl Input {
         let action = match key.code {
             KeyCode::Esc => Action::EnterNormal,
             KeyCode::Char('c') if ctrl => Action::EnterNormal,
+            // The completion menu's keys — the editor decides whether one is
+            // open; `Ctrl-N` with none up is the manual summons.
+            KeyCode::Char('n') if ctrl => Action::CompleteNext,
+            KeyCode::Char('p') if ctrl => Action::CompletePrev,
             KeyCode::Char(c) => Action::InsertChar(c),
             KeyCode::Enter => Action::InsertNewline,
             KeyCode::Backspace => Action::Backspace,
@@ -2100,6 +2108,21 @@ leader = \" \"
         assert_eq!(typed("gr").action, Action::Ex { line: "references".into(), run: true });
         assert_eq!(typed("]d").action, Action::Ex { line: "dnext".into(), run: true });
         assert_eq!(typed("[d").action, Action::Ex { line: "dprev".into(), run: true });
+        assert_eq!(typed("K").action, Action::Ex { line: "hover".into(), run: true });
+    }
+
+    /// `Ctrl-N` / `Ctrl-P` in insert mode belong to the completion menu — the
+    /// editor decides what they do there; the grammar only names them.
+    #[test]
+    fn insert_mode_ctrl_n_and_p_are_the_menu_keys() {
+        let mut input = Input::default();
+        let next = input.on_key(ctrl('n'), &Mode::Insert, ContentKind::Text);
+        assert_eq!(next.unwrap().action, Action::CompleteNext);
+        let prev = input.on_key(ctrl('p'), &Mode::Insert, ContentKind::Text);
+        assert_eq!(prev.unwrap().action, Action::CompletePrev);
+        // And a plain `n` is still a letter.
+        let plain = input.on_key(key('n'), &Mode::Insert, ContentKind::Text);
+        assert_eq!(plain.unwrap().action, Action::InsertChar('n'));
     }
 
     #[test]

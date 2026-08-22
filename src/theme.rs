@@ -187,6 +187,11 @@ pub struct Ui {
     pub diag_info: Style,
     pub diag_hint: Style,
 
+    /// The float surface — hover and the completion menu. One key: the
+    /// menu's selection and badges reuse `picker_selected` / `picker_badge`,
+    /// so choosing looks the same everywhere bi offers a choice.
+    pub popup: Style,
+
     pub mode_normal: Style,
     pub mode_insert: Style,
     pub mode_pick: Style,
@@ -241,6 +246,7 @@ impl Ui {
         "diag_warning",
         "diag_info",
         "diag_hint",
+        "popup",
         "mode_normal",
         "mode_insert",
         "mode_pick",
@@ -291,6 +297,7 @@ impl Ui {
             "diag_warning" => self.diag_warning = style,
             "diag_info" => self.diag_info = style,
             "diag_hint" => self.diag_hint = style,
+            "popup" => self.popup = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,
             "mode_pick" => self.mode_pick = style,

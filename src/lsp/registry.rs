@@ -75,6 +75,19 @@ pub enum Effect {
     /// A formatting answer. `version` is what the request was computed
     /// against; the editor drops the lot on a mismatch.
     Formatting { buffer: BufferId, version: i32, edits: Vec<types::TextEdit>, encoding: Encoding },
+    /// A hover answer, already normalised to one markdown string — `None`
+    /// when the server had nothing to say.
+    Hover { window: WindowId, anchor: usize, markdown: Option<String> },
+    /// A completion answer. `incomplete` means the server wants re-asking as
+    /// the word grows rather than local narrowing.
+    Completion {
+        buffer: BufferId,
+        request: u64,
+        manual: bool,
+        incomplete: bool,
+        items: Vec<types::CompletionItem>,
+        encoding: Encoding,
+    },
 }
 
 pub struct Registry {
@@ -336,6 +349,46 @@ impl Registry {
         )
     }
 
+    /// `textDocument/hover` at `position`. The anchor rides the intent.
+    pub fn hover(
+        &mut self,
+        doc: &Doc,
+        position: types::Position,
+        window: WindowId,
+        anchor: usize,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": doc.uri }, "position": position }),
+            Intent::Hover { window, anchor },
+        )
+    }
+
+    /// `textDocument/completion`. `trigger` is the character that opened the
+    /// menu when one did — the context the spec wants servers told about.
+    pub fn completion(
+        &mut self,
+        doc: &Doc,
+        position: types::Position,
+        buffer: BufferId,
+        request: u64,
+        manual: bool,
+        trigger: Option<char>,
+    ) -> Result<(), String> {
+        let context = match trigger {
+            Some(c) => json!({ "triggerKind": 2, "triggerCharacter": c.to_string() }),
+            None => json!({ "triggerKind": 1 }),
+        };
+        self.request(
+            doc.server,
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": doc.uri }, "position": position,
+                    "context": context }),
+            Intent::Completion { buffer, request, manual },
+        )
+    }
+
     /// The buffer is going away, or its path changed under the document.
     pub fn close(&mut self, doc: &Doc) {
         self.docs.remove(&doc.uri);
@@ -393,6 +446,28 @@ impl Registry {
                         encoding: client.encoding,
                     }),
                     Err(e) => Some(Effect::Status(format!("format: {}", e.message))),
+                },
+                Intent::Hover { window, anchor } => match result {
+                    Ok(value) => {
+                        Some(Effect::Hover { window, anchor, markdown: hover_markdown(&value) })
+                    }
+                    Err(e) => Some(Effect::Status(format!("hover: {}", e.message))),
+                },
+                Intent::Completion { buffer, request, manual } => match result {
+                    Ok(value) => {
+                        let (incomplete, items) = completion_items(value);
+                        Some(Effect::Completion {
+                            buffer,
+                            request,
+                            manual,
+                            incomplete,
+                            items,
+                            encoding: client.encoding,
+                        })
+                    }
+                    // Silent unless summoned: an error per keystroke is
+                    // worse than no completion.
+                    Err(e) => manual.then(|| Effect::Status(format!("completion: {}", e.message))),
                 },
             },
 
@@ -528,6 +603,51 @@ fn locations(value: Value) -> Vec<(PathBuf, types::Range)> {
         Value::Array(items) => items.iter().filter_map(one).collect(),
         v @ Value::Object(_) => one(&v).into_iter().collect(),
         _ => Vec::new(),
+    }
+}
+
+/// A hover answer's `contents`, in any of its four wire shapes, as one
+/// markdown string — or `None` for a null answer or an empty one.
+///
+/// A `MarkedString` with a language becomes a fenced block, which is what it
+/// abbreviates; an array joins with blank lines.
+fn hover_markdown(value: &Value) -> Option<String> {
+    fn marked(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => match (o.get("language").and_then(Value::as_str), o.get("value")) {
+                (Some(language), Some(Value::String(value))) => {
+                    Some(format!("```{language}\n{value}\n```"))
+                }
+                (None, Some(Value::String(value))) => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    let contents = value.get("contents")?;
+    let text = match contents {
+        Value::Array(items) => items.iter().filter_map(marked).collect::<Vec<_>>().join("\n\n"),
+        one => marked(one)?,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// A completion answer in either wire shape — a bare array, or a
+/// `CompletionList` carrying `isIncomplete` — as `(incomplete, items)`.
+fn completion_items(value: Value) -> (bool, Vec<types::CompletionItem>) {
+    match value {
+        Value::Array(_) => (false, serde_json::from_value(value).unwrap_or_default()),
+        Value::Object(mut o) => {
+            let incomplete = o.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false);
+            let items = o
+                .remove("items")
+                .map(|items| serde_json::from_value(items).unwrap_or_default())
+                .unwrap_or_default();
+            (incomplete, items)
+        }
+        _ => (false, Vec::new()),
     }
 }
 
@@ -1100,6 +1220,83 @@ mod tests {
                 assert_eq!(edits[0].new_text, "    ");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_contents_normalise_from_every_wire_shape() {
+        // A bare string.
+        let s = hover_markdown(&json!({ "contents": "plain words" }));
+        assert_eq!(s.as_deref(), Some("plain words"));
+
+        // MarkupContent.
+        let m = hover_markdown(&json!({ "contents": { "kind": "markdown", "value": "# doc" } }));
+        assert_eq!(m.as_deref(), Some("# doc"));
+
+        // A MarkedString with a language becomes the fence it abbreviates.
+        let l = hover_markdown(&json!({ "contents": { "language": "rust", "value": "fn f()" } }));
+        assert_eq!(l.as_deref(), Some("```rust\nfn f()\n```"));
+
+        // An array joins; an empty answer is no answer.
+        let a = hover_markdown(&json!({ "contents": ["one", { "language": "c", "value": "x;" }] }));
+        assert_eq!(a.as_deref(), Some("one\n\n```c\nx;\n```"));
+        assert_eq!(hover_markdown(&json!({ "contents": "" })), None);
+        assert_eq!(hover_markdown(&Value::Null), None);
+    }
+
+    #[test]
+    fn completion_answers_parse_both_wire_shapes() {
+        let bare = completion_items(json!([{ "label": "a" }, { "label": "b" }]));
+        assert!(!bare.0);
+        assert_eq!(bare.1.len(), 2);
+
+        let list = completion_items(json!({
+            "isIncomplete": true,
+            "items": [{ "label": "c", "insertText": "c()", "kind": 3 }]
+        }));
+        assert!(list.0);
+        assert_eq!(list.1[0].new_text(), "c()");
+
+        assert_eq!(completion_items(Value::Null).1.len(), 0);
+    }
+
+    #[test]
+    fn a_completion_request_carries_its_trigger_context() {
+        let mut rig = rig("ctx");
+        let (doc, _) = opened(&mut rig, incremental());
+        let position = Position { line: 0, character: 3 };
+
+        rig.registry.completion(&doc, position, BufferId(0), 1, false, Some('.')).unwrap();
+        let sent = rig.fake.last(doc.server, "textDocument/completion").unwrap();
+        assert_eq!(sent["params"]["context"]["triggerKind"], 2);
+        assert_eq!(sent["params"]["context"]["triggerCharacter"], ".");
+
+        rig.registry.completion(&doc, position, BufferId(0), 2, true, None).unwrap();
+        let sent = rig.fake.last(doc.server, "textDocument/completion").unwrap();
+        assert_eq!(sent["params"]["context"]["triggerKind"], 1);
+    }
+
+    #[test]
+    fn a_failed_completion_is_silent_unless_summoned() {
+        let mut rig = rig("quiet");
+        let (doc, _) = opened(&mut rig, incremental());
+        let inbox = rig.fake.spawned.lock().unwrap()[0].1.clone();
+        let position = Position { line: 0, character: 0 };
+
+        for (request, manual, expects_status) in [(1u64, false, false), (2, true, true)] {
+            rig.registry.completion(&doc, position, BufferId(0), request, manual, None).unwrap();
+            let id = rig.fake.last(doc.server, "textDocument/completion").unwrap()["id"]
+                .as_i64()
+                .unwrap();
+            let error = super::super::rpc::ResponseError { code: 1, message: "busy".into() };
+            inbox.deliver(doc.server, Inbound::Response { id, result: Err(error) });
+            let (from, msg) = rig.registry.drain().pop().unwrap();
+            let effect = rig.registry.accept(from, msg);
+            assert_eq!(
+                matches!(effect, Some(Effect::Status(_))),
+                expects_status,
+                "manual={manual}"
+            );
         }
     }
 

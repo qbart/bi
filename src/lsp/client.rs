@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::pos::{Encoding, uri_of};
 use super::transport::{Spawn, Transport};
-use super::types::{InitializeResult, SyncCaps, truthy};
+use super::types::{InitializeResult, SyncCaps, trigger_characters, truthy};
 use super::{Inbox, ServerId, rpc};
 use crate::buffer::BufferId;
 use crate::window::WindowId;
@@ -44,6 +44,20 @@ pub enum Intent {
         buffer: BufferId,
         version: i32,
     },
+    /// `K` — the anchor is the char the question was asked about, because by
+    /// the time the answer lands the cursor may have moved on.
+    Hover {
+        window: WindowId,
+        anchor: usize,
+    },
+    /// Insert-mode completion. `request` is the ask's sequence number — only
+    /// the newest one's answer is accepted — and `manual` is whether Ctrl-N
+    /// summoned it, which is what earns an empty answer a status line.
+    Completion {
+        buffer: BufferId,
+        request: u64,
+        manual: bool,
+    },
 }
 
 /// The provider switches core features read from `initialize`. More arrive
@@ -53,6 +67,8 @@ pub struct Caps {
     pub definition: bool,
     pub references: bool,
     pub formatting: bool,
+    pub hover: bool,
+    pub completion: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +95,9 @@ pub struct Client {
     pub encoding: Encoding,
     pub sync: SyncCaps,
     pub caps: Caps,
+    /// The characters that open the completion menu without a word — `.`,
+    /// `::` — as the server listed them.
+    pub trigger_chars: Vec<String>,
     pub server_info: Option<String>,
     /// Keyed by the progress token, stringified — the token is the server's
     /// and may be a number or a string.
@@ -109,6 +128,7 @@ impl Client {
             encoding: Encoding::Utf16,
             sync: SyncCaps::default(),
             caps: Caps::default(),
+            trigger_chars: Vec::new(),
             server_info: None,
             progress: BTreeMap::new(),
             transport,
@@ -185,7 +205,10 @@ impl Client {
             definition: truthy(parsed.capabilities.definition_provider.as_ref()),
             references: truthy(parsed.capabilities.references_provider.as_ref()),
             formatting: truthy(parsed.capabilities.formatting_provider.as_ref()),
+            hover: truthy(parsed.capabilities.hover_provider.as_ref()),
+            completion: truthy(parsed.capabilities.completion_provider.as_ref()),
         };
+        self.trigger_chars = trigger_characters(parsed.capabilities.completion_provider.as_ref());
         self.server_info = parsed.server_info.map(|s| s.name);
         self.transport.send(&rpc::notification("initialized", json!({})));
         self.phase = Phase::Running;

@@ -6,9 +6,10 @@ built in, not plugins.
 Status: modal editing, undo, registers, tree-sitter highlighting for twenty
 languages, a buffer list, split windows, a file tree, and LSP — servers start
 and sync per project, diagnostics are drawn on the text and jumped to with
-`]d` / `[d`, `gd` goes to a definition, `gr` lists references in a pane, and
-`:format` reformats the file. Hover and completion are next; they wait on a
-popup surface.
+`]d` / `[d`, `gd` goes to a definition, `gr` lists references in a pane,
+`:format` reformats the file, `K` floats what the server knows about the
+cursor, and completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk
+it, `Tab` or `Enter` accepts, auto-imports included.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -363,7 +364,11 @@ Printable keys insert themselves, arrows and `Home`/`End` move, and `Esc` or
 
 `Tab` moves to the next indent stop rather than inserting a fixed width, so a
 line lines up with the one above it whatever column you started from;
-`Shift-Tab` goes back one, and never eats a character you typed. `Backspace`
+`Shift-Tab` goes back one, and never eats a character you typed. While the
+completion menu is up those keys mean the menu instead: `Ctrl-N`/`Ctrl-P`
+(and `Shift-Tab`) move its selection, `Tab` or `Enter` accepts, and `Esc`
+closes it and keeps you typing — see
+[docs/specs/complete.md](docs/specs/complete.md). `Backspace`
 takes a whole indent when there is nothing but whitespace to its left, and one
 character everywhere else. `Enter` starts the new line under the old one, with
 the same indent characters — a tab-indented file stays tab-indented. A line you
@@ -469,6 +474,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:references` `:refs` | `gr` — every reference, in a results pane; `:replace` over it is a rename |
 | `:format` `:fmt` | the whole file, by the server, as one undo step |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
+| `:hover` | `K` — what the server knows about the cursor, floated beside it |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |

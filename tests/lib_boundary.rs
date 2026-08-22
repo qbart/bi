@@ -164,6 +164,7 @@ const LIB_MODULES: &[&str] = &[
     "cmd_history.rs",
     "cmdline.rs",
     "colors.rs",
+    "complete.rs",
     "config/keys.rs",
     "config/mod.rs",
     "config/parse.rs",
