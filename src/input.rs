@@ -49,6 +49,10 @@ pub struct Input {
     motion_count: Option<usize>,
     operator: Option<Operator>,
     g_pending: bool,
+    /// `]` or `[` has been typed — vim's bracket family. `true` is forward.
+    /// Claimed only with no operator pending, so `di[` still reads as the
+    /// text object it always was.
+    bracket_pending: Option<bool>,
     /// `"` has been typed and is waiting for the register it names.
     quote_pending: bool,
     /// `ys`, `ds`, `cs` and visual `S` — see `docs/specs/surround.md`.
@@ -177,6 +181,7 @@ impl Input {
             || self.object_pending.is_some()
             || self.window_pending
             || self.g_pending
+            || self.bracket_pending.is_some()
             || self.delete_pending
     }
 
@@ -399,6 +404,9 @@ impl Input {
         }
         if self.g_pending {
             s.push('g');
+        }
+        if let Some(forward) = self.bracket_pending {
+            s.push(if forward { ']' } else { '[' });
         }
         if self.replace_pending {
             s.push('r');
@@ -920,6 +928,22 @@ impl Input {
             return None;
         }
 
+        // `]` or `[` is holding out for its second key. Only `d` — the
+        // diagnostic jumps — answers today; the family grows a letter at a
+        // time. See `docs/specs/diagnostics.md`.
+        if let Some(forward) = self.bracket_pending.take() {
+            return match c {
+                'd' => {
+                    let line = if forward { "dnext" } else { "dprev" };
+                    self.plain(Action::Ex { line: line.into(), run: true })
+                }
+                _ => {
+                    self.reset();
+                    None
+                }
+            };
+        }
+
         // `g` is holding out for a second key.
         if self.g_pending {
             self.g_pending = false;
@@ -939,6 +963,10 @@ impl Input {
                 // one people reach for when they mean "go to a file".
                 // See `docs/specs/buffers.md`.
                 'f' => self.plain(Action::Buffer(BufferCmd::List)),
+                // The two LSP jumps, as the ex commands they abbreviate —
+                // the same shape as `ga`. See `docs/specs/lsp-requests.md`.
+                'd' => self.plain(Action::Ex { line: "definition".into(), run: true }),
+                'r' => self.plain(Action::Ex { line: "references".into(), run: true }),
                 _ => {
                     self.reset();
                     None
@@ -1154,6 +1182,12 @@ impl Input {
             }
             'g' => {
                 self.g_pending = true;
+                return None;
+            }
+            // Not under an operator: `d]` is not a motion bi has, and the
+            // bracket family must not turn it into one that jumps.
+            ']' | '[' if self.operator.is_none() => {
+                self.bracket_pending = Some(c == ']');
                 return None;
             }
             // `G` with a count is "go to line N", without one it's "go to the
@@ -2055,6 +2089,39 @@ leader = \" \"
     fn the_g_prefix_reaches_the_other_file_and_the_buffer_list() {
         assert_eq!(typed("ga").action, Action::Ex { line: "alt".into(), run: true });
         assert_eq!(typed("gf").action, Action::Buffer(BufferCmd::List));
+    }
+
+    /// The LSP jumps ride the same rail as `ga`: a key that abbreviates an ex
+    /// command, so the command exists without the key and the key can be
+    /// rebound by name. See `docs/specs/lsp-requests.md`.
+    #[test]
+    fn the_lsp_jumps_are_ex_commands_wearing_keys() {
+        assert_eq!(typed("gd").action, Action::Ex { line: "definition".into(), run: true });
+        assert_eq!(typed("gr").action, Action::Ex { line: "references".into(), run: true });
+        assert_eq!(typed("]d").action, Action::Ex { line: "dnext".into(), run: true });
+        assert_eq!(typed("[d").action, Action::Ex { line: "dprev".into(), run: true });
+    }
+
+    #[test]
+    fn a_bracket_under_an_operator_is_not_a_jump() {
+        // `d]` is not a motion bi has; it must reset, not queue a jump that
+        // fires with a delete pending.
+        let mut input = Input::default();
+        assert!(input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(input.on_key(key(']'), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(
+            input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_none(),
+            "the reset swallowed the bracket; this `d` starts a fresh delete"
+        );
+    }
+
+    #[test]
+    fn a_pending_bracket_shows_and_a_stray_second_key_clears_it() {
+        let mut input = Input::default();
+        input.on_key(key(']'), &Mode::Normal, ContentKind::Text);
+        assert_eq!(input.pending_display(), "]");
+        assert!(input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_none());
+        assert_eq!(input.pending_display(), "", "cleared, not stuck");
     }
 
     /// Two keys, one list: `gf` over every path under the root, `/` over the

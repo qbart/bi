@@ -81,6 +81,13 @@ todo_warn  = { fg = "#fbf1c7", bg = "#b57614", bold = true }
 todo_perf  = { fg = "#fbf1c7", bg = "#8f3f71", bold = true }
 todo_note  = { fg = "#fbf1c7", bg = "#79740e", bold = true }
 
+# What the language server found wrong, worn by the text it names.
+# gruvbox faded red, yellow, blue, and gray.
+diag_error   = { fg = "#9d0006", underline = true }
+diag_warning = { fg = "#b57614", underline = true }
+diag_info    = { fg = "#076678", underline = true }
+diag_hint    = { fg = "#928374", underline = true }
+
 mode_normal = { fg = "#fbf1c7", bg = "#076678", bold = true }
 mode_insert = { fg = "#fbf1c7", bg = "#79740e", bold = true }
 mode_pick   = { fg = "#fbf1c7", bg = "#8f3f71", bold = true }

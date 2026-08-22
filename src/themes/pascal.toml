@@ -106,6 +106,13 @@ todo_warn  = { fg = "#000000", bg = "#ffff55", bold = true }
 todo_perf  = { fg = "#000000", bg = "#ff55ff", bold = true }
 todo_note  = { fg = "#000000", bg = "#55ff55", bold = true }
 
+# What the language server found wrong, worn by the text it names.
+# lightred, yellow, lightcyan, lightgray — EGA has no subtlety.
+diag_error   = { fg = "#ff5555", underline = true }
+diag_warning = { fg = "#ffff55", underline = true }
+diag_info    = { fg = "#55ffff", underline = true }
+diag_hint    = { fg = "#aaaaaa", underline = true }
+
 # The status bar: black on light gray, which is the single most recognisable
 # thing about the whole IDE.
 mode_normal = { fg = "#000000", bg = "#aaaaaa", bold = true }

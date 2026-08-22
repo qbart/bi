@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 
 use super::pos::{Encoding, uri_of};
 use super::transport::{Spawn, Transport};
-use super::types::{InitializeResult, SyncCaps};
+use super::types::{InitializeResult, SyncCaps, truthy};
 use super::{Inbox, ServerId, rpc};
+use crate::buffer::BufferId;
+use crate::window::WindowId;
 
 /// What to do with a response when it arrives. A closure would be shorter and
 /// uninspectable; a variant names the continuation, and later features add
@@ -26,6 +28,31 @@ use super::{Inbox, ServerId, rpc};
 pub enum Intent {
     Initialize,
     Shutdown,
+    /// `gd` — jump the window that asked.
+    Definition {
+        window: WindowId,
+    },
+    /// `gr` — the symbol under the cursor at request time, for the pane's
+    /// title and its query.
+    References {
+        symbol: String,
+    },
+    /// `:format` — the document version the request was computed against.
+    /// A response for any other version is dropped: applying a format meant
+    /// for text that no longer exists is how a formatter eats a file.
+    Formatting {
+        buffer: BufferId,
+        version: i32,
+    },
+}
+
+/// The provider switches core features read from `initialize`. More arrive
+/// with the features that need them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub definition: bool,
+    pub references: bool,
+    pub formatting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +78,7 @@ pub struct Client {
     pub phase: Phase,
     pub encoding: Encoding,
     pub sync: SyncCaps,
+    pub caps: Caps,
     pub server_info: Option<String>,
     /// Keyed by the progress token, stringified — the token is the server's
     /// and may be a number or a string.
@@ -80,6 +108,7 @@ impl Client {
             // The mandated default, until the server grants utf-8.
             encoding: Encoding::Utf16,
             sync: SyncCaps::default(),
+            caps: Caps::default(),
             server_info: None,
             progress: BTreeMap::new(),
             transport,
@@ -152,6 +181,11 @@ impl Client {
             self.encoding = Encoding::Utf8;
         }
         self.sync = SyncCaps::parse(parsed.capabilities.text_document_sync.as_ref());
+        self.caps = Caps {
+            definition: truthy(parsed.capabilities.definition_provider.as_ref()),
+            references: truthy(parsed.capabilities.references_provider.as_ref()),
+            formatting: truthy(parsed.capabilities.formatting_provider.as_ref()),
+        };
         self.server_info = parsed.server_info.map(|s| s.name);
         self.transport.send(&rpc::notification("initialized", json!({})));
         self.phase = Phase::Running;

@@ -100,6 +100,13 @@ todo_warn  = { fg = "#101010", bg = "#FFC799", bold = true }   # accent / warnin
 todo_perf  = { fg = "#101010", bg = "#FFD1A8", bold = true }   # accent_bright
 todo_note  = { fg = "#101010", bg = "#B3FFE4", bold = true }   # string_bright
 
+# What the language server found wrong, worn by the text it names.
+# error, the warm accent, the cool accent, and a gray for hints.
+diag_error   = { fg = "#FF8080", underline = true }
+diag_warning = { fg = "#FFC799", underline = true }
+diag_info    = { fg = "#99FFE4", underline = true }
+diag_hint    = { fg = "#8b8b8b", underline = true }
+
 # The source has no mode-badge concept of its own — this is bi's furniture,
 # not vesper's — so these three borrow the roles nearest in spirit: neutral
 # for normal, the cool accent for insert (new text, same hue as an addition),

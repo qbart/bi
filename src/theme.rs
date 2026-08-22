@@ -178,6 +178,15 @@ pub struct Ui {
     pub todo_perf: Style,
     pub todo_note: Style,
 
+    /// What the language server found wrong, worn by the text it names —
+    /// four severities, four keys. The built-ins colour and underline; a
+    /// bare underline vanishes at a glance and a recolour alone reads as
+    /// syntax. See `docs/specs/diagnostics.md`.
+    pub diag_error: Style,
+    pub diag_warning: Style,
+    pub diag_info: Style,
+    pub diag_hint: Style,
+
     pub mode_normal: Style,
     pub mode_insert: Style,
     pub mode_pick: Style,
@@ -228,6 +237,10 @@ impl Ui {
         "todo_warn",
         "todo_perf",
         "todo_note",
+        "diag_error",
+        "diag_warning",
+        "diag_info",
+        "diag_hint",
         "mode_normal",
         "mode_insert",
         "mode_pick",
@@ -274,6 +287,10 @@ impl Ui {
             "todo_warn" => self.todo_warn = style,
             "todo_perf" => self.todo_perf = style,
             "todo_note" => self.todo_note = style,
+            "diag_error" => self.diag_error = style,
+            "diag_warning" => self.diag_warning = style,
+            "diag_info" => self.diag_info = style,
+            "diag_hint" => self.diag_hint = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,
             "mode_pick" => self.mode_pick = style,

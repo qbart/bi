@@ -138,6 +138,11 @@ pub struct Options {
     pub whitespace: bool,
     /// Whether `TODO:` and its friends are picked out of the text.
     pub todo_comments: bool,
+    /// Whether stored LSP diagnostics are *drawn* — the underline, the
+    /// gutter sign, the message at the cursor line's end. Never gates the
+    /// storing: `:lsp` counts them either way, and turning this back on
+    /// costs nothing. See `docs/specs/diagnostics.md`.
+    pub diagnostics: bool,
     /// Whether a colour literal is drawn in the colour it names.
     pub color_swatches: bool,
     /// How many enclosing blocks repeat their opening line after the line that
@@ -191,6 +196,7 @@ impl Default for Options {
             gutter: 1,
             whitespace: false,
             todo_comments: true,
+            diagnostics: true,
             color_swatches: true,
             context_depth: 1,
             context_header_depth: 1,
@@ -250,6 +256,8 @@ impl Options {
             ("whitespace", _) => return Err("whitespace takes true or false".into()),
             ("todo_comments", OptionValue::Bool(on)) => self.todo_comments = on,
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
+            ("diagnostics", OptionValue::Bool(on)) => self.diagnostics = on,
+            ("diagnostics", _) => return Err("diagnostics takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
             ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
             ("context_depth", OptionValue::Int(n)) if n >= 0 => self.context_depth = n as usize,
@@ -313,6 +321,7 @@ impl Options {
             "gutter" => OptionValue::Int(self.gutter as i64),
             "whitespace" => OptionValue::Bool(self.whitespace),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
+            "diagnostics" => OptionValue::Bool(self.diagnostics),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "context_depth" => OptionValue::Int(self.context_depth as i64),
             "context_header_depth" => OptionValue::Int(self.context_header_depth as i64),

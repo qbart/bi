@@ -4,9 +4,11 @@ A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
 Status: modal editing, undo, registers, tree-sitter highlighting for twenty
-languages, a buffer list, split windows, a file tree, and an LSP core —
-servers start and sync per project, `:lsp` says where a buffer stands, and
-diagnostics are stored but not yet drawn.
+languages, a buffer list, split windows, a file tree, and LSP — servers start
+and sync per project, diagnostics are drawn on the text and jumped to with
+`]d` / `[d`, `gd` goes to a definition, `gr` lists references in a pane, and
+`:format` reformats the file. Hover and completion are next; they wait on a
+popup surface.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -462,6 +464,11 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:m .+1` `:m+1` | the `.` written out, or the space left off. Both are the address above |
 | `:2,5m 0` `:%m $` | a range says *which* lines; with none, the selection does |
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
+| `:lsp` | where this buffer stands with its language server; `restart` and `stop` manage it |
+| `:definition` `:def` | `gd` — jump to the definition the server names |
+| `:references` `:refs` | `gr` — every reference, in a results pane; `:replace` over it is a rename |
+| `:format` `:fmt` | the whole file, by the server, as one undo step |
+| `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |

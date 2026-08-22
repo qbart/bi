@@ -45,6 +45,32 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// One `Location` from a definition or references answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Location {
+    pub uri: String,
+    pub range: Range,
+}
+
+/// A `LocationLink` — the other shape a definition answer may take.
+/// `target_selection_range` is the symbol itself, which is where a jump
+/// wants to land; `target_range` is the whole declaration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocationLink {
+    #[serde(rename = "targetUri")]
+    pub target_uri: String,
+    #[serde(rename = "targetSelectionRange")]
+    pub target_selection_range: Range,
+}
+
+/// One edit from `textDocument/formatting`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TextEdit {
+    pub range: Range,
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
 /// What `initialize` answered with, reduced to the parts core reads.
 /// `#[serde(default)]` throughout: a missing capability is an answer, not a
 /// parse failure.
@@ -72,6 +98,22 @@ pub struct Capabilities {
     /// A bare number or an options object — see [`SyncCaps::parse`].
     #[serde(default, rename = "textDocumentSync")]
     pub text_document_sync: Option<Value>,
+    /// Each provider is a bool or an options object; [`truthy`] reads both.
+    #[serde(default, rename = "definitionProvider")]
+    pub definition_provider: Option<Value>,
+    #[serde(default, rename = "referencesProvider")]
+    pub references_provider: Option<Value>,
+    #[serde(default, rename = "documentFormattingProvider")]
+    pub formatting_provider: Option<Value>,
+}
+
+/// Whether a `*Provider` capability is on. The spec lets a server say `true`,
+/// `false`, or an options object — an object is an elaborate yes.
+pub fn truthy(capability: Option<&Value>) -> bool {
+    match capability {
+        None | Some(Value::Bool(false)) | Some(Value::Null) => false,
+        Some(_) => true,
+    }
 }
 
 /// How the server wants document changes, decoded from either wire shape.
@@ -247,6 +289,51 @@ mod tests {
         assert_eq!(none, SyncCaps { kind: SyncKind::Incremental, save: None });
 
         assert_eq!(SyncCaps::parse(None), SyncCaps::default());
+    }
+
+    #[test]
+    fn provider_capabilities_read_bool_and_object_alike() {
+        let caps = json!({
+            "definitionProvider": true,
+            "referencesProvider": { "workDoneProgress": true },
+            "documentFormattingProvider": false,
+        });
+        let parsed: Capabilities = serde_json::from_value(caps).unwrap();
+        assert!(truthy(parsed.definition_provider.as_ref()), "a plain yes");
+        assert!(truthy(parsed.references_provider.as_ref()), "an elaborate yes");
+        assert!(!truthy(parsed.formatting_provider.as_ref()), "an explicit no");
+        assert!(!truthy(None), "silence is no");
+    }
+
+    #[test]
+    fn locations_links_and_edits_parse_their_wire_shapes() {
+        let location: Location = serde_json::from_value(json!({
+            "uri": "file:///a.rs",
+            "range": { "start": { "line": 1, "character": 2 },
+                       "end": { "line": 1, "character": 5 } }
+        }))
+        .unwrap();
+        assert_eq!(location.range.start.line, 1);
+
+        let link: LocationLink = serde_json::from_value(json!({
+            "originSelectionRange": { "start": { "line": 0, "character": 0 },
+                                      "end": { "line": 0, "character": 3 } },
+            "targetUri": "file:///b.rs",
+            "targetRange": { "start": { "line": 10, "character": 0 },
+                             "end": { "line": 20, "character": 1 } },
+            "targetSelectionRange": { "start": { "line": 10, "character": 4 },
+                                      "end": { "line": 10, "character": 9 } }
+        }))
+        .unwrap();
+        assert_eq!(link.target_selection_range.start.character, 4, "the symbol, not the block");
+
+        let edit: TextEdit = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 0 },
+                       "end": { "line": 1, "character": 0 } },
+            "newText": "fn main() {\n"
+        }))
+        .unwrap();
+        assert_eq!(edit.new_text, "fn main() {\n");
     }
 
     #[test]

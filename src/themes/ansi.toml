@@ -80,6 +80,12 @@ todo_warn  = { fg = "black", bg = "yellow", bold = true }
 todo_perf  = { fg = "black", bg = "magenta", bold = true }
 todo_note  = { fg = "black", bg = "green", bold = true }
 
+# What the language server found wrong, worn by the text it names.
+diag_error   = { fg = "red", underline = true }
+diag_warning = { fg = "yellow", underline = true }
+diag_info    = { fg = "blue", underline = true }
+diag_hint    = { fg = "darkgray", underline = true }
+
 mode_normal = { fg = "black", bg = "blue", bold = true }
 mode_insert = { fg = "black", bg = "green", bold = true }
 mode_pick   = { fg = "black", bg = "magenta", bold = true }

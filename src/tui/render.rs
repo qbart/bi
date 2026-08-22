@@ -688,6 +688,9 @@ fn render_window(
     let last_row = (scroll + text_area.height as usize).min(total);
     // The same rule, for everything drawn that is not buffer text.
     let decorations = ed.decorations(id, scroll..last_row);
+    // The sign column's marks. A map, because the loop below asks per row.
+    let signs: std::collections::HashMap<usize, (char, ThemeStyle)> =
+        ed.gutter_signs(id, scroll..last_row).into_iter().map(|(r, c, s)| (r, (c, s))).collect();
     let highlights = syntax.map(|syntax| {
         let rope = buffer.rope();
         let from = rope.line_to_byte(scroll.min(rope.len_lines()));
@@ -704,13 +707,19 @@ fn render_window(
             cursor_screen_col = col + inline_shift(&decorations, row, col);
         }
 
-        // The sign column first, blank until something produces a sign — it is
-        // held open so that the day one arrives the file does not shift. Then
-        // the number, or a blank cell where one is not due so the text stays
-        // put.
+        // The sign column first — held open since before anything produced a
+        // sign, so that the day one arrived the file did not shift. That day
+        // came with diagnostics. Then the number, or a blank cell where one
+        // is not due so the text stays put.
         let mut spans = Vec::new();
         if options.gutter > 0 {
-            spans.push(Span::raw(" ".repeat(options.gutter)));
+            match signs.get(&row) {
+                Some((sign, style)) => spans.push(Span::styled(
+                    format!("{sign}{}", " ".repeat(options.gutter - 1)),
+                    tui(*style),
+                )),
+                None => spans.push(Span::raw(" ".repeat(options.gutter))),
+            }
         }
         match options.number.label_for(row, cursor_row) {
             _ if numbers == 0 => {}

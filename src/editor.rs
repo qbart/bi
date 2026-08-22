@@ -1407,6 +1407,17 @@ enum ExLine {
     /// `:lsp` — where this buffer stands with its language server; `:lsp
     /// restart` and `:lsp stop` manage the instance. See `docs/specs/lsp.md`.
     Lsp(LspCmd),
+    /// `:definition` — `gd`. See `docs/specs/lsp-requests.md`.
+    Definition,
+    /// `:references` — `gr`, into a `Results` pane.
+    References,
+    /// `:format` — the whole file, by the server, as one undo step.
+    Format,
+    /// `:dnext` / `:dprev` — `]d` / `[d`, wrapping. See
+    /// `docs/specs/diagnostics.md`.
+    DiagnosticJump {
+        forward: bool,
+    },
     /// `:resize 30`, `:resize +3,-3`, `:resize 1:2` — see
     /// `docs/specs/resize.md`.
     Resize(crate::resize::Resize),
@@ -1613,6 +1624,14 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             "stop" => ExLine::Lsp(LspCmd::Stop),
             _ => ExLine::Error("lsp takes restart, stop, or nothing for status".into()),
         },
+        "def" | "definition" => ExLine::Definition,
+        "refs" | "references" => ExLine::References,
+        "fmt" | "format" if arg.is_empty() => ExLine::Format,
+        "fmt" | "format" => {
+            ExLine::Error("format takes no argument — it follows tab_width and expandtab".into())
+        }
+        "dn" | "dnext" => ExLine::DiagnosticJump { forward: true },
+        "dp" | "dprev" => ExLine::DiagnosticJump { forward: false },
         // The whole argument is the pattern, spaces and all: `:find fn main`
         // has to search for `fn main`. That is also why there are no flags on
         // this line and a second command name instead — a `-r` would be a
@@ -2598,6 +2617,58 @@ impl Editor {
         }
         if options.todo_comments {
             todo_comments(buffer, &self.theme, rows.clone(), &mut out);
+        }
+        // What the server said is wrong, worn by the text it names — under
+        // the selection, like a TODO tag. A zero-width diagnostic ("missing
+        // semicolon *here*") still gets one cell to wear.
+        if options.diagnostics
+            && let Some(id) = self.window_of(window).and_then(Window::buffer)
+        {
+            let len = buffer.rope().len_chars();
+            for d in self.diagnostics(id) {
+                if buffer.row_at(Cursor::at(d.start)) >= rows.end
+                    || buffer.row_at(Cursor::at(d.end)) < rows.start
+                {
+                    continue;
+                }
+                let end = d.end.max(d.start + 1).min(len);
+                if d.start >= end {
+                    continue;
+                }
+                out.push(crate::decoration::Decoration::Repaint {
+                    range: d.start..end,
+                    style: self.diag_style(d.severity),
+                    layer: crate::decoration::Layer::Under,
+                });
+            }
+            // The message rides the cursor's row — the row where "what is
+            // wrong here" is being asked — and only in the focused window,
+            // for the same reason the context marks stay there.
+            if window == self.focus {
+                let cursor_row = buffer.row_at(text.selections.cursor());
+                let on_row: Vec<&lsp::Diag> = self
+                    .diagnostics(id)
+                    .iter()
+                    .filter(|d| buffer.row_at(Cursor::at(d.start)) == cursor_row)
+                    .collect();
+                if rows.contains(&cursor_row)
+                    && let Some(first) = on_row.first()
+                {
+                    let mut message = first.message.lines().next().unwrap_or("").to_string();
+                    if on_row.len() > 1 {
+                        message.push_str(&format!(" (+{})", on_row.len() - 1));
+                    }
+                    // The underline comes off: it marks a *range*, and this
+                    // text is bi's annotation past the end of one.
+                    let mut style = self.diag_style(first.severity);
+                    style.underline = false;
+                    out.push(crate::decoration::Decoration::Eol {
+                        row: cursor_row,
+                        text: format!("  ■ {message}"),
+                        style,
+                    });
+                }
+            }
         }
         // Only in the focused window: an unfocused pane's cursor is not where
         // you are looking, and annotating a brace for reasons off the screen
@@ -4646,6 +4717,10 @@ impl Editor {
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
+            ExLine::Definition => self.lsp_definition(),
+            ExLine::References => self.lsp_references(),
+            ExLine::Format => self.lsp_format(),
+            ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
             ExLine::Resize(how) => self.run_resize(how),
             ExLine::Find(pattern) => self.run_find(&pattern, false),
             ExLine::FindRegex(pattern) => self.run_find(&pattern, true),
@@ -4890,6 +4965,22 @@ impl Editor {
 
     pub fn settle(&mut self) {
         self.attach_lsp();
+        self.drain_edits();
+        self.flush_saves();
+        self.pump_lsp();
+        // The pump can itself edit — a `:format` answer — so the drain runs
+        // once more: the parse tree and the servers see those edits before
+        // the frame that shows them, not one keystroke later.
+        self.drain_edits();
+        // Last, so the settle that sees a handshake complete is the settle
+        // that opens the documents waiting on it.
+        self.open_lsp_docs();
+    }
+
+    /// The drain itself: every buffer's `pending_edits`, fed to tree-sitter,
+    /// to LSP `didChange`, to the stored diagnostics, and to the selections
+    /// of every window not responsible for them.
+    fn drain_edits(&mut self) {
         let focus = self.focus;
         for entry in &mut self.buffers {
             let edits = std::mem::take(&mut entry.buffer.pending_edits);
@@ -4946,11 +5037,6 @@ impl Editor {
                 text.scroll = entry.buffer.row_at(Cursor::at(moved));
             }
         }
-        self.flush_saves();
-        self.pump_lsp();
-        // After the pump, so the settle that sees a handshake complete is the
-        // settle that opens the documents waiting on it.
-        self.open_lsp_docs();
     }
 
     /// Resolves LSP attachment for any buffer that has none — lazily, here,
@@ -5020,6 +5106,15 @@ impl Editor {
                 Some(lsp::Effect::Diagnostics { buffer, version, diagnostics, encoding }) => {
                     self.store_diagnostics(buffer, version, diagnostics, encoding)
                 }
+                Some(lsp::Effect::Definition { window, targets, encoding }) => {
+                    self.apply_definition(window, targets, encoding)
+                }
+                Some(lsp::Effect::References { symbol, root, targets, encoding }) => {
+                    self.apply_references(symbol, root, targets, encoding)
+                }
+                Some(lsp::Effect::Formatting { buffer, version, edits, encoding }) => {
+                    self.apply_formatting(buffer, version, edits, encoding)
+                }
                 None => {}
             }
         }
@@ -5069,6 +5164,326 @@ impl Editor {
         // In buffer order, which is the order everything that will draw or
         // walk them wants.
         doc.diagnostics.sort_by_key(|d| (d.start, d.end));
+    }
+
+    /// The focused buffer's live document, for a request about to be sent —
+    /// or the status-line reason there is nothing to ask.
+    ///
+    /// Everything owned, because the caller's next move is a `&mut` call on
+    /// the registry the borrows would otherwise pin.
+    fn lsp_target(&self) -> Result<(BufferId, lsp::Doc, lsp::client::Caps), String> {
+        let Some(id) = self.window().buffer() else {
+            return Err("no buffer in this window".into());
+        };
+        match &self.entry(id).lsp {
+            lsp::Attach::Doc(doc) if doc.opened => {
+                let caps = self
+                    .lsp
+                    .instance(doc.server)
+                    .map(|c| c.caps)
+                    .ok_or("lsp: instance gone — :lsp restart")?;
+                Ok((id, doc.clone(), caps))
+            }
+            lsp::Attach::Doc(_) => Err("lsp: server is still starting".into()),
+            lsp::Attach::Unresolved => Err("lsp: not attached".into()),
+            lsp::Attach::No { reason, .. } => Err(format!("lsp: {reason}")),
+        }
+    }
+
+    /// The wire position of the focused cursor, in the encoding the server
+    /// was granted.
+    fn lsp_position(&self, id: BufferId, server: lsp::ServerId) -> Option<lsp::types::Position> {
+        let encoding = self.lsp.instance(server)?.encoding;
+        let at = self.window().text()?.selections.cursor().at;
+        Some(lsp::pos::position_of(self.entry(id).buffer.rope(), at, encoding))
+    }
+
+    /// `:definition` — `gd`. Files the request; the answer jumps this window
+    /// when it lands, through the pump.
+    fn lsp_definition(&mut self) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.definition {
+                return Err("definition: this server does not offer it".into());
+            }
+            let position = self.lsp_position(id, doc.server).ok_or("no cursor here")?;
+            self.lsp.definition(&doc, position, self.focus)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// `:references` — `gr`. The answer becomes a `Results` pane.
+    fn lsp_references(&mut self) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.references {
+                return Err("references: this server does not offer it".into());
+            }
+            let position = self.lsp_position(id, doc.server).ok_or("no cursor here")?;
+            // The symbol travels with the intent: it is the pane's title and
+            // its query, and by the time the answer lands the cursor may be
+            // on a different word entirely.
+            let symbol = {
+                let buffer = &self.entry(id).buffer;
+                let cursor =
+                    self.window().text().expect("lsp_target found a buffer").selections.cursor();
+                match buffer.word_at(cursor) {
+                    Some((start, end)) => buffer.rope().slice(start..end).to_string(),
+                    None => return Err("no word under the cursor".into()),
+                }
+            };
+            self.lsp.references(&doc, position, symbol)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// `:format` — the whole file, by the server, as one undo step.
+    fn lsp_format(&mut self) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.formatting {
+                return Err("format: this server does not offer it".into());
+            }
+            let options = &self.entry(id).options;
+            self.lsp.formatting(&doc, id, options.tab_width, options.expandtab)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// A definition answer: open the first target where the request was made.
+    fn apply_definition(
+        &mut self,
+        window: WindowId,
+        targets: Vec<(PathBuf, lsp::types::Range)>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        let Some((path, range)) = targets.first().cloned() else {
+            self.session.status = "no definition found".into();
+            return;
+        };
+        // The window that asked may have closed while the server thought.
+        if self.window_of(window).is_none() {
+            return;
+        }
+        let id = match self.open_path(&path.to_string_lossy()) {
+            Ok(id) => id,
+            Err(e) => {
+                self.session.status = format!("error: {e:#}");
+                return;
+            }
+        };
+        self.show(window, id);
+        let at = lsp::pos::char_of(self.entry(id).buffer.rope(), range.start, encoding);
+        if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
+            text.selections = Selections::from_pairs(vec![(at, at)]);
+        }
+        if targets.len() > 1 {
+            self.session.status = format!("went to the first of {} definitions", targets.len());
+        }
+    }
+
+    /// A references answer, as the pane `find-in-files.md` promised it.
+    fn apply_references(
+        &mut self,
+        symbol: String,
+        root: PathBuf,
+        targets: Vec<(PathBuf, lsp::types::Range)>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        if targets.is_empty() {
+            self.session.status = format!("no references to {symbol}");
+            return;
+        }
+
+        let mut unreadable = 0;
+        let mut matches: Vec<crate::find_in_files::Match> = Vec::new();
+        for (path, range) in &targets {
+            let row = range.start.line as usize;
+            let Some(text) = self.line_text(path, row) else {
+                unreadable += 1;
+                continue;
+            };
+            let col = lsp::pos::col_to_char(&text, range.start.character, encoding);
+            // A range that runs past its line — a multi-line reference —
+            // counts to the line's end; the row is still the answer.
+            let len = match range.end.line as usize == row {
+                true => lsp::pos::col_to_char(&text, range.end.character, encoding),
+                false => text.chars().count(),
+            }
+            .saturating_sub(col)
+            .max(1);
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+            matches.push(crate::find_in_files::Match { path: rel, line: row + 1, col, len, text });
+        }
+        // Servers answer in whatever order indexing found them; the pane
+        // groups by file, so the matches have to arrive that way.
+        matches.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
+
+        if matches.is_empty() {
+            self.session.status = format!("references to {symbol}: none readable");
+            return;
+        }
+
+        let files = {
+            let mut n = 0;
+            let mut last: Option<&std::path::PathBuf> = None;
+            for m in &matches {
+                if last != Some(&m.path) {
+                    n += 1;
+                    last = Some(&m.path);
+                }
+            }
+            n
+        };
+        let mut report = format!(
+            "{} reference{} in {files} file{}",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+        );
+        if unreadable > 0 {
+            report.push_str(&format!(", {unreadable} unreadable"));
+        }
+
+        // The query is the symbol, which is what makes `:replace` over this
+        // pane a rename spelled with two commands bi already has.
+        let query = crate::find_in_files::Query {
+            pattern: symbol.clone(),
+            regex: false,
+            gitignore: self.options().gitignore,
+            ..Default::default()
+        };
+        let results =
+            crate::results::Results::new(format!("references: {symbol}"), query, root, matches);
+        let focus = self.focus;
+        if let Some(window) = self.window_mut_of(focus) {
+            window.show(Content::Results(Box::new(results)));
+        }
+        self.session.status = report;
+    }
+
+    /// One line of a file, from the open buffer when there is one — unsaved
+    /// edits included — and from the disk otherwise.
+    fn line_text(&self, path: &std::path::Path, row: usize) -> Option<String> {
+        let wanted = lsp::pos::canonical(path).ok()?;
+        for entry in &self.buffers {
+            let Some(p) = &entry.buffer.path else { continue };
+            if lsp::pos::canonical(p).ok().as_deref() == Some(&wanted) {
+                return (row < entry.buffer.line_count()).then(|| entry.buffer.line(row));
+            }
+        }
+        let text = std::fs::read_to_string(&wanted).ok()?;
+        text.lines().nth(row).map(str::to_string)
+    }
+
+    /// A formatting answer: the server's edits, applied as one undo step.
+    fn apply_formatting(
+        &mut self,
+        id: BufferId,
+        version: i32,
+        edits: Vec<lsp::types::TextEdit>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        if edits.is_empty() {
+            self.session.status = "already formatted".into();
+            return;
+        }
+        let focus = self.focus;
+        let focused_here = self.window_of(focus).and_then(Window::buffer) == Some(id);
+        // Undo lands you where you were when you asked — the live selections
+        // when the buffer is on screen, its parked ones when it is not.
+        let current = self
+            .window_of(focus)
+            .and_then(Window::text)
+            .filter(|_| focused_here)
+            .map(|t| t.selections.as_pairs());
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return };
+
+        // The version gate: a format computed against text that no longer
+        // exists must not touch the text that replaced it.
+        match &entry.lsp {
+            lsp::Attach::Doc(doc) if doc.version == version => {}
+            _ => {
+                self.session.status = "text changed under :format — run it again".into();
+                return;
+            }
+        }
+
+        // Converted against the current rope — which the version gate just
+        // proved is the text the edits were computed for — then applied
+        // bottom-up so an earlier edit cannot move a later one.
+        let rope = entry.buffer.rope();
+        let mut spans: Vec<(usize, usize, String)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    lsp::pos::char_of(rope, e.range.start, encoding),
+                    lsp::pos::char_of(rope, e.range.end, encoding),
+                    e.new_text.clone(),
+                )
+            })
+            .collect();
+        spans.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let before = current.unwrap_or_else(|| entry.last.clone());
+        let applied_from = entry.buffer.pending_edits.len();
+        for (start, end, text) in &spans {
+            entry.buffer.replace_range(*start, *end, text);
+        }
+        let across = {
+            let applied = entry.buffer.pending_edits[applied_from..].to_vec();
+            move |at: usize| applied.iter().fold(at, |at, e| e.map(at))
+        };
+
+        // The focused window is the one `settle` deliberately skips, so its
+        // selections are this function's to carry.
+        let after: crate::history::Cursors =
+            before.iter().map(|&(a, h)| (across(a), across(h))).collect();
+        entry.buffer.commit_undo(before, after);
+        if focused_here && let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) {
+            let mapped: Vec<Selection> = text
+                .selections
+                .all()
+                .iter()
+                .map(|s| Selection {
+                    anchor: Cursor::at(across(s.anchor.at)),
+                    head: Cursor::at(across(s.head.at)),
+                })
+                .collect();
+            text.selections.set(mapped);
+        }
+        self.session.status =
+            format!("formatted — {} edit{}", spans.len(), if spans.len() == 1 { "" } else { "s" });
+    }
+
+    /// `:dnext` / `:dprev` — `]d` / `[d`. Wraps, and puts the message on the
+    /// status line, which is also where a message too long for its EOL tail
+    /// can be read whole.
+    fn diagnostic_jump(&mut self, forward: bool) {
+        let Some(id) = self.window().buffer() else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        let diagnostics = self.diagnostics(id);
+        if diagnostics.is_empty() {
+            self.session.status = "no diagnostics here".into();
+            return;
+        }
+        let Some(at) = self.cursor().map(|c| c.at) else { return };
+        let index = match forward {
+            true => diagnostics.iter().position(|d| d.start > at).unwrap_or(0),
+            false => match diagnostics.iter().rposition(|d| d.start < at) {
+                Some(i) => i,
+                None => diagnostics.len() - 1,
+            },
+        };
+        let d = &diagnostics[index];
+        let (start, message) = (d.start, d.message.lines().next().unwrap_or("").to_string());
+        self.session.status = format!("[{}/{}] {message}", index + 1, diagnostics.len());
+        self.set_cursor(Cursor::at(start));
     }
 
     /// `:lsp`, `:lsp restart`, `:lsp stop` — all about the focused buffer.
@@ -5188,9 +5603,48 @@ impl Editor {
         self.lsp.shutdown_all();
     }
 
+    /// The theme's style for a severity.
+    fn diag_style(&self, severity: lsp::Severity) -> crate::theme::Style {
+        match severity {
+            lsp::Severity::Error => self.theme.ui.diag_error,
+            lsp::Severity::Warning => self.theme.ui.diag_warning,
+            lsp::Severity::Info => self.theme.ui.diag_info,
+            lsp::Severity::Hint => self.theme.ui.diag_hint,
+        }
+    }
+
+    /// The gutter cell's marks for the rows on screen: `(row, sign, style)`.
+    ///
+    /// Its own call rather than a decoration, because the gutter has always
+    /// been the frontend's to draw — a decoration names columns of the text
+    /// area. The worst severity on a row wins its one cell.
+    pub fn gutter_signs(
+        &self,
+        window: WindowId,
+        rows: std::ops::Range<usize>,
+    ) -> Vec<(usize, char, crate::theme::Style)> {
+        let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else {
+            return Vec::new();
+        };
+        if options.gutter == 0 || !options.diagnostics {
+            return Vec::new();
+        }
+        let Some(id) = self.window_of(window).and_then(Window::buffer) else { return Vec::new() };
+        let mut worst: std::collections::BTreeMap<usize, lsp::Severity> = Default::default();
+        for d in self.diagnostics(id) {
+            let row = buffer.row_at(Cursor::at(d.start));
+            if rows.contains(&row) {
+                let sev = worst.entry(row).or_insert(d.severity);
+                *sev = (*sev).min(d.severity);
+            }
+        }
+        worst.into_iter().map(|(row, sev)| (row, '●', self.diag_style(sev))).collect()
+    }
+
     /// The stored diagnostics for a buffer, in buffer order — empty until a
-    /// server has spoken, and empty again when it publishes so. Nothing draws
-    /// these yet; the diagnostics feature will. See `docs/specs/lsp.md`.
+    /// server has spoken, and empty again when it publishes so. The
+    /// decorations pass draws them; `]d` / `[d` walk them. See
+    /// `docs/specs/diagnostics.md`.
     pub fn diagnostics(&self, id: BufferId) -> &[lsp::Diag] {
         match self.buffers.iter().find(|b| b.id == id).map(|b| &b.lsp) {
             Some(lsp::Attach::Doc(doc)) => &doc.diagnostics,
@@ -15074,10 +15528,35 @@ int main(void) {
             fake.grant(
                 id,
                 json!({ "positionEncoding": "utf-8",
-                        "textDocumentSync": { "openClose": true, "change": 2, "save": true } }),
+                        "textDocumentSync": { "openClose": true, "change": 2, "save": true },
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "documentFormattingProvider": true }),
             );
             ed.settle();
             id
+        }
+
+        /// Answers the newest request of `method` as the server, and settles
+        /// so the answer lands.
+        fn respond(
+            ed: &mut Editor,
+            fake: &FakeSpawn,
+            server: crate::lsp::ServerId,
+            method: &str,
+            result: serde_json::Value,
+        ) {
+            let id = fake.last(server, method).unwrap()["id"].as_i64().unwrap();
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(server, Inbound::Response { id, result: Ok(result) });
+            ed.settle();
+        }
+
+        fn open_uri(fake: &FakeSpawn, server: crate::lsp::ServerId) -> String {
+            fake.last(server, "textDocument/didOpen").unwrap()["params"]["textDocument"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_string()
         }
 
         fn publish(
@@ -15267,6 +15746,229 @@ int main(void) {
             let spawned = fake.spawned.lock().unwrap();
             assert_eq!(spawned.len(), 2, "a fresh spawn");
             assert_ne!(spawned[1].0, id, "a restarted server is a new instance");
+        }
+
+        #[test]
+        fn gd_jumps_where_the_answer_points_in_the_same_file() {
+            let (_dir, mut ed, fake) = project("gd-here");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            ex(&mut ed, "definition");
+            let sent = fake.last(id, "textDocument/definition").unwrap();
+            assert_eq!(sent["params"]["position"], json!({ "line": 0, "character": 0 }));
+
+            // "fn |main| ..." — the answer points at column 3.
+            let answer = json!({ "uri": uri,
+                "range": { "start": { "line": 0, "character": 3 },
+                           "end": { "line": 0, "character": 7 } } });
+            respond(&mut ed, &fake, id, "textDocument/definition", answer);
+            assert_eq!(ed.cursor().unwrap().at, 3);
+        }
+
+        #[test]
+        fn gd_opens_the_file_the_answer_names() {
+            let (dir, mut ed, fake) = project("gd-cross");
+            std::fs::write(dir.0.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "definition");
+            let target = crate::lsp::pos::canonical(&dir.0.join("src/lib.rs")).unwrap();
+            let answer = json!([{ "uri": crate::lsp::pos::uri_of(&target),
+                "range": { "start": { "line": 0, "character": 7 },
+                           "end": { "line": 0, "character": 13 } } }]);
+            respond(&mut ed, &fake, id, "textDocument/definition", answer);
+
+            let shown = ed.window().buffer().unwrap();
+            let path = ed.entry(shown).buffer.path.clone().expect("a file-backed buffer");
+            assert_eq!(path, target, "the other file is on screen");
+            assert_eq!(ed.cursor().unwrap().at, 7);
+        }
+
+        #[test]
+        fn a_definition_nobody_has_is_a_status_line_answer() {
+            let (_dir, mut ed, fake) = project("gd-none");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "definition");
+            respond(&mut ed, &fake, id, "textDocument/definition", serde_json::Value::Null);
+            assert_eq!(ed.session.status, "no definition found");
+        }
+
+        #[test]
+        fn a_capability_the_server_lacks_refuses_before_sending() {
+            let (_dir, mut ed, fake) = project("gd-nocap");
+            // A handshake that offers nothing beyond sync.
+            ed.settle();
+            let id = fake.spawned.lock().unwrap()[0].0;
+            fake.grant(id, json!({ "textDocumentSync": 2 }));
+            ed.settle();
+
+            ex(&mut ed, "definition");
+            assert!(ed.session.status.contains("does not offer"), "{}", ed.session.status);
+            assert_eq!(fake.last(id, "textDocument/definition"), None, "nothing was sent");
+        }
+
+        #[test]
+        fn gr_builds_a_results_pane_titled_by_the_symbol() {
+            let (_dir, mut ed, fake) = project("gr");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            // The cursor sits on `fn`, so `fn` is the symbol.
+            ex(&mut ed, "references");
+            let answer = json!([
+                { "uri": uri, "range": { "start": { "line": 0, "character": 3 },
+                                         "end": { "line": 0, "character": 7 } } },
+                { "uri": uri, "range": { "start": { "line": 0, "character": 0 },
+                                         "end": { "line": 0, "character": 2 } } },
+            ]);
+            respond(&mut ed, &fake, id, "textDocument/references", answer);
+
+            let results = ed.window().results().expect("a results pane");
+            assert_eq!(results.title, "references: fn");
+            assert_eq!(results.matches().len(), 2);
+            // Sorted by position, whatever order the server answered in.
+            assert_eq!(results.matches()[0].col, 0);
+            assert_eq!(results.matches()[1].col, 3);
+            assert_eq!(results.matches()[0].text, "fn main() {");
+            assert!(ed.session.status.contains("2 references in 1 file"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn format_applies_the_edits_as_one_undo_step() {
+            let (_dir, mut ed, fake) = project("fmt");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "format");
+            let sent = fake.last(id, "textDocument/formatting").unwrap();
+            assert_eq!(sent["params"]["options"]["tabSize"], 4);
+            assert_eq!(sent["params"]["options"]["insertSpaces"], true);
+
+            // Two edits: replace `fn ` and append a comment line.
+            let answer = json!([
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 0, "character": 3 } },
+                  "newText": "pub fn " },
+                { "range": { "start": { "line": 2, "character": 0 },
+                             "end": { "line": 2, "character": 0 } },
+                  "newText": "// end\n" },
+            ]);
+            respond(&mut ed, &fake, id, "textDocument/formatting", answer);
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "pub fn main() {\n}\n// end\n");
+            assert!(ed.session.status.contains("formatted"), "{}", ed.session.status);
+
+            // The server heard about its own edits, or its copy is now wrong.
+            let change = fake.last(id, "textDocument/didChange").unwrap();
+            assert_eq!(change["params"]["textDocument"]["version"], 2);
+
+            ed.apply(cmd(Action::Undo));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn main() {\n}\n", "one step");
+        }
+
+        #[test]
+        fn a_format_computed_against_old_text_is_dropped() {
+            let (_dir, mut ed, fake) = project("fmt-stale");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "format");
+            // The text moves on while the server thinks: version is now 2,
+            // and the answer was computed against 1.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+
+            let answer = json!([{ "range": { "start": { "line": 0, "character": 0 },
+                                             "end": { "line": 1, "character": 0 } },
+                                  "newText": "clobbered\n" }]);
+            respond(&mut ed, &fake, id, "textDocument/formatting", answer);
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "xfn main() {\n}\n", "untouched");
+            assert!(ed.session.status.contains(":format"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn diagnostic_jumps_walk_forward_backward_and_wrap() {
+            let (_dir, mut ed, fake) = project("djump");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+            let buffer = ed.window().buffer().unwrap();
+
+            let range = |a: u32, b: u32| {
+                json!({ "start": { "line": 0, "character": a },
+                        "end": { "line": 0, "character": b } })
+            };
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({ "uri": uri, "version": 1, "diagnostics": [
+                    { "range": range(3, 7), "severity": 1, "message": "first" },
+                    { "range": range(10, 11), "severity": 2, "message": "second" },
+                ]}),
+            );
+            assert_eq!(ed.diagnostics(buffer).len(), 2);
+
+            ex(&mut ed, "dnext");
+            assert_eq!(ed.cursor().unwrap().at, 3);
+            assert!(ed.session.status.contains("[1/2] first"), "{}", ed.session.status);
+            ex(&mut ed, "dnext");
+            assert_eq!(ed.cursor().unwrap().at, 10);
+            ex(&mut ed, "dnext");
+            assert_eq!(ed.cursor().unwrap().at, 3, "wrapped");
+            ex(&mut ed, "dprev");
+            assert_eq!(ed.cursor().unwrap().at, 10, "wrapped the other way");
+        }
+
+        #[test]
+        fn diagnostics_dress_the_text_and_the_gutter_until_told_not_to() {
+            let (_dir, mut ed, fake) = project("ddress");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({ "uri": uri, "version": 1, "diagnostics": [
+                    { "range": { "start": { "line": 0, "character": 3 },
+                                 "end": { "line": 0, "character": 7 } },
+                      "severity": 1, "message": "cannot find value" },
+                ]}),
+            );
+
+            let error = ed.theme().ui.diag_error;
+            let repaint = ed.decorations(ed.focus(), 0..2).into_iter().find_map(|d| match d {
+                crate::decoration::Decoration::Repaint { range, style, .. } if style == error => {
+                    Some(range)
+                }
+                _ => None,
+            });
+            assert_eq!(repaint, Some(3..7), "the range wears the severity");
+
+            // The cursor is on row 0, so the message rides that row's end.
+            let eol = ed.decorations(ed.focus(), 0..2).into_iter().find_map(|d| match d {
+                crate::decoration::Decoration::Eol { row: 0, text, .. }
+                    if text.contains("cannot find value") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            });
+            assert!(eol.is_some(), "the message at the line's end");
+
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert_eq!(signs.len(), 1);
+            assert_eq!((signs[0].0, signs[0].1), (0, '●'));
+
+            // `:set diagnostics false` hides the lot without forgetting it.
+            ex(&mut ed, "set diagnostics false");
+            let drawn = ed.decorations(ed.focus(), 0..2).into_iter().any(|d| {
+                matches!(d, crate::decoration::Decoration::Repaint { style, .. } if style == error)
+            });
+            assert!(!drawn, "hidden");
+            assert!(ed.gutter_signs(ed.focus(), 0..2).is_empty());
+            let buffer = ed.window().buffer().unwrap();
+            assert_eq!(ed.diagnostics(buffer).len(), 1, "but not forgotten");
         }
 
         #[test]

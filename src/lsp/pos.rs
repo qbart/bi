@@ -78,6 +78,24 @@ pub fn position_of(rope: &Rope, at: usize, encoding: Encoding) -> Position {
     Position { line: line as u32, character }
 }
 
+/// A wire column as a char offset into one line of text, clamped to the
+/// line's end. The line-level twin of [`char_of`], for text that lives in a
+/// `String` rather than a rope — a references row read straight off the disk.
+pub fn col_to_char(line: &str, units: u32, encoding: Encoding) -> usize {
+    let mut acc = 0;
+    for (i, c) in line.chars().enumerate() {
+        if c == '\n' || c == '\r' {
+            return i;
+        }
+        let width = encoding.width(c);
+        if acc + width > units {
+            return i;
+        }
+        acc += width;
+    }
+    line.chars().count()
+}
+
 /// The one spelling of a path every URI derives from: absolutized against
 /// the process's cwd, symlinks resolved when the file exists on disk (a new
 /// file is still a document). One function, so `didOpen` and every later
@@ -187,6 +205,14 @@ mod tests {
         let r = rope("");
         assert_eq!(char_of(&r, Position { line: 0, character: 0 }, Encoding::Utf16), 0);
         assert_eq!(position_of(&r, 0, Encoding::Utf16), Position { line: 0, character: 0 });
+    }
+
+    #[test]
+    fn a_line_column_converts_like_its_rope_twin() {
+        assert_eq!(col_to_char("é𝕊x", 6, Encoding::Utf8), 2);
+        assert_eq!(col_to_char("é𝕊x", 3, Encoding::Utf16), 2);
+        assert_eq!(col_to_char("ab", 99, Encoding::Utf8), 2, "clamped to the line end");
+        assert_eq!(col_to_char("ab\n", 99, Encoding::Utf8), 2, "the newline is not a column");
     }
 
     #[test]

@@ -20,6 +20,7 @@ use super::transport::Spawn;
 use super::types::{PublishDiagnostics, ShowMessage, SyncKind, WorkDone};
 use super::{Doc, Inbound, Inbox, ServerId, client, rpc, sync, types};
 use crate::buffer::{BufferId, Edit};
+use crate::window::WindowId;
 
 /// One server's definition, from `[lsp.servers.<name>]` — built-in defaults
 /// with the user's config merged over them. See `docs/specs/config.md` for
@@ -59,6 +60,21 @@ pub enum Effect {
     /// A line for the status bar — a crash, or a `showMessage` at error or
     /// warning severity.
     Status(String),
+    /// A definition answer: where to jump `window`. Wire ranges still, since
+    /// the target file may not even be open yet — the editor converts after
+    /// loading it.
+    Definition { window: WindowId, targets: Vec<(PathBuf, types::Range)>, encoding: Encoding },
+    /// A references answer, bound for a `Results` pane rooted at the
+    /// client's workspace root.
+    References {
+        symbol: String,
+        root: PathBuf,
+        targets: Vec<(PathBuf, types::Range)>,
+        encoding: Encoding,
+    },
+    /// A formatting answer. `version` is what the request was computed
+    /// against; the editor drops the lot on a mismatch.
+    Formatting { buffer: BufferId, version: i32, edits: Vec<types::TextEdit>, encoding: Encoding },
 }
 
 pub struct Registry {
@@ -244,6 +260,82 @@ impl Registry {
         client.notify("textDocument/didSave", params);
     }
 
+    /// Files a request with the intent its answer resolves. `Err` is the
+    /// status line's to show — a server that is starting, dead, or gone.
+    pub fn request(
+        &mut self,
+        server: ServerId,
+        method: &str,
+        params: Value,
+        intent: Intent,
+    ) -> Result<(), String> {
+        let Some(client) = self.clients.iter_mut().find(|c| c.id == server) else {
+            return Err("lsp: instance gone — :lsp restart".into());
+        };
+        match &client.phase {
+            Phase::Running => {
+                client.request(method, params, intent);
+                Ok(())
+            }
+            Phase::Starting => Err(format!("{} is still starting", client.name)),
+            Phase::Dead { .. } => Err(format!("{} exited — :lsp restart", client.name)),
+        }
+    }
+
+    /// `textDocument/definition` for the symbol at `position`.
+    pub fn definition(
+        &mut self,
+        doc: &Doc,
+        position: types::Position,
+        window: WindowId,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/definition",
+            json!({ "textDocument": { "uri": doc.uri }, "position": position }),
+            Intent::Definition { window },
+        )
+    }
+
+    /// `textDocument/references`. The declaration is included — a reference
+    /// list that hides where the thing lives answers half the question.
+    pub fn references(
+        &mut self,
+        doc: &Doc,
+        position: types::Position,
+        symbol: String,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": doc.uri },
+                "position": position,
+                "context": { "includeDeclaration": true },
+            }),
+            Intent::References { symbol },
+        )
+    }
+
+    /// `textDocument/formatting`, under the indentation options in force.
+    pub fn formatting(
+        &mut self,
+        doc: &Doc,
+        buffer: BufferId,
+        tab_width: usize,
+        expandtab: bool,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": doc.uri },
+                "options": { "tabSize": tab_width, "insertSpaces": expandtab },
+            }),
+            Intent::Formatting { buffer, version: doc.version },
+        )
+    }
+
     /// The buffer is going away, or its path changed under the document.
     pub fn close(&mut self, doc: &Doc) {
         self.docs.remove(&doc.uri);
@@ -276,6 +368,32 @@ impl Registry {
                 // The answer to `shutdown` needs no action — `exit` already
                 // followed it out the door.
                 Intent::Shutdown => None,
+                Intent::Definition { window } => match result {
+                    Ok(value) => Some(Effect::Definition {
+                        window,
+                        targets: locations(value),
+                        encoding: client.encoding,
+                    }),
+                    Err(e) => Some(Effect::Status(format!("definition: {}", e.message))),
+                },
+                Intent::References { symbol } => match result {
+                    Ok(value) => Some(Effect::References {
+                        symbol,
+                        root: client.root.clone(),
+                        targets: locations(value),
+                        encoding: client.encoding,
+                    }),
+                    Err(e) => Some(Effect::Status(format!("references: {}", e.message))),
+                },
+                Intent::Formatting { buffer, version } => match result {
+                    Ok(value) => Some(Effect::Formatting {
+                        buffer,
+                        version,
+                        edits: serde_json::from_value(value).unwrap_or_default(),
+                        encoding: client.encoding,
+                    }),
+                    Err(e) => Some(Effect::Status(format!("format: {}", e.message))),
+                },
             },
 
             Inbound::Request { id, method, params } => {
@@ -390,6 +508,29 @@ impl Registry {
     }
 }
 
+/// Every `(path, range)` a definition or references answer names, whatever
+/// wire shape it arrived in: null, one `Location`, an array of them, or an
+/// array of `LocationLink`s. Non-`file://` URIs are dropped — they name
+/// nothing on this filesystem.
+fn locations(value: Value) -> Vec<(PathBuf, types::Range)> {
+    fn one(v: &Value) -> Option<(PathBuf, types::Range)> {
+        if v.get("uri").is_some() {
+            let l: types::Location = serde_json::from_value(v.clone()).ok()?;
+            Some((super::pos::path_of(&l.uri)?, l.range))
+        } else {
+            // A link's selection range is the symbol itself — where a jump
+            // wants to land — rather than the whole declaration block.
+            let l: types::LocationLink = serde_json::from_value(v.clone()).ok()?;
+            Some((super::pos::path_of(&l.target_uri)?, l.target_selection_range))
+        }
+    }
+    match value {
+        Value::Array(items) => items.iter().filter_map(one).collect(),
+        v @ Value::Object(_) => one(&v).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The nearest ancestor holding one of `markers`, else the nearest holding
 /// `.git` — the universal project mark — else `None`, which the caller reads
 /// as "the file's own directory".
@@ -406,6 +547,7 @@ fn find_root(dir: &Path, markers: &[String]) -> Option<PathBuf> {
 mod tests {
     use crate::buffer::{Buffer, Cursor};
     use crate::lsp::transport::fake::FakeSpawn;
+    use crate::lsp::types::Position;
 
     use super::*;
 
@@ -809,6 +951,156 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_request_resolves_its_intent_into_an_effect() {
+        let mut rig = rig("req-def");
+        let (doc, _) = opened(&mut rig, incremental());
+        let window = WindowId(0);
+
+        rig.registry
+            .request(
+                doc.server,
+                "textDocument/definition",
+                json!({}),
+                Intent::Definition { window },
+            )
+            .unwrap();
+        let sent = rig.fake.last(doc.server, "textDocument/definition").unwrap();
+        let id = sent["id"].as_i64().unwrap();
+
+        // The three wire shapes: a single Location…
+        let single = json!({ "uri": "file:///a.rs",
+            "range": { "start": { "line": 3, "character": 4 },
+                       "end": { "line": 3, "character": 9 } } });
+        let inbox = rig.fake.spawned.lock().unwrap()[0].1.clone();
+        inbox.deliver(doc.server, Inbound::Response { id, result: Ok(single) });
+        let (from, msg) = rig.registry.drain().pop().unwrap();
+        match rig.registry.accept(from, msg) {
+            Some(Effect::Definition { window: w, targets, encoding }) => {
+                assert_eq!(w, window);
+                assert_eq!(targets[0].0, PathBuf::from("/a.rs"));
+                assert_eq!(targets[0].1.start.line, 3);
+                assert_eq!(encoding, Encoding::Utf8);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // …an array of LocationLinks…
+        rig.registry
+            .request(
+                doc.server,
+                "textDocument/definition",
+                json!({}),
+                Intent::Definition { window },
+            )
+            .unwrap();
+        let id =
+            rig.fake.last(doc.server, "textDocument/definition").unwrap()["id"].as_i64().unwrap();
+        let links = json!([{
+            "targetUri": "file:///b.rs",
+            "targetRange": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 9, "character": 0 } },
+            "targetSelectionRange": { "start": { "line": 2, "character": 7 },
+                                      "end": { "line": 2, "character": 12 } }
+        }, {
+            "targetUri": "untitled:nope",
+            "targetRange": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 0, "character": 0 } },
+            "targetSelectionRange": { "start": { "line": 0, "character": 0 },
+                                      "end": { "line": 0, "character": 0 } }
+        }]);
+        inbox.deliver(doc.server, Inbound::Response { id, result: Ok(links) });
+        let (from, msg) = rig.registry.drain().pop().unwrap();
+        match rig.registry.accept(from, msg) {
+            Some(Effect::Definition { targets, .. }) => {
+                assert_eq!(targets.len(), 1, "the foreign scheme dropped");
+                assert_eq!(targets[0].1.start, Position { line: 2, character: 7 }, "the symbol");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // …and null, which is an answer too.
+        rig.registry
+            .request(
+                doc.server,
+                "textDocument/definition",
+                json!({}),
+                Intent::Definition { window },
+            )
+            .unwrap();
+        let id =
+            rig.fake.last(doc.server, "textDocument/definition").unwrap()["id"].as_i64().unwrap();
+        inbox.deliver(doc.server, Inbound::Response { id, result: Ok(Value::Null) });
+        let (from, msg) = rig.registry.drain().pop().unwrap();
+        match rig.registry.accept(from, msg) {
+            Some(Effect::Definition { targets, .. }) => assert!(targets.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_request_to_a_server_that_cannot_take_it_is_a_status_not_a_hang() {
+        let mut rig = rig("req-early");
+        let path = rig.dir.join("src/main.rs");
+        let doc = rig.registry.attach(BufferId(0), &path, "rust", &rig.servers).unwrap();
+
+        // Still starting.
+        let err = rig
+            .registry
+            .request(
+                doc.server,
+                "textDocument/definition",
+                json!({}),
+                Intent::Definition { window: WindowId(0) },
+            )
+            .unwrap_err();
+        assert!(err.contains("starting"), "{err}");
+
+        // Dead.
+        rig.registry.accept(doc.server, Inbound::Eof);
+        let err = rig
+            .registry
+            .request(
+                doc.server,
+                "textDocument/definition",
+                json!({}),
+                Intent::Definition { window: WindowId(0) },
+            )
+            .unwrap_err();
+        assert!(err.contains(":lsp restart"), "{err}");
+    }
+
+    #[test]
+    fn a_formatting_answer_carries_the_version_it_was_asked_at() {
+        let mut rig = rig("req-fmt");
+        let (doc, _) = opened(&mut rig, incremental());
+
+        rig.registry
+            .request(
+                doc.server,
+                "textDocument/formatting",
+                json!({}),
+                Intent::Formatting { buffer: BufferId(0), version: 1 },
+            )
+            .unwrap();
+        let id =
+            rig.fake.last(doc.server, "textDocument/formatting").unwrap()["id"].as_i64().unwrap();
+        let edits = json!([{ "range": { "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 2 } },
+                             "newText": "    " }]);
+        let inbox = rig.fake.spawned.lock().unwrap()[0].1.clone();
+        inbox.deliver(doc.server, Inbound::Response { id, result: Ok(edits) });
+        let (from, msg) = rig.registry.drain().pop().unwrap();
+        match rig.registry.accept(from, msg) {
+            Some(Effect::Formatting { buffer, version, edits, .. }) => {
+                assert_eq!(buffer, BufferId(0));
+                assert_eq!(version, 1);
+                assert_eq!(edits[0].new_text, "    ");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

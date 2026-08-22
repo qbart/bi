@@ -134,6 +134,13 @@ todo_warn  = { fg = "#161616", bg = "#f1c21b", bold = true }
 todo_perf  = { fg = "#161616", bg = "#be95ff", bold = true }
 todo_note  = { fg = "#161616", bg = "#ff7eb6", bold = true }
 
+# What the language server found wrong, worn by the text it names.
+# Carbon red 50, yellow 30, blue 50, and the ramp grey for hints.
+diag_error   = { fg = "#fa4d56", underline = true }
+diag_warning = { fg = "#f1c21b", underline = true }
+diag_info    = { fg = "#4589ff", underline = true }
+diag_hint    = { fg = "#8d8d8d", underline = true }
+
 mode_normal = { fg = "#161616", bg = "#00D3D0", bold = true }
 mode_insert = { fg = "#161616", bg = "#ff7eb6", bold = true }
 mode_pick   = { fg = "#161616", bg = "#ee5396", bold = true }

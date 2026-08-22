@@ -355,6 +355,11 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Normal, "change_to_line_end", "C"),
     (KeyMode::Normal, "change_line", "S"),
     (KeyMode::Normal, "substitute", "s"),
+    // The LSP jumps — each an ex command wearing a key, like `ga`.
+    (KeyMode::Normal, "definition", "gd"),
+    (KeyMode::Normal, "references", "gr"),
+    (KeyMode::Normal, "diagnostic_next", "]d"),
+    (KeyMode::Normal, "diagnostic_prev", "[d"),
     // The window prefix. Two keys each, and a name apiece so a leader binding
     // can reach them — `<leader>e` for the tree is the one everybody writes.
     (KeyMode::Normal, "window_split", "<C-w>s"),

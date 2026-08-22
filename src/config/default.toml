@@ -47,6 +47,13 @@ whitespace = false
 # See docs/specs/todo-comments.md.
 todo_comments = true
 
+# What the language server found wrong, drawn on the text: the range in the
+# theme's `diag_*` colours, a sign in the gutter cell, and the message after
+# the end of the cursor's line. Off hides the marks without forgetting them —
+# `:lsp` still counts, and `]d` / `[d` still jump.
+# See docs/specs/diagnostics.md.
+diagnostics = true
+
 # #fb4934, rgb(251,73,52) and rgb(0.5f,0.1f,0.1) drawn in the colour they name,
 # with black or white text over them — whichever can be read.
 # See docs/specs/colors.md.
