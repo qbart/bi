@@ -88,6 +88,18 @@ pub enum Effect {
         items: Vec<types::CompletionItem>,
         encoding: Encoding,
     },
+    /// A signature answer, already resolved to what the float draws — `None`
+    /// is the server saying the cursor left the call, which means close.
+    Signature { request: u64, help: Option<SignatureData> },
+}
+
+/// The parameters float's content: one label, the active parameter's char
+/// range within it, and how many other signatures the server offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureData {
+    pub label: String,
+    pub active: Option<std::ops::Range<usize>>,
+    pub total: usize,
 }
 
 pub struct Registry {
@@ -389,6 +401,29 @@ impl Registry {
         )
     }
 
+    /// `textDocument/signatureHelp`. `trigger` is the char that opened or
+    /// moved the float, when one did.
+    pub fn signature(
+        &mut self,
+        doc: &Doc,
+        position: types::Position,
+        request: u64,
+        trigger: Option<char>,
+    ) -> Result<(), String> {
+        let context = match trigger {
+            Some(c) => json!({ "triggerKind": 2, "triggerCharacter": c.to_string(),
+                               "isRetrigger": false }),
+            None => json!({ "triggerKind": 3, "isRetrigger": true }),
+        };
+        self.request(
+            doc.server,
+            "textDocument/signatureHelp",
+            json!({ "textDocument": { "uri": doc.uri }, "position": position,
+                    "context": context }),
+            Intent::Signature { request },
+        )
+    }
+
     /// The buffer is going away, or its path changed under the document.
     pub fn close(&mut self, doc: &Doc) {
         self.docs.remove(&doc.uri);
@@ -452,6 +487,14 @@ impl Registry {
                         Some(Effect::Hover { window, anchor, markdown: hover_markdown(&value) })
                     }
                     Err(e) => Some(Effect::Status(format!("hover: {}", e.message))),
+                },
+                Intent::Signature { request } => match result {
+                    Ok(value) => Some(Effect::Signature {
+                        request,
+                        help: signature_data(&value, client.encoding),
+                    }),
+                    // The float is cosmetic; an error is a close, not a scold.
+                    Err(_) => Some(Effect::Signature { request, help: None }),
                 },
                 Intent::Completion { buffer, request, manual } => match result {
                     Ok(value) => {
@@ -632,6 +675,53 @@ fn hover_markdown(value: &Value) -> Option<String> {
         one => marked(one)?,
     };
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// A signature answer as the float's content: the active signature's label,
+/// the active parameter resolved to a char range in it, and the count. `None`
+/// for null or empty — the server saying the cursor is not in a call.
+///
+/// The parameter's span arrives in two wire shapes — a substring of the
+/// label, or a pair of offsets in the negotiated encoding — and both resolve
+/// here, at the boundary, like every other wire position.
+fn signature_data(value: &Value, encoding: Encoding) -> Option<SignatureData> {
+    let signatures = value.get("signatures")?.as_array()?;
+    if signatures.is_empty() {
+        return None;
+    }
+    let active_signature =
+        value.get("activeSignature").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let sig = signatures.get(active_signature).unwrap_or(&signatures[0]);
+    let label = sig.get("label")?.as_str()?.to_string();
+
+    // 3.16 lets each signature carry its own active parameter; the top-level
+    // one is the fallback, and 0 is the spec's own default.
+    let param_index = sig
+        .get("activeParameter")
+        .or_else(|| value.get("activeParameter"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let active = sig
+        .get("parameters")
+        .and_then(Value::as_array)
+        .and_then(|params| params.get(param_index))
+        .and_then(|param| param.get("label"))
+        .and_then(|span| match span {
+            Value::String(text) => {
+                let start = label.find(text.as_str())?;
+                let chars_before = label[..start].chars().count();
+                Some(chars_before..chars_before + text.chars().count())
+            }
+            Value::Array(pair) => {
+                let (a, b) = (pair.first()?.as_u64()?, pair.get(1)?.as_u64()?);
+                Some(
+                    super::pos::col_to_char(&label, a as u32, encoding)
+                        ..super::pos::col_to_char(&label, b as u32, encoding),
+                )
+            }
+            _ => None,
+        });
+    Some(SignatureData { label, active, total: signatures.len() })
 }
 
 /// A completion answer in either wire shape — a bare array, or a
@@ -1298,6 +1388,68 @@ mod tests {
                 "manual={manual}"
             );
         }
+    }
+
+    #[test]
+    fn signature_answers_resolve_both_parameter_shapes() {
+        // Offsets into the label, in the negotiated encoding.
+        let offsets = json!({
+            "signatures": [{
+                "label": "fn add(a: i32, b: i32)",
+                "parameters": [{ "label": [7, 13] }, { "label": [15, 21] }],
+            }],
+            "activeParameter": 1,
+        });
+        let data = signature_data(&offsets, Encoding::Utf8).unwrap();
+        assert_eq!(data.label, "fn add(a: i32, b: i32)");
+        assert_eq!(data.active, Some(15..21), "the second parameter");
+        assert_eq!(data.total, 1);
+
+        // A substring of the label — the other legal spelling.
+        let substring = json!({
+            "signatures": [
+                { "label": "f(x: u8)", "parameters": [{ "label": "x: u8" }] },
+                { "label": "f()" },
+            ],
+        });
+        let data = signature_data(&substring, Encoding::Utf16).unwrap();
+        assert_eq!(data.active, Some(2..7));
+        assert_eq!(data.total, 2, "counted, not paged");
+
+        // The per-signature activeParameter (3.16) outranks the top-level.
+        let per_sig = json!({
+            "signatures": [{
+                "label": "g(a, b)",
+                "activeParameter": 1,
+                "parameters": [{ "label": "a" }, { "label": "b" }],
+            }],
+            "activeParameter": 0,
+        });
+        assert_eq!(signature_data(&per_sig, Encoding::Utf8).unwrap().active, Some(5..6));
+
+        // Null and empty both mean "not in a call" — close.
+        assert_eq!(signature_data(&Value::Null, Encoding::Utf8), None);
+        assert_eq!(signature_data(&json!({ "signatures": [] }), Encoding::Utf8), None);
+        // No parameters is a label with nothing to highlight, not a close.
+        let bare = json!({ "signatures": [{ "label": "h()" }] });
+        assert_eq!(signature_data(&bare, Encoding::Utf8).unwrap().active, None);
+    }
+
+    #[test]
+    fn a_signature_request_says_what_moved_it() {
+        let mut rig = rig("sigctx");
+        let (doc, _) = opened(&mut rig, incremental());
+        let position = Position { line: 0, character: 5 };
+
+        rig.registry.signature(&doc, position, 1, Some('(')).unwrap();
+        let sent = rig.fake.last(doc.server, "textDocument/signatureHelp").unwrap();
+        assert_eq!(sent["params"]["context"]["triggerKind"], 2);
+        assert_eq!(sent["params"]["context"]["triggerCharacter"], "(");
+
+        rig.registry.signature(&doc, position, 2, None).unwrap();
+        let sent = rig.fake.last(doc.server, "textDocument/signatureHelp").unwrap();
+        assert_eq!(sent["params"]["context"]["triggerKind"], 3);
+        assert_eq!(sent["params"]["context"]["isRetrigger"], true);
     }
 
     #[test]

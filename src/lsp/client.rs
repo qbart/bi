@@ -58,6 +58,10 @@ pub enum Intent {
         request: u64,
         manual: bool,
     },
+    /// The parameters float. Same request-counter rule as completion.
+    Signature {
+        request: u64,
+    },
 }
 
 /// The provider switches core features read from `initialize`. More arrive
@@ -69,6 +73,7 @@ pub struct Caps {
     pub formatting: bool,
     pub hover: bool,
     pub completion: bool,
+    pub signature: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +103,8 @@ pub struct Client {
     /// The characters that open the completion menu without a word — `.`,
     /// `::` — as the server listed them.
     pub trigger_chars: Vec<String>,
+    /// The characters that open the parameters float — `(`, `,`.
+    pub signature_chars: Vec<String>,
     pub server_info: Option<String>,
     /// Keyed by the progress token, stringified — the token is the server's
     /// and may be a number or a string.
@@ -129,6 +136,7 @@ impl Client {
             sync: SyncCaps::default(),
             caps: Caps::default(),
             trigger_chars: Vec::new(),
+            signature_chars: Vec::new(),
             server_info: None,
             progress: BTreeMap::new(),
             transport,
@@ -207,8 +215,11 @@ impl Client {
             formatting: truthy(parsed.capabilities.formatting_provider.as_ref()),
             hover: truthy(parsed.capabilities.hover_provider.as_ref()),
             completion: truthy(parsed.capabilities.completion_provider.as_ref()),
+            signature: truthy(parsed.capabilities.signature_help_provider.as_ref()),
         };
         self.trigger_chars = trigger_characters(parsed.capabilities.completion_provider.as_ref());
+        self.signature_chars =
+            trigger_characters(parsed.capabilities.signature_help_provider.as_ref());
         self.server_info = parsed.server_info.map(|s| s.name);
         self.transport.send(&rpc::notification("initialized", json!({})));
         self.phase = Phase::Running;

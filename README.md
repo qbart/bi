@@ -8,8 +8,9 @@ languages, a buffer list, split windows, a file tree, and LSP — servers start
 and sync per project, diagnostics are drawn on the text and jumped to with
 `]d` / `[d`, `gd` goes to a definition, `gr` lists references in a pane,
 `:format` reformats the file, `K` floats what the server knows about the
-cursor, and completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk
-it, `Tab` or `Enter` accepts, auto-imports included.
+cursor, completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk it,
+`Tab` or `Enter` accepts, auto-imports included — and typing `(` floats the
+signature with the parameter you are on highlighted.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 

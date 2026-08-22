@@ -878,6 +878,22 @@ fn render_window(
     if focused && let Some(menu) = &ed.session.completion {
         render_menu(frame, menu, buffer, &ed.theme().ui, scroll, last_row, gutter, tab, text_area);
     }
+    // Above the cursor while the menu sits below the word — both at once is
+    // exactly the moment both are wanted: picking an argument while being
+    // told which parameter it is.
+    if focused && let Some(sig) = &ed.session.signature {
+        render_signature(
+            frame,
+            sig,
+            buffer,
+            &ed.theme().ui,
+            scroll,
+            last_row,
+            gutter,
+            tab,
+            text_area,
+        );
+    }
 
     focused.then(|| {
         (
@@ -1085,6 +1101,54 @@ fn render_menu(
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).style(tui(ui.popup)), rect);
+}
+
+/// The parameters float: one line, the active parameter in bold underline —
+/// the popup's own ink made louder, not a new theme entry. A dim ` (1/3)`
+/// when the server offered more signatures than the one shown.
+#[allow(clippy::too_many_arguments, reason = "a pane's geometry is this many facts")]
+fn render_signature(
+    frame: &mut Frame,
+    sig: &bi::editor::Signature,
+    buffer: &bi::buffer::Buffer,
+    ui: &Ui,
+    scroll: usize,
+    last_row: usize,
+    gutter: usize,
+    tab: usize,
+    area: Rect,
+) {
+    let Some(anchor) = anchor_cell(buffer, sig.anchor, scroll, last_row, gutter, tab, area) else {
+        return;
+    };
+    let data = &sig.data;
+
+    let take = |from: usize, to: usize| -> String {
+        data.label.chars().skip(from).take(to.saturating_sub(from)).collect()
+    };
+    let total = data.label.chars().count();
+    let mut spans = vec![Span::raw(" ")];
+    match &data.active {
+        Some(range) => {
+            spans.push(Span::raw(take(0, range.start)));
+            spans.push(Span::styled(
+                take(range.start, range.end),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+            spans.push(Span::raw(take(range.end, total)));
+        }
+        None => spans.push(Span::raw(data.label.clone())),
+    }
+    if data.total > 1 {
+        spans.push(Span::styled(format!(" (1/{})", data.total), tui(ui.status_muted)));
+    }
+    spans.push(Span::raw(" "));
+
+    let line = Line::from(spans);
+    let width = line.width() as u16;
+    let Some(rect) = float_rect(anchor, (width, 1), area, true) else { return };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(line).style(tui(ui.popup)), rect);
 }
 
 fn truncate(text: &str, width: usize) -> String {

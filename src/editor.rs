@@ -652,6 +652,10 @@ pub struct Session {
     pub hover: Option<Hover>,
     /// The completion menu, while one is up. See `docs/specs/complete.md`.
     pub completion: Option<crate::complete::Completion>,
+    /// The parameters float, while the cursor is in a call. Unlike `hover`
+    /// it survives commands — typing is how it is used — and closes when the
+    /// server says the call ended. See `docs/specs/signature.md`.
+    pub signature: Option<Signature>,
     /// Buffers written since the last settle, for LSP `didSave` — recorded by
     /// the write paths, drained by `Editor::settle`, the same shape as
     /// `pending_edits` itself. On the session because a write can happen from
@@ -1742,6 +1746,15 @@ pub enum HoverLine {
     Rule,
 }
 
+/// The parameters float: the active signature, the active parameter's span
+/// in it, and how many more the server offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    /// Char offset the float hangs from — the cursor when the answer landed.
+    pub anchor: usize,
+    pub data: lsp::SignatureData,
+}
+
 /// A completion ask, parked between `apply` and `settle`. A request filed
 /// during `apply` would reach the server *before* the `didChange` carrying
 /// the char that triggered it — so `apply` marks, and `settle` sends after
@@ -1937,6 +1950,10 @@ pub struct Editor {
     complete_want: Option<CompleteWant>,
     /// The newest completion request's number; only its answer is accepted.
     complete_seq: u64,
+    /// A signature ask parked the same way; the char is the trigger when one
+    /// opened it, `None` for the re-ask that follows the cursor.
+    signature_want: Option<Option<char>>,
+    signature_seq: u64,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2273,6 +2290,8 @@ impl Editor {
             lsp: lsp::Registry::default(),
             complete_want: None,
             complete_seq: 0,
+            signature_want: None,
+            signature_seq: 0,
         };
         editor.resolve_options();
         editor
@@ -5020,6 +5039,7 @@ impl Editor {
         // After, so the trigger logic reads the buffer the command left
         // behind — the char is in, the cursor has moved.
         self.sync_completion(&action);
+        self.sync_signature(&action);
     }
 
     /// Settles everything an edit leaves behind. Called once per key, after the
@@ -5075,10 +5095,11 @@ impl Editor {
     pub fn settle(&mut self) {
         self.attach_lsp();
         self.drain_edits();
-        // After the drain: a completion ask must trail the `didChange` that
-        // carries the char that triggered it, or the server completes
-        // yesterday's text.
+        // After the drain: a completion or signature ask must trail the
+        // `didChange` that carries the char that triggered it, or the server
+        // answers about yesterday's text.
         self.flush_completion();
+        self.flush_signature();
         self.flush_saves();
         self.pump_lsp();
         // The pump can itself edit — a `:format` answer — so the drain runs
@@ -5239,6 +5260,9 @@ impl Editor {
                     items,
                     encoding,
                 }) => self.apply_completion(buffer, request, manual, incomplete, items, encoding),
+                Some(lsp::Effect::Signature { request, help }) => {
+                    self.apply_signature(request, help)
+                }
                 None => {}
             }
         }
@@ -5761,6 +5785,74 @@ impl Editor {
         if menu.is_empty() {
             self.close_completion();
         }
+    }
+
+    /// After a command: whether the parameters float opens, follows, or
+    /// closes. It follows by re-asking — the server already has the parser
+    /// that knows which comma the cursor is behind, in every language.
+    fn sync_signature(&mut self, action: &Action) {
+        if self.session.mode != Mode::Insert {
+            self.session.signature = None;
+            self.signature_want = None;
+            return;
+        }
+        match action {
+            Action::InsertChar(c) => {
+                if self.is_signature_char(*c) {
+                    self.signature_want = Some(Some(*c));
+                } else if self.session.signature.is_some() {
+                    self.signature_want = Some(None);
+                }
+            }
+            Action::Backspace if self.session.signature.is_some() => {
+                self.signature_want = Some(None);
+            }
+            Action::Move(_) => {
+                self.session.signature = None;
+                self.signature_want = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the focused buffer's server opens the float on `c` — `(` and
+    /// `,` for rust-analyzer.
+    fn is_signature_char(&self, c: char) -> bool {
+        let Some(id) = self.window().buffer() else { return false };
+        let lsp::Attach::Doc(doc) = &self.entry(id).lsp else { return false };
+        let Some(client) = self.lsp.instance(doc.server) else { return false };
+        let mut buf = [0u8; 4];
+        let c = &*c.encode_utf8(&mut buf);
+        client.caps.signature && client.signature_chars.iter().any(|t| t == c)
+    }
+
+    /// Sends the parked signature ask — same settle timing, same reason, as
+    /// `flush_completion` below.
+    fn flush_signature(&mut self) {
+        let Some(trigger) = self.signature_want.take() else { return };
+        if self.session.mode != Mode::Insert {
+            return;
+        }
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.signature {
+                return Err(String::new());
+            }
+            let position = self.lsp_position(id, doc.server).ok_or("")?;
+            self.signature_seq += 1;
+            self.lsp.signature(&doc, position, self.signature_seq, trigger)
+        });
+        // Automatic and cosmetic: failure is silence, never status noise.
+        let _ = sent;
+    }
+
+    /// A signature answer: the float follows the cursor, or closes when the
+    /// server says the call ended.
+    fn apply_signature(&mut self, request: u64, help: Option<lsp::SignatureData>) {
+        if request != self.signature_seq || self.session.mode != Mode::Insert {
+            return;
+        }
+        let Some(at) = self.cursor().map(|c| c.at) else { return };
+        self.session.signature = help.map(|data| Signature { anchor: at, data });
     }
 
     /// Sends the parked ask, from `settle`, *after* the drain — a request
@@ -15967,7 +16059,8 @@ int main(void) {
                         "referencesProvider": true,
                         "documentFormattingProvider": true,
                         "hoverProvider": true,
-                        "completionProvider": { "triggerCharacters": ["."] } }),
+                        "completionProvider": { "triggerCharacters": ["."] },
+                        "signatureHelpProvider": { "triggerCharacters": ["(", ","] } }),
             );
             ed.settle();
             id
@@ -16588,6 +16681,79 @@ int main(void) {
             respond(&mut ed, &fake, id, "textDocument/completion", answer);
             let menu = ed.session.completion.as_ref().expect("open");
             assert_eq!(menu.selected_item().unwrap().insert, "println!(\"\")");
+        }
+
+        #[test]
+        fn an_open_paren_floats_the_signature_and_the_call_ending_closes_it() {
+            let (_dir, mut ed, fake) = project("sig");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('(')));
+            ed.settle();
+            let sent = fake.last(id, "textDocument/signatureHelp").unwrap();
+            assert_eq!(sent["params"]["context"]["triggerCharacter"], "(");
+
+            let answer = json!({
+                "signatures": [{ "label": "fn main(argc: i32)",
+                                 "parameters": [{ "label": "argc: i32" }] }],
+            });
+            respond(&mut ed, &fake, id, "textDocument/signatureHelp", answer);
+            let sig = ed.session.signature.as_ref().expect("a float");
+            assert_eq!(sig.data.label, "fn main(argc: i32)");
+            assert_eq!(sig.data.active, Some(8..17));
+
+            // While it is up, typing follows the cursor by re-asking…
+            ed.apply(cmd(Action::InsertChar('x')));
+            ed.settle();
+            let sent = fake.last(id, "textDocument/signatureHelp").unwrap();
+            assert_eq!(sent["params"]["context"]["isRetrigger"], true);
+
+            // …and the server answering null is the call ending.
+            respond(&mut ed, &fake, id, "textDocument/signatureHelp", serde_json::Value::Null);
+            assert!(ed.session.signature.is_none(), "closed by the server's silence");
+        }
+
+        #[test]
+        fn leaving_insert_mode_takes_the_signature_with_it() {
+            let (_dir, mut ed, fake) = project("sig-esc");
+            let id = handshake(&mut ed, &fake);
+
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('(')));
+            ed.settle();
+            let answer = json!({ "signatures": [{ "label": "f()" }] });
+            respond(&mut ed, &fake, id, "textDocument/signatureHelp", answer);
+            assert!(ed.session.signature.is_some());
+
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(ed.session.signature.is_none());
+
+            // And a stale answer cannot resurrect it: the seq moved on.
+            ed.apply(cmd(Action::EnterInsert));
+            ed.apply(cmd(Action::InsertChar('(')));
+            ed.settle();
+            ed.apply(cmd(Action::InsertChar(',')));
+            ed.settle();
+            let old = fake
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(sid, m)| *sid == id && m["method"] == "textDocument/signatureHelp")
+                .nth_back(1)
+                .map(|(_, m)| m["id"].as_i64().unwrap())
+                .unwrap();
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(
+                id,
+                Inbound::Response {
+                    id: old,
+                    result: Ok(json!({ "signatures": [{ "label": "stale()" }] })),
+                },
+            );
+            ed.settle();
+            assert!(ed.session.signature.is_none(), "yesterday's answer");
         }
 
         #[test]

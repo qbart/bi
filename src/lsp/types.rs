@@ -157,6 +157,9 @@ pub struct Capabilities {
     /// (`.`, `::`) that open the menu without a word being typed.
     #[serde(default, rename = "completionProvider")]
     pub completion_provider: Option<Value>,
+    /// Ditto — `(` and `,` open and move the parameters float.
+    #[serde(default, rename = "signatureHelpProvider")]
+    pub signature_help_provider: Option<Value>,
 }
 
 /// The `triggerCharacters` of a `completionProvider`, empty when absent.

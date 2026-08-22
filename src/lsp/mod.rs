@@ -18,7 +18,7 @@ pub mod types;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-pub use registry::{Effect, Registry, ServerConfig};
+pub use registry::{Effect, Registry, ServerConfig, SignatureData};
 
 /// A running server instance's identity within a session.
 ///
