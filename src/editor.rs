@@ -14,6 +14,7 @@ use crate::cmd_history::History;
 use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
 use crate::history::Cursors;
+use crate::lsp;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
 use crate::range::{Address, Scope, Where};
@@ -639,6 +640,11 @@ pub struct Session {
     /// `docs/specs/options.md`.
     /// What the last yank read, and until when — see `docs/specs/flash.md`.
     pub flash: Option<Flash>,
+    /// Buffers written since the last settle, for LSP `didSave` — recorded by
+    /// the write paths, drained by `Editor::settle`, the same shape as
+    /// `pending_edits` itself. On the session because a write can happen from
+    /// a view, which holds no registry.
+    pub pending_saves: Vec<BufferId>,
     /// The letters currently on screen, and what they stand for — see
     /// `docs/specs/labels.md`.
     pub labels: Option<Labels>,
@@ -872,7 +878,7 @@ struct BufferEntry {
     /// The parse tree, when the file's extension has a grammar.
     ///
     /// Beside the buffer rather than on it, because `pending_edits` has more
-    /// than one consumer — tree-sitter now, LSP `didChange` later — and
+    /// than one consumer — tree-sitter and LSP `didChange` — and
     /// whoever drains it destroys it for the others. Putting the tree on
     /// `Buffer` would move the drain inside the buffer and break that.
     syntax: Option<Syntax>,
@@ -880,6 +886,10 @@ struct BufferEntry {
     /// claims the name. The key the option layers and the grammar are both
     /// chosen by; see `crate::syntax::filetype`.
     filetype: Option<&'static str>,
+    /// Where this buffer stands with LSP — beside the buffer for the same
+    /// reason `syntax` is: per-document derived state, fed at the one drain
+    /// point. Resolved lazily in [`Editor::settle`]. See `docs/specs/lsp.md`.
+    lsp: lsp::Attach,
     /// The options in force here: the session's, with whatever this file's
     /// type and project ask for laid over them.
     ///
@@ -908,6 +918,7 @@ impl BufferEntry {
             buffer,
             options: Options::default(),
             last: Vec::new(),
+            lsp: lsp::Attach::Unresolved,
         }
     }
 }
@@ -1393,6 +1404,9 @@ enum ExLine {
     Alternate,
     /// `:symbols` — the declarations in this file, to jump to one.
     Symbols,
+    /// `:lsp` — where this buffer stands with its language server; `:lsp
+    /// restart` and `:lsp stop` manage the instance. See `docs/specs/lsp.md`.
+    Lsp(LspCmd),
     /// `:resize 30`, `:resize +3,-3`, `:resize 1:2` — see
     /// `docs/specs/resize.md`.
     Resize(crate::resize::Resize),
@@ -1593,6 +1607,12 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // Plural, because the command shows a list. `:sym` is the short form;
         // `:s` is taken by substitute and always will be.
         "sym" | "symbols" => ExLine::Symbols,
+        "lsp" => match arg {
+            "" => ExLine::Lsp(LspCmd::Status),
+            "restart" => ExLine::Lsp(LspCmd::Restart),
+            "stop" => ExLine::Lsp(LspCmd::Stop),
+            _ => ExLine::Error("lsp takes restart, stop, or nothing for status".into()),
+        },
         // The whole argument is the pattern, spaces and all: `:find fn main`
         // has to search for `fn main`. That is also why there are no flags on
         // this line and a second command name instead — a `-r` would be a
@@ -1627,6 +1647,15 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // command, and was handled before the table.
         _ => ExLine::Unknown(name.into()),
     })
+}
+
+/// What `:lsp` was asked to do. Three values because the core has three
+/// verbs: say where things stand, start over, stand down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspCmd {
+    Status,
+    Restart,
+    Stop,
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -1793,6 +1822,9 @@ pub struct Editor {
     /// `:reload` then has nothing to re-read and says so.
     config_source: Option<Box<dyn ConfigSource>>,
     config_epoch: u64,
+    /// The language servers: running clients, their inbox, and the routing.
+    /// See `docs/specs/lsp.md`.
+    lsp: lsp::Registry,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2126,6 +2158,7 @@ impl Editor {
             remote: false,
             config_source: None,
             config_epoch: 0,
+            lsp: lsp::Registry::default(),
         };
         editor.resolve_options();
         editor
@@ -2982,6 +3015,15 @@ impl Editor {
         if self.is_modified(id) && !force {
             self.session.status = "unsaved changes (use `:bd!` to discard)".into();
             return;
+        }
+
+        // The server hears first: a `didClose` after the list forgot the
+        // entry would have nothing left to say.
+        if let Some(entry) = self.buffers.iter().find(|b| b.id == id)
+            && let lsp::Attach::Doc(doc) = &entry.lsp
+        {
+            let doc = doc.clone();
+            self.lsp.close(&doc);
         }
 
         let ids = self.buffer_ids();
@@ -4153,7 +4195,10 @@ impl Editor {
             // the ones for a buffer in view have not moved.
             let pairs = entry.last.clone();
             match entry.buffer.save(pairs.clone(), pairs) {
-                Ok(()) => written += 1,
+                Ok(()) => {
+                    written += 1;
+                    self.session.pending_saves.push(*id);
+                }
                 Err(e) => {
                     self.session.status = format!("error: {e:#}");
                     return;
@@ -4600,6 +4645,7 @@ impl Editor {
             }
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
+            ExLine::Lsp(cmd) => self.run_lsp(cmd),
             ExLine::Resize(how) => self.run_resize(how),
             ExLine::Find(pattern) => self.run_find(&pattern, false),
             ExLine::FindRegex(pattern) => self.run_find(&pattern, true),
@@ -4843,6 +4889,7 @@ impl Editor {
     }
 
     pub fn settle(&mut self) {
+        self.attach_lsp();
         let focus = self.focus;
         for entry in &mut self.buffers {
             let edits = std::mem::take(&mut entry.buffer.pending_edits);
@@ -4851,6 +4898,17 @@ impl Editor {
             }
             if let Some(syntax) = &mut entry.syntax {
                 syntax.update(entry.buffer.rope(), &edits);
+            }
+
+            // The drain's second consumer, promised since the field was
+            // designed: the server's copy follows the text, and the stored
+            // diagnostics follow it exactly as the selections below do.
+            if let lsp::Attach::Doc(doc) = &mut entry.lsp {
+                for diag in &mut doc.diagnostics {
+                    diag.start = edits.iter().fold(diag.start, |at, e| e.map(at));
+                    diag.end = edits.iter().fold(diag.end, |at, e| e.map(at));
+                }
+                self.lsp.change(doc, entry.buffer.rope(), &edits);
             }
 
             // Text windows only: a tree pane shows no rope and has nothing in
@@ -4887,6 +4945,256 @@ impl Editor {
                 let moved = edits.iter().fold(start, |at, e| e.map(at));
                 text.scroll = entry.buffer.row_at(Cursor::at(moved));
             }
+        }
+        self.flush_saves();
+        self.pump_lsp();
+        // After the pump, so the settle that sees a handshake complete is the
+        // settle that opens the documents waiting on it.
+        self.open_lsp_docs();
+    }
+
+    /// Resolves LSP attachment for any buffer that has none — lazily, here,
+    /// because settle runs after every event: a file opened any way at all is
+    /// looked at one event later at most, and the answer is cached on the
+    /// entry until the config moves. See `docs/specs/lsp.md`.
+    fn attach_lsp(&mut self) {
+        let epoch = self.config_epoch;
+        for i in 0..self.buffers.len() {
+            let entry = &self.buffers[i];
+            let stale = match &entry.lsp {
+                lsp::Attach::Unresolved => true,
+                lsp::Attach::No { epoch: at, .. } => *at != epoch,
+                lsp::Attach::Doc(_) => false,
+            };
+            if !stale {
+                continue;
+            }
+            let no = |reason: &str| lsp::Attach::No { epoch, reason: reason.into() };
+            let resolved = if !self.config.lsp.enabled {
+                no("off (`enabled = false` in [lsp])")
+            } else if let Some(path) = entry.buffer.path.clone() {
+                match entry.filetype {
+                    Some(filetype) => {
+                        match self.lsp.attach(entry.id, &path, filetype, &self.config.lsp.servers) {
+                            Ok(doc) => lsp::Attach::Doc(doc),
+                            Err(reason) => lsp::Attach::No { epoch, reason },
+                        }
+                    }
+                    None => no("no filetype for this buffer"),
+                }
+            } else {
+                no("no file behind this buffer")
+            };
+            self.buffers[i].lsp = resolved;
+        }
+    }
+
+    /// `didSave` for every write since the last settle.
+    fn flush_saves(&mut self) {
+        for id in std::mem::take(&mut self.session.pending_saves) {
+            let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { continue };
+            let lsp::Attach::Doc(doc) = &mut entry.lsp else { continue };
+            let current = entry
+                .buffer
+                .path
+                .as_deref()
+                .and_then(|p| lsp::pos::canonical(p).ok())
+                .map(|p| lsp::pos::uri_of(&p));
+            if current.as_deref() == Some(doc.uri.as_str()) {
+                self.lsp.saved(doc, entry.buffer.rope());
+            } else {
+                // `:w other.rs` moved the file under the document: the server
+                // is told the old one closed, and the new path attaches fresh
+                // on the next settle.
+                self.lsp.close(doc);
+                entry.lsp = lsp::Attach::Unresolved;
+            }
+        }
+    }
+
+    /// Applies everything the servers sent since the last settle.
+    fn pump_lsp(&mut self) {
+        for (from, msg) in self.lsp.drain() {
+            match self.lsp.accept(from, msg) {
+                Some(lsp::Effect::Status(status)) => self.session.status = status,
+                Some(lsp::Effect::Diagnostics { buffer, version, diagnostics, encoding }) => {
+                    self.store_diagnostics(buffer, version, diagnostics, encoding)
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// `didOpen` for any attached document whose server has finished its
+    /// handshake — which is also what lets the open carry whatever was typed
+    /// while the server was starting. See `Registry::try_open`.
+    fn open_lsp_docs(&mut self) {
+        for entry in &mut self.buffers {
+            if let lsp::Attach::Doc(doc) = &mut entry.lsp
+                && !doc.opened
+                && let Some(filetype) = entry.filetype
+            {
+                self.lsp.try_open(doc, filetype, entry.buffer.rope());
+            }
+        }
+    }
+
+    /// One `publishDiagnostics`, converted to char offsets and stored.
+    fn store_diagnostics(
+        &mut self,
+        buffer: BufferId,
+        version: Option<i32>,
+        diagnostics: Vec<lsp::types::Diagnostic>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else { return };
+        let lsp::Attach::Doc(doc) = &mut entry.lsp else { return };
+        // Tagged with a version other than the current one: these describe
+        // text that no longer exists, and their successor is already being
+        // computed. Untagged ones are taken at their word.
+        if version.is_some_and(|v| v != doc.version) {
+            return;
+        }
+        let rope = entry.buffer.rope();
+        doc.diagnostics = diagnostics
+            .into_iter()
+            .map(|d| lsp::Diag {
+                start: lsp::pos::char_of(rope, d.range.start, encoding),
+                end: lsp::pos::char_of(rope, d.range.end, encoding),
+                severity: lsp::Severity::from_wire(d.severity),
+                message: d.message,
+                source: d.source,
+            })
+            .collect();
+        // In buffer order, which is the order everything that will draw or
+        // walk them wants.
+        doc.diagnostics.sort_by_key(|d| (d.start, d.end));
+    }
+
+    /// `:lsp`, `:lsp restart`, `:lsp stop` — all about the focused buffer.
+    fn run_lsp(&mut self, cmd: LspCmd) {
+        let Some(id) = self.window().buffer() else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        match cmd {
+            LspCmd::Status => self.session.status = self.lsp_status(id),
+            LspCmd::Restart => self.lsp_restart(id),
+            LspCmd::Stop => self.lsp_stop(id),
+        }
+    }
+
+    /// One line: which server, what state, and what it is doing right now.
+    fn lsp_status(&self, id: BufferId) -> String {
+        let doc = match &self.entry(id).lsp {
+            lsp::Attach::Unresolved => return "lsp: not looked at yet".into(),
+            lsp::Attach::No { reason, .. } => return format!("lsp: {reason}"),
+            lsp::Attach::Doc(doc) => doc,
+        };
+        let Some(client) = self.lsp.instance(doc.server) else {
+            return "lsp: instance gone — :lsp restart".into();
+        };
+
+        let root = client.root.display().to_string();
+        match &client.phase {
+            lsp::client::Phase::Starting => format!("{}: starting · {root}", client.name),
+            lsp::client::Phase::Dead { reason } => {
+                // The stderr tail is the epitaph: the first question about a
+                // dead server is "what did it say on the way out".
+                let last = client.stderr_tail().last().cloned();
+                let stderr = last.map(|l| format!(" · stderr: {l}")).unwrap_or_default();
+                format!("{}: {reason} — :lsp restart{stderr}", client.name)
+            }
+            lsp::client::Phase::Running => {
+                let n = doc.diagnostics.len();
+                let mut parts = vec![
+                    format!("{}: running", client.name),
+                    root,
+                    client.encoding.name().to_string(),
+                    format!("{n} diagnostic{}", if n == 1 { "" } else { "s" }),
+                ];
+                if let Some((_, p)) = client.progress.first_key_value() {
+                    let pct = p.percentage.map(|pct| format!(" {pct}%")).unwrap_or_default();
+                    parts.push(format!("{}{pct}", p.title));
+                }
+                parts.join(" · ")
+            }
+        }
+    }
+
+    /// Kills this buffer's instance and lets the next settle spawn a fresh
+    /// one — the deliberate act after a crash, a hang, or installing the
+    /// binary that was missing.
+    fn lsp_restart(&mut self, id: BufferId) {
+        // Wiped either way: the point of a manual restart after installing
+        // the binary is that the spawn is actually retried.
+        self.lsp.clear_failures();
+        match &self.entry(id).lsp {
+            lsp::Attach::Doc(doc) => {
+                let server = doc.server;
+                self.lsp.kill_instance(server);
+                // Every buffer of that instance re-attaches, which is also
+                // what re-opens their documents on the fresh one.
+                for entry in &mut self.buffers {
+                    if matches!(&entry.lsp, lsp::Attach::Doc(d) if d.server == server) {
+                        entry.lsp = lsp::Attach::Unresolved;
+                    }
+                }
+            }
+            // Not attached: a fresh verdict, not a shrug — the config or the
+            // filesystem may have changed since the last look.
+            _ => self.entry_mut(id).lsp = lsp::Attach::Unresolved,
+        }
+        self.session.status = "lsp: restarting".into();
+    }
+
+    /// Shuts this buffer's instance down and keeps it down — until `:lsp
+    /// restart`, or a config reload, asks again.
+    fn lsp_stop(&mut self, id: BufferId) {
+        let lsp::Attach::Doc(doc) = &self.entry(id).lsp else {
+            self.session.status = "lsp: nothing to stop".into();
+            return;
+        };
+        let server = doc.server;
+        let epoch = self.config_epoch;
+        self.lsp.kill_instance(server);
+        for entry in &mut self.buffers {
+            if matches!(&entry.lsp, lsp::Attach::Doc(d) if d.server == server) {
+                entry.lsp =
+                    lsp::Attach::No { epoch, reason: "stopped (`:lsp restart` starts it)".into() };
+            }
+        }
+        self.session.status = "lsp: stopped".into();
+    }
+
+    /// Registers how LSP reader threads wake the frontend's event loop — the
+    /// same handshake as `set_clipboard`: the library does not learn what an
+    /// event loop is. Without one, messages wait for the next natural settle,
+    /// which is what a headless embedder that pumps on its own schedule wants.
+    pub fn set_lsp_waker(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.lsp.inbox().set_waker(wake);
+    }
+
+    /// Replaces how language servers come to exist — a test's fake, or an
+    /// embedding host that has no processes to spawn.
+    pub fn set_lsp_spawner(&mut self, spawner: impl lsp::transport::Spawn + 'static) {
+        self.lsp.set_spawner(spawner);
+    }
+
+    /// Session end: every server asked to leave, briefly waited for, then
+    /// made to. The frontend calls this once, after its loop and before the
+    /// terminal is handed back.
+    pub fn shutdown_lsp(&mut self) {
+        self.lsp.shutdown_all();
+    }
+
+    /// The stored diagnostics for a buffer, in buffer order — empty until a
+    /// server has spoken, and empty again when it publishes so. Nothing draws
+    /// these yet; the diagnostics feature will. See `docs/specs/lsp.md`.
+    pub fn diagnostics(&self, id: BufferId) -> &[lsp::Diag] {
+        match self.buffers.iter().find(|b| b.id == id).map(|b| &b.lsp) {
+            Some(lsp::Attach::Doc(doc)) => &doc.diagnostics,
+            _ => &[],
         }
     }
 
@@ -6654,6 +6962,9 @@ impl View<'_> {
                 let name =
                     self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 self.session.status = format!("\"{name}\" written");
+                // For LSP `didSave` — drained by `Editor::settle`, which also
+                // notices when the path moved under the document.
+                self.session.pending_saves.push(self.id);
                 true
             }
             Err(e) => {
@@ -14730,5 +15041,246 @@ int main(void) {
             ed.name_of(ed.window().buffer().unwrap()).ends_with("a.txt"),
             "`at` is a subsequence of a.txt and of nothing else here"
         );
+    }
+
+    /// The editor's half of LSP: attachment in `settle`, the drain feeding
+    /// `didChange`, stored diagnostics, and `:lsp`. The protocol itself is
+    /// tested in `src/lsp/`; here the server is a fake and the interest is
+    /// the wiring. See `docs/specs/lsp.md`.
+    mod lsp_integration {
+        use serde_json::json;
+
+        use super::*;
+        use crate::lsp::transport::fake::FakeSpawn;
+        use crate::lsp::{Inbound, Severity};
+
+        /// A project on disk, an editor opened on its main file, and a fake
+        /// behind the registry — installed before the first settle, which is
+        /// when attachment happens.
+        fn project(name: &str) -> (ScratchDir, Editor, FakeSpawn) {
+            let dir = ScratchDir::new(&format!("lsp-{name}"))
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", "fn main() {\n}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            let fake = FakeSpawn::default();
+            ed.set_lsp_spawner(fake.clone());
+            (dir, ed, fake)
+        }
+
+        /// Settle to attach, grant the handshake, settle to open.
+        fn handshake(ed: &mut Editor, fake: &FakeSpawn) -> crate::lsp::ServerId {
+            ed.settle();
+            let id = fake.spawned.lock().unwrap()[0].0;
+            fake.grant(
+                id,
+                json!({ "positionEncoding": "utf-8",
+                        "textDocumentSync": { "openClose": true, "change": 2, "save": true } }),
+            );
+            ed.settle();
+            id
+        }
+
+        fn publish(
+            ed: &mut Editor,
+            fake: &FakeSpawn,
+            id: crate::lsp::ServerId,
+            params: serde_json::Value,
+        ) {
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(
+                id,
+                Inbound::Notification { method: "textDocument/publishDiagnostics".into(), params },
+            );
+            ed.settle();
+        }
+
+        #[test]
+        fn opening_a_rust_file_attaches_and_opens_after_the_handshake() {
+            let (_dir, mut ed, fake) = project("attach");
+            let id = handshake(&mut ed, &fake);
+
+            assert_eq!(
+                fake.methods(id),
+                ["initialize", "initialized", "textDocument/didOpen"],
+                "the protocol's own order, driven entirely by settle"
+            );
+            let open = fake.last(id, "textDocument/didOpen").unwrap();
+            assert_eq!(open["params"]["textDocument"]["text"], "fn main() {\n}\n");
+            assert_eq!(open["params"]["textDocument"]["languageId"], "rust");
+
+            ex(&mut ed, "lsp");
+            let status = &ed.session.status;
+            assert!(status.contains("rust-analyzer: running"), "{status}");
+            assert!(status.contains("utf-8"), "{status}");
+            assert!(status.contains("0 diagnostics"), "{status}");
+        }
+
+        #[test]
+        fn text_typed_while_the_server_starts_rides_the_did_open() {
+            let (_dir, mut ed, fake) = project("early");
+            ed.settle();
+            let id = fake.spawned.lock().unwrap()[0].0;
+
+            // Typed before the handshake answered: no didChange can be sent,
+            // and none is needed — the open carries the current text.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+
+            fake.grant(id, json!({ "textDocumentSync": 2 }));
+            ed.settle();
+            assert_eq!(fake.methods(id), ["initialize", "initialized", "textDocument/didOpen"]);
+            let open = fake.last(id, "textDocument/didOpen").unwrap();
+            assert_eq!(open["params"]["textDocument"]["text"], "xfn main() {\n}\n");
+        }
+
+        #[test]
+        fn an_edit_becomes_one_did_change_through_the_same_drain_as_the_parse_tree() {
+            let (_dir, mut ed, fake) = project("change");
+            let id = handshake(&mut ed, &fake);
+
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(3), "x");
+            ed.settle();
+
+            let change = fake.last(id, "textDocument/didChange").unwrap();
+            assert_eq!(change["params"]["textDocument"]["version"], 2);
+            let c = &change["params"]["contentChanges"][0];
+            assert_eq!(c["range"]["start"], json!({ "line": 0, "character": 0 }));
+            assert_eq!(c["range"]["end"], json!({ "line": 1, "character": 0 }));
+            assert_eq!(c["text"], "fn xmain() {\n");
+        }
+
+        #[test]
+        fn diagnostics_are_stored_as_char_offsets_and_follow_edits() {
+            let (_dir, mut ed, fake) = project("diag");
+            let id = handshake(&mut ed, &fake);
+            let buffer = ed.window().buffer().unwrap();
+            let uri =
+                fake.last(id, "textDocument/didOpen").unwrap()["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({
+                    "uri": uri, "version": 1,
+                    "diagnostics": [{ "range": { "start": { "line": 0, "character": 3 },
+                                                 "end": { "line": 0, "character": 7 } },
+                                      "severity": 1, "source": "rustc", "message": "nope" }]
+                }),
+            );
+
+            let stored = ed.diagnostics(buffer);
+            assert_eq!((stored[0].start, stored[0].end), (3, 7));
+            assert_eq!(stored[0].severity, Severity::Error);
+            assert_eq!(stored[0].message, "nope");
+
+            // An edit above shifts them, exactly as it shifts a selection.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+            let stored = ed.diagnostics(buffer);
+            assert_eq!((stored[0].start, stored[0].end), (4, 8));
+
+            ex(&mut ed, "lsp");
+            assert!(ed.session.status.contains("· 1 diagnostic"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn diagnostics_for_a_version_that_is_gone_are_dropped() {
+            let (_dir, mut ed, fake) = project("stale");
+            let id = handshake(&mut ed, &fake);
+            let buffer = ed.window().buffer().unwrap();
+            let uri =
+                fake.last(id, "textDocument/didOpen").unwrap()["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+            // The edit moves the document to version 2; version-1 findings
+            // describe text that no longer exists.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({
+                    "uri": uri, "version": 1,
+                    "diagnostics": [{ "range": { "start": { "line": 0, "character": 0 },
+                                                 "end": { "line": 0, "character": 1 } },
+                                      "message": "old news" }]
+                }),
+            );
+            assert!(ed.diagnostics(buffer).is_empty());
+        }
+
+        #[test]
+        fn a_write_becomes_did_save() {
+            let (_dir, mut ed, fake) = project("save");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "w");
+            ed.settle();
+            let save = fake.last(id, "textDocument/didSave").unwrap();
+            assert!(save["params"]["textDocument"]["uri"].as_str().unwrap().starts_with("file://"));
+        }
+
+        #[test]
+        fn deleting_the_buffer_closes_the_document() {
+            let (_dir, mut ed, fake) = project("close");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "bd");
+            ed.settle();
+            assert!(fake.last(id, "textDocument/didClose").is_some());
+        }
+
+        #[test]
+        fn a_filetype_no_server_claims_is_a_reason_not_an_error() {
+            let dir = ScratchDir::new("lsp-none").written("notes.md", "# hi\n");
+            let mut ed = Editor::open(format!("{}/notes.md", dir.path())).unwrap();
+            let fake = FakeSpawn::default();
+            ed.set_lsp_spawner(fake.clone());
+            ed.settle();
+
+            assert!(fake.spawned.lock().unwrap().is_empty(), "nothing to spawn");
+            ex(&mut ed, "lsp");
+            assert!(ed.session.status.contains("no server for filetype"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_crash_reaches_the_status_line_and_restart_spawns_a_fresh_instance() {
+            let (_dir, mut ed, fake) = project("crash");
+            let id = handshake(&mut ed, &fake);
+
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(id, Inbound::Eof);
+            ed.settle();
+            assert!(ed.session.status.contains("rust-analyzer"), "{}", ed.session.status);
+            ex(&mut ed, "lsp");
+            assert!(ed.session.status.contains(":lsp restart"), "{}", ed.session.status);
+
+            ex(&mut ed, "lsp restart");
+            ed.settle();
+            let spawned = fake.spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 2, "a fresh spawn");
+            assert_ne!(spawned[1].0, id, "a restarted server is a new instance");
+        }
+
+        #[test]
+        fn lsp_stop_stands_the_server_down_and_keeps_it_down() {
+            let (_dir, mut ed, fake) = project("stop");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "lsp stop");
+            assert!(fake.killed.lock().unwrap().contains(&id));
+            ed.settle();
+            ed.settle();
+            assert_eq!(fake.spawned.lock().unwrap().len(), 1, "no quiet resurrection");
+            ex(&mut ed, "lsp");
+            assert!(ed.session.status.contains("stopped"), "{}", ed.session.status);
+        }
     }
 }

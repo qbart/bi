@@ -4,7 +4,9 @@ A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
 Status: modal editing, undo, registers, tree-sitter highlighting for twenty
-languages, a buffer list, split windows, and a file tree.
+languages, a buffer list, split windows, a file tree, and an LSP core —
+servers start and sync per project, `:lsp` says where a buffer stands, and
+diagnostics are stored but not yet drawn.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 

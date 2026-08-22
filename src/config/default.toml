@@ -147,6 +147,53 @@ trim_final_newline = true
 "*.cc" = ["*.hh", "*.hpp", "*.h"]
 "*.hh" = ["*.cc", "*.cpp"]
 
+# Language servers. Setting `enabled` to false turns the lot off. Each
+# [lsp.servers.<name>] section below is one server: `command` is its argv,
+# `filetypes` the files it claims (the same names [filetype.<name>] uses), and
+# `roots` the files that mark a project's top — walked up from the file, with
+# .git as the fallback. A server that is not installed costs nothing: bi tries
+# it once per project, and `:lsp` says what happened. A section of yours
+# patches the same-named one here field by field, so overriding `command`
+# alone keeps the filetypes and roots; an `enabled` of false inside one turns
+# off that server only. See docs/specs/lsp.md.
+[lsp]
+enabled = true
+
+[lsp.servers.rust-analyzer]
+command = ["rust-analyzer"]
+filetypes = ["rust"]
+roots = ["Cargo.toml"]
+
+[lsp.servers.gopls]
+command = ["gopls"]
+filetypes = ["go"]
+roots = ["go.work", "go.mod"]
+
+[lsp.servers.clangd]
+command = ["clangd"]
+filetypes = ["c", "cpp"]
+roots = ["compile_commands.json", ".clangd"]
+
+[lsp.servers.pyright]
+command = ["pyright-langserver", "--stdio"]
+filetypes = ["python"]
+roots = ["pyproject.toml", "setup.py", "requirements.txt"]
+
+[lsp.servers.typescript-language-server]
+command = ["typescript-language-server", "--stdio"]
+filetypes = ["typescript", "tsx", "javascript"]
+roots = ["tsconfig.json", "package.json"]
+
+[lsp.servers.lua-language-server]
+command = ["lua-language-server"]
+filetypes = ["lua"]
+roots = [".luarc.json"]
+
+[lsp.servers.bash-language-server]
+command = ["bash-language-server", "start"]
+filetypes = ["bash"]
+roots = []
+
 [keys]
 # The key <leader> stands for in a binding. Nothing uses it until you write a
 # binding that spells it — and the moment one does, this key stops meaning

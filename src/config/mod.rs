@@ -460,6 +460,25 @@ pub struct Config {
     /// pattern that matches decides, so `*_test.go` has to be tried before
     /// `*.go`. See `docs/specs/alternate.md`.
     pub alternates: Vec<(String, Vec<String>)>,
+    /// `[lsp]` — the master switch and the server table. See
+    /// `docs/specs/lsp.md`.
+    pub lsp: Lsp,
+}
+
+/// The `[lsp]` section: whether servers start at all, and which ones exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lsp {
+    pub enabled: bool,
+    /// `[lsp.servers.<name>]`, the user's entries merged field-wise over the
+    /// built-in defaults of the same name — overriding `command` alone keeps
+    /// the filetypes and roots.
+    pub servers: std::collections::BTreeMap<String, crate::lsp::ServerConfig>,
+}
+
+impl Default for Lsp {
+    fn default() -> Self {
+        Self { enabled: true, servers: Default::default() }
+    }
 }
 
 impl Default for Config {
@@ -477,6 +496,7 @@ impl Default for Config {
                     keys: Keymap::default(),
                     filetypes: Default::default(),
                     alternates: Vec::new(),
+                    lsp: Lsp::default(),
                 };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })

@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn guides_go_at_every_level_and_never_on_the_text() {
         assert_eq!(guide_columns(8, 4).collect::<Vec<_>>(), [0, 4]);
-        assert_eq!(guide_columns(0, 4).collect::<Vec<_>>(), [], "nothing to guide");
+        assert_eq!(guide_columns(0, 4).count(), 0, "nothing to guide");
         assert_eq!(guide_columns(6, 4).collect::<Vec<_>>(), [0, 4], "a ragged indent still gets 4");
         assert_eq!(guide_columns(3, 4).collect::<Vec<_>>(), [0]);
     }

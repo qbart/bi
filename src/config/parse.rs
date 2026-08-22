@@ -38,6 +38,7 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
             "keys" => read_keys(src, table, &mut config, &mut problems),
             "filetype" => read_filetypes(src, table, &mut config, &mut problems),
             "alternate" => read_alternates(src, table, &mut config, &mut problems),
+            "lsp" => read_lsp(src, table, &mut config, &mut problems),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -147,6 +148,81 @@ fn read_alternates(src: &str, table: &Table, config: &mut Config, problems: &mut
             None => config.alternates.push((pattern.to_string(), targets)),
         }
     }
+}
+
+/// `[lsp]`: `enabled`, and `[lsp.servers.<name>]` sections. See
+/// `docs/specs/lsp.md`.
+fn read_lsp(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    for (key, item) in table.iter() {
+        let line = line_for(table, key, src);
+        match key {
+            "enabled" => match item.as_value().and_then(Value::as_bool) {
+                Some(b) => config.lsp.enabled = b,
+                None => {
+                    problems.push(Diagnostic { line, message: "enabled is true or false".into() })
+                }
+            },
+            "servers" => match item.as_table() {
+                Some(servers) => read_servers(src, servers, config, problems),
+                None => problems.push(Diagnostic {
+                    line,
+                    message: "servers holds [lsp.servers.<name>] sections".into(),
+                }),
+            },
+            other => {
+                problems.push(Diagnostic { line, message: format!("unknown lsp setting: {other}") })
+            }
+        }
+    }
+}
+
+/// One `[lsp.servers.<name>]` merges **field-wise** over the built-in server
+/// of the same name — the same patch promise the rest of the file makes, so
+/// overriding `command` alone keeps the default filetypes and roots.
+fn read_servers(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+    for (name, item) in table.iter() {
+        let line = line_for(table, name, src);
+        let Some(server) = item.as_table() else {
+            problems.push(Diagnostic {
+                line,
+                message: format!("{name} is a section: [lsp.servers.{name}]"),
+            });
+            continue;
+        };
+        let entry = config.lsp.servers.entry(name.to_string()).or_default();
+        for (field, item) in server.iter() {
+            let line = line_for(server, field, src);
+            match field {
+                "enabled" => match item.as_value().and_then(Value::as_bool) {
+                    Some(b) => entry.enabled = b,
+                    None => problems
+                        .push(Diagnostic { line, message: "enabled is true or false".into() }),
+                },
+                "command" | "filetypes" | "roots" => match string_list(item) {
+                    Some(list) => match field {
+                        "command" => entry.command = list,
+                        "filetypes" => entry.filetypes = list,
+                        _ => entry.roots = list,
+                    },
+                    None => problems.push(Diagnostic {
+                        line,
+                        message: format!("{field} takes a list of strings"),
+                    }),
+                },
+                other => problems
+                    .push(Diagnostic { line, message: format!("unknown server setting: {other}") }),
+            }
+        }
+    }
+}
+
+/// An array of strings, whole — one non-string poisons the lot, because half
+/// an argv silently applied is worse than none.
+fn string_list(item: &Item) -> Option<Vec<String>> {
+    let array = item.as_value().and_then(Value::as_array)?;
+    let strings: Vec<String> =
+        array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+    (strings.len() == array.len()).then_some(strings)
 }
 
 /// `leader`, `[keys.normal]`, `[keys.visual]`, `[keys.tree]`.
@@ -595,5 +671,70 @@ mod tests {
     fn set_and_get_reach_the_same_option() {
         let (config, _) = ok("[options]\nhlsearch = true\n");
         assert_eq!(config.options.get("hlsearch"), Some(OptionValue::Bool(true)));
+    }
+
+    #[test]
+    fn the_shipped_defaults_carry_a_server_table() {
+        let config = Config::default();
+        assert!(config.lsp.enabled);
+        let ra = &config.lsp.servers["rust-analyzer"];
+        assert_eq!(ra.command, ["rust-analyzer"]);
+        assert_eq!(ra.filetypes, ["rust"]);
+        assert_eq!(ra.roots, ["Cargo.toml"]);
+        assert!(config.lsp.servers.contains_key("gopls"));
+    }
+
+    /// The promise the section header makes: overriding one field keeps the
+    /// rest of the built-in server it patches.
+    #[test]
+    fn a_server_override_merges_field_wise_over_the_default() {
+        let (config, problems) =
+            ok("[lsp.servers.rust-analyzer]\ncommand = [\"ra-nightly\", \"--log\"]\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let ra = &config.lsp.servers["rust-analyzer"];
+        assert_eq!(ra.command, ["ra-nightly", "--log"]);
+        assert_eq!(ra.filetypes, ["rust"], "kept from the default");
+        assert_eq!(ra.roots, ["Cargo.toml"], "kept from the default");
+    }
+
+    #[test]
+    fn a_new_server_is_defined_whole() {
+        let src = "[lsp.servers.zls]\ncommand = [\"zls\"]\nfiletypes = [\"zig\"]\n\
+                   roots = [\"build.zig\"]\n";
+        let (config, problems) = ok(src);
+        assert!(problems.is_empty(), "{problems:?}");
+        let zls = &config.lsp.servers["zls"];
+        assert_eq!(zls.command, ["zls"]);
+        assert!(zls.enabled, "enabled unless said otherwise");
+    }
+
+    #[test]
+    fn lsp_switches_off_wholesale_or_per_server() {
+        let (config, _) = ok("[lsp]\nenabled = false\n");
+        assert!(!config.lsp.enabled);
+
+        let (config, _) = ok("[lsp.servers.gopls]\nenabled = false\n");
+        assert!(!config.lsp.servers["gopls"].enabled);
+        assert_eq!(config.lsp.servers["gopls"].command, ["gopls"], "definition kept, just off");
+        assert!(config.lsp.enabled, "the master switch is untouched");
+    }
+
+    #[test]
+    fn lsp_mistakes_are_named_with_their_line() {
+        let (_, problems) = ok("[lsp]\nenabled = \"yes\"\n");
+        assert_eq!(problems, ["2: enabled is true or false"]);
+
+        let (config, problems) = ok("[lsp.servers.gopls]\ncommand = \"gopls\"\n");
+        assert_eq!(problems, ["2: command takes a list of strings"]);
+        assert_eq!(config.lsp.servers["gopls"].command, ["gopls"], "the default survives");
+
+        let (_, problems) = ok("[lsp.servers.gopls]\ncommand = [\"gopls\", 3]\n");
+        assert_eq!(problems, ["2: command takes a list of strings"]);
+
+        let (_, problems) = ok("[lsp]\nnope = 1\n");
+        assert_eq!(problems, ["2: unknown lsp setting: nope"]);
+
+        let (_, problems) = ok("[lsp.servers.gopls]\ncmd = [\"gopls\"]\n");
+        assert_eq!(problems, ["2: unknown server setting: cmd"]);
     }
 }

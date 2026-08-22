@@ -9,7 +9,6 @@ mod tui;
 use std::io::{self, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
@@ -58,6 +57,10 @@ fn main() -> Result<()> {
     // `"+y` and `"+p`. The library holds the trait; the terminal is what knows
     // how to reach a clipboard from inside one.
     editor.set_clipboard(tui::clipboard::Osc52);
+    // Language servers arrive the same way the clipboard does: the library
+    // holds the trait, and spawning processes is a fact about the host. An
+    // editor whose frontend never calls this attaches nothing.
+    editor.set_lsp_spawner(bi::lsp::transport::ProcessSpawn);
 
     let mut term = setup().context("entering raw mode")?;
 
@@ -68,6 +71,9 @@ fn main() -> Result<()> {
     }
 
     let result = run(&mut term, &mut editor);
+    // Before `restore`, not after: the servers get their shutdown while the
+    // screen is still bi's, and a hung one is killed rather than waited on.
+    editor.shutdown_lsp();
     restore()?;
     result
 }
@@ -281,7 +287,39 @@ fn restore() -> Result<()> {
     Ok(())
 }
 
+/// One thing the loop can be woken by. Terminal events arrive from a thread
+/// that blocks in `event::read`; LSP wakes arrive from server reader threads.
+/// One channel, so the loop blocks on exactly one thing — and every async
+/// source there will ever be joins by sending into it.
+enum Wake {
+    Term(Event),
+    Lsp,
+}
+
 fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // The terminal reader. Detached: it blocks in `event::read` with nothing
+    // to interrupt it, and process exit is what ends it — the same blocking
+    // read this loop itself used to sit in, moved one thread over so a
+    // language server can wake the editor while the keyboard is silent.
+    let term_tx = tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(event) => {
+                    if term_tx.send(Wake::Term(event)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    ed.set_lsp_waker(move || {
+        let _ = tx.send(Wake::Lsp);
+    });
+
     let mut input = Input::default();
     // The keymap lives on `Input`, which is the frontend's, while `:reload`
     // happens inside the editor. `config_epoch` is how the two meet: the
@@ -300,26 +338,32 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
         // Something on screen may go away on its own — the flash a yank left.
         // Waiting is the frontend's job and the clock is the editor's, so the
         // loop asks how long it may block for and draws when that runs out
-        // whether or not a key arrived. `None` is the usual case: nothing is
-        // pending, so `read` below blocks as it always did.
-        if let Some(until) = ed.redraw_in()
-            && !event::poll(until)?
-        {
-            continue;
-        }
+        // whether or not anything arrived. `None` is the usual case: nothing
+        // is pending, so `recv` blocks as `event::read` used to.
+        let first = match ed.redraw_in() {
+            Some(until) => match rx.recv_timeout(until) {
+                Ok(wake) => wake,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            },
+            None => match rx.recv() {
+                Ok(wake) => wake,
+                Err(_) => return Ok(()),
+            },
+        };
 
         // Everything that has already arrived is applied before the next draw.
         // A frame the user never sees is a frame not worth rendering, and this
         // is what makes a burst — a paste into a terminal that does not support
         // bracketed paste, or a held-down `j` — cost one redraw instead of one
-        // per keystroke. The first `read` blocks; the loop then drains whatever
-        // is queued behind it without waiting.
-        let mut pending = true;
-        while pending {
-            match event::read()? {
+        // per keystroke. The first wake blocked above; the loop then drains
+        // whatever is queued behind it without waiting.
+        let mut next = Some(first);
+        while let Some(wake) = next {
+            match wake {
                 // Windows terminals emit Release too; without this filter every
                 // key fires twice.
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Wake::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if let Some(key) = tui::keys::translate(key)
                         && let Some(cmd) = input.on_key(key, &ed.session.mode, ed.content_kind())
                     {
@@ -330,11 +374,14 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
                 // A bracketed paste: one event, one insertion, one undo entry.
                 // The terminal sends it whole, so nothing here has to guess
                 // where it ends.
-                Event::Paste(text) => ed.paste_text(text),
-                Event::Resize(_, _) => {}
-                _ => {}
+                Wake::Term(Event::Paste(text)) => ed.paste_text(text),
+                Wake::Term(_) => {}
+                // Nothing to do here by name: the settle below pumps the LSP
+                // inbox along with everything else.
+                Wake::Lsp => {}
             }
-            // Feed the parse tree. LSP will hang off the same drain.
+            // Feed the parse tree and the language servers — both hang off
+            // this one drain.
             //
             // Per event rather than once per burst, even though once would be
             // cheaper: `settle` skips the focused window because the command
@@ -344,7 +391,7 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
             if ed.session.quit {
                 return Ok(());
             }
-            pending = event::poll(Duration::ZERO)?;
+            next = rx.try_recv().ok();
         }
     }
 }

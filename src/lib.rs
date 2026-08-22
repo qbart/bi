@@ -14,7 +14,7 @@
 //!
 //! The seams the remaining work needs already exist: [`buffer::Edit`] and the
 //! [`editor::Action`] table, plus [`editor::Editor::settle`], which drains
-//! the edit log for tree-sitter today and for LSP `didChange` later.
+//! the edit log for tree-sitter and for LSP `didChange` alike.
 
 pub mod alternate;
 pub mod buffer;
@@ -36,6 +36,7 @@ pub mod indent;
 pub mod input;
 pub mod key;
 pub mod label;
+pub mod lsp;
 pub mod motion;
 pub mod picker;
 pub mod range;

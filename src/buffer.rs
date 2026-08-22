@@ -39,7 +39,7 @@ pub struct Point {
 ///
 /// One record with both, because there is one drain — see `Editor::settle`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code, reason = "the byte fields are for LSP, which has not landed")]
+
 pub struct Edit {
     pub start_byte: usize,
     pub old_end_byte: usize,
@@ -120,7 +120,7 @@ pub struct BufferId(pub u32);
 pub struct Buffer {
     rope: Rope,
     pub path: Option<PathBuf>,
-    /// Drained by tree-sitter / LSP once those exist.
+    /// Drained by `Editor::settle` — for tree-sitter and LSP `didChange` both.
     pub pending_edits: Vec<Edit>,
     history: History,
     /// Bumped by every mutation, undo and redo included. A cache over the text
