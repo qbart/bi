@@ -598,7 +598,7 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(theme.ui.background, Some(Color::Rgb(0x16, 0x16, 0x16)));
         assert_eq!(theme.ui.foreground, Some(Color::Rgb(0xdd, 0xe1, 0xe6)));
-        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xff, 0x7e, 0xb6))));
+        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xee, 0x53, 0x96))));
 
         // Carbon's grey ramp. `context` is deliberately not on it — see below.
         const RAMP: &[(u8, u8, u8)] = &[
@@ -628,13 +628,14 @@ mod tests {
             assert!(RAMP.contains(&(r, g, b)), "{role} left the grey ramp: {colour:?}");
         }
 
-        // `context` is the deliberate exception, and the exception is the
-        // point: a near-black annotation on a near-black frame is a shape you
-        // cannot find when you go looking for it, which is the failure mode
-        // opposite to the one the other built-ins guard against. It has to be
-        // legible, and it has to not be a colour a capture already owns.
+        // `context` sits mid-ramp, italic: quiet enough to be an annotation,
+        // far enough from the frame's near-black to be findable. It was
+        // briefly a cyan of its own; the current look keeps the frame
+        // monochrome instead. What it still must not do is wear a colour a
+        // capture already owns, or the annotation reads as code.
         let context = theme.ui.context.fg.expect("context is a foreground");
-        assert_eq!(context, Color::Rgb(0x00, 0xd2, 0xff));
+        assert_eq!(context, Color::Rgb(0x6f, 0x6f, 0x6f));
+        assert!(theme.ui.context.italic, "italic is what marks it as not-code");
         for role in ["property", "type", "attribute", "operator", "keyword"] {
             assert_ne!(
                 theme.style(role).and_then(|s| s.fg),
