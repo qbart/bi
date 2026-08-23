@@ -6186,7 +6186,15 @@ impl Editor {
                 *sev = (*sev).min(d.severity);
             }
         }
-        worst.into_iter().map(|(row, sev)| (row, '●', self.diag_style(sev))).collect()
+        worst
+            .into_iter()
+            .map(|(row, sev)| {
+                // The underline comes off, as it does on the EOL message: it
+                // marks a range of text, and this is a mark about the line.
+                let style = crate::theme::Style { underline: false, ..self.diag_style(sev) };
+                (row, '•', style)
+            })
+            .collect()
     }
 
     /// The stored diagnostics for a buffer, in buffer order — empty until a
@@ -16599,7 +16607,9 @@ int main(void) {
 
             let signs = ed.gutter_signs(ed.focus(), 0..2);
             assert_eq!(signs.len(), 1);
-            assert_eq!((signs[0].0, signs[0].1), (0, '●'));
+            assert_eq!((signs[0].0, signs[0].1), (0, '•'));
+            assert!(!signs[0].2.underline, "the underline marks a range, not a sign");
+            assert_eq!(signs[0].2.fg, error.fg, "but the severity's colour stays");
 
             // `:set diagnostics false` hides the lot without forgetting it.
             ex(&mut ed, "set diagnostics false");

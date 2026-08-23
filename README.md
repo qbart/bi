@@ -274,7 +274,7 @@ every one of them is typeable without its key and rebindable by name
 | `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
 | `K` | what the server knows about the cursor, floated beside it |
 
-Diagnostics wear their severity's colour on the text, a `●` in the gutter,
+Diagnostics wear their severity's colour on the text, a `•` in the gutter,
 and the message at the end of the cursor's line; `:set diagnostics false`
 hides the marks without forgetting them. `:lsp` says where a buffer stands,
 `:format` reformats the file as one undo step, and completion opens by

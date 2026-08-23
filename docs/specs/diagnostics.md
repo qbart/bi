@@ -21,7 +21,9 @@ Three marks per diagnostic, all through machinery that already exists:
   without one reads as syntax. A theme is free to disagree.
 - **A sign in the gutter cell** — the cell `gutter = 1` has held open since
   the day it was reserved "for a git sign, a diagnostic, a breakpoint";
-  diagnostics are its first client. `●` in the severity's colour, the worst
+  diagnostics are its first client. `•` in the severity's colour — and only
+  the colour: the underline the range styles carry comes off, since it marks
+  a span of text and this is a mark about the line — the worst
   severity on the row winning. The core exposes
   `Editor::gutter_signs(window, rows)`; painting it is the frontend's job,
   because the gutter has always been the frontend's to draw.
