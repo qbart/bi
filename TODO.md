@@ -6,15 +6,7 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NOT DO IT NOW
 
-### LSP
-
 ### documentation of code
-
-### formatter
-
-### autocomplete
-
-### DIAGNOSTICS
 
 ### peek defintion
 
