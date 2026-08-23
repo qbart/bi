@@ -270,7 +270,7 @@ every one of them is typeable without its key and rebindable by name
 | Key | Does |
 |---|---|
 | `gd` | go to the definition, opening the file it lives in |
-| `gr` | every reference, in a results pane — `:replace` over it is a rename |
+| `gr` | every reference, in a results pane — `:replace //new/` over it is a rename |
 | `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
 | `K` | what the server knows about the cursor, floated beside it |
 
@@ -490,7 +490,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:lsp` | where this buffer stands with its language server; `restart` and `stop` manage it |
 | `:definition` `:def` | `gd` — jump to the definition the server names |
-| `:references` `:refs` | `gr` — every reference, in a results pane; `:replace` over it is a rename |
+| `:references` `:refs` | `gr` — every reference, in a results pane; `:replace //new/` over it is a rename |
 | `:format` `:fmt` | the whole file, by the server, as one undo step |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
@@ -747,29 +747,44 @@ drawn here that is not buffer text" and the frontend paints it, which is what
 #### `:find` and `:replace`
 
 `/` searches the buffer; `:find` searches the project and puts what it found in
-a pane.
+a pane. `:replace` shows every rewrite before any of them happens.
 
 ```
-:find needle        every match under the project root
-:findre \bfn \w+    the same, as a regular expression
-:replace pin        rewrite every match the pane is showing
+:find needle           every match under the project root
+:find src/ needle      the same, under src/ only
+:find~ \bfn \w+        the pattern read as a regular expression
+:replace /old/new/     find old, preview replacing it with new
+:replace //new/        preview replacing what the pane already shows
+:replace~ /f(\w+)/$1/  the regex twin — $1 is the first capture group
+:results               bring the last results pane back
 ```
 
-The whole argument is the pattern, so `:find fn main()` searches for exactly
-that — there are no flags on the line, because a `-r` would be a pattern you
-could not search for. Smart case: insensitive until you type a capital.
+The whole argument of `:find` is the pattern, so `:find fn main()` searches for
+exactly that — there are no flags on the line, because a `-r` would be a
+pattern you could not search for. Smart case: insensitive until you type a
+capital. A first word ending in `/` that names a directory under the root is a
+scope, and the search walks only it.
 
 Results are a **pane**, not an overlay — a third content kind beside text and
 the file tree. It stays open beside the file you are editing, `j`/`k` and
 `gg`/`G` move, Enter opens the file **at the match's column**, and `q` puts
 back whatever the pane displaced. Enter on a file heading opens the top of that
-file.
+file. `x` drops a row — a hit, or a heading with everything under it — which is
+how you narrow what a replace is about to take. `Ctrl-^` after Enter swaps the
+pane back, exactly as a parked tree; `:results` brings the last list back
+later, as you left it.
 
-`:replace` rewrites **into buffers, never straight to disk**: every affected
-file is opened, edited as one undo step and left modified, so `:wa` commits the
-lot and `u` takes any one of them back. That is the confirmation — the review
-happens in the editor, before the repository hears about it. A line that
-changed since the search is skipped and counted rather than silently rewritten.
+`:replace` never rewrites on Enter: it **arms** the pane. Every hit row shows
+its line as it will read, the new text highlighted; `a` applies the selected
+row (a heading applies its file), `A` applies everything still pending, and
+applied rows keep a ✓. With an empty pattern (`:replace //new/`) it takes the
+matches the pane is already showing — prunes included, and over a `gr`
+references pane that is a rename.
+
+What `a` and `A` apply goes **into buffers, never straight to disk**: every
+affected file is opened, edited as one undo step and left modified, so `:wa`
+commits the lot and `u` takes any one of them back. A line that changed since
+the search is skipped and counted rather than silently rewritten.
 
 Searching is ripgrep's own crates — `grep-searcher`, `grep-regex`, `ignore` —
 not an `rg` subprocess, so the core stays a library that works wherever it is

@@ -63,6 +63,40 @@ pub fn parse(arg: &str) -> Result<Substitute, String> {
     Ok(out)
 }
 
+/// `/{pattern}/{replacement}/` for `:replace` — the same delimiter language
+/// as `:s`, with no flags to have.
+///
+/// The argument is delimited, always: a replacement is text and text can
+/// start with anything, so a bare-word spelling would have had to guess what
+/// `:replace /usr/local` meant — and a command that guesses about a
+/// project-wide rewrite is the wrong command. An empty pattern is the
+/// caller's to read as "what the pane is showing". See
+/// `docs/specs/find-in-files.md`.
+pub fn parse_replace(arg: &str) -> Result<(String, String), String> {
+    let mut chars = arg.chars();
+    let Some(delim) = chars.next().filter(|c| is_delimiter(*c)) else {
+        return Err(
+            "replace how? `:replace /old/new/` — `//new/` takes the pane's own search".into()
+        );
+    };
+    let (pattern, rest) = take_field(chars.as_str(), delim);
+    let Some(rest) = rest else {
+        return Err(format!(
+            "no `{delim}` after the pattern: `:replace {delim}old{delim}new{delim}`"
+        ));
+    };
+    let (replacement, rest) = take_field(rest, delim);
+    if let Some(extra) = rest
+        && !extra.trim().is_empty()
+    {
+        // Named rather than ignored, the same rule the flags follow: text
+        // after the closing delimiter quietly dropped is how you believe a
+        // replace did something it did not.
+        return Err(format!("nothing goes after the replacement — got `{}`", extra.trim()));
+    }
+    Ok((pattern, replacement))
+}
+
 /// One field off the front, up to an unescaped `delim`.
 ///
 /// Returns what was read and what is left *after* the delimiter, or `None`
@@ -161,5 +195,36 @@ mod tests {
         assert!(!is_delimiter('e'), "or `:set` would be a substitution");
         assert!(!is_delimiter('2') && !is_delimiter(' '));
         assert!(!is_delimiter('\\') && !is_delimiter('"') && !is_delimiter('|'));
+    }
+
+    // ---- parse_replace ------------------------------------------------------
+
+    #[test]
+    fn replace_parses_the_same_delimiter_language() {
+        assert_eq!(parse_replace("/a/b/").unwrap(), ("a".into(), "b".into()));
+        assert_eq!(parse_replace("#a#b#").unwrap(), ("a".into(), "b".into()));
+        assert_eq!(parse_replace("/a/b").unwrap(), ("a".into(), "b".into()), "closing optional");
+        assert_eq!(parse_replace("//b/").unwrap(), ("".into(), "b".into()), "the pane's own");
+        assert_eq!(parse_replace("/a//").unwrap(), ("a".into(), "".into()), "deleting is allowed");
+        assert_eq!(parse_replace(r"/a\/b/c/").unwrap(), ("a/b".into(), "c".into()));
+    }
+
+    #[test]
+    fn replace_without_a_delimiter_is_an_error_showing_the_shape() {
+        let message = parse_replace("pin").unwrap_err();
+        assert!(message.starts_with("replace how?"), "{message}");
+    }
+
+    #[test]
+    fn replace_without_a_separator_names_the_missing_delimiter() {
+        let message = parse_replace("/old").unwrap_err();
+        assert!(message.starts_with("no `/` after the pattern"), "{message}");
+    }
+
+    #[test]
+    fn replace_refuses_text_after_the_replacement() {
+        let message = parse_replace("/a/b/g").unwrap_err();
+        assert!(message.contains("nothing goes after the replacement"), "{message}");
+        assert!(parse_replace("/a/b/ ").is_ok(), "trailing space is nothing");
     }
 }

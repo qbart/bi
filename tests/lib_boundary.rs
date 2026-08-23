@@ -196,6 +196,7 @@ const LIB_MODULES: &[&str] = &[
     "results.rs",
     "resize.rs",
     "selection.rs",
+    "sort.rs",
     "surround.rs",
     "substitute.rs",
     "syntax.rs",

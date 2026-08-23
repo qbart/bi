@@ -686,6 +686,11 @@ pub struct Session {
     /// so a value left behind here cannot paint a rectangle over a later
     /// normal mode.
     interrupted_visual: Option<Shape>,
+    /// The last results list that left a window — Enter displaced it, `q`
+    /// closed it, a new search replaced it. `:results` puts it back exactly
+    /// as it was: selection, prunes and applied marks intact. Nothing here
+    /// re-runs the search. See `docs/specs/find-in-files.md`.
+    parked_results: Option<Box<crate::results::Results>>,
     /// Where each row of a [`PickerKind::Symbol`] list goes, by the same index
     /// the picker holds its items at.
     ///
@@ -1482,11 +1487,22 @@ enum ExLine {
     /// `docs/specs/resize.md`.
     Resize(crate::resize::Resize),
     /// `:find <pattern>` — every match under the project root, in a pane.
-    Find(String),
-    /// `:findre <pattern>` — the same, reading the pattern as a regex.
-    FindRegex(String),
-    /// `:replace <text>` — rewrite every match the last `:find` produced.
-    Replace(String),
+    /// `:find~` reads the pattern as a regex. A first word ending in `/` that
+    /// names a directory under the root is a scope, which is the editor's to
+    /// resolve — parsing cannot ask the filesystem.
+    Find {
+        pattern: String,
+        regex: bool,
+    },
+    /// `:replace /old/new/` — search and offer, `//new/` over the pane's own
+    /// matches. Raw here for the same reason `Find`'s scope is: the argument
+    /// cannot be split from a possible leading scope without the filesystem.
+    Replace {
+        arg: String,
+        regex: bool,
+    },
+    /// `:results` — the last results list that left a window, put back.
+    ResultsPane,
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -1529,6 +1545,14 @@ fn parse_move(arg: &str) -> Option<Address> {
 /// never a delimiter. See `docs/specs/substitute.md`.
 fn split_glued_substitute(cmd: &str) -> Option<(&str, &str)> {
     let rest = cmd.strip_prefix("substitute").or_else(|| cmd.strip_prefix('s'))?;
+    let delimited = rest.starts_with(crate::substitute::is_delimiter);
+    delimited.then(|| cmd.split_at(cmd.len() - rest.len()))
+}
+
+/// `replace/a/b/` as `("replace", "/a/b/")` — the same glue `:s` gets, for
+/// the same fingers. `replace~` first, because `replace` is its prefix.
+fn split_glued_replace(cmd: &str) -> Option<(&str, &str)> {
+    let rest = cmd.strip_prefix("replace~").or_else(|| cmd.strip_prefix("replace"))?;
     let delimited = rest.starts_with(crate::substitute::is_delimiter);
     delimited.then(|| cmd.split_at(cmd.len() - rest.len()))
 }
@@ -1578,7 +1602,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // `:s/a/b/ g` is not a thing anyone types, so the substitute split runs
     // whether or not a space was found — unlike `:m`'s, which only has to
     // catch a bare `:m+1`.
-    let (cmd, arg) = match split_glued_substitute(cmd) {
+    let (cmd, arg) = match split_glued_substitute(cmd).or_else(|| split_glued_replace(cmd)) {
         Some((name, glued)) => (name, format!("{glued}{arg}")),
         None => match arg.is_empty() {
             true => {
@@ -1697,13 +1721,17 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // has to search for `fn main`. That is also why there are no flags on
         // this line and a second command name instead — a `-r` would be a
         // pattern you could not search for.
-        "find" if !arg.is_empty() => ExLine::Find(arg.into()),
+        "find" | "find~" if !arg.is_empty() => {
+            ExLine::Find { pattern: arg.into(), regex: name == "find~" }
+        }
         "find" => ExLine::Error("find what?".into()),
-        "findre" if !arg.is_empty() => ExLine::FindRegex(arg.into()),
-        "findre" => ExLine::Error("find what pattern?".into()),
-        // An empty replacement is deleting every match, which is a thing
-        // people mean — so it is allowed, and the count says what happened.
-        "replace" => ExLine::Replace(arg.into()),
+        "find~" => ExLine::Error("find what pattern?".into()),
+        // The argument is delimited, always — `/old/new/`, any delimiter, an
+        // empty pattern meaning the pane's own search. The parse itself waits
+        // for `run_replace`, which can see the filesystem a leading scope
+        // needs.
+        "replace" | "replace~" => ExLine::Replace { arg: arg.into(), regex: name == "replace~" },
+        "results" => ExLine::ResultsPane,
         "res" | "resize" => match crate::resize::parse(arg) {
             Ok(how) => ExLine::Resize(how),
             Err(message) => ExLine::Error(message),
@@ -1837,6 +1865,14 @@ pub enum ResultsCmd {
     Open,
     /// `Ctrl-^` back to what the pane was showing before the search.
     Close,
+    /// `a` — apply the selected rewrite (or a heading's whole file), on an
+    /// armed pane. See `docs/specs/find-in-files.md`.
+    Apply,
+    /// `A` — apply every rewrite still pending.
+    ApplyAll,
+    /// `x` — drop the row from the list: the hit, or a heading with
+    /// everything under it. Edits nothing; narrows the offer.
+    Remove,
 }
 
 /// What a key does in a window holding a tree.
@@ -3091,6 +3127,8 @@ impl Editor {
         if !last.is_empty() {
             text.selections = Selections::from_pairs(last);
         }
+        // A results pane about to be displaced is kept for `:results`.
+        self.park_results(window);
         let window = self.window_mut_of(window).expect("checked above");
         window.show(Content::Text(text));
         self.sweep_scratch();
@@ -3155,9 +3193,11 @@ impl Editor {
         // directory would lose the expansion you had built up.
         // Checked before taking: a buffer alternate must stay where it is, and
         // `take` on a failed pattern would still have emptied the slot.
-        if cmd == BufferCmd::Alternate && matches!(self.window().alt, Some(Content::Tree(_))) {
-            let tree = self.window_mut().alt.take().expect("checked above");
-            return self.window_mut().show(tree);
+        if cmd == BufferCmd::Alternate
+            && matches!(self.window().alt, Some(Content::Tree(_) | Content::Results(_)))
+        {
+            let parked = self.window_mut().alt.take().expect("checked above");
+            return self.window_mut().show(parked);
         }
 
         let ids = self.buffer_ids();
@@ -3345,8 +3385,106 @@ impl Editor {
     /// alternate, so `Ctrl-^` puts your file back. A split first is how you get
     /// both at once, which is one keystroke and saves this command a policy
     /// about where results ought to live.
-    fn run_find(&mut self, pattern: &str, regex: bool) {
+    /// Keeps a results pane that is about to leave `id`'s content slot, so
+    /// `:results` can bring it back — selection, prunes and applied marks
+    /// intact. Cheap when the content is anything else.
+    fn park_results(&mut self, id: WindowId) {
+        let parked = match self.window_of(id).map(|w| &w.content) {
+            Some(Content::Results(results)) => Some(results.clone()),
+            _ => None,
+        };
+        if let Some(results) = parked {
+            self.session.parked_results = Some(results);
+        }
+    }
+
+    /// `:results` — the last list back, as it was.
+    fn reopen_results(&mut self) {
+        if self.window().results().is_some() {
+            self.session.status = "already looking at them".into();
+            return;
+        }
+        let Some(results) = self.session.parked_results.take() else {
+            self.session.status = "no results to bring back — `:find` something first".into();
+            return;
+        };
+        let focus = self.focus;
+        if let Some(window) = self.window_mut_of(focus) {
+            window.show(Content::Results(results));
+        }
+    }
+
+    /// Shows `results` in the focused window, parking whatever list it
+    /// displaces.
+    fn show_results(&mut self, results: crate::results::Results) {
+        let focus = self.focus;
+        self.park_results(focus);
+        if let Some(window) = self.window_mut_of(focus) {
+            window.show(Content::Results(Box::new(results)));
+        }
+    }
+
+    /// Splits a leading directory scope off a `:find`/`:replace` argument.
+    ///
+    /// A first word ending in `/` that names a directory under `root` is a
+    /// scope. Both conditions, deliberately: the trailing slash is you saying
+    /// "directory", and the existence check is what keeps a pattern like
+    /// `foo/ bar` searchable — a word naming no directory stays in the
+    /// pattern, and the status line echoes what was searched, so a typo'd
+    /// scope reads back as the literal it became. Absolute paths are not
+    /// scopes: the project root is the promise `:find` makes.
+    fn split_scope<'a>(root: &Path, arg: &'a str) -> (Option<PathBuf>, &'a str) {
+        let Some((first, rest)) = arg.split_once(char::is_whitespace) else {
+            return (None, arg);
+        };
+        let scoped = first.len() > 1
+            && first.ends_with('/')
+            && !first.starts_with('/')
+            && root.join(first).is_dir();
+        match scoped {
+            true => (Some(PathBuf::from(first)), rest.trim_start()),
+            false => (None, arg),
+        }
+    }
+
+    /// Walks the project — or `scope` under it — for `query`. Matches come
+    /// back with the scope joined onto their paths, so a row reads the same
+    /// wherever the walk started and Enter opens the right file.
+    fn search_project(
+        &self,
+        root: &Path,
+        scope: Option<&Path>,
+        query: &crate::find_in_files::Query,
+    ) -> Result<crate::find_in_files::Found, String> {
+        let walk = match scope {
+            Some(scope) => root.join(scope),
+            None => root.to_path_buf(),
+        };
+        let mut found = crate::find_in_files::search(&walk, query)?;
+        if let Some(scope) = scope {
+            for m in &mut found.matches {
+                m.path = scope.join(&m.path);
+            }
+        }
+        Ok(found)
+    }
+
+    /// How many files a match list spans — they arrive grouped by file.
+    fn files_of(matches: &[crate::find_in_files::Match]) -> usize {
+        let mut n = 0;
+        let mut last: Option<&std::path::PathBuf> = None;
+        for m in matches {
+            if last != Some(&m.path) {
+                n += 1;
+                last = Some(&m.path);
+            }
+        }
+        n
+    }
+
+    fn run_find(&mut self, arg: &str, regex: bool) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let (scope, pattern) = Self::split_scope(&root, arg);
         let query = crate::find_in_files::Query {
             pattern: pattern.to_string(),
             regex,
@@ -3354,7 +3492,7 @@ impl Editor {
             ..Default::default()
         };
 
-        let found = match crate::find_in_files::search(&root, &query) {
+        let found = match self.search_project(&root, scope.as_deref(), &query) {
             Ok(found) => found,
             Err(message) => {
                 self.session.status = message;
@@ -3370,15 +3508,7 @@ impl Editor {
             return;
         }
 
-        let files = {
-            let mut seen: Vec<&std::path::PathBuf> = Vec::new();
-            for m in &found.matches {
-                if seen.last() != Some(&&m.path) {
-                    seen.push(&m.path);
-                }
-            }
-            seen.len()
-        };
+        let files = Self::files_of(&found.matches);
         let mut report = format!(
             "{} match{} in {files} file{}",
             found.matches.len(),
@@ -3394,44 +3524,120 @@ impl Editor {
             report.push_str(&format!(", {} unreadable", found.unreadable));
         }
 
-        let title = format!("find: {pattern}");
-        let results = crate::results::Results::new(title, query, root, found.matches);
-        let focus = self.focus;
-        if let Some(window) = self.window_mut_of(focus) {
-            window.show(Content::Results(Box::new(results)));
-        }
+        let title = match &scope {
+            Some(scope) => format!("find: {pattern} — in {}", scope.display()),
+            None => format!("find: {pattern}"),
+        };
+        self.show_results(crate::results::Results::new(title, query, root, found.matches));
         self.session.status = report;
     }
 
-    /// `:replace <text>` — rewrites every match the results pane is showing.
-    ///
-    /// **Into buffers, not onto the disk.** Every file that had a match is
-    /// opened, edited as one undo step, and left modified; `:wa` commits the
-    /// lot and `u` in any one of them takes that file back. That is what makes
-    /// a whole-project rewrite reviewable in the editor before it is a change
-    /// to the repository, and it is why there is no confirmation prompt: the
-    /// undo history and the unwritten buffers are the confirmation.
-    fn run_replace(&mut self, with: &str) {
-        let Some(results) = self.window().results().cloned() else {
-            self.session.status = "no results here — run `:find` first".into();
-            return;
+    /// `:replace /old/new/` — search and offer; `//new/` — offer over the
+    /// pane's own matches. Never rewrites on Enter: it **arms** the pane, and
+    /// the pane's keys (`a`, `A`, `x`) decide. See
+    /// `docs/specs/find-in-files.md`.
+    fn run_replace(&mut self, arg: &str, regex: bool) {
+        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let (scope, rest) = Self::split_scope(&root, arg);
+        let (pattern, with) = match crate::substitute::parse_replace(rest) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
         };
 
-        // Grouped by file, and each file's matches applied bottom-up so an
-        // earlier rewrite cannot move a later one's column. The results were
-        // produced in line order per file, so reversing is enough.
-        let mut by_file: Vec<(std::path::PathBuf, Vec<&crate::find_in_files::Match>)> = Vec::new();
-        for m in results.matches() {
-            match by_file.last_mut() {
-                Some((path, hits)) if *path == m.path => hits.push(m),
-                _ => by_file.push((m.path.clone(), vec![m])),
+        // An empty pattern is what the pane is showing — the `:s//new/`
+        // convention, and how a replace inherits a search already narrowed
+        // with `x`. Over a references pane it is a rename.
+        if pattern.is_empty() {
+            if scope.is_some() {
+                self.session.status = "a scope needs a pattern — `:replace src/ /old/new/`".into();
+                return;
             }
+            let Some(results) = self.window_mut().results_mut() else {
+                self.session.status =
+                    "no results here — `:find` first, or `:replace /old/new/`".into();
+                return;
+            };
+            results.arm(with);
+            let offers = results.pending().len();
+            self.session.status = format!(
+                "{offers} rewrite{} offered — `a` applies, `A` applies all, `x` drops",
+                if offers == 1 { "" } else { "s" },
+            );
+            return;
         }
+
+        let query = crate::find_in_files::Query {
+            pattern,
+            regex,
+            gitignore: self.options().gitignore,
+            ..Default::default()
+        };
+        let found = match self.search_project(&root, scope.as_deref(), &query) {
+            Ok(found) => found,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        if found.matches.is_empty() {
+            self.session.status = format!("no matches for {}", query.pattern);
+            return;
+        }
+
+        let files = Self::files_of(&found.matches);
+        let mut report = format!(
+            "{} rewrite{} in {files} file{} — `a` applies, `A` applies all, `x` drops",
+            found.matches.len(),
+            if found.matches.len() == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+        );
+        if found.capped {
+            report.push_str(&format!(" — stopped at {}", crate::find_in_files::LIMIT));
+        }
+
+        let title = format!("find: {}", query.pattern);
+        let mut results = crate::results::Results::new(title, query, root, found.matches);
+        results.arm(with);
+        self.show_results(results);
+        self.session.status = report;
+    }
+
+    /// `a` and `A` — applies armed rewrites into buffers, never straight to
+    /// disk.
+    ///
+    /// Every file with an applied match is opened (or reused, so a replace
+    /// over a file with unsaved edits edits *those* — the only answer that
+    /// cannot lose work), edited as one undo step per file per press, and
+    /// left modified. `:wa` commits the lot; `u` in any one file takes it
+    /// back. `only` is `a`'s row; `None` is `A`, everything still pending.
+    fn apply_replace(&mut self, only: Option<Vec<usize>>) {
+        let Some(results) = self.window().results() else { return };
+        if results.replace.is_none() {
+            self.session.status = "nothing armed — `:replace //new/` offers a rewrite first".into();
+            return;
+        }
+        let indices: Vec<usize> = match only {
+            Some(list) => list.into_iter().filter(|&i| !results.is_applied(i)).collect(),
+            None => results.pending(),
+        };
+        if indices.is_empty() {
+            self.session.status = "nothing left to apply".into();
+            return;
+        }
+
+        let root = results.root.clone();
+        let with = results.replace.as_ref().expect("checked above").with.clone();
+        let query = results.query.clone();
+        let hits: Vec<(usize, crate::find_in_files::Match)> =
+            indices.iter().map(|&i| (i, results.matches()[i].clone())).collect();
 
         // The same engine that produced the list, so what gets rewritten is
         // what you were shown — a second engine agreeing today is a second
         // engine that can disagree tomorrow.
-        let matcher = match crate::find_in_files::matcher(&results.query) {
+        let matcher = match crate::find_in_files::matcher(&query) {
             Ok(matcher) => matcher,
             Err(message) => {
                 self.session.status = message;
@@ -3439,13 +3645,22 @@ impl Editor {
             }
         };
 
+        // Grouped by file, and each file's matches applied bottom-up so an
+        // earlier rewrite cannot move a later one's line. The results were
+        // produced in line order per file, so reversing is enough.
+        let mut by_file: Vec<(std::path::PathBuf, Vec<(usize, crate::find_in_files::Match)>)> =
+            Vec::new();
+        for (index, m) in hits {
+            match by_file.last_mut() {
+                Some((path, group)) if *path == m.path => group.push((index, m)),
+                _ => by_file.push((m.path.clone(), vec![(index, m)])),
+            }
+        }
+
+        let mut applied: Vec<usize> = Vec::new();
         let (mut changed, mut files, mut skipped, mut failed) = (0usize, 0usize, 0usize, 0usize);
-        for (path, hits) in by_file {
-            let full = results.root.join(&path);
-            // `open_path` reuses a buffer that is already open rather than
-            // reading the file again, so a replace over a file you have
-            // unsaved edits in edits *those* — the only answer that cannot
-            // lose work.
+        for (path, group) in by_file {
+            let full = root.join(&path);
             let Ok(id) = self.open_path(&full.to_string_lossy()) else {
                 failed += 1;
                 continue;
@@ -3453,7 +3668,7 @@ impl Editor {
             let entry = self.entry_mut(id);
             let before = entry.last.clone();
             let mut here = 0;
-            for m in hits.iter().rev() {
+            for (index, m) in group.iter().rev() {
                 let row = m.line.saturating_sub(1);
                 if row >= entry.buffer.line_count() {
                     skipped += 1;
@@ -3470,15 +3685,18 @@ impl Editor {
                     skipped += 1;
                     continue;
                 }
-                let Some((rewritten, count)) =
-                    crate::find_in_files::replace_all(&matcher, &line, with)
+                // The replacement is read the way the pattern was: `$1` under
+                // `:replace~`, a literal dollar under `:replace`.
+                let Some(rewrite) =
+                    crate::find_in_files::rewrite_line(&matcher, &line, &with, query.regex)
                 else {
                     skipped += 1;
                     continue;
                 };
                 let start = entry.buffer.rope().line_to_char(row);
-                entry.buffer.replace_range(start, start + line.chars().count(), &rewritten);
-                here += count;
+                entry.buffer.replace_range(start, start + line.chars().count(), &rewrite.text);
+                here += rewrite.count;
+                applied.push(*index);
             }
             if here > 0 {
                 let after = entry.last.clone();
@@ -3486,6 +3704,12 @@ impl Editor {
                 changed += here;
                 files += 1;
             }
+        }
+
+        // The ✓ is the record of what happened; a skipped line stays pending,
+        // visibly, because it is one you need to look at again.
+        if let Some(results) = self.window_mut().results_mut() {
+            results.mark_applied(&applied);
         }
 
         let mut report = format!(
@@ -3734,6 +3958,7 @@ impl Editor {
     /// close, so it shows a buffer instead. Which is what Enter on a file does
     /// from a `bi .` session, and leaves a session that still has a window.
     fn close_tree(&mut self, id: WindowId) {
+        self.park_results(id);
         if self.windows.len() > 1 {
             self.close_window(id);
             return;
@@ -3780,12 +4005,45 @@ impl Editor {
     /// A key in a results pane.
     fn run_results_cmd(&mut self, cmd: ResultsCmd, count: usize) {
         let height = self.window().height;
+
+        // The applying pair first: they reach into buffers, which the
+        // mutable borrow below could not allow.
+        match cmd {
+            ResultsCmd::Apply => {
+                let Some(results) = self.window().results() else { return };
+                let indices = results.selected_indices();
+                self.apply_replace(Some(indices));
+                if let Some(results) = self.window_mut().results_mut() {
+                    // On to the next offer, so `a a a` walks the list.
+                    results.advance_to_pending();
+                    results.scroll_to_selected(height);
+                }
+                return;
+            }
+            ResultsCmd::ApplyAll => {
+                self.apply_replace(None);
+                return;
+            }
+            _ => {}
+        }
+
         let Some(results) = self.window_mut().results_mut() else { return };
 
         match cmd {
             ResultsCmd::Move(by) => results.move_by(by * count as isize),
             ResultsCmd::First => results.select(0),
             ResultsCmd::Last => results.select(usize::MAX),
+            ResultsCmd::Remove => {
+                results.remove_selected();
+                if results.is_empty() {
+                    // An empty pane is a worse answer than the line saying
+                    // why it is empty.
+                    self.session.status = "nothing left in the list".into();
+                    let focus = self.focus;
+                    self.close_tree(focus);
+                    return;
+                }
+            }
             ResultsCmd::Close => {
                 // The pane displaced whatever was here to get on screen, and
                 // putting that back is exactly what `close_tree` already does
@@ -3795,6 +4053,7 @@ impl Editor {
                 self.close_tree(focus);
                 return;
             }
+            ResultsCmd::Apply | ResultsCmd::ApplyAll => unreachable!("handled above"),
             ResultsCmd::Open => {
                 let root = results.root.clone();
                 let Some(path) = results.selected_path().cloned() else { return };
@@ -4103,6 +4362,8 @@ impl Editor {
             self.session.status = "cannot close the last window".into();
             return false;
         };
+        // A results pane goes down with its window; keep it for `:results`.
+        self.park_results(id);
         // Its cursor is worth keeping: reopening a split on the same file
         // should land where the closed one was looking.
         if let Some(text) = self.window_of(id).and_then(Window::text) {
@@ -4491,6 +4752,8 @@ impl Editor {
         // Naming a directory is one of the three ways to say where the session
         // is scoped — `+` and `-` are the others.
         self.session.tree_root = Some(tree.root().to_path_buf());
+        let focus = self.focus;
+        self.park_results(focus);
         self.window_mut().show(Content::Tree(tree));
     }
 
@@ -4883,9 +5146,9 @@ impl Editor {
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
             ExLine::Hover => self.lsp_hover(),
             ExLine::Resize(how) => self.run_resize(how),
-            ExLine::Find(pattern) => self.run_find(&pattern, false),
-            ExLine::FindRegex(pattern) => self.run_find(&pattern, true),
-            ExLine::Replace(with) => self.run_replace(&with),
+            ExLine::Find { pattern, regex } => self.run_find(&pattern, regex),
+            ExLine::Replace { arg, regex } => self.run_replace(&arg, regex),
+            ExLine::ResultsPane => self.reopen_results(),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -5579,10 +5842,7 @@ impl Editor {
         };
         let results =
             crate::results::Results::new(format!("references: {symbol}"), query, root, matches);
-        let focus = self.focus;
-        if let Some(window) = self.window_mut_of(focus) {
-            window.show(Content::Results(Box::new(results)));
-        }
+        self.show_results(results);
         self.session.status = report;
     }
 
@@ -13813,7 +14073,7 @@ mod tests {
         ex(&mut ed, "find a.c");
         assert_eq!(ed.window().results().unwrap().matches().len(), 1, "`.` is a dot");
 
-        ex(&mut ed, "findre a.c");
+        ex(&mut ed, "find~ a.c");
         assert_eq!(ed.window().results().unwrap().matches().len(), 2, "and now it is a regex");
     }
 
@@ -13857,12 +14117,23 @@ mod tests {
     }
 
     #[test]
-    fn replace_rewrites_every_match_into_buffers() {
+    fn replace_arms_first_and_a_capital_a_takes_everything() {
         let files = project("replace-basic");
         let mut ed = in_project(&files, "c.rs");
         ex(&mut ed, "find needle");
 
-        ex(&mut ed, "replace pin");
+        ex(&mut ed, "replace //pin/");
+        assert!(
+            ed.session.status.starts_with("3 rewrites offered"),
+            "armed, nothing applied: {}",
+            ed.session.status
+        );
+        assert!(
+            std::fs::read_to_string(files.0.join("a.rs")).unwrap().contains("needle"),
+            "arming rewrites nothing"
+        );
+
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
 
         assert!(ed.session.status.starts_with("3 replaced in 2 files"), "{}", ed.session.status);
         // Unwritten: the files on disk still say what they said.
@@ -13877,7 +14148,8 @@ mod tests {
         let files = project("replace-write");
         let mut ed = in_project(&files, "c.rs");
         ex(&mut ed, "find needle");
-        ex(&mut ed, "replace pin");
+        ex(&mut ed, "replace //pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
 
         ex(&mut ed, "wa");
 
@@ -13900,7 +14172,8 @@ mod tests {
         let mut ed = in_project(&files, "a.txt");
         ex(&mut ed, "find needle");
 
-        ex(&mut ed, "replace pin");
+        ex(&mut ed, "replace //pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
 
         let a =
             ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&files.0.join("a.txt")));
@@ -13918,7 +14191,8 @@ mod tests {
         // yourself between the search and the replace.
         std::fs::write(files.0.join("a.rs"), "something else entirely\n").unwrap();
 
-        ex(&mut ed, "replace pin");
+        ex(&mut ed, "replace //pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
 
         assert!(
             ed.session.status.contains("changed since the search"),
@@ -13932,9 +14206,257 @@ mod tests {
         let files = project("replace-none");
         let mut ed = in_project(&files, "c.rs");
 
+        ex(&mut ed, "replace //pin/");
+
+        assert_eq!(ed.session.status, "no results here — `:find` first, or `:replace /old/new/`");
+    }
+
+    #[test]
+    fn replace_without_a_delimiter_shows_the_shape() {
+        let files = project("replace-shape");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+
         ex(&mut ed, "replace pin");
 
-        assert_eq!(ed.session.status, "no results here — run `:find` first");
+        assert_eq!(
+            ed.session.status,
+            "replace how? `:replace /old/new/` — `//new/` takes the pane's own search"
+        );
+        assert!(
+            std::fs::read_to_string(files.0.join("a.rs")).unwrap().contains("needle"),
+            "and nothing was rewritten"
+        );
+    }
+
+    #[test]
+    fn replace_with_a_pattern_is_find_and_the_offer_in_one_line() {
+        let files = project("replace-standalone");
+        let mut ed = in_project(&files, "c.rs");
+
+        ex(&mut ed, "replace /needle/pin/");
+        assert!(ed.session.status.starts_with("3 rewrites in 2 files"), "{}", ed.session.status);
+        assert!(ed.window().results().is_some(), "the offer is a pane");
+
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
+        assert!(ed.session.status.starts_with("3 replaced in 2 files"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn replace_glued_to_its_argument_still_reads() {
+        let files = project("replace-glued");
+        let mut ed = in_project(&files, "c.rs");
+
+        ex(&mut ed, "replace/needle/pin/");
+
+        assert!(ed.window().results().is_some(), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn a_applies_the_selected_row_and_walks_on() {
+        let files = Files::new("replace-one-row");
+        files.file("a.rs", "one needle\ntwo needle\n");
+        let mut ed = in_project(&files, "a.rs");
+        ex(&mut ed, "find needle");
+        ex(&mut ed, "replace //pin/");
+
+        // Row 0 is the heading; row 1 the first hit.
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Apply)));
+
+        assert!(ed.session.status.starts_with("1 replaced in 1 file"), "{}", ed.session.status);
+        let a = ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&files.0.join("a.rs")));
+        let buffer = &a.unwrap().buffer;
+        assert_eq!(buffer.line(0), "one pin");
+        assert_eq!(buffer.line(1), "two needle", "only the row you pressed `a` on");
+
+        let results = ed.window().results().unwrap();
+        assert!(results.is_applied(0), "the ✓ is the record");
+        assert!(!results.is_applied(1));
+        assert_eq!(results.selected(), 2, "and the selection walked to the next offer");
+    }
+
+    #[test]
+    fn a_on_a_heading_takes_the_whole_file() {
+        let files = project("replace-heading");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+        ex(&mut ed, "replace //pin/");
+
+        // Row 0 is the first file's heading.
+        ed.apply(cmd(Action::Results(ResultsCmd::Apply)));
+
+        assert!(ed.session.status.contains("replaced in 1 file"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn a_with_nothing_armed_says_what_arms() {
+        let files = project("replace-unarmed");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Apply)));
+
+        assert_eq!(ed.session.status, "nothing armed — `:replace //new/` offers a rewrite first");
+    }
+
+    #[test]
+    fn replace_tilde_interpolates_its_groups() {
+        let files = Files::new("replace-groups");
+        files.file("a.rs", "fn alpha() {}\n");
+        let mut ed = in_project(&files, "a.rs");
+
+        ex(&mut ed, r"replace~ /fn (\w+)/fn new_$1/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
+
+        let a = ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&files.0.join("a.rs")));
+        assert_eq!(a.unwrap().buffer.line(0), "fn new_alpha() {}");
+    }
+
+    #[test]
+    fn a_literal_replacement_keeps_its_dollars() {
+        let files = Files::new("replace-dollars");
+        files.file("a.rs", "the needle\n");
+        let mut ed = in_project(&files, "a.rs");
+
+        ex(&mut ed, "replace /needle/$1/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
+
+        let a = ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&files.0.join("a.rs")));
+        assert_eq!(a.unwrap().buffer.line(0), "the $1", "no groups you could not have written");
+    }
+
+    #[test]
+    fn x_drops_a_row_and_the_replace_no_longer_offers_it() {
+        let files = Files::new("prune-row");
+        files.file("a.rs", "one needle\ntwo needle\n");
+        let mut ed = in_project(&files, "a.rs");
+        ex(&mut ed, "find needle");
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Remove)));
+        assert_eq!(result_rows(&ed), ["a.rs (1)".to_string(), "  2: two needle".to_string()]);
+
+        ex(&mut ed, "replace //pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
+
+        let a = ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&files.0.join("a.rs")));
+        let buffer = &a.unwrap().buffer;
+        assert_eq!(buffer.line(0), "one needle", "dropped, so untouched");
+        assert_eq!(buffer.line(1), "two pin");
+    }
+
+    #[test]
+    fn x_on_a_heading_drops_the_file_and_on_the_last_row_closes_the_pane() {
+        let files = project("prune-file");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+
+        // Row 0: the first file's heading. Dropping it leaves the other file.
+        ed.apply(cmd(Action::Results(ResultsCmd::Remove)));
+        assert_eq!(ed.window().results().unwrap().files(), 1);
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Remove)));
+        assert!(ed.window().results().is_none(), "an emptied list closes");
+        assert_eq!(ed.session.status, "nothing left in the list");
+        assert_eq!(ed.buffer().unwrap().line(0), "nothing", "the file is back");
+    }
+
+    #[test]
+    fn find_scoped_to_a_directory_walks_only_it() {
+        let files = Files::new("find-scoped");
+        files.dir("sub");
+        files.file("top.rs", "needle up here\n");
+        files.file("sub/inner.rs", "needle down here\n");
+        let mut ed = in_project(&files, "top.rs");
+
+        ex(&mut ed, "find sub/ needle");
+
+        assert_eq!(
+            result_rows(&ed),
+            ["sub/inner.rs (1)".to_string(), "  1: needle down here".to_string()],
+            "the scope narrows the walk, not the names"
+        );
+
+        // A first word naming no directory stays in the pattern.
+        ex(&mut ed, "find zub/ needle");
+        assert_eq!(ed.session.status, "no matches for zub/ needle");
+    }
+
+    #[test]
+    fn replace_scoped_to_a_directory_offers_only_it() {
+        let files = Files::new("replace-scoped");
+        files.dir("sub");
+        files.file("top.rs", "needle up here\n");
+        files.file("sub/inner.rs", "needle down here\n");
+        let mut ed = in_project(&files, "top.rs");
+
+        ex(&mut ed, "replace sub/ /needle/pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::ApplyAll)));
+
+        let line = |name: &str| {
+            let path = files.0.join(name);
+            let entry = ed.buffers.iter().find(|b| b.buffer.path.as_deref() == Some(&*path));
+            entry.map(|b| b.buffer.line(0))
+        };
+        assert_eq!(line("top.rs").unwrap(), "needle up here", "outside the scope");
+        assert_eq!(line("sub/inner.rs").unwrap(), "pin down here");
+    }
+
+    #[test]
+    fn a_scope_needs_a_pattern() {
+        let files = Files::new("scope-no-pattern");
+        files.dir("sub");
+        files.file("sub/inner.rs", "needle\n");
+        let mut ed = in_project(&files, "sub/inner.rs");
+        ed.session.tree_root = Some(files.0.clone());
+
+        ex(&mut ed, "replace sub/ //pin/");
+
+        assert_eq!(ed.session.status, "a scope needs a pattern — `:replace src/ /old/new/`");
+    }
+
+    #[test]
+    fn the_alternate_swaps_an_opened_result_back_to_the_pane() {
+        let files = project("results-alt");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        assert!(ed.window().results().is_none(), "the file displaced the pane");
+
+        ex(&mut ed, "b#");
+
+        let results = ed.window().results().expect("the pane is the alternate, like a tree");
+        assert_eq!(results.selected(), 1, "as you left it");
+    }
+
+    #[test]
+    fn results_brings_the_last_list_back_as_it_was() {
+        let files = project("results-back");
+        let mut ed = in_project(&files, "c.rs");
+        ex(&mut ed, "find needle");
+        ex(&mut ed, "replace //pin/");
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Apply)));
+
+        // Leave through Enter, then wander off — the alternate slot moves on.
+        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        let other = files.0.join("c.rs").to_string_lossy().into_owned();
+        ex(&mut ed, &format!("e {other}"));
+
+        ex(&mut ed, "results");
+
+        let results = ed.window().results().expect("the list is back");
+        assert!(results.is_applied(0), "decisions intact");
+        assert!(results.replace.is_some(), "still armed");
+    }
+
+    #[test]
+    fn results_with_nothing_to_bring_back_says_so() {
+        let mut ed = editor("x\n");
+        ex(&mut ed, "results");
+        assert_eq!(ed.session.status, "no results to bring back — `:find` something first");
     }
 
     #[test]
@@ -13942,6 +14464,8 @@ mod tests {
         let mut ed = editor("x\n");
         ex(&mut ed, "find");
         assert_eq!(ed.session.status, "find what?");
+        ex(&mut ed, "find~");
+        assert_eq!(ed.session.status, "find what pattern?");
     }
 
     // ---- :resize ------------------------------------------------------------

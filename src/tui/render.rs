@@ -601,6 +601,14 @@ fn render_results(
     let mut cursor_at = None;
     let mut lines = Vec::with_capacity(area.height as usize);
 
+    // Armed once, drawn per row: the pane previews every hit as it will
+    // read, with the same matcher that found it. Bounded by the viewport
+    // like every other pass in here.
+    let armed = results
+        .replace
+        .as_ref()
+        .and_then(|r| Some((r.with.clone(), bi::find_in_files::matcher(&results.query).ok()?)));
+
     for (index, row) in rows.iter().enumerate().take(last).skip(results.scroll()) {
         let spans = match row {
             // A file leads its group, bold and in the tree's directory colour:
@@ -614,17 +622,59 @@ fn render_results(
             ],
             Row::Hit { index } => {
                 let m = &results.matches()[*index];
-                // The line number in the gutter's colour, so the eye can run
-                // down the numbers without the text getting in the way. The
-                // match itself is painted, which is what makes a row scannable
-                // when the line is long.
-                let mut out = vec![Span::styled(format!("{:>6}  ", m.line), tui(ui.gutter))];
-                let text: Vec<char> = m.text.chars().collect();
-                let (from, to) = (m.col.min(text.len()), (m.col + m.len).min(text.len()));
-                out.push(Span::raw(text[..from].iter().collect::<String>()));
-                out.push(Span::styled(text[from..to].iter().collect::<String>(), tui(ui.search)));
-                out.push(Span::raw(text[to..].iter().collect::<String>()));
-                out
+                match &armed {
+                    Some((with, matcher)) => {
+                        // The line as it will read, the new text highlighted;
+                        // an applied row keeps a ✓ as the record. A line the
+                        // rewrite no longer matches is shown as it was.
+                        let mark = match results.is_applied(*index) {
+                            true => Span::styled("✓ ".to_string(), tui(ui.mark_copy)),
+                            false => Span::raw("  ".to_string()),
+                        };
+                        let mut out =
+                            vec![Span::styled(format!("{:>6} ", m.line), tui(ui.gutter)), mark];
+                        match bi::find_in_files::rewrite_line(
+                            matcher,
+                            &m.text,
+                            with,
+                            results.query.regex,
+                        ) {
+                            Some(rewrite) => {
+                                let text: Vec<char> = rewrite.text.chars().collect();
+                                let mut at = 0;
+                                for (from, to) in rewrite.spans {
+                                    let (from, to) = (from.min(text.len()), to.min(text.len()));
+                                    out.push(Span::raw(text[at..from].iter().collect::<String>()));
+                                    out.push(Span::styled(
+                                        text[from..to].iter().collect::<String>(),
+                                        tui(ui.search),
+                                    ));
+                                    at = to;
+                                }
+                                out.push(Span::raw(text[at..].iter().collect::<String>()));
+                            }
+                            None => out.push(Span::raw(m.text.clone())),
+                        }
+                        out
+                    }
+                    None => {
+                        // The line number in the gutter's colour, so the eye
+                        // can run down the numbers without the text getting in
+                        // the way. The match itself is painted, which is what
+                        // makes a row scannable when the line is long.
+                        let mut out =
+                            vec![Span::styled(format!("{:>6}  ", m.line), tui(ui.gutter))];
+                        let text: Vec<char> = m.text.chars().collect();
+                        let (from, to) = (m.col.min(text.len()), (m.col + m.len).min(text.len()));
+                        out.push(Span::raw(text[..from].iter().collect::<String>()));
+                        out.push(Span::styled(
+                            text[from..to].iter().collect::<String>(),
+                            tui(ui.search),
+                        ));
+                        out.push(Span::raw(text[to..].iter().collect::<String>()));
+                        out
+                    }
+                }
             }
         };
 

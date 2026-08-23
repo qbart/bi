@@ -665,6 +665,11 @@ impl Input {
             KeyCode::Char('d') if ctrl => ResultsCmd::Move(10),
             KeyCode::Char('u') if ctrl => ResultsCmd::Move(-10),
             KeyCode::Enter | KeyCode::Char('o') => ResultsCmd::Open,
+            // The armed pane's pair, and the prune. See
+            // `docs/specs/find-in-files.md`.
+            KeyCode::Char('a') => ResultsCmd::Apply,
+            KeyCode::Char('A') => ResultsCmd::ApplyAll,
+            KeyCode::Char('x') => ResultsCmd::Remove,
             // The two ways out, and both are ways out of a *pane*: `q` because
             // it is what closes a list everywhere, and `Ctrl-^` because the
             // pane displaced something to be here.

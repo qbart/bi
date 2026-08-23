@@ -97,7 +97,20 @@ pub fn matcher(query: &Query) -> Result<grep_regex::RegexMatcher, String> {
     builder.build(&query.pattern).map_err(|e| format!("bad pattern: {e}"))
 }
 
-/// Rewrites every occurrence in `line`, and says how many.
+/// One line rewritten, and where the new text landed in it.
+///
+/// The spans are what the preview highlights — in characters, because they
+/// are for something being drawn, and a span after an `é` is otherwise in the
+/// wrong cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    pub text: String,
+    /// Char range of each inserted replacement, within `text`.
+    pub spans: Vec<(usize, usize)>,
+    pub count: usize,
+}
+
+/// Rewrites every occurrence in `line`, and says how many and where.
 ///
 /// `None` when there were none, so a caller can leave the line — and the undo
 /// history — completely alone.
@@ -105,22 +118,58 @@ pub fn matcher(query: &Query) -> Result<grep_regex::RegexMatcher, String> {
 /// Every occurrence rather than the first, because the result pane shows one
 /// row per line: a row that says `needle and needle` and then replaces half of
 /// itself is a row that lied about what it was offering.
-pub fn replace_all(
+///
+/// `interpolate` reads the replacement the way the pattern was read: under a
+/// regex, `$1` is the first capture group, `$name` a named one, `$$` a
+/// literal dollar. Under a literal pattern the replacement is literal too,
+/// dollars and all — groups you could not have written do not deserve syntax
+/// you have to escape.
+pub fn rewrite_line(
     matcher: &grep_regex::RegexMatcher,
     line: &str,
     with: &str,
-) -> Option<(String, usize)> {
-    use grep_matcher::Matcher;
+    interpolate: bool,
+) -> Option<Rewrite> {
+    use grep_matcher::{Captures as _, Matcher};
 
+    let mut caps = interpolate.then(|| matcher.new_captures().ok()).flatten();
     let mut out = String::with_capacity(line.len());
+    let mut out_chars = 0;
+    let mut spans = Vec::new();
     let mut at = 0;
     let mut count = 0;
     while at <= line.len() {
-        let found = matcher.find_at(line.as_bytes(), at).ok().flatten();
-        let Some(m) = found else { break };
-        out.push_str(&line[at..m.start()]);
-        out.push_str(with);
+        let m = match &mut caps {
+            Some(caps) => match matcher.captures_at(line.as_bytes(), at, caps).ok() {
+                Some(true) => caps.get(0),
+                _ => None,
+            },
+            None => matcher.find_at(line.as_bytes(), at).ok().flatten(),
+        };
+        let Some(m) = m else { break };
+        let kept = &line[at..m.start()];
+        out.push_str(kept);
+        out_chars += kept.chars().count();
+
+        let inserted = match &caps {
+            Some(caps) => {
+                let mut dst = Vec::new();
+                caps.interpolate(
+                    |name| matcher.capture_index(name),
+                    line.as_bytes(),
+                    with.as_bytes(),
+                    &mut dst,
+                );
+                String::from_utf8(dst).unwrap_or_else(|_| with.to_string())
+            }
+            None => with.to_string(),
+        };
+        let inserted_chars = inserted.chars().count();
+        spans.push((out_chars, out_chars + inserted_chars));
+        out.push_str(&inserted);
+        out_chars += inserted_chars;
         count += 1;
+
         // An empty match would sit here forever; step past one character so a
         // pattern that can match nothing terminates.
         at = match m.end() > m.start() {
@@ -128,6 +177,7 @@ pub fn replace_all(
             false => match line[m.end()..].chars().next() {
                 Some(c) => {
                     out.push(c);
+                    out_chars += 1;
                     m.end() + c.len_utf8()
                 }
                 None => break,
@@ -138,7 +188,7 @@ pub fn replace_all(
         return None;
     }
     out.push_str(&line[at.min(line.len())..]);
-    Some((out, count))
+    Some(Rewrite { text: out, spans, count })
 }
 
 /// Searches every file under `root`.
@@ -375,37 +425,69 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_rewrites_every_occurrence_on_the_line() {
+    fn rewriting_takes_every_occurrence_on_the_line() {
         let m = matcher(&query("needle")).unwrap();
 
+        let r = rewrite_line(&m, "needle and needle", "pin", false).unwrap();
         assert_eq!(
-            replace_all(&m, "needle and needle", "pin"),
-            Some(("pin and pin".to_string(), 2)),
+            (r.text.as_str(), r.count),
+            ("pin and pin", 2),
             "the row showed one line, so the whole line is rewritten"
         );
-        assert_eq!(replace_all(&m, "nothing here", "pin"), None);
-        assert_eq!(replace_all(&m, "needle", ""), Some((String::new(), 1)), "deleting is allowed");
+        assert_eq!(rewrite_line(&m, "nothing here", "pin", false), None);
+        let gone = rewrite_line(&m, "needle", "", false).unwrap();
+        assert_eq!((gone.text.as_str(), gone.count), ("", 1), "deleting is allowed");
     }
 
     #[test]
-    fn replace_all_follows_the_case_rule_the_search_used() {
+    fn rewriting_reports_where_the_new_text_landed_in_characters() {
+        let m = matcher(&query("needle")).unwrap();
+
+        let r = rewrite_line(&m, "héllo needle and needle", "pin", false).unwrap();
+
+        assert_eq!(r.text, "héllo pin and pin");
+        assert_eq!(r.spans, [(6, 9), (14, 17)], "chars, not bytes — the é counts once");
+    }
+
+    #[test]
+    fn rewriting_follows_the_case_rule_the_search_used() {
         // Whatever the list showed you is what gets rewritten, which only
         // holds because both go through the same matcher.
         let insensitive = matcher(&query("beta")).unwrap();
-        assert_eq!(replace_all(&insensitive, "Beta beta", "x").unwrap().1, 2);
+        assert_eq!(rewrite_line(&insensitive, "Beta beta", "x", false).unwrap().count, 2);
 
         let sensitive = matcher(&query("Beta")).unwrap();
-        assert_eq!(replace_all(&sensitive, "Beta beta", "x").unwrap().1, 1);
+        assert_eq!(rewrite_line(&sensitive, "Beta beta", "x", false).unwrap().count, 1);
+    }
+
+    #[test]
+    fn a_regex_replacement_interpolates_its_groups() {
+        let q = Query { pattern: r"fn (\w+)".into(), regex: true, ..Query::default() };
+        let m = matcher(&q).unwrap();
+
+        let r = rewrite_line(&m, "fn alpha() and fn beta()", "fn new_$1", true).unwrap();
+
+        assert_eq!(r.text, "fn new_alpha() and fn new_beta()");
+        assert_eq!(r.count, 2);
+    }
+
+    #[test]
+    fn a_literal_replacement_keeps_its_dollars() {
+        let m = matcher(&query("cost")).unwrap();
+
+        let r = rewrite_line(&m, "the cost", "$1 and $$", false).unwrap();
+
+        assert_eq!(r.text, "the $1 and $$", "no groups you could not have written");
     }
 
     #[test]
     fn a_pattern_that_can_match_nothing_still_terminates() {
         let m = matcher(&Query { pattern: "x*".into(), regex: true, ..Query::default() }).unwrap();
 
-        let (text, count) = replace_all(&m, "axb", "-").unwrap();
+        let r = rewrite_line(&m, "axb", "-", false).unwrap();
 
-        assert!(count > 0, "it matched something");
-        assert!(text.contains('a') && text.contains('b'), "and ate nothing: {text}");
+        assert!(r.count > 0, "it matched something");
+        assert!(r.text.contains('a') && r.text.contains('b'), "and ate nothing: {}", r.text);
     }
 
     #[test]
