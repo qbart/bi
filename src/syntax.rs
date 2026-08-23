@@ -204,7 +204,7 @@ fn grammar(filetype: &str) -> Option<(Language, &'static str)> {
         "go" => (tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY),
         "c3" => (tree_sitter_c3::LANGUAGE.into(), tree_sitter_c3::HIGHLIGHTS_QUERY),
         "cpp" => (tree_sitter_cpp::LANGUAGE.into(), &CPP_HIGHLIGHTS),
-        "c" => (tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY),
+        "c" => (tree_sitter_c::LANGUAGE.into(), &C_HIGHLIGHTS),
         "lua" => (tree_sitter_lua::LANGUAGE.into(), tree_sitter_lua::HIGHLIGHTS_QUERY),
         "bash" => bash(),
         // The query is bi's own — see `src/queries/hcl.scm`.
@@ -215,9 +215,9 @@ fn grammar(filetype: &str) -> Option<(Language, &'static str)> {
         // it outright (no `auto` node) and HLSL accepts it but then matches
         // nothing at all, which is the worse failure of the two because it
         // looks like a working grammar. Both are pinned by tests below.
-        "slang" => (tree_sitter_slang::LANGUAGE_SLANG.into(), tree_sitter_c::HIGHLIGHT_QUERY),
-        "glsl" => (tree_sitter_glsl::LANGUAGE_GLSL.into(), tree_sitter_glsl::HIGHLIGHTS_QUERY),
-        "hlsl" => (tree_sitter_hlsl::LANGUAGE_HLSL.into(), tree_sitter_c::HIGHLIGHT_QUERY),
+        "slang" => (tree_sitter_slang::LANGUAGE_SLANG.into(), &C_HIGHLIGHTS),
+        "glsl" => (tree_sitter_glsl::LANGUAGE_GLSL.into(), &GLSL_HIGHLIGHTS),
+        "hlsl" => (tree_sitter_hlsl::LANGUAGE_HLSL.into(), &C_HIGHLIGHTS),
         "python" => (tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY),
         "ruby" => ruby(),
         "html" => (tree_sitter_html::LANGUAGE.into(), tree_sitter_html::HIGHLIGHTS_QUERY),
@@ -303,8 +303,27 @@ const TEMPL_HIGHLIGHTS_OWN: &str = include_str!("queries/templ.scm");
 /// C's `(call_expression function: (identifier) @function)` must stay after
 /// its own `(identifier) @variable`, and C++'s overrides after both.
 static CPP_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY)
+    format!(
+        "{}\n{}\n{C_BOOLEANS}",
+        tree_sitter_c::HIGHLIGHT_QUERY,
+        tree_sitter_cpp::HIGHLIGHT_QUERY
+    )
 });
+
+/// C's upstream query captures `(null)` and every number and stops short of
+/// the booleans: `true` and `false` are their own node types in the grammar,
+/// and the bundled query never names them — parsed, and painted plain. One
+/// appended line closes the gap, and the whole C family gets it: C itself,
+/// C++ above, the borrowers (Slang, HLSL), and GLSL's own query, which has
+/// the same hole. Every one of those grammars defines the two nodes, which
+/// matters — a query naming a node a grammar lacks refuses to compile.
+const C_BOOLEANS: &str = "[(true) (false)] @boolean";
+
+static C_HIGHLIGHTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}\n{C_BOOLEANS}", tree_sitter_c::HIGHLIGHT_QUERY));
+
+static GLSL_HIGHLIGHTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}\n{C_BOOLEANS}", tree_sitter_glsl::HIGHLIGHTS_QUERY));
 
 /// TypeScript's highlights are JavaScript's, then TypeScript's own.
 ///
@@ -1057,6 +1076,29 @@ mod tests {
     /// while matching `auto` and almost nothing else, so every language gets a
     /// snippet whose comment, keyword and literal must all come back captured.
     #[test]
+    /// The regression behind `C_BOOLEANS`: `nullptr` and the numbers took a
+    /// colour and `true`/`false` rendered plain, in every C-family grammar
+    /// at once — none of their upstream queries captures the two nodes.
+    #[test]
+    fn the_c_family_booleans_take_the_boolean_capture() {
+        for (file, text) in [
+            ("c", "int f(void) { return true == false; }\n"),
+            ("cpp", "bool f() { return true && false; }\n"),
+            ("glsl", "void main() { bool b = true; bool c = false; }\n"),
+            ("hlsl", "float f() { bool b = true; bool c = false; return 0; }\n"),
+            ("slang", "float f() { bool b = true; bool c = false; return 0; }\n"),
+        ] {
+            let found = captures(file, text);
+            for spelling in ["true", "false"] {
+                assert!(
+                    found.iter().any(|(name, t)| name == "boolean" && t == spelling),
+                    "{file}: {spelling} is not a @boolean — got {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_language_captures_a_comment_a_keyword_and_a_literal() {
         // (one key per grammar, snippet, comment, keyword, literal)
         let cases: &[(&str, &str, &str, &str, &str)] = &[
@@ -1087,9 +1129,9 @@ mod tests {
                 "fn",
                 "\"hi\"",
             ),
-            // GLSL's query captures no boolean, so the literal here is a
-            // number — the assertion is that literals reach the frontend at
-            // all, not that a particular spelling of one does.
+            // The number as the literal, not a boolean — the boolean gap in
+            // GLSL's query is closed by `C_BOOLEANS` and pinned by its own
+            // test below; this one asserts literals reach the frontend at all.
             ("glsl", "// note\nvoid main() { if (1) {} }\n", "// note", "if", "1"),
             ("hlsl", "// note\nfloat f() { if (1) {} return 0; }\n", "// note", "return", "0"),
             ("slang", "// note\nfloat f() { if (1) {} return 0; }\n", "// note", "return", "0"),
