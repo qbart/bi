@@ -398,6 +398,7 @@ impl Input {
             Some(Operator::Yank) => s.push('y'),
             Some(Operator::Indent { right }) => s.push(if right { '>' } else { '<' }),
             Some(Operator::Reflow) => s.push_str("gq"),
+            Some(Operator::Reindent) => s.push('='),
             None => {}
         }
         if let Some(n) = self.motion_count {
@@ -1018,6 +1019,7 @@ impl Input {
                     | (Operator::Indent { right: false }, '<')
                     // `gqq`, and `gqgq` via the `g` block above.
                     | (Operator::Reflow, 'q')
+                    | (Operator::Reindent, '=')
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
@@ -1030,7 +1032,7 @@ impl Input {
                     Operator::Yank => Some(Surround::Add),
                     Operator::Delete => Some(Surround::Delete),
                     Operator::Change => Some(Surround::Change(None)),
-                    Operator::Indent { .. } | Operator::Reflow => None,
+                    Operator::Indent { .. } | Operator::Reflow | Operator::Reindent => None,
                 };
                 if self.surround.is_some() {
                     // `ys` keeps the yank operator pending, because what
@@ -1201,6 +1203,10 @@ impl Input {
                 self.operator = Some(Operator::Indent { right: c == '>' });
                 return None;
             }
+            '=' => {
+                self.operator = Some(Operator::Reindent);
+                return None;
+            }
             '"' => {
                 self.quote_pending = true;
                 return None;
@@ -1340,6 +1346,7 @@ impl Input {
             'c' | 's' => Some(Operator::Change),
             'y' => Some(Operator::Yank),
             '>' | '<' => Some(Operator::Indent { right: c == '>' }),
+            '=' => Some(Operator::Reindent),
             _ => None,
         };
         if let Some(op) = op {
@@ -2349,6 +2356,28 @@ leader = \" \"
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn equals_is_the_third_indent_operator() {
+        assert_eq!(
+            typed("==").action,
+            Action::Operate {
+                op: Operator::Reindent,
+                target: Target::Motion(Motion::CurrentLine),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        assert_eq!(
+            typed("=G").action,
+            Action::Operate {
+                op: Operator::Reindent,
+                target: Target::Motion(Motion::LastLine),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
     }
 
     #[test]

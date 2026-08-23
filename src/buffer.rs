@@ -686,6 +686,38 @@ impl Buffer {
         Some(self.first_non_blank(self.clamped(self.at_row(end_row, false), false)))
     }
 
+    /// Rewrites the indentation of rows `first..=last` to what
+    /// [`indent::reindent`] says the structure wants — `=`. The lines above
+    /// the range are context: walked for their bracket depth, never touched.
+    /// Says where the cursor goes — the first non-blank of the last row
+    /// touched. `None` when every line already sat where it should.
+    pub fn reindent_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        indent: &Indent,
+    ) -> Option<Cursor> {
+        let last = last.min(self.line_count().saturating_sub(1));
+        let lines: Vec<String> = (0..=last).map(|row| self.line(row)).collect();
+        let new = indent::reindent(&lines, first, indent);
+        let mut changed = false;
+
+        // Bottom-up, so an edit on one row cannot move the rows still to come.
+        for row in (first..=last).rev() {
+            let text = &lines[row];
+            let lead = indent::leading(text);
+            let wanted = &new[row - first];
+            if lead == wanted {
+                continue;
+            }
+            let start = self.rope.line_to_char(row);
+            self.apply_edit(start, start + lead.chars().count(), wanted);
+            changed = true;
+        }
+
+        changed.then(|| self.first_non_blank(self.clamped(self.at_row(last, false), false)))
+    }
+
     /// `Tab` in insert mode: forward to the next indent stop.
     ///
     /// Aligns rather than inserting a fixed width, which is what a tab has

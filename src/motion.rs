@@ -144,6 +144,10 @@ pub enum Operator {
     /// like [`Operator::Indent`], and for the same reasons. See
     /// `docs/specs/reflow.md`.
     Reflow,
+    /// `=` — reindent to what the structure wants, which today is bracket
+    /// depth. The third indent operator; captures nothing, always linewise.
+    /// See `docs/specs/indent.md`.
+    Reindent,
 }
 
 /// How a motion's endpoints turn into a range.

@@ -7442,6 +7442,22 @@ impl View<'_> {
                     }
                 });
             }
+            // `=` beside `gq` and `>`: captures nothing, always linewise.
+            // See `docs/specs/indent.md`.
+            Action::Operate { op: Operator::Reindent, target, count, .. } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                let count = *count;
+                let indent = self.options.indent();
+                self.for_each_selection(|ed, sel| {
+                    let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
+                        return sel;
+                    };
+                    match ed.buffer.reindent_rows(first, last, &indent) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => sel,
+                    }
+                });
+            }
             // Like `>`: captures nothing, always linewise. See
             // `docs/specs/reflow.md`.
             Action::Operate { op: Operator::Reflow, target, count, .. } => {
@@ -7717,6 +7733,19 @@ impl View<'_> {
                         false => Selection { anchor: start, head: end },
                     }
                 });
+            }
+            Action::OperateSelection { op: Operator::Reindent, .. } => {
+                let indent = self.options.indent();
+                self.for_each_selection(|ed, sel| {
+                    let (lo, hi) = sel.range();
+                    let first = ed.buffer.row_at(Cursor::at(lo));
+                    let last = ed.buffer.row_at(Cursor::at(hi));
+                    match ed.buffer.reindent_rows(first, last, &indent) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => Selection::collapsed(sel.head),
+                    }
+                });
+                self.session.mode = Mode::Normal;
             }
             // The rows the selection touches, whatever its shape — there is
             // no reflowing half a line. Unlike `>` it consumes the selection:
@@ -11055,6 +11084,56 @@ mod tests {
 
         assert_eq!(rope_of(&ed), "one two\nthree four\nrest\n");
         assert_eq!(ed.session.mode, Mode::Normal, "the selection was consumed");
+    }
+
+    // ---- =, reindent --------------------------------------------------------
+
+    #[test]
+    fn double_equals_reindents_the_cursors_line_by_bracket_depth() {
+        let mut ed = editor("fn f() {\nx();\n}\n");
+        ed.set_cursor(Cursor::at(9));
+
+        ed.apply(operate(Operator::Reindent, Motion::CurrentLine, 1));
+
+        assert_eq!(rope_of(&ed), "fn f() {\n    x();\n}\n");
+    }
+
+    /// `gg=G` is this: the cursor at the top, `=` to the last line. One undo
+    /// step, and the closers sit with the lines that opened them.
+    #[test]
+    fn equals_to_the_last_line_reindents_the_file() {
+        let mut ed = editor("fn f() {\n        a();\nif b {\nc();\n}\n}\n");
+
+        ed.apply(operate(Operator::Reindent, Motion::LastLine, 1));
+
+        assert_eq!(rope_of(&ed), "fn f() {\n    a();\n    if b {\n        c();\n    }\n}\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(rope_of(&ed), "fn f() {\n        a();\nif b {\nc();\n}\n}\n", "one `u`");
+    }
+
+    /// The lines above are context and the lines below are not touched: `==`
+    /// still knows its depth, and fixes only what it was aimed at.
+    #[test]
+    fn a_line_outside_the_reindented_range_is_untouched() {
+        let mut ed = editor("{\nx\ny\n}\n");
+        ed.set_cursor(Cursor::at(2));
+
+        ed.apply(operate(Operator::Reindent, Motion::CurrentLine, 1));
+
+        assert_eq!(rope_of(&ed), "{\n    x\ny\n}\n", "`y` keeps its wrong indent");
+    }
+
+    #[test]
+    fn visual_equals_reindents_the_selected_rows_and_collapses() {
+        let mut ed = editor("{\nx\n}\n");
+        ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Reindent, sink: Sink::Ring }));
+
+        assert_eq!(rope_of(&ed), "{\n    x\n}\n");
+        assert_eq!(ed.session.mode, Mode::Normal);
     }
 
     #[test]

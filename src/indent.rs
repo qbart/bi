@@ -145,6 +145,60 @@ pub fn retab(line: &str, indent: &Indent) -> Option<String> {
     (now != was).then_some(now)
 }
 
+/// The new indentation for the rows from `first` to the end of `lines` —
+/// `=`'s answer, one rendered indent per row.
+///
+/// What the structure wants is bracket depth: one step per `{`, `[` or `(`
+/// left open on the lines above, minus the closers a line itself leads with.
+/// The rows before `first` are context — walked, never touched — which is
+/// how `==` on one line knows where it stands.
+///
+/// The counting is textual until it is syntactic: a bracket inside a string
+/// counts, and a language whose blocks are not bracketed gets flattened.
+/// That is vim's own `=` baseline, and tree-sitter indent queries replace
+/// this function without changing its shape — the same seam `matches_in`
+/// leaves for regex. See `docs/specs/indent.md`.
+///
+/// A blank line's indent is the empty string: pushing whitespace onto a line
+/// with nothing on it buys nothing and fills the diff.
+pub fn reindent(lines: &[String], first: usize, indent: &Indent) -> Vec<String> {
+    let mut depth: usize = 0;
+    for line in &lines[..first.min(lines.len())] {
+        depth = depth_after(line, depth);
+    }
+    let mut out = Vec::new();
+    for line in &lines[first.min(lines.len())..] {
+        let text = line.trim_start();
+        if text.is_empty() {
+            out.push(String::new());
+        } else {
+            let effective = depth.saturating_sub(leading_closers(text));
+            out.push(indent.render(effective * indent.step()));
+        }
+        depth = depth_after(line, depth);
+    }
+    out
+}
+
+/// The bracket depth in force after `line`, clamped at zero — an over-closed
+/// file cannot owe indentation.
+fn depth_after(line: &str, mut depth: usize) -> usize {
+    for c in line.chars() {
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// How many closers `text` (already trimmed) leads with — the `}` that sits
+/// with the line that opened it, and the `})` that closes two at once.
+fn leading_closers(text: &str) -> usize {
+    text.chars().take_while(|c| matches!(c, '}' | ']' | ')')).count()
+}
+
 /// The columns a line indented `width` gets vertical guides at: 0, one step
 /// in, two steps in, up to but not including the text itself.
 ///
@@ -170,6 +224,43 @@ mod tests {
 
     fn tabs() -> Indent {
         Indent { expandtab: false, ..Indent::default() }
+    }
+
+    fn reindented(text: &[&str], first: usize) -> Vec<String> {
+        let lines: Vec<String> = text.iter().map(|s| s.to_string()).collect();
+        reindent(&lines, first, &spaces())
+    }
+
+    #[test]
+    fn reindent_puts_a_line_at_one_step_per_open_bracket() {
+        assert_eq!(
+            reindented(&["fn f() {", "let x = 1;", "if y {", "z();", "}", "}"], 0),
+            ["", "    ", "    ", "        ", "    ", ""],
+            "and a closer sits with the line that opened it"
+        );
+    }
+
+    /// The rows before `first` are context: `==` on one line still knows
+    /// where it stands.
+    #[test]
+    fn reindent_reads_the_lines_above_without_touching_them() {
+        assert_eq!(reindented(&["fn f() {", "        x();"], 1), ["    "]);
+    }
+
+    #[test]
+    fn reindent_leaves_a_blank_line_empty() {
+        assert_eq!(reindented(&["{", "", "x", "}"], 0), ["", "", "    ", ""]);
+    }
+
+    #[test]
+    fn reindent_clamps_an_over_closed_file_at_column_zero() {
+        assert_eq!(reindented(&["}", "}", "x"], 0), ["", "", ""]);
+    }
+
+    #[test]
+    fn reindent_writes_tabs_when_the_options_do() {
+        let lines: Vec<String> = ["{", "x", "}"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(reindent(&lines, 0, &tabs()), ["", "\t", ""]);
     }
 
     #[test]
