@@ -618,6 +618,58 @@ impl Syntax {
         out
     }
 
+    /// The block and argument-list nodes — what `:ts` paints and `]]`/`[[`
+    /// walk. Byte ranges, in tree order; the caller turns each end into a
+    /// stop. See `docs/specs/boundaries.md`.
+    ///
+    /// A block is any named node spanning more than one line — the same wager
+    /// `contexts` makes about structure, and what covers every grammar with
+    /// no table of kinds. An argument or parameter *list* — a kind containing
+    /// the word and shaped like a list — comes with each of its named
+    /// children, single-line as they are: hopping a signature argument to
+    /// argument is the case the span rule cannot serve.
+    pub fn boundaries(&self) -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        let mut cursor = self.tree.walk();
+        // The root is skipped by starting below it: the file's own ends are
+        // not stops anyone asked to visit.
+        if !cursor.goto_first_child() {
+            return out;
+        }
+        loop {
+            let node = cursor.node();
+            if node.is_named() {
+                let multiline = node.end_position().row > node.start_position().row;
+                let kind = node.kind();
+                // "arguments", "parameters", "argument_list",
+                // "type_arguments" — the *list*, and not the
+                // "parameter_declaration" sitting inside one.
+                let list = (kind.contains("argument") || kind.contains("parameter"))
+                    && (kind.ends_with('s') || kind.ends_with("_list"));
+                if multiline || list {
+                    out.push(node.byte_range());
+                }
+                if list {
+                    let mut walk = node.walk();
+                    for child in node.named_children(&mut walk) {
+                        out.push(child.byte_range());
+                    }
+                }
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return out;
+                }
+            }
+        }
+    }
+
     /// What `:symbols` navigates: the declarations in the file, in the order
     /// they appear.
     ///
@@ -840,6 +892,24 @@ mod tests {
 
     fn rust(text: &str) -> Syntax {
         Syntax::new("rs", &Rope::from_str(text)).expect("rust grammar")
+    }
+
+    #[test]
+    fn boundaries_are_blocks_and_argument_lists() {
+        let text = "fn add(a: i32, b: i32) {\n    a + b;\n}\n";
+        let syntax = rust(text);
+        let slices: Vec<String> =
+            syntax.boundaries().into_iter().map(|r| text[r].to_string()).collect();
+
+        assert!(slices.contains(&text.trim_end().to_string()), "the function: {slices:?}");
+        assert!(slices.contains(&"(a: i32, b: i32)".to_string()), "the list: {slices:?}");
+        assert!(slices.contains(&"a: i32".to_string()), "each argument: {slices:?}");
+        assert!(slices.contains(&"b: i32".to_string()), "each argument: {slices:?}");
+        assert!(slices.contains(&"{\n    a + b;\n}".to_string()), "the body: {slices:?}");
+        assert!(
+            !slices.iter().any(|s| s == "a + b;"),
+            "a single-line statement is not a block: {slices:?}"
+        );
     }
 
     fn names(syntax: &Syntax, rope: &Rope, range: Range<usize>) -> Vec<(String, String)> {

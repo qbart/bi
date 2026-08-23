@@ -11,7 +11,8 @@ would be a bad popup system. They wait for their own design.
 
 ## Status
 
-**Built.**
+**Built.** `:peek` — the definition in a split — came later and sits below
+`gd`, whose machinery it borrows whole.
 
 ## The shape all three share
 
@@ -44,6 +45,29 @@ a list of them, `LocationLink`s, or null — all four shapes normalise to
 through the same path `:e` uses (a buffer already open is reused, same file
 included) and the cursor lands on the range start; more than one target says
 `went to the first of N`. Nothing found says so.
+
+## `:peek` — the definition beside you
+
+`gd` replaces what you were looking at, and half the time the question was
+"what *is* that" rather than "take me there". `:peek` answers it without the
+round trip: a vertical split opens, the definition request runs in it, and
+the answer lands there — the definition on one side, the call site untouched
+on the other, focus on the definition so `Ctrl-W q` is the whole way back.
+
+The implementation is the composition it sounds like: check the server offers
+definitions *first* — a `:peek` with nothing to show must not leave an empty
+split behind — then `:vs`, then the same `:definition` the `gd` key runs,
+which lands in the focused window and the focused window is now the split.
+The async plumbing, the response shapes and the buffer reuse are all `gd`'s,
+untouched; a `:peek` whose answer is "nothing found" reports it on the status
+line and leaves the split showing the same file, which is what `:vs` would
+have shown and is yours to close.
+
+No default key. `gp` would be the vim-adjacent spelling, but the `g` row is
+filling up and a command you run a few times an hour is cheap to type;
+`"<leader>p" = ":peek<CR>"` is one line of config.
+
+Tests: `:peek` with no server says why and does not split.
 
 ## `gr` — references
 

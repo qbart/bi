@@ -384,6 +384,11 @@ pub enum Action {
         line: String,
         run: bool,
     },
+    /// `]]` / `[[` — the next or previous tree-sitter boundary. See
+    /// `docs/specs/boundaries.md`.
+    BoundaryJump {
+        forward: bool,
+    },
     CommandChar(char),
     CommandBackspace,
     /// Moving the cursor along the `:` line. Arrows and the shells' `Ctrl-A` /
@@ -725,6 +730,9 @@ pub struct Session {
     /// `last_search` because it is set in the same breath — see
     /// `docs/specs/substitute.md`.
     pub last_substitute: Option<crate::substitute::Substitute>,
+    /// Whether `:ts` has the boundaries on show — a toggle, recomputed each
+    /// frame from the live tree. See `docs/specs/boundaries.md`.
+    pub ts_marks: bool,
     /// Everything `:set` can change, and everything `[options]` can say.
     ///
     /// One struct rather than a field each so that a new option is one line in
@@ -1325,6 +1333,55 @@ fn find_decorations(
     }
 }
 
+/// Every boundary as a char position, sorted and deduplicated — the stops
+/// `]]` walks and `:ts` paints. A range contributes its first character and
+/// its last, which for a one-character node is one stop, not two.
+fn boundary_positions(syntax: &Syntax, rope: &ropey::Rope) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for range in syntax.boundaries() {
+        let start = rope.byte_to_char(range.start);
+        let end = rope.byte_to_char(range.end);
+        out.push(start);
+        if end > start + 1 {
+            out.push(end - 1);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// What `:ts` puts on screen: the dim, and a mark on every boundary — shaped
+/// exactly as `find_decorations` shapes `s`'s. See `docs/specs/boundaries.md`.
+fn boundary_marks(
+    buffer: &Buffer,
+    syntax: &Syntax,
+    theme: &Theme,
+    rows: &std::ops::Range<usize>,
+    out: &mut Vec<crate::decoration::Decoration>,
+) {
+    use crate::decoration::{Decoration, Layer};
+
+    let rope = buffer.rope();
+    let last = rows.end.min(buffer.line_count());
+    let from = rope.line_to_char(rows.start.min(rope.len_lines().saturating_sub(1)));
+    let to = match last >= buffer.line_count() {
+        true => rope.len_chars(),
+        false => rope.line_to_char(last),
+    };
+    out.push(Decoration::Repaint { range: from..to, style: theme.ui.dim, layer: Layer::Under });
+    for at in boundary_positions(syntax, rope) {
+        if at < from || at >= to {
+            continue;
+        }
+        out.push(Decoration::Repaint {
+            range: at..at + 1,
+            style: theme.ui.search,
+            layer: Layer::Under,
+        });
+    }
+}
+
 /// Colour literals, drawn in the colour they name.
 ///
 /// The style is an exact `Rgb` pair rather than anything a theme could have
@@ -1505,6 +1562,11 @@ enum ExLine {
     Lsp(LspCmd),
     /// `:definition` — `gd`. See `docs/specs/lsp-requests.md`.
     Definition,
+    /// `:peek` — the definition in a fresh vertical split, focus on it. See
+    /// `docs/specs/lsp-requests.md`.
+    Peek,
+    /// `:ts` — toggle the boundary marks. See `docs/specs/boundaries.md`.
+    TsMarks,
     /// `:references` — `gr`, into a `Results` pane.
     References,
     /// `:format` — the whole file, by the server, as one undo step.
@@ -1812,6 +1874,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             _ => ExLine::Error("lsp takes restart, stop, or nothing for status".into()),
         },
         "def" | "definition" => ExLine::Definition,
+        "peek" => ExLine::Peek,
+        "ts" => ExLine::TsMarks,
         "refs" | "references" => ExLine::References,
         "fmt" | "format" if arg.is_empty() => ExLine::Format,
         "fmt" | "format" => {
@@ -2890,6 +2954,16 @@ impl Editor {
                 &rows,
                 &mut out,
             );
+        }
+        // `:ts` — every boundary on show. The same dim `s` uses, and for the
+        // same reason: the text is background while the marks are the
+        // subject. Focused window only, recomputed each frame from the live
+        // tree, so it cannot go stale. See `docs/specs/boundaries.md`.
+        if self.session.ts_marks
+            && window == self.focus
+            && let Some(syntax) = syntax
+        {
+            boundary_marks(buffer, syntax, &self.theme, &rows, &mut out);
         }
         // The guides stand down while the blanks are on show. On a line with
         // text a bullet would win the column anyway, but a guide at column 0
@@ -4601,6 +4675,7 @@ impl Editor {
                 self.run_ex_over(&line, shape);
                 self.revive_visual(shape);
             }
+            Action::BoundaryJump { forward } => self.boundary_jump(*forward),
             Action::Ex { line, run } => {
                 let line = line.clone();
                 match run {
@@ -5251,6 +5326,8 @@ impl Editor {
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
             ExLine::Definition => self.lsp_definition(),
+            ExLine::Peek => self.peek_definition(),
+            ExLine::TsMarks => self.toggle_ts_marks(),
             ExLine::References => self.lsp_references(),
             ExLine::Format => self.lsp_format(),
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
@@ -6014,6 +6091,67 @@ impl Editor {
         if let Err(status) = sent {
             self.session.status = status;
         }
+    }
+
+    /// `:peek` — the definition beside you: a vertical split, the same
+    /// `:definition` the `gd` key runs, focus on the answer. See
+    /// `docs/specs/lsp-requests.md`.
+    fn peek_definition(&mut self) {
+        // The server is asked about *before* the split: a `:peek` with
+        // nothing to show must not leave an empty split behind.
+        match self.lsp_target() {
+            Ok((_, _, caps)) if caps.definition => {}
+            Ok(_) => {
+                self.session.status = "definition: this server does not offer it".into();
+                return;
+            }
+            Err(status) => {
+                self.session.status = status;
+                return;
+            }
+        }
+        let before = self.window_ids().len();
+        self.run_window_cmd(WindowCmd::Split { dir: Dir::Vertical, path: None });
+        if self.window_ids().len() == before {
+            // No room; the split said so.
+            return;
+        }
+        // Focus is the new window now, and the request carries it — the
+        // answer lands in the split, not where you were reading.
+        self.lsp_definition();
+    }
+
+    /// `]]` / `[[` — the next or previous boundary, starts and ends both
+    /// stops. At the last one it stays put rather than wrapping: a boundary
+    /// walk is local, and teleporting to the top of the file is not walking.
+    /// See `docs/specs/boundaries.md`.
+    fn boundary_jump(&mut self, forward: bool) {
+        let Some(buffer) = self.buffer() else { return };
+        let Some(syntax) = self.syntax() else {
+            self.session.status = "no syntax tree here".into();
+            return;
+        };
+        let rope = buffer.rope();
+        let stops = boundary_positions(syntax, rope);
+        let Some(cursor) = self.cursor() else { return };
+        let target = match forward {
+            true => stops.iter().find(|&&at| at > cursor.at),
+            false => stops.iter().rev().find(|&&at| at < cursor.at),
+        };
+        let Some(&at) = target else { return };
+        self.set_cursor(Cursor::at(at));
+    }
+
+    /// `:ts` — the boundaries on show, or put away. See
+    /// `docs/specs/boundaries.md`.
+    fn toggle_ts_marks(&mut self) {
+        if !self.session.ts_marks && self.syntax().is_none() {
+            self.session.status = "no syntax tree here".into();
+            return;
+        }
+        self.session.ts_marks = !self.session.ts_marks;
+        self.session.status =
+            if self.session.ts_marks { "boundaries on" } else { "boundaries off" }.into();
     }
 
     /// `:references` — `gr`. The answer becomes a `Results` pane.
@@ -8047,6 +8185,7 @@ impl View<'_> {
             // tree, the buffer list, the command line and the picker.
             Action::EnterCommandMode
             | Action::Ex { .. }
+            | Action::BoundaryJump { .. }
             | Action::CommandChar(_)
             | Action::CommandBackspace
             | Action::CommandMove(_)
@@ -11014,6 +11153,114 @@ mod tests {
 
         assert_eq!(rope_of(&ed), "a\nb\n");
         assert!(ed.session.status.starts_with("`:d` deletes lines"), "{}", ed.session.status);
+    }
+
+    // ---- boundaries: ]], [[, :ts, :peek -------------------------------------
+
+    /// A parsed buffer with a function, its parameters, and a body — enough
+    /// structure for every boundary case.
+    fn rust_editor() -> Editor {
+        let mut ed = editor("fn add(a: i32, b: i32) {\n    a + b;\n}\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(0));
+        ed
+    }
+
+    /// From the top: the `(`, each parameter's ends, the `)`, the `{`, and
+    /// the shared final `}` — starts and ends both stops.
+    #[test]
+    fn boundary_jump_walks_blocks_and_arguments() {
+        let mut ed = rust_editor();
+
+        for want in [6, 7, 12, 15, 20, 21, 23, 36] {
+            ed.apply(cmd(Action::BoundaryJump { forward: true }));
+            assert_eq!(ed.cursor().unwrap().at, want);
+        }
+        ed.apply(cmd(Action::BoundaryJump { forward: true }));
+        assert_eq!(ed.cursor().unwrap().at, 36, "the last boundary does not wrap");
+
+        ed.apply(cmd(Action::BoundaryJump { forward: false }));
+        assert_eq!(ed.cursor().unwrap().at, 23, "`[[` walks the same stops back");
+    }
+
+    #[test]
+    fn a_boundary_jump_without_a_tree_says_so() {
+        let mut ed = editor("plain text\n");
+
+        ed.apply(cmd(Action::BoundaryJump { forward: true }));
+
+        assert_eq!(ed.session.status, "no syntax tree here");
+        assert_eq!(ed.cursor().unwrap().at, 0, "and the cursor stayed");
+    }
+
+    #[test]
+    fn ts_toggles_both_ways_and_reports() {
+        let mut ed = rust_editor();
+
+        ex(&mut ed, "ts");
+        assert!(ed.session.ts_marks);
+        assert_eq!(ed.session.status, "boundaries on");
+
+        ex(&mut ed, "ts");
+        assert!(!ed.session.ts_marks);
+        assert_eq!(ed.session.status, "boundaries off");
+    }
+
+    #[test]
+    fn ts_without_a_tree_stays_off_and_says_why() {
+        let mut ed = editor("plain\n");
+
+        ex(&mut ed, "ts");
+
+        assert!(!ed.session.ts_marks);
+        assert_eq!(ed.session.status, "no syntax tree here");
+    }
+
+    /// The `s` treatment: the dim under everything, a mark per boundary —
+    /// and only where you are looking.
+    #[test]
+    fn ts_decorations_dim_and_mark_the_focused_window_only() {
+        let mut ed = rust_editor();
+        sized(&mut ed);
+        ex(&mut ed, "vs");
+        ex(&mut ed, "ts");
+
+        let dim = ed.theme.ui.dim;
+        let mark = ed.theme.ui.search;
+        let repaints = |ed: &Editor, id| {
+            ed.decorations(id, 0..3)
+                .into_iter()
+                .filter_map(|d| match d {
+                    Decoration::Repaint { range, style, .. } => Some((range, style)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let focused = repaints(&ed, ed.focus());
+        assert!(focused.iter().any(|(_, style)| *style == dim), "the dim went down");
+        assert!(
+            focused.iter().any(|(range, style)| *style == mark && range.start == 6),
+            "the `(` wears a mark: {focused:?}"
+        );
+
+        let other = ed.window_ids().into_iter().find(|&id| id != ed.focus()).unwrap();
+        assert!(
+            !repaints(&ed, other).iter().any(|(_, style)| *style == dim),
+            "the unfocused window reads normally"
+        );
+    }
+
+    #[test]
+    fn peek_without_a_server_says_why_and_does_not_split() {
+        let mut ed = editor("fn main() {}\n");
+        sized(&mut ed);
+        let before = ed.window_ids().len();
+
+        ex(&mut ed, "peek");
+
+        assert_eq!(ed.window_ids().len(), before, "no empty split left behind");
+        assert!(ed.session.status.starts_with("lsp:"), "{}", ed.session.status);
     }
 
     // ---- gq, reflow ---------------------------------------------------------

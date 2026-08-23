@@ -935,15 +935,21 @@ impl Input {
             return None;
         }
 
-        // `]` or `[` is holding out for its second key. Only `d` — the
-        // diagnostic jumps — answers today; the family grows a letter at a
-        // time. See `docs/specs/diagnostics.md`.
+        // `]` or `[` is holding out for its second key: `d` — the diagnostic
+        // jumps — and the doubled form, the boundary walk. The family grows a
+        // letter at a time. See `docs/specs/diagnostics.md` and
+        // `docs/specs/boundaries.md`.
         if let Some(forward) = self.bracket_pending.take() {
             return match c {
                 'd' => {
                     let line = if forward { "dnext" } else { "dprev" };
                     self.plain(Action::Ex { line: line.into(), run: true })
                 }
+                // `]]` and `[[` — the doubled key, never the crossed pair:
+                // `][` meaning something subtly different is vim trivia bi
+                // declines to inherit.
+                ']' if forward => self.plain(Action::BoundaryJump { forward: true }),
+                '[' if !forward => self.plain(Action::BoundaryJump { forward: false }),
                 _ => {
                     self.reset();
                     None
@@ -2376,6 +2382,12 @@ leader = \" \"
                 sink: Sink::Ring
             }
         );
+    }
+
+    #[test]
+    fn doubled_brackets_walk_boundaries() {
+        assert_eq!(typed("]]").action, Action::BoundaryJump { forward: true });
+        assert_eq!(typed("[[").action, Action::BoundaryJump { forward: false });
     }
 
     #[test]
