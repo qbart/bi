@@ -81,6 +81,32 @@ the lines starting `w`. That is the feature `Ctrl-R` already is, done better:
 it filters on every term, shows you the list, and does not make you guess how
 many times to press a key. `Up` is for the last thing or the one before it.
 
+## The selection comes back
+
+Pressing `:` with a selection up prefills `'v ` and remembers the shape it
+interrupted (`Session::interrupted_visual`). What happens to that selection
+when the line is done depends on what the line did:
+
+- **A command that consumed it** — `:'v case snake`, `:'v s/a/b/` — collapses
+  the selections as part of its edit and the editor stays in normal mode.
+  That was already true.
+- **Anything else returns to visual mode.** A command that failed
+  (`:'v case invalid`, an unknown name, `no line 99`), a command that had no
+  use for the selection (`:w`), a command that deliberately kept it
+  (`:'v m +1` keeps the moved block selected so you can move it again), `Esc`
+  on the line, and backspacing off the front of it — in every one of these
+  the selection is still standing, so the mode says so.
+
+**The rule is one test, not a list**: after the `:` line closes, if the
+window still holds a selection with room in it, the editor is back in the
+visual mode it interrupted. There is no registry of which commands fail and
+which succeed — a command that consumes the selection collapses it, and the
+collapse is the signal. That matters because the renderer already paints every
+uncollapsed selection whatever the mode: without this rule a failed
+`:'v case invalid` left the selection *painted* but the mode normal, so the
+next `:` prefilled nothing and the retyped command quietly acted on the word
+under the cursor instead of the selection you were looking at.
+
 ## Where it does not apply
 
 The `/` and `?` lines keep their append-and-backspace `String`. They want the
@@ -105,6 +131,13 @@ In `editor.rs`:
 - `Up` with an empty history leaves the line alone.
 - typing after a recall ends the walk: `Down` then does nothing.
 - executing a recalled line runs it and records it at the front.
+- a failed `:'v case invalid` returns to visual mode with the selection
+  standing, and the next `:` prefills `'v ` again; so do an unknown command,
+  `Esc` on the line, and backspacing off the front of it.
+- `:'v case snake` still ends in normal mode — consuming the selection
+  collapses it, and the collapse is the signal.
+- `:'v m +1` returns to visual mode with the moved block selected.
+- the shape survives: a rectangle interrupted is a rectangle restored.
 
 In `input.rs`:
 

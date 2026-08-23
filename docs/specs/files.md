@@ -28,10 +28,28 @@ is exactly the thing terms cannot do, and the same laxness that would be
 useless over prose is what makes a path list usable. So the picker asks its
 kind which rule to apply, and files are the kind that gets subsequences.
 
-Case-insensitive, and the order is the walk's rather than a ranking. A ranking
-— fzf's, which weighs word boundaries and consecutive runs — is a real
-improvement and a bigger piece of work; the walk order is directories first and
-then alphabetical, which is at least an order somebody chose.
+Case-insensitive, and **ranked**: the list is sorted by how well each path
+matches, not left in the walk's order. The first cut left the walk order —
+directories first, then alphabetical — and it put `src/core/animation_curve.cpp`
+above `src/main.cpp` for the query `main`, because both contain the letters in
+order and `animation_curve` comes first alphabetically. A subsequence filter
+without a ranking misses the point of a fuzzy finder: the letters appearing
+*together* is most of what you were saying.
+
+The scorer is the one the tree picker already had — 8 for a consecutive
+character, 4 for one landing on a boundary, 1 anywhere else, shorter breaking
+ties — with one repair it needed before a file list could trust it: it takes
+the **best anchor for the first character**, not the first one. Scored greedily
+from the first `m` in the text, `main` against `domain/main.rs` matches
+`m`‑`a`‑`i`‑`n` scattered through `domain` and never sees the whole word
+sitting after the slash. Every occurrence of the query's first character is a
+candidate start, each is scored greedily from there, and the best one is the
+answer. That is still not every alignment of every character — no fuzzy finder
+people like does that — but it is the half of Sublime's ranking that pays for
+itself.
+
+The sort is stable, so equal scores keep the walk order, which stays the tie
+someone chose.
 
 ## What is walked
 
@@ -67,6 +85,11 @@ copy of it.
 ## Tests
 
 - A subsequence finds a path: `sfr` matches `src/find/render.rs`.
+- `main` ranks `src/main.cpp` above `src/core/animation_curve.cpp` — the run
+  beats the scatter.
+- `main` against `domain/main.rs` scores the word after the slash, not the
+  letters inside `domain` — the anchor is the best one, not the first one.
+- Equal scores keep the walk order.
 - Terms still rule the register picker, so prose does not match everything.
 - Hidden entries are absent from the walk, and so is everything the project's
   `.gitignore` names.

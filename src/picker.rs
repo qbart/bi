@@ -92,17 +92,19 @@ impl PickerKind {
     /// Whether matches are sorted by how well they match, rather than kept in
     /// the order they were given.
     ///
-    /// Only the tree list, and the reason is that only its order is
-    /// meaningless: the register ring, the buffer list and the command history
-    /// are all newest-first, which is an answer to "which one did you mean"
-    /// that a score would throw away. A tree in filesystem order has no such
-    /// answer, and the whole-tree list is long enough to need one.
+    /// The lists whose given order answers nothing: a tree in filesystem
+    /// order, a file walk in directory order. The register ring, the buffer
+    /// list and the command history stay unranked because newest-first is
+    /// already an answer to "which one did you mean" that a score would throw
+    /// away. Unranked, `main` put `src/core/animation_curve.cpp` above
+    /// `src/main.cpp` — the letters in order, alphabetically first, and not
+    /// what anyone typing `main` meant. See `docs/specs/files.md`.
     ///
     /// The sort is stable, which is the other half of it: the caller puts the
     /// rows it would rather offer first, and they win every tie without
     /// winning an argument. See `docs/specs/tree.md`.
     fn ranked(&self) -> bool {
-        matches!(self, PickerKind::TreeRow)
+        matches!(self, PickerKind::TreeRow | PickerKind::File)
     }
 }
 
@@ -170,15 +172,36 @@ fn matches_subsequence(text: &str, query: &str) -> bool {
 /// - **shorter wins a tie**, by a small subtraction rather than a rule, so a
 ///   deep path never loses to a short one it genuinely matched better.
 ///
-/// Greedy and left to right, which is what [`matches_subsequence`] already
-/// does: the alternative is every alignment of the query, and no fuzzy finder
-/// that people like does that.
+/// Greedy from the best anchor. Greedy left to right is what
+/// [`matches_subsequence`] already does, but anchored at the *first*
+/// occurrence of the query's first character it never sees `main` sitting
+/// whole in `domain/main.rs` — it spends the `m` inside `domain` and scores
+/// the scatter. So every occurrence of the first character is a candidate
+/// start, each is scored greedily from there, and the best one is the answer.
+/// Still not every alignment of every character — no fuzzy finder that people
+/// like does that — but the half of it that pays for itself.
 fn score(text: &str, query: &str) -> i32 {
-    let wanted: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+    let wanted: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
     if wanted.is_empty() {
         return 0;
     }
     let chars: Vec<char> = text.chars().collect();
+    let lowered: Vec<char> = chars.iter().map(|c| c.to_lowercase().next().unwrap_or(*c)).collect();
+
+    (0..chars.len())
+        .filter(|&start| lowered[start] == wanted[0])
+        .filter_map(|start| score_from(&chars, &lowered, &wanted, start))
+        .max()
+        .unwrap_or(0)
+}
+
+/// One greedy pass, anchored: the first character taken at `start`, the rest
+/// wherever they next appear.
+fn score_from(chars: &[char], lowered: &[char], wanted: &[char], start: usize) -> Option<i32> {
     let boundary = |i: usize| match i {
         0 => true,
         i => {
@@ -187,11 +210,9 @@ fn score(text: &str, query: &str) -> i32 {
         }
     };
 
-    let (mut total, mut at, mut previous) = (0, 0, None);
-    for want in wanted {
-        let want = want.to_lowercase().next().unwrap_or(want);
-        let found = chars[at..].iter().position(|c| c.to_lowercase().next() == Some(want));
-        let Some(offset) = found else { return 0 };
+    let (mut total, mut at, mut previous) = (0, start, None);
+    for &want in wanted {
+        let offset = lowered[at..].iter().position(|&c| c == want)?;
         let i = at + offset;
         total += match (previous == Some(i.wrapping_sub(1)), boundary(i)) {
             (true, _) => 8,
@@ -203,7 +224,7 @@ fn score(text: &str, query: &str) -> i32 {
     }
     // A tiebreak, not a weight: it can separate two equal matches and can
     // never outrank one character landing where it should.
-    total - (chars.len() as i32) / 8
+    Some(total - (chars.len() as i32) / 8)
 }
 
 impl Picker {
@@ -446,6 +467,40 @@ mod tests {
         assert_eq!(shown(&p), ["Retry Later"]);
     }
 
+    /// The run beats the scatter: `main` appearing whole outranks its letters
+    /// spread through `animation`, whatever the walk order said.
+    #[test]
+    fn a_file_list_ranks_the_run_above_the_scatter() {
+        let mut p = files(&[
+            "src/core/animation_curve.cpp",
+            "src/core/animation_curve.hpp",
+            "src/main.cpp",
+        ]);
+        type_query(&mut p, "main");
+        assert_eq!(shown(&p)[0], "src/main.cpp");
+    }
+
+    /// The anchor is the best one, not the first one: greedy from the first
+    /// `m` would spend it inside `domain` and never see the word after the
+    /// slash.
+    #[test]
+    fn the_scorer_anchors_where_the_match_is_best() {
+        let mut p = files(&["domain/main.rs", "dominic/other.rs"]);
+        type_query(&mut p, "main");
+        assert_eq!(shown(&p), ["domain/main.rs"]);
+        assert!(
+            score("domain/main.rs", "main") > score("dxoxmxain/list.rs", "main"),
+            "the whole word outranks the scatter even behind a decoy prefix"
+        );
+    }
+
+    #[test]
+    fn equal_scores_keep_the_walk_order() {
+        let mut p = files(&["a/same.rs", "b/same.rs", "c/same.rs"]);
+        type_query(&mut p, "same");
+        assert_eq!(shown(&p), ["a/same.rs", "b/same.rs", "c/same.rs"]);
+    }
+
     /// Recency is the ranking. The most recently captured thing is usually the
     /// one you want, and no relevance heuristic beats that for a clipboard.
     #[test]
@@ -568,15 +623,13 @@ mod tests {
     /// The lists whose order is an answer keep it: newest-first is what the
     /// register ring, the buffer list and the history are telling you.
     #[test]
-    fn only_the_tree_list_is_ranked() {
+    fn only_the_orderless_lists_are_ranked() {
         assert!(PickerKind::TreeRow.ranked());
-        for kind in [
-            PickerKind::File,
-            PickerKind::Buffer,
-            PickerKind::History,
-            PickerKind::Register { before: false },
-        ] {
-            assert!(!kind.ranked(), "{kind:?}");
+        assert!(PickerKind::File.ranked(), "the walk order answers nothing");
+        for kind in
+            [PickerKind::Buffer, PickerKind::History, PickerKind::Register { before: false }]
+        {
+            assert!(!kind.ranked(), "{kind:?} is newest-first, which is already an answer");
         }
     }
 
