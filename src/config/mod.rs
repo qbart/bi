@@ -140,6 +140,10 @@ pub struct Options {
     pub shiftwidth: usize,
     /// Whether a new line starts under the one above it.
     pub autoindent: bool,
+    /// The column `gq` folds prose to. 80 rather than vim's 0, because bi
+    /// does not wrap while typing and 0 would leave `gq` with nothing to aim
+    /// at. See `docs/specs/reflow.md`.
+    pub textwidth: usize,
     /// Whether each level of indentation gets a vertical line down it.
     pub indent_guides: bool,
     /// Cells reserved to the left of the line numbers, for a mark about the
@@ -209,6 +213,7 @@ impl Default for Options {
             expandtab: indent.expandtab,
             shiftwidth: indent.shiftwidth,
             autoindent: indent.autoindent,
+            textwidth: 80,
             indent_guides: true,
             gutter: 1,
             whitespace: false,
@@ -265,6 +270,9 @@ impl Options {
             ("expandtab", _) => return Err("expandtab takes true or false".into()),
             ("autoindent", OptionValue::Bool(on)) => self.autoindent = on,
             ("autoindent", _) => return Err("autoindent takes true or false".into()),
+            // A width of nothing would fold every word onto its own line.
+            ("textwidth", OptionValue::Int(n)) if n >= 1 => self.textwidth = n as usize,
+            ("textwidth", _) => return Err("textwidth takes a count of 1 or more".into()),
             ("indent_guides", OptionValue::Bool(on)) => self.indent_guides = on,
             ("indent_guides", _) => return Err("indent_guides takes true or false".into()),
             ("gutter", OptionValue::Int(n)) if n >= 0 => self.gutter = n as usize,
@@ -334,6 +342,7 @@ impl Options {
             "shiftwidth" => OptionValue::Int(self.shiftwidth as i64),
             "expandtab" => OptionValue::Bool(self.expandtab),
             "autoindent" => OptionValue::Bool(self.autoindent),
+            "textwidth" => OptionValue::Int(self.textwidth as i64),
             "indent_guides" => OptionValue::Bool(self.indent_guides),
             "gutter" => OptionValue::Int(self.gutter as i64),
             "whitespace" => OptionValue::Bool(self.whitespace),

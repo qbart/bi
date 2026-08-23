@@ -397,6 +397,7 @@ impl Input {
             Some(Operator::Change) => s.push('c'),
             Some(Operator::Yank) => s.push('y'),
             Some(Operator::Indent { right }) => s.push(if right { '>' } else { '<' }),
+            Some(Operator::Reflow) => s.push_str("gq"),
             None => {}
         }
         if let Some(n) = self.motion_count {
@@ -975,6 +976,16 @@ impl Input {
                 // The last substitute over the whole file — `:%&&` and
                 // nothing more. See `docs/specs/substitute.md`.
                 '&' => self.plain(Action::Ex { line: "%&&".into(), run: true }),
+                // `gq` — the format operator. Under a pending `gq` this same
+                // key is the doubled form's tail, so `gqgq` covers the line
+                // the way `gqq` does. See `docs/specs/reflow.md`.
+                'q' if self.operator == Some(Operator::Reflow) => {
+                    self.resolve(Motion::CurrentLine)
+                }
+                'q' if self.operator.is_none() => {
+                    self.operator = Some(Operator::Reflow);
+                    None
+                }
                 _ => {
                     self.reset();
                     None
@@ -1005,6 +1016,8 @@ impl Input {
                     | (Operator::Yank, 'y')
                     | (Operator::Indent { right: true }, '>')
                     | (Operator::Indent { right: false }, '<')
+                    // `gqq`, and `gqgq` via the `g` block above.
+                    | (Operator::Reflow, 'q')
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
@@ -1017,7 +1030,7 @@ impl Input {
                     Operator::Yank => Some(Surround::Add),
                     Operator::Delete => Some(Surround::Delete),
                     Operator::Change => Some(Surround::Change(None)),
-                    Operator::Indent { .. } => None,
+                    Operator::Indent { .. } | Operator::Reflow => None,
                 };
                 if self.surround.is_some() {
                     // `ys` keeps the yank operator pending, because what
@@ -1305,6 +1318,19 @@ impl Input {
         if c == 'i' || c == 'a' {
             self.object_pending = Some(c == 'a');
             return None;
+        }
+
+        // `gq` — two keys where the others are one, so the `g` is caught
+        // here before the fall-through to `normal` reads it as a motion
+        // prefix and this `q` as an operator start.
+        if self.g_pending && c == 'q' {
+            self.g_pending = false;
+            let sink = self.sink;
+            self.reset();
+            return Some(Command {
+                count: 1,
+                action: Action::OperateSelection { op: Operator::Reflow, sink },
+            });
         }
 
         // An operator in visual mode takes the selection, not a motion, so it
@@ -2295,6 +2321,46 @@ leader = \" \"
                 count: 3,
                 sink: Sink::Ring
             }
+        );
+    }
+
+    /// `gq` is an operator in the full sense, with both of vim's doubled
+    /// spellings.
+    #[test]
+    fn gq_is_an_operator_and_doubles_both_ways() {
+        assert_eq!(
+            typed("gqj").action,
+            Action::Operate {
+                op: Operator::Reflow,
+                target: Target::Motion(Motion::Down),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        for spelling in ["gqq", "gqgq"] {
+            assert_eq!(
+                typed(spelling).action,
+                Action::Operate {
+                    op: Operator::Reflow,
+                    target: Target::Motion(Motion::CurrentLine),
+                    count: 1,
+                    sink: Sink::Ring
+                },
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_gq_takes_the_selection() {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in "gq".chars() {
+            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+        }
+        assert_eq!(
+            last.expect("resolved").action,
+            Action::OperateSelection { op: Operator::Reflow, sink: Sink::Ring }
         );
     }
 

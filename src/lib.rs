@@ -41,6 +41,7 @@ pub mod lsp;
 pub mod motion;
 pub mod picker;
 pub mod range;
+pub mod reflow;
 pub mod region;
 pub mod registers;
 pub mod resize;

@@ -191,6 +191,7 @@ const LIB_MODULES: &[&str] = &[
     "motion.rs",
     "picker.rs",
     "range.rs",
+    "reflow.rs",
     "region.rs",
     "registers.rs",
     "results.rs",

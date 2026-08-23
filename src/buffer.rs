@@ -662,6 +662,30 @@ impl Buffer {
         changed.then(|| self.first_non_blank(self.clamped(self.at_row(first, false), false)))
     }
 
+    /// Rewraps rows `first..=last` to `width` columns — `gq`, through
+    /// [`crate::reflow::reflow`]. Says where the cursor goes: the first
+    /// non-blank of the last row produced, the end of what was formatted.
+    /// `None` when nothing changed, so no no-op lands on the undo stack.
+    pub fn reflow_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        width: usize,
+        tab_width: usize,
+    ) -> Option<Cursor> {
+        let last = last.min(self.line_count().saturating_sub(1));
+        let lines: Vec<String> = (first..=last).map(|row| self.line(row)).collect();
+        let wrapped = crate::reflow::reflow(&lines, width, tab_width);
+        if wrapped == lines {
+            return None;
+        }
+        let start = self.rope.line_to_char(first);
+        let stop = self.rope.line_to_char(last) + self.line_len(last);
+        self.apply_edit(start, stop, &wrapped.join("\n"));
+        let end_row = first + wrapped.len().saturating_sub(1);
+        Some(self.first_non_blank(self.clamped(self.at_row(end_row, false), false)))
+    }
+
     /// `Tab` in insert mode: forward to the next indent stop.
     ///
     /// Aligns rather than inserting a fixed width, which is what a tab has

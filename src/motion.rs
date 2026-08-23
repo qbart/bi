@@ -140,6 +140,10 @@ pub enum Operator {
     Indent {
         right: bool,
     },
+    /// `gq` — rewrap to `textwidth`. Captures nothing and is always linewise,
+    /// like [`Operator::Indent`], and for the same reasons. See
+    /// `docs/specs/reflow.md`.
+    Reflow,
 }
 
 /// How a motion's endpoints turn into a range.

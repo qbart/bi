@@ -19,6 +19,9 @@ shiftwidth = 0
 expandtab = true
 autoindent = true
 
+# The column `gq` folds prose to. See docs/specs/reflow.md.
+textwidth = 80
+
 # A vertical line down each level of indentation. Its colour is the theme's
 # `indent_guide`. See docs/specs/indent.md.
 indent_guides = true

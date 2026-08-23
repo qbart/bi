@@ -7442,6 +7442,22 @@ impl View<'_> {
                     }
                 });
             }
+            // Like `>`: captures nothing, always linewise. See
+            // `docs/specs/reflow.md`.
+            Action::Operate { op: Operator::Reflow, target, count, .. } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                let count = *count;
+                let (width, tab) = (self.options.textwidth, self.options.tab_width);
+                self.for_each_selection(|ed, sel| {
+                    let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
+                        return sel;
+                    };
+                    match ed.buffer.reflow_rows(first, last, width, tab) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => sel,
+                    }
+                });
+            }
             Action::Operate { op, target, count, sink } => {
                 let Some(target) = self.resolve_find_target(*target) else { return };
                 let (op, count, sink) = (*op, *count, *sink);
@@ -7701,6 +7717,22 @@ impl View<'_> {
                         false => Selection { anchor: start, head: end },
                     }
                 });
+            }
+            // The rows the selection touches, whatever its shape — there is
+            // no reflowing half a line. Unlike `>` it consumes the selection:
+            // the text under it has been rewrapped out of recognition.
+            Action::OperateSelection { op: Operator::Reflow, .. } => {
+                let (width, tab) = (self.options.textwidth, self.options.tab_width);
+                self.for_each_selection(|ed, sel| {
+                    let (lo, hi) = sel.range();
+                    let first = ed.buffer.row_at(Cursor::at(lo));
+                    let last = ed.buffer.row_at(Cursor::at(hi));
+                    match ed.buffer.reflow_rows(first, last, width, tab) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => Selection::collapsed(sel.head),
+                    }
+                });
+                self.session.mode = Mode::Normal;
             }
             Action::OperateSelection { op, sink }
                 if self.session.mode.visual() == Some(Shape::Block) =>
@@ -10957,6 +10989,87 @@ mod tests {
 
         assert_eq!(rope_of(&ed), "a\nb\n");
         assert!(ed.session.status.starts_with("`:d` deletes lines"), "{}", ed.session.status);
+    }
+
+    // ---- gq, reflow ---------------------------------------------------------
+
+    #[test]
+    fn gqq_wraps_the_cursors_line_to_textwidth() {
+        let mut ed = editor("one two three four five\n");
+        ex(&mut ed, "set textwidth 10");
+
+        ed.apply(operate(Operator::Reflow, Motion::CurrentLine, 1));
+
+        assert_eq!(rope_of(&ed), "one two\nthree four\nfive\n");
+    }
+
+    #[test]
+    fn gqip_wraps_the_paragraph_and_leaves_its_neighbour() {
+        let mut ed = editor("aaa bbb\nccc\n\nnext one\n");
+        ex(&mut ed, "set textwidth 40");
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Reflow,
+            target: Target::Object { object: TextObject::Paragraph, around: false },
+            count: 1,
+            sink: Sink::Ring,
+        }));
+
+        assert_eq!(rope_of(&ed), "aaa bbb ccc\n\nnext one\n");
+    }
+
+    /// Vim's habit: the cursor at the end of what was formatted, ready to
+    /// continue below it.
+    #[test]
+    fn the_reflow_cursor_lands_on_the_last_line_produced() {
+        let mut ed = editor("one two three\nrest\n");
+        ex(&mut ed, "set textwidth 8");
+
+        ed.apply(operate(Operator::Reflow, Motion::CurrentLine, 1));
+
+        assert_eq!(rope_of(&ed), "one two\nthree\nrest\n");
+        let row = ed.buffer().unwrap().row_at(ed.cursor().unwrap());
+        assert_eq!(row, 1);
+    }
+
+    #[test]
+    fn a_comment_reflow_keeps_its_leader_and_is_one_undo_step() {
+        let mut ed = editor("// alpha beta gamma\n");
+        ex(&mut ed, "set textwidth 11");
+
+        ed.apply(operate(Operator::Reflow, Motion::CurrentLine, 1));
+        assert_eq!(rope_of(&ed), "// alpha\n// beta\n// gamma\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(rope_of(&ed), "// alpha beta gamma\n");
+    }
+
+    #[test]
+    fn visual_gq_wraps_the_selected_rows_and_collapses() {
+        let mut ed = editor("one two three four\nrest\n");
+        ex(&mut ed, "set textwidth 10");
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+
+        ed.apply(cmd(Action::OperateSelection { op: Operator::Reflow, sink: Sink::Ring }));
+
+        assert_eq!(rope_of(&ed), "one two\nthree four\nrest\n");
+        assert_eq!(ed.session.mode, Mode::Normal, "the selection was consumed");
+    }
+
+    #[test]
+    fn dot_repeats_a_reflow() {
+        let mut ed = editor("aaa bbb ccc\n\nddd eee fff\n");
+        ex(&mut ed, "set textwidth 7");
+
+        ed.apply(operate(Operator::Reflow, Motion::CurrentLine, 1));
+        assert_eq!(rope_of(&ed), "aaa bbb\nccc\n\nddd eee fff\n");
+
+        let at = rope_of(&ed).find("ddd").unwrap();
+        ed.set_cursor(Cursor::at(at));
+        ed.apply(cmd(Action::RepeatChange { count: None }));
+
+        assert_eq!(rope_of(&ed), "aaa bbb\nccc\n\nddd eee\nfff\n");
     }
 
     // ---- file operations ----------------------------------------------------
