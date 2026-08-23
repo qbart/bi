@@ -972,6 +972,9 @@ impl Input {
                 // the same shape as `ga`. See `docs/specs/lsp-requests.md`.
                 'd' => self.plain(Action::Ex { line: "definition".into(), run: true }),
                 'r' => self.plain(Action::Ex { line: "references".into(), run: true }),
+                // The last substitute over the whole file — `:%&&` and
+                // nothing more. See `docs/specs/substitute.md`.
+                '&' => self.plain(Action::Ex { line: "%&&".into(), run: true }),
                 _ => {
                     self.reset();
                     None
@@ -1155,6 +1158,10 @@ impl Input {
                 self.reset();
                 return Some(Command { count: 1, action: Action::RepeatChange { count } });
             }
+            // The ex command spelled for the keyboard, the same shape as `ga`
+            // and `gd`. `&&` rather than vim's flag-dropping `&` — see
+            // `docs/specs/substitute.md`.
+            '&' => return self.plain(Action::Ex { line: "&&".into(), run: true }),
             '~' => {
                 let count = self.fold_count();
                 self.reset();

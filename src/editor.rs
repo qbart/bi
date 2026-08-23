@@ -721,6 +721,10 @@ pub struct Session {
     /// The last search, for `n`/`N` and the highlight pass. Beside
     /// `last_find`, and there for the same reason: it outlives `Input::reset`.
     pub last_search: Option<Search>,
+    /// The last `:s` that ran, pattern resolved, for `&` and `:&&`. Beside
+    /// `last_search` because it is set in the same breath — see
+    /// `docs/specs/substitute.md`.
+    pub last_substitute: Option<crate::substitute::Substitute>,
     /// Everything `:set` can change, and everything `[options]` can say.
     ///
     /// One struct rather than a field each so that a new option is one line in
@@ -1440,6 +1444,12 @@ enum ExLine {
         scope: Option<Scope>,
         how: crate::substitute::Substitute,
     },
+    /// `:&` and `:&&` — the last substitute again, flags and all. One meaning
+    /// under two spellings, deliberately: vim's flag-dropping `:&` is the
+    /// gotcha bi declines. See `docs/specs/substitute.md`.
+    SubstituteRepeat {
+        scope: Option<Scope>,
+    },
     /// `:[scope]sort [flags]` — order the rows, the whole file when nothing
     /// narrows it. See `docs/specs/sort.md`.
     Sort {
@@ -1624,7 +1634,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
     if scope.is_some()
-        && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case" | "sort")
+        && !matches!(
+            name,
+            "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case" | "sort" | "&" | "&&"
+        )
     {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
     }
@@ -1697,6 +1710,13 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "s" | "substitute" => match crate::substitute::parse(arg) {
             Ok(how) => ExLine::Substitute { scope, how },
             Err(message) => ExLine::Error(message),
+        },
+        // One meaning under both spellings — see `docs/specs/substitute.md`.
+        // The argument is refused rather than dropped, the flags' own rule:
+        // `:& g` quietly ignoring the `g` is how you believe it ran with it.
+        "&" | "&&" => match arg.is_empty() {
+            true => ExLine::SubstituteRepeat { scope },
+            false => ExLine::Error(format!("nothing goes after `{name}` — got `{arg}`")),
         },
         "alt" | "alternate" => ExLine::Alternate,
         // Plural, because the command shows a list. `:sym` is the short form;
@@ -5127,16 +5147,11 @@ impl Editor {
             ExLine::Retab(scope) => {
                 self.in_view(|view| view.retab(scope, shape));
             }
-            ExLine::Substitute { scope, how } => {
-                // The last search is the session's, and an empty pattern means
-                // it — so it is read here, where both are in reach.
-                let last = self.session.last_search.as_ref().map(|s| s.pattern.clone());
-                let found = self.in_view(|view| view.substitute(scope, shape, &how, last));
-                if let Some(Some(pattern)) = found {
-                    self.session.last_search =
-                        Some(Search { pattern, whole_word: false, forward: true });
-                }
-            }
+            ExLine::Substitute { scope, how } => self.run_substitute(scope, shape, &how),
+            ExLine::SubstituteRepeat { scope } => match self.session.last_substitute.clone() {
+                Some(how) => self.run_substitute(scope, shape, &how),
+                None => self.session.status = "no substitute to repeat".into(),
+            },
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
@@ -5168,6 +5183,29 @@ impl Editor {
                     self.quit(true);
                 }
             }
+        }
+    }
+
+    /// `:s` and the `&` family both end here: run it, and remember what ran.
+    ///
+    /// The memory holds the pattern that was in force, not the empty one that
+    /// may have been typed — `&` repeats what happened, and what happened to
+    /// an empty pattern was the last search *of that moment*.
+    fn run_substitute(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        how: &crate::substitute::Substitute,
+    ) {
+        // The last search is the session's, and an empty pattern means it —
+        // so it is read here, where both are in reach.
+        let last = self.session.last_search.as_ref().map(|s| s.pattern.clone());
+        let found = self.in_view(|view| view.substitute(scope, shape, how, last));
+        if let Some(Some(pattern)) = found {
+            self.session.last_search =
+                Some(Search { pattern: pattern.clone(), whole_word: false, forward: true });
+            self.session.last_substitute =
+                Some(crate::substitute::Substitute { pattern, ..how.clone() });
         }
     }
 
@@ -10323,6 +10361,72 @@ mod tests {
         ex(&mut ed, "set number 0");
 
         assert_eq!(ed.session.options.number, LineNumbers::Off);
+    }
+
+    /// `&` repeats the last substitute on the cursor's line — flags and all,
+    /// which is the point of remembering the command rather than the pattern.
+    #[test]
+    fn ampersand_repeats_the_last_substitute_where_the_cursor_is() {
+        let mut ed = editor("a a\na a\n");
+        ex(&mut ed, "s/a/b/g");
+        assert_eq!(rope_of(&ed), "b b\na a\n");
+
+        ed.set_cursor(Cursor::at(4));
+        ed.apply(cmd(Action::Ex { line: "&&".into(), run: true }));
+
+        assert_eq!(rope_of(&ed), "b b\nb b\n", "the `g` came along");
+    }
+
+    #[test]
+    fn g_ampersand_repeats_it_over_the_whole_file() {
+        let mut ed = editor("a\na\na\n");
+        ex(&mut ed, "s/a/b/");
+        assert_eq!(rope_of(&ed), "b\na\na\n");
+
+        ed.apply(cmd(Action::Ex { line: "%&&".into(), run: true }));
+
+        assert_eq!(rope_of(&ed), "b\nb\nb\n");
+    }
+
+    #[test]
+    fn ampersand_before_any_substitute_says_so() {
+        let mut ed = editor("a\n");
+
+        ed.apply(cmd(Action::Ex { line: "&&".into(), run: true }));
+
+        assert_eq!(rope_of(&ed), "a\n");
+        assert_eq!(ed.session.status, "no substitute to repeat");
+    }
+
+    /// The memory holds the pattern that *ran*: an empty pattern resolved to
+    /// the search of that moment, and later searches do not rewrite history.
+    #[test]
+    fn the_repeat_keeps_the_pattern_that_was_in_force() {
+        let mut ed = editor("one two\nnew two\n");
+        ed.session.last_search =
+            Some(Search { pattern: "two".into(), whole_word: false, forward: true });
+        ex(&mut ed, "s//2/");
+        assert_eq!(rope_of(&ed), "one 2\nnew two\n");
+
+        ed.session.last_search =
+            Some(Search { pattern: "new".into(), whole_word: false, forward: true });
+        ed.set_cursor(Cursor::at(6));
+        ed.apply(cmd(Action::Ex { line: "&&".into(), run: true }));
+
+        assert_eq!(rope_of(&ed), "one 2\nnew 2\n", "still `two`, not `new`");
+    }
+
+    #[test]
+    fn the_repeat_takes_a_range_and_refuses_an_argument() {
+        let mut ed = editor("a\na\na\na\n");
+        ex(&mut ed, "s/a/b/");
+
+        ex(&mut ed, "2,3&&");
+        assert_eq!(rope_of(&ed), "b\nb\nb\na\n");
+
+        ex(&mut ed, "&& g");
+        assert!(ed.session.status.starts_with("nothing goes after"), "{}", ed.session.status);
+        assert_eq!(rope_of(&ed), "b\nb\nb\na\n");
     }
 
     // ---- file operations ----------------------------------------------------

@@ -11,9 +11,9 @@ without the command changing shape.
 
 ## Status
 
-**Built.** Literal patterns, any delimiter, a range, `g`, `i`/`I` and `n`.
-`c` (confirm) and the whole of the pattern language are deferred, with reasons
-at the bottom.
+**Built.** Literal patterns, any delimiter, a range, `g`, `i`/`I` and `n`,
+and `&`/`g&`/`:&&` repeating the last one. `c` (confirm) and the whole of the
+pattern language are deferred, with reasons at the bottom.
 
 ## The command
 
@@ -147,20 +147,50 @@ other two `:` commands that rewrite lines.
 than derived from the pattern. `matches_in` keeps its signature and delegates
 with `None`, so the search highlight and the match count are untouched.
 
+## `&` — again
+
+A substitute that worked once is usually about to be wanted again, a line at a
+time, wherever the cursor has got to since.
+
+```
+:[range]&        the last substitute, over the range
+:[range]&&       the same command — one spelling, written twice
+&                the ex command, on the cursor's line
+g&               the ex command, over the whole file
+```
+
+**`&` repeats the last `:s` exactly — flags included.** Vim's `:&` drops the
+flags and `:&&` keeps them, a distinction almost nobody wants and everybody
+trips over; bi spells both the same on purpose, so there is one thing to
+remember instead of two. `g&` is `:%&&` and nothing more — vim's `g&` also
+swaps in the last *search* pattern, which turns "do that again everywhere"
+into "do something related everywhere", and bi declines the swap.
+
+What is remembered is the command as it ran: the pattern already resolved, so
+`:s//b/` then `&` repeats the search that was in force *then*, not whatever
+has been searched since. `n` — count only — is remembered too, because
+repeating a question is still repeating. A `:s` that failed to parse or
+matched nothing leaves the memory alone; `&` before any `:s` at all says
+`no substitute to repeat`.
+
+The keys are the ex command spelled for the keyboard: `&` is
+`Action::Ex { line: "&&" }`, `g&` is `Action::Ex { line: "%&&" }` — the same
+shape `ga` and `gd` already have, so the keymap learns no new machinery.
+
+The memory is `session.last_substitute`, an `Option<Substitute>` set beside
+`last_search` where the substitute already reports its pattern.
+
 ## Deferred
 
 **Regular expressions.** The reason `search.md` deferred `:s` in the first
 place, still the biggest missing thing here, and now the only one. When they
 land they land in `Buffer::matches_in_cased` and every caller — `/`, `n`, the
-highlight, this — gets them at once. `&`, `\1` and `\r` come with them.
+highlight, this — gets them at once. `\1` and `\r` come with them.
 
 **`c`, confirm.** `:%s/a/b/gc` stops on each match and waits for `y`, `n`, `a`,
 `q` or `l`. That is a modal loop with its own keymap and its own drawing, which
 is a feature rather than a flag, and it wants the match highlighted on screen
 while it asks. Nothing here blocks it.
-
-**`&` and `:&&`**, repeating the last substitute. Cheap once there is a last
-substitute to remember, and worth waiting for the shape of one.
 
 ## Tests
 
@@ -188,3 +218,8 @@ In `editor.rs`:
 - the cursor ends on the last line changed, and `n` afterwards finds the
   pattern.
 - `:2,99s/…` says `no line 99` — the range rules are not re-implemented here.
+- `&` repeats the last substitute on the cursor's line, flags and all.
+- `g&` repeats it over the whole file.
+- `&` before any substitute says so and changes nothing.
+- the memory holds the pattern that *ran*: `:s//b/` then a new search then
+  `&` repeats the old pattern, not the new one.

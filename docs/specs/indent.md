@@ -129,11 +129,35 @@ way to get rid of it.
 vim, and which means a repeated `>>` keeps pushing the line it is looking at
 rather than sliding off the end of the indent it just made.
 
-**`=` is deliberately absent.** Reindenting to what the language thinks is
-correct needs tree-sitter indent queries, which is its own spec and its own
-pile of per-grammar behaviour. `>` and `<` say what *you* want; `=` says what
-the grammar wants, and those are different features that happen to share a
-neighbourhood on the keyboard.
+### `=` — reindent
+
+```
+={motion}   =G  =ip  ==      reindent
+=           (visual)         reindent the selected rows
+```
+
+`>` and `<` say what *you* want; `=` says what the structure wants. It is the
+third indent operator and works like the other two — takes a motion, doubles
+(`==`), `.` repeats it, always linewise, captures nothing, empty lines left
+empty, cursor on the first non-blank of the last line touched (the end of
+what was fixed, where `>` picks the first because it is usually about to run
+again).
+
+**What the structure wants is bracket depth.** A line's indent is one step
+per `{`, `[` or `(` left open above it, minus the closers the line itself
+leads with — computed from the top of the file, so `==` on one line still
+knows where it stands, and applied only to the rows the motion names. That is
+the same baseline vim's own `=` falls back to when nothing configures it, and
+it is honest about the same two limits: brackets inside strings count (the
+counting is textual until it is syntactic), and a language whose blocks are
+not bracketed — Python — gets its continuation lines aligned and its block
+structure flattened, so `=G` in Python is a thing the spec tells you not to
+do rather than a thing the editor refuses.
+
+The depth-counting is a pure function in `indent.rs` beside `leading` and
+`retab`; tree-sitter indent queries, when they come, replace the counting
+without changing the shape — the same seam `matches_in` leaves for regex.
+`gg=G` composes from parts that already exist.
 
 ## Insert mode
 
@@ -267,3 +291,9 @@ then config, then `.editorconfig`, then an explicit `:set` — is built.
 - The renderer holds no width of its own: the same text laid out at two widths
   comes out two lengths, which is only possible because the number arrives from
   the options rather than from a constant beside the drawing code.
+- `==` puts a brace-nested line at one step per open bracket; a line leading
+  with `}` sits with the line that opened it.
+- `=G` from the top reindents the file; a line outside the range is untouched.
+- `gg=G` composes; visual `=` covers the selected rows; both one undo step.
+- an over-closed file clamps at column zero rather than going negative.
+- blank lines stay empty under `=`.
