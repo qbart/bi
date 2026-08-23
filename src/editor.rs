@@ -4173,6 +4173,9 @@ impl Editor {
                     && line.is_empty()
                 {
                     self.session.mode = Mode::Normal;
+                    // Leaving this way is `Esc` spelled slower.
+                    let shape = self.session.interrupted_visual.take();
+                    self.revive_visual(shape);
                 }
             }
             Action::CommandMove(how) => {
@@ -4197,6 +4200,10 @@ impl Editor {
                 self.session.mode = Mode::Normal;
                 // The one `:` line that means something when abandoned.
                 self.abandon_paste();
+                // Backing out of the line is not a reason to lose what you
+                // had selected before pressing `:`.
+                let shape = self.session.interrupted_visual.take();
+                self.revive_visual(shape);
             }
             Action::CommandExecute => {
                 let Mode::Command(line) = std::mem::take(&mut self.session.mode) else {
@@ -4213,6 +4220,7 @@ impl Editor {
                 // noise in the list that exists to give your own back.
                 self.session.cmd_history.push(&line);
                 self.run_ex_over(&line, shape);
+                self.revive_visual(shape);
             }
             Action::Ex { line, run } => {
                 let line = line.clone();
@@ -4884,6 +4892,33 @@ impl Editor {
                     self.quit(true);
                 }
             }
+        }
+    }
+
+    /// Puts the editor back in the visual mode a `:` line interrupted, when
+    /// the selection it named is still standing.
+    ///
+    /// One test, not a registry of which commands fail: a command that
+    /// consumed the selection collapsed it as part of its edit (`:'v case`,
+    /// `:'v s/…`), and a collapsed selection is nothing to revive. Everything
+    /// else — a parse error, `no line 99`, a command with no use for the
+    /// scope, `Esc` on the line, `:'v m +1` deliberately keeping the moved
+    /// block — leaves the selection with room in it, and the renderer paints
+    /// every uncollapsed selection whatever the mode says. Without this the
+    /// paint lied: the selection was on screen but the next `:` prefilled
+    /// nothing, and the retyped command quietly acted on the word under the
+    /// cursor instead. See `docs/specs/cmdline.md`.
+    fn revive_visual(&mut self, shape: Option<Shape>) {
+        let Some(shape) = shape else { return };
+        if self.session.mode != Mode::Normal {
+            // The command opened something of its own — another `:` line, a
+            // picker — and taking the mode back would take that away.
+            return;
+        }
+        let standing =
+            self.selections().is_some_and(|s| s.all().iter().any(|sel| !sel.is_collapsed()));
+        if standing {
+            self.session.mode = Mode::Visual(shape);
         }
     }
 
@@ -14270,6 +14305,106 @@ mod tests {
         ex(&mut ed, "'v case snake");
 
         assert_eq!(whole(&ed), "let some_name = 1;\n", "and not the `let` in front of it");
+    }
+
+    /// A failed command keeps the selection *actionable*, not just painted:
+    /// visual mode comes back, so the next `:` prefills `'v ` again and the
+    /// fixed command acts on what you were looking at.
+    /// See `docs/specs/cmdline.md`.
+    #[test]
+    fn a_failed_command_returns_to_visual_mode() {
+        let mut ed = visual("hello world\n", 0, Shape::Chars);
+        for _ in 0..4 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v case invalid");
+
+        assert!(ed.session.status.starts_with("case what?"), "{}", ed.session.status);
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars), "the selection is still live");
+        assert_eq!(ed.selections().unwrap().primary().range(), (0, 4));
+
+        // And the retry is the whole point: `:` prefills the scope again.
+        ed.apply(cmd(Action::EnterCommandMode));
+        assert_eq!(ed.session.mode, Mode::Command(CmdLine::from("'v ")));
+        for c in "case upper".chars() {
+            ed.apply(cmd(Action::CommandChar(c)));
+        }
+        ed.apply(cmd(Action::CommandExecute));
+        assert_eq!(whole(&ed), "HELLO world\n", "the fixed command acts on the selection");
+        assert_eq!(ed.session.mode, Mode::Normal, "consumed, so it collapses");
+    }
+
+    #[test]
+    fn an_unknown_command_returns_to_visual_mode_too() {
+        let mut ed = visual("hello\n", 0, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+
+        ex(&mut ed, "flub");
+
+        assert_eq!(ed.session.status, "not a command: flub");
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
+    }
+
+    /// The shape survives the round trip: a rectangle interrupted is a
+    /// rectangle restored.
+    #[test]
+    fn the_shape_survives_a_failed_command() {
+        let mut ed = block_over_the_names(NAMES);
+
+        ex(&mut ed, "'v case sideways");
+
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Block));
+    }
+
+    #[test]
+    fn esc_on_the_line_puts_the_selection_back() {
+        let mut ed = visual("hello\n", 0, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        ed.apply(cmd(Action::CommandCancel));
+
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
+    }
+
+    #[test]
+    fn backspacing_off_the_line_puts_the_selection_back() {
+        let mut ed = visual("hello\n", 0, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        // The prefill is `'v ` — three characters, then the leaving press.
+        for _ in 0..4 {
+            ed.apply(cmd(Action::CommandBackspace));
+        }
+
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
+    }
+
+    /// `:m` keeps the moved block selected so you can move it again — and now
+    /// the mode agrees, so `:` prefills `'v ` for the next nudge.
+    #[test]
+    fn a_command_that_keeps_the_selection_returns_to_visual_mode() {
+        let mut ed = visual("one\ntwo\nthree\n", 0, Shape::Lines);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ex(&mut ed, "'v m $");
+
+        assert_eq!(whole(&ed), "three\none\ntwo\n");
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Lines), "still selected, and it says so");
+    }
+
+    /// A command with no use for the scope leaves the selection exactly as
+    /// interesting as it found it.
+    #[test]
+    fn a_command_that_ignores_the_selection_returns_to_visual_mode() {
+        let mut ed = visual("hello\n", 0, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+
+        ex(&mut ed, "noh");
+
+        assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
     }
 
     /// `:s` inside a rectangle stays inside it. The columns are the scope,
