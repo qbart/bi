@@ -105,7 +105,10 @@ pub fn parse_replace(arg: &str) -> Result<(String, String), String> {
 /// `\<delim>` is that character and `\\` is a backslash; every other `\` keeps
 /// its backslash, because the pattern is literal and `\d` is two characters
 /// until there is a regex to make it one.
-fn take_field(text: &str, delim: char) -> (String, Option<&str>) {
+///
+/// `pub(crate)` because `:g/pattern/cmd` reads its pattern in exactly this
+/// language — one escape rule, not two.
+pub(crate) fn take_field(text: &str, delim: char) -> (String, Option<&str>) {
     let mut out = String::new();
     let mut chars = text.char_indices();
     while let Some((i, c)) = chars.next() {

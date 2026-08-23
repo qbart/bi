@@ -1450,6 +1450,29 @@ enum ExLine {
     SubstituteRepeat {
         scope: Option<Scope>,
     },
+    /// `:[range]g/pattern/cmd` — `cmd` on every matching line; `invert` is
+    /// `:v` and `:g!`, the lines that do *not* match. The sub-command stays a
+    /// string until it runs, so there is exactly one ex grammar. See
+    /// `docs/specs/global.md`.
+    Global {
+        scope: Option<Scope>,
+        invert: bool,
+        pattern: String,
+        cmd: String,
+    },
+    /// `:[range]normal {keys}` — the keys replayed through the same machinery
+    /// a frontend feeds, once per row of the range, or once at the cursor.
+    Normal {
+        scope: Option<Scope>,
+        keys: String,
+    },
+    /// `:[range]d` — the rows, gone. The cursor's line by default. Short name
+    /// only: `:delete` keeps meaning a *path*, and the two cannot be mistyped
+    /// into each other because `:delete` demands an argument and `:d` refuses
+    /// one. See `docs/specs/global.md`.
+    DeleteLines {
+        scope: Option<Scope>,
+    },
     /// `:[scope]sort [flags]` — order the rows, the whole file when nothing
     /// narrows it. See `docs/specs/sort.md`.
     Sort {
@@ -1567,6 +1590,36 @@ fn split_glued_replace(cmd: &str) -> Option<(&str, &str)> {
     delimited.then(|| cmd.split_at(cmd.len() - rest.len()))
 }
 
+/// `:g/pattern/cmd`, `:v/pattern/cmd` and their long names, read off the
+/// whole line — *before* the whitespace split, because a pattern may contain
+/// spaces and the generic glue below would rejoin around them.
+///
+/// `None` when the line is not a global at all — a name that is not one of
+/// the four, or one of them with no delimiter after it (`:vs`, `:vnew` and
+/// any future `g…` command all keep working, because a letter is never a
+/// delimiter).
+fn parse_global(line: &str, scope: Option<Scope>) -> Option<ExLine> {
+    let rest = line
+        .strip_prefix("global")
+        .or_else(|| line.strip_prefix("vglobal"))
+        .or_else(|| line.strip_prefix('g'))
+        .or_else(|| line.strip_prefix('v'))?;
+    // `:v` is `:g!` under vim's other name; both spellings of "does not
+    // match" land on the same flag.
+    let invert = line.starts_with('v') || rest.starts_with('!');
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    // `:g /foo/d` — the space vim allows before the pattern.
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some(ExLine::Error("global what? `:g/pattern/cmd`".into()));
+    }
+    let mut chars = rest.chars();
+    let delim = chars.next().filter(|c| crate::substitute::is_delimiter(*c))?;
+    let (pattern, cmd) = crate::substitute::take_field(chars.as_str(), delim);
+    let cmd = cmd.unwrap_or("").trim().to_string();
+    Some(ExLine::Global { scope, invert, pattern, cmd })
+}
+
 /// `m+1` as `("m", "+1")` — the address vim lets touch the command name.
 ///
 /// `:m` is the only command that needs this, and it needs it because it is the
@@ -1604,6 +1657,13 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         };
     }
 
+    // `:g` and `:v` first, off the whole line: their pattern may contain
+    // spaces and their command is a line of its own, so neither survives the
+    // split-and-rejoin below.
+    if let Some(parsed) = parse_global(line, scope) {
+        return Some(parsed);
+    }
+
     let (cmd, arg) = match line.split_once(char::is_whitespace) {
         Some((c, a)) => (c, a.trim()),
         None => (line, ""),
@@ -1636,7 +1696,18 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     if scope.is_some()
         && !matches!(
             name,
-            "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case" | "sort" | "&" | "&&"
+            "m" | "move"
+                | "s"
+                | "substitute"
+                | "ret"
+                | "retab"
+                | "case"
+                | "sort"
+                | "&"
+                | "&&"
+                | "d"
+                | "normal"
+                | "norm"
         )
     {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
@@ -1717,6 +1788,18 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "&" | "&&" => match arg.is_empty() {
             true => ExLine::SubstituteRepeat { scope },
             false => ExLine::Error(format!("nothing goes after `{name}` — got `{arg}`")),
+        },
+        // Short name only — `:delete` keeps meaning a path, and the argument
+        // rule is what keeps the two apart. See `docs/specs/global.md`.
+        "d" => match arg.is_empty() {
+            true => ExLine::DeleteLines { scope },
+            false => ExLine::Error(format!(
+                "`:d` deletes lines and takes no argument — `:delete {arg}` deletes a path"
+            )),
+        },
+        "normal" | "norm" => match arg.is_empty() {
+            true => ExLine::Error("normal what? `:normal {keys}`".into()),
+            false => ExLine::Normal { scope, keys: arg.to_string() },
         },
         "alt" | "alternate" => ExLine::Alternate,
         // Plural, because the command shows a list. `:sym` is the short form;
@@ -2020,6 +2103,10 @@ pub struct Editor {
     /// opened it, `None` for the re-ask that follows the cursor.
     signature_want: Option<Option<char>>,
     signature_seq: u64,
+    /// Whether `:normal` is running. It refuses to nest — replayed keys
+    /// running the replayer is a loop with a keyboard in it. See
+    /// `docs/specs/global.md`.
+    replaying_normal: bool,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2383,6 +2470,7 @@ impl Editor {
             complete_seq: 0,
             signature_want: None,
             signature_seq: 0,
+            replaying_normal: false,
         };
         editor.resolve_options();
         editor
@@ -5152,6 +5240,13 @@ impl Editor {
                 Some(how) => self.run_substitute(scope, shape, &how),
                 None => self.session.status = "no substitute to repeat".into(),
             },
+            ExLine::Global { scope, invert, pattern, cmd } => {
+                self.run_global(scope, shape, invert, &pattern, &cmd);
+            }
+            ExLine::Normal { scope, keys } => self.run_normal_cmd(scope, shape, &keys),
+            ExLine::DeleteLines { scope } => {
+                self.in_view(|view| view.delete_rows(scope, shape));
+            }
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
@@ -5206,6 +5301,192 @@ impl Editor {
                 Some(Search { pattern: pattern.clone(), whole_word: false, forward: true });
             self.session.last_substitute =
                 Some(crate::substitute::Substitute { pattern, ..how.clone() });
+        }
+    }
+
+    /// Runs `run` with the focused buffer's undo deferred into one group —
+    /// the batch commands' single `u`. Begun and ended on the buffer that was
+    /// focused at the start, whatever `run` did with focus in between.
+    fn grouped_undo(&mut self, run: impl FnOnce(&mut Self)) {
+        let id = self.window().buffer();
+        let before = self.selections().map(|s| s.as_pairs());
+        let (Some(id), Some(before)) = (id, before) else {
+            run(self);
+            return;
+        };
+        self.entry_mut(id).buffer.begin_undo_group(before);
+        run(self);
+        let after = self.selections().map(|s| s.as_pairs()).unwrap_or_default();
+        self.entry_mut(id).buffer.end_undo_group(after);
+    }
+
+    /// `:[range]g/pattern/cmd` — see `docs/specs/global.md`.
+    fn run_global(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        invert: bool,
+        pattern: &str,
+        cmd: &str,
+    ) {
+        // The sub-command is judged before anything runs: refused by name,
+        // not discovered broken on the fortieth matching line.
+        if cmd.is_empty() {
+            self.session.status = "and do what? `:g/pattern/d`".into();
+            return;
+        }
+        match parse_ex(cmd) {
+            Some(
+                ExLine::DeleteLines { .. }
+                | ExLine::Substitute { .. }
+                | ExLine::SubstituteRepeat { .. }
+                | ExLine::Move { .. }
+                | ExLine::Case { .. }
+                | ExLine::Retab(_)
+                | ExLine::Normal { .. },
+            ) => {}
+            Some(ExLine::Error(message)) => {
+                self.session.status = message;
+                return;
+            }
+            // A whitelist, not a blacklist: the failure mode of a blacklist
+            // is `:g/x/q` closing the editor on the first match. The allowed
+            // commands are the ones that act on the cursor's line when no
+            // range narrows them, which is exactly the contract the walk
+            // below hands each of them.
+            _ => {
+                let head = cmd.split_whitespace().next().unwrap_or(cmd);
+                self.session.status =
+                    format!("`:g` runs d, s, &, m, case, retab or normal — not `{head}`");
+                return;
+            }
+        }
+
+        let pattern = match pattern.is_empty() {
+            false => pattern.to_string(),
+            // An empty pattern is the last search, the same rule `:s` reads
+            // it by.
+            true => match self.session.last_search.as_ref().map(|s| s.pattern.clone()) {
+                Some(pattern) if !pattern.is_empty() => pattern,
+                _ => {
+                    self.session.status = "no previous search".into();
+                    return;
+                }
+            },
+        };
+
+        // The scan finishes before the first command runs, so a command
+        // cannot edit a line into or out of the match set.
+        let Some(rows) = self.in_view(|view| view.global_rows(scope, shape, &pattern, invert))
+        else {
+            return;
+        };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        if rows.is_empty() {
+            self.session.status = format!("pattern not found: {pattern}");
+            return;
+        }
+        // The pattern becomes the last search, as `:s`'s does — it is what
+        // makes `:g/foo/s//bar/g` the idiom it is.
+        self.session.last_search =
+            Some(Search { pattern: pattern.clone(), whole_word: false, forward: true });
+
+        let matched = rows.len();
+        self.grouped_undo(|ed| {
+            // A command that deletes or adds lines shifts every row below
+            // it; the walk carries the difference. Exact for commands that
+            // stay on their own line — which the allowed ones do.
+            let mut delta: isize = 0;
+            for row in rows {
+                let row = row as isize + delta;
+                let Some(buffer) = ed.buffer() else { break };
+                let lines_before = buffer.rope().len_lines() as isize;
+                if row < 0 || row >= lines_before {
+                    continue;
+                }
+                let at = buffer.rope().line_to_char(row as usize);
+                ed.set_cursor(Cursor::at(at));
+                ed.run_ex_over(cmd, None);
+                let Some(buffer) = ed.buffer() else { break };
+                delta += buffer.rope().len_lines() as isize - lines_before;
+            }
+        });
+
+        self.session.status =
+            format!("{matched} matching line{}", if matched == 1 { "" } else { "s" });
+        self.session.mode = Mode::Normal;
+    }
+
+    /// `:[range]normal {keys}` — see `docs/specs/global.md`.
+    fn run_normal_cmd(&mut self, scope: Option<Scope>, shape: Option<Shape>, keys: &str) {
+        if self.replaying_normal {
+            self.session.status = "normal does not nest".into();
+            return;
+        }
+        let rows = match scope {
+            None => None,
+            Some(_) => match self.in_view(|view| view.scope_rows(scope, shape)) {
+                None => return,
+                Some(Err(message)) => {
+                    self.session.status = message;
+                    return;
+                }
+                Some(Ok((first, last))) => Some((first, last)),
+            },
+        };
+
+        self.replaying_normal = true;
+        self.grouped_undo(|ed| match rows {
+            None => ed.feed_keys(keys),
+            Some((first, last)) => {
+                let mut delta: isize = 0;
+                for row in first..=last {
+                    let row = row as isize + delta;
+                    let Some(buffer) = ed.buffer() else { break };
+                    let lines_before = buffer.rope().len_lines() as isize;
+                    if row < 0 || row >= lines_before {
+                        continue;
+                    }
+                    let at = buffer.rope().line_to_char(row as usize);
+                    ed.set_cursor(Cursor::at(at));
+                    ed.feed_keys(keys);
+                    let Some(buffer) = ed.buffer() else { break };
+                    delta += buffer.rope().len_lines() as isize - lines_before;
+                }
+            }
+        });
+        self.replaying_normal = false;
+        self.session.mode = Mode::Normal;
+    }
+
+    /// Feeds characters through the same key grammar a frontend uses, then
+    /// puts the editor back in normal mode — the trailing `Esc` nobody can
+    /// type on a `:` line, pressed for you so a half-finished insert cannot
+    /// leak into the next line of a `:g`.
+    fn feed_keys(&mut self, keys: &str) {
+        let mut input = crate::input::Input::default();
+        for c in keys.chars() {
+            let key = crate::key::Key::char(c);
+            if let Some(cmd) = input.on_key(key, &self.session.mode, self.content_kind()) {
+                self.apply(cmd);
+            }
+        }
+        // Twice at most: one Esc closes an insert or a selection, and one
+        // more closes what that revealed — a `:` line typed under insert.
+        for _ in 0..2 {
+            if self.session.mode == Mode::Normal {
+                break;
+            }
+            let esc = crate::key::Key::code(crate::key::KeyCode::Esc);
+            if let Some(cmd) = input.on_key(esc, &self.session.mode, self.content_kind()) {
+                self.apply(cmd);
+            }
         }
     }
 
@@ -8464,6 +8745,70 @@ impl View<'_> {
             format!("{rows} line{} retabbed to {how}", if rows == 1 { "" } else { "s" });
     }
 
+    /// `:[range]d` — the rows, gone. The cursor's line by default. See
+    /// `docs/specs/global.md`.
+    fn delete_rows(&mut self, scope: Option<Scope>, shape: Option<Shape>) {
+        let region = match self.region(scope, shape, Fallback::CursorRow) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let Some((first, last)) = self.whole_rows(region) else { return };
+
+        let before = self.selections.as_pairs();
+        let start = self.buffer.rope().line_to_char(first);
+        let stop = self.buffer.rope().line_to_char(last + 1);
+        self.buffer.replace_range(start, stop, "");
+
+        // Column 0 of the line that moved up into the gap, clamped to the
+        // file that is left.
+        *self.selections = Selections::single(self.buffer.clamped(Cursor::at(start), false));
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        let rows = last - first + 1;
+        self.session.status = format!("{rows} fewer line{}", if rows == 1 { "" } else { "s" });
+        // A selection that has been deleted out from under you is not a
+        // selection any more.
+        self.session.mode = Mode::Normal;
+    }
+
+    /// The rows of the range that hold — or, inverted, lack — a match:
+    /// `:g`'s scan, finished before its first command runs. See
+    /// `docs/specs/global.md`.
+    fn global_rows(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        pattern: &str,
+        invert: bool,
+    ) -> Result<Vec<usize>, String> {
+        let region = self.region(scope, shape, Fallback::File)?;
+        let Some((first, last)) = self.whole_rows(region) else { return Ok(Vec::new()) };
+        let mut rows = Vec::new();
+        for row in first..=last {
+            let start = self.buffer.rope().line_to_char(row);
+            let end = start + self.buffer.line_len(row);
+            // Smartcase, the same reading `/` and `:s` give a pattern.
+            let hit = !self.buffer.matches_in_cased(start, end, pattern, false, None).is_empty();
+            if hit != invert {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The whole rows a scope names — `:normal`'s walk.
+    fn scope_rows(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+    ) -> Result<(usize, usize), String> {
+        let region = self.region(scope, shape, Fallback::CursorRow)?;
+        self.whole_rows(region).ok_or_else(|| "nothing selected".into())
+    }
+
     /// Tidies the text before it goes to disk, and carries the cursors across
     /// what it removed.
     ///
@@ -10427,6 +10772,191 @@ mod tests {
         ex(&mut ed, "&& g");
         assert!(ed.session.status.starts_with("nothing goes after"), "{}", ed.session.status);
         assert_eq!(rope_of(&ed), "b\nb\nb\na\n");
+    }
+
+    // ---- :g, :v, :normal, :d ------------------------------------------------
+
+    /// The first and the last line both go: the walk's row arithmetic holds
+    /// at the ends, where off-by-ones live.
+    #[test]
+    fn global_delete_takes_exactly_the_matching_lines() {
+        let mut ed = editor("foo one\nkeep\nfoo two\nkeep\nfoo three\n");
+
+        ex(&mut ed, "g/foo/d");
+
+        assert_eq!(rope_of(&ed), "keep\nkeep\n");
+        assert_eq!(ed.session.status, "3 matching lines");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(
+            rope_of(&ed),
+            "foo one\nkeep\nfoo two\nkeep\nfoo three\n",
+            "one `u`, not three"
+        );
+    }
+
+    #[test]
+    fn vglobal_keeps_exactly_the_matching_lines() {
+        let mut ed = editor("save a\ndrop\nsave b\n");
+
+        ex(&mut ed, "v/save/d");
+
+        assert_eq!(rope_of(&ed), "save a\nsave b\n");
+    }
+
+    #[test]
+    fn g_bang_is_v() {
+        let mut ed = editor("save a\ndrop\nsave b\n");
+
+        ex(&mut ed, "g!/save/d");
+
+        assert_eq!(rope_of(&ed), "save a\nsave b\n");
+    }
+
+    #[test]
+    fn a_range_narrows_what_the_scan_reads() {
+        let mut ed = editor("foo\nfoo\nfoo\nfoo\n");
+
+        ex(&mut ed, "2,3g/foo/d");
+
+        assert_eq!(rope_of(&ed), "foo\nfoo\n", "the first and last line were never scanned");
+    }
+
+    /// The `:g` pattern is the last search by the time the inner `s` asks —
+    /// vim's idiom, and the reason `:g/foo/s//bar/g` reads as one thought.
+    #[test]
+    fn the_global_pattern_feeds_an_empty_substitute_pattern() {
+        let mut ed = editor("foo x\nbar\nfoo y\n");
+
+        ex(&mut ed, "g/foo/s//FOO/g");
+
+        assert_eq!(rope_of(&ed), "FOO x\nbar\nFOO y\n");
+    }
+
+    /// The scan finishes before the first command runs: a command cannot
+    /// edit a line into the match set.
+    #[test]
+    fn global_does_not_chase_its_own_output() {
+        let mut ed = editor("a\nz\n");
+
+        ex(&mut ed, "g/a/normal oa");
+
+        assert_eq!(rope_of(&ed), "a\na\nz\n", "the line it made was not visited");
+    }
+
+    /// A whitelist, not a blacklist: the failure mode of a blacklist is
+    /// `:g/x/q` closing the editor on the first match.
+    #[test]
+    fn global_refuses_a_command_that_is_not_line_scoped() {
+        let mut ed = editor("a\n");
+
+        ex(&mut ed, "g/a/q");
+
+        assert_eq!(rope_of(&ed), "a\n");
+        assert!(ed.session.status.contains("not `q`"), "{}", ed.session.status);
+        assert!(!ed.session.quit, "and it did not quit");
+    }
+
+    #[test]
+    fn global_with_no_match_says_so_and_runs_nothing() {
+        let mut ed = editor("alpha\n");
+
+        ex(&mut ed, "g/zebra/d");
+
+        assert_eq!(rope_of(&ed), "alpha\n");
+        assert_eq!(ed.session.status, "pattern not found: zebra");
+    }
+
+    #[test]
+    fn global_with_no_command_asks_for_one() {
+        let mut ed = editor("a\n");
+
+        ex(&mut ed, "g/a/");
+
+        assert_eq!(rope_of(&ed), "a\n");
+        assert_eq!(ed.session.status, "and do what? `:g/pattern/d`");
+    }
+
+    /// `:vs` and `:vnew` still split — a letter is never a delimiter, so the
+    /// `v` of `:v/pat/cmd` cannot swallow them.
+    #[test]
+    fn the_other_v_commands_are_still_themselves() {
+        let mut ed = editor("a\n");
+        sized(&mut ed);
+
+        ex(&mut ed, "vs");
+
+        assert_eq!(ed.window_ids().len(), 2, "it split, it did not scan");
+    }
+
+    #[test]
+    fn normal_replays_keys_and_returns_to_normal_mode() {
+        let mut ed = editor("fix\n");
+
+        ex(&mut ed, "normal A!");
+
+        assert_eq!(rope_of(&ed), "fix!\n", "`A` entered insert and `!` was typed");
+        assert_eq!(ed.session.mode, Mode::Normal, "the Esc was pressed for you");
+    }
+
+    #[test]
+    fn normal_under_a_range_runs_once_per_row_as_one_undo_step() {
+        let mut ed = editor("one\ntwo\nthree\n");
+
+        ex(&mut ed, "%normal I//");
+
+        assert_eq!(rope_of(&ed), "//one\n//two\n//three\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(rope_of(&ed), "one\ntwo\nthree\n", "one `u`, not three");
+    }
+
+    #[test]
+    fn normal_with_nothing_to_type_asks() {
+        let mut ed = editor("a\n");
+
+        ex(&mut ed, "normal");
+
+        assert!(ed.session.status.starts_with("normal what?"), "{}", ed.session.status);
+    }
+
+    /// `:g/TODO/normal A // fixme` — the line this feature was asked with.
+    #[test]
+    fn global_normal_appends_to_every_match() {
+        let mut ed = editor("code();\ntodo one\ncode();\ntodo two\n");
+
+        ex(&mut ed, "g/todo/normal A // fixme");
+
+        assert_eq!(rope_of(&ed), "code();\ntodo one // fixme\ncode();\ntodo two // fixme\n");
+    }
+
+    #[test]
+    fn d_deletes_the_cursors_line_and_a_range_deletes_its_rows() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.set_cursor(Cursor::at(2));
+        ex(&mut ed, "d");
+        assert_eq!(rope_of(&ed), "a\nc\nd\n");
+        assert_eq!(ed.session.status, "1 fewer line");
+
+        let mut ed = editor("a\nb\nc\nd\n");
+        ex(&mut ed, "2,3d");
+        assert_eq!(rope_of(&ed), "a\nd\n");
+        assert_eq!(ed.session.status, "2 fewer lines");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(rope_of(&ed), "a\nb\nc\nd\n", "one undo step");
+    }
+
+    /// `:delete` is a path and `:d` is lines; the argument rule keeps a typo
+    /// in one from reaching the other.
+    #[test]
+    fn d_refuses_an_argument() {
+        let mut ed = editor("a\nb\n");
+
+        ex(&mut ed, "d 4");
+
+        assert_eq!(rope_of(&ed), "a\nb\n");
+        assert!(ed.session.status.starts_with("`:d` deletes lines"), "{}", ed.session.status);
     }
 
     // ---- file operations ----------------------------------------------------

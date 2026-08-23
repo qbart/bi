@@ -96,9 +96,11 @@ so a half-finished insert cannot leak into the next line of a `:g`.
   what you could type on a `:` line, which insert-mode edits and normal-mode
   operators almost always are. The notation is deferred, not refused —
   `config::spell` already names keys and can be taught to read them back.
-- **It does not nest.** `:normal :g/x/normal j` is refused: replayed keys
-  running the replayer is a loop with a keyboard in it. Depth one, error
-  `normal does not nest`.
+- **It does not nest.** Replayed keys running the replayer is a loop with a
+  keyboard in it, so a `:normal` reached from inside a `:normal` is refused —
+  `normal does not nest`. Unreachable today (a replayed `:` line has no Enter
+  to press until the key notation lands), and guarded anyway, because the
+  notation will land.
 
 The argument is taken as written, trimmed at the edges like every ex
 argument; `:normal` with nothing after it is `normal what?`.
@@ -147,6 +149,5 @@ In `editor.rs`:
 - `:g/foo/` — and do what?
 - `:normal A!` appends to the cursor's line and returns to normal mode.
 - `:%normal I// ` comments every line, one undo step.
-- `:normal :normal x` does not nest.
 - `:d` deletes the cursor's line; `:2,5d` deletes four; both one undo step.
 - `:d 4` is an error — `:d` refuses an argument.

@@ -297,6 +297,18 @@ impl Buffer {
         self.history.commit(before, after);
     }
 
+    /// Opens an undo group: every `commit_undo` until `end_undo_group` is
+    /// deferred into one revision. `:g` and `:normal` run sub-commands that
+    /// commit at their own boundaries, and this is what makes the batch one
+    /// `u` anyway. Nests; the outermost pair wins.
+    pub fn begin_undo_group(&mut self, before: Cursors) {
+        self.history.begin_group(before);
+    }
+
+    pub fn end_undo_group(&mut self, after: Cursors) {
+        self.history.end_group(after);
+    }
+
     /// Replays `changes` through [`Buffer::edit_raw`], so history traversal
     /// emits [`Edit`]s exactly as ordinary typing does — an undo reaches
     /// tree-sitter and LSP as just another incremental edit.
@@ -312,6 +324,9 @@ impl Buffer {
     /// Steps one revision back. Returns false at the oldest change.
     /// `None` at the oldest change. `Some` carries the selections to restore.
     pub fn undo(&mut self, before: Cursors, after: Cursors) -> Option<Cursors> {
+        // A `u` replayed mid-batch seals the group where it stands: undo
+        // must not walk the tree with half a revision still pending.
+        self.history.close_group(after.clone());
         self.commit_undo(before, after);
         let (changes, cursors) = self.history.undo()?;
         Some(self.replay(changes, cursors))
@@ -320,6 +335,7 @@ impl Buffer {
     /// Steps one revision forward, along the most recently created branch.
     /// Returns false at the newest change.
     pub fn redo(&mut self, before: Cursors, after: Cursors) -> Option<Cursors> {
+        self.history.close_group(after.clone());
         self.commit_undo(before, after);
         let (changes, cursors) = self.history.redo()?;
         Some(self.replay(changes, cursors))

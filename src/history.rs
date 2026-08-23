@@ -63,6 +63,12 @@ pub struct History {
     /// from a state we can no longer identify — currently unreachable, but
     /// `saved` is an `Option` so that a failed write can clear it.
     saved: Option<usize>,
+    /// An open group: the `before` cursors of its first commit, and how many
+    /// `begin_group`s deep it is. While one is open, `commit` defers — the
+    /// changes keep accumulating in `pending` — and closing the group seals
+    /// them as one revision. This is how `:g` across four hundred lines is
+    /// one `u`: the tree stays append-only, the commit just waits.
+    group: Option<(Cursors, usize)>,
 }
 
 impl Default for History {
@@ -78,6 +84,7 @@ impl Default for History {
             current: 0,
             pending: Vec::new(),
             saved: Some(0),
+            group: None,
         }
     }
 }
@@ -94,8 +101,16 @@ impl History {
 
     /// Closes the current group into a revision. A no-op when nothing is
     /// pending, so callers can commit at every command boundary without
-    /// checking.
+    /// checking — and a deferral while a group is open, so a batch command
+    /// can run sub-commands that commit blindly and still be one revision.
     pub fn commit(&mut self, before: Cursors, after: Cursors) {
+        if self.group.is_some() {
+            return;
+        }
+        self.commit_now(before, after);
+    }
+
+    fn commit_now(&mut self, before: Cursors, after: Cursors) {
         if self.pending.is_empty() {
             return;
         }
@@ -109,6 +124,34 @@ impl History {
         });
         self.revisions[self.current].children.push(node);
         self.current = node;
+    }
+
+    /// Opens a group, or deepens the one that is open — the outermost caller's
+    /// `before` is the one undo restores, because it is where the whole batch
+    /// started.
+    pub fn begin_group(&mut self, before: Cursors) {
+        match &mut self.group {
+            Some((_, depth)) => *depth += 1,
+            None => self.group = Some((before, 1)),
+        }
+    }
+
+    /// Closes one level; the outermost close seals the revision.
+    pub fn end_group(&mut self, after: Cursors) {
+        match self.group.take() {
+            Some((before, 1)) => self.commit_now(before, after),
+            Some((before, depth)) => self.group = Some((before, depth - 1)),
+            None => {}
+        }
+    }
+
+    /// Force-closes an open group, whatever its depth — the escape hatch
+    /// `undo` and `redo` pull, so a `u` replayed mid-batch cannot walk the
+    /// tree with half a revision still pending.
+    pub fn close_group(&mut self, after: Cursors) {
+        if let Some((before, _)) = self.group.take() {
+            self.commit_now(before, after);
+        }
     }
 
     /// Records that the current revision is what's on disk.
@@ -157,6 +200,64 @@ mod tests {
 
     fn ins(start: usize, text: &str) -> Change {
         Change { start, removed: String::new(), inserted: text.into() }
+    }
+
+    /// A group defers the commits inside it into one revision — the batch
+    /// commands' whole claim on undo.
+    #[test]
+    fn a_group_makes_many_commits_one_revision() {
+        let mut h = History::default();
+        h.begin_group(one(0));
+        h.record(ins(0, "a"));
+        h.commit(one(1), one(1));
+        h.record(ins(1, "b"));
+        h.commit(one(2), one(2));
+        h.end_group(one(2));
+
+        assert_eq!(h.revisions.len(), 2, "root plus the one the group sealed");
+        assert_eq!(h.revisions[1].changes, vec![ins(0, "a"), ins(1, "b")]);
+        assert_eq!(h.revisions[1].before, one(0), "undo lands where the batch started");
+        assert_eq!(h.revisions[1].after, one(2));
+    }
+
+    #[test]
+    fn groups_nest_and_the_outermost_seals() {
+        let mut h = History::default();
+        h.begin_group(one(0));
+        h.begin_group(one(9));
+        h.record(ins(0, "a"));
+        h.end_group(one(9));
+        assert_eq!(h.revisions.len(), 1, "the inner close seals nothing");
+        h.record(ins(1, "b"));
+        h.end_group(one(2));
+
+        assert_eq!(h.revisions.len(), 2);
+        assert_eq!(h.revisions[1].before, one(0), "the outer `before` wins");
+    }
+
+    #[test]
+    fn an_empty_group_leaves_no_revision() {
+        let mut h = History::default();
+        h.begin_group(one(0));
+        h.end_group(one(0));
+
+        assert_eq!(h.revisions.len(), 1);
+    }
+
+    /// Undo mid-group must not walk the tree with half a revision pending.
+    #[test]
+    fn close_group_seals_whatever_depth_was_open() {
+        let mut h = History::default();
+        h.begin_group(one(0));
+        h.begin_group(one(9));
+        h.record(ins(0, "a"));
+        h.close_group(one(1));
+
+        assert_eq!(h.revisions.len(), 2);
+        let (changes, _) = h.undo().expect("the sealed revision undoes");
+        assert_eq!(changes.len(), 1);
+        h.end_group(one(1));
+        assert_eq!(h.revisions.len(), 2, "the stale end_group is harmless");
     }
 
     /// The property the tree exists for: an edit made after an undo must not
