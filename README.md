@@ -11,6 +11,10 @@ and sync per project, diagnostics are drawn on the text and jumped to with
 cursor, completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk it,
 `Tab` or `Enter` accepts, auto-imports included — and typing `(` floats the
 signature with the parameter you are on highlighted.
+Batch edits run through `:g`/`:v`/`:normal`, `:s` substitutes and `&` repeats
+it, `gq` reflows comments to `textwidth`, `=` reindents, `]]`/`[[` walk the
+parse tree's boundaries (`:ts` paints them), and `:peek` opens a definition
+in a split beside you.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -50,6 +54,7 @@ words. `{n}` below means an optional count.
 | `$` | end of the line |
 | `%` | the bracket matching the one at or after the cursor |
 | `{` `}` | previous / next blank line — the paragraph boundary |
+| `]]` `[[` | next / previous tree-sitter boundary — block ends and arguments are stops too |
 | `gg` | first line |
 | `G` | last line, or line `{n}` when counted |
 | arrows, `Home`, `End` | same as the above |
@@ -65,10 +70,12 @@ the word, `dw` takes the word and the space after it.
 | `c{motion}` | change — delete, then enter insert mode |
 | `y{motion}` | yank |
 | `>{motion}` `<{motion}` | indent / outdent the lines it covers |
+| `gq{motion}` | reflow prose to `textwidth`, comment leaders kept — `gqq` / `gqgq` for the line |
+| `={motion}` | reindent to what the brackets say — `==` the line, `gg=G` the file |
 | `dd` `cc` `yy` | the whole line, `{n}` of them when counted |
 | `>>` `<<` | the whole line, `{n}` of them when counted |
 | `D` `C` | `d$` / `c$` — to the end of the line |
-| `S` | `cc` |
+| `S` | select by structure — see below; `cc` is what vim spent it on |
 | `Y` | `yy` |
 | `x` `s` | delete / change the char under the cursor — `dl` and `cl` |
 | `X` | delete the char before the cursor — `dh` |
@@ -95,6 +102,13 @@ nodes containing the cursor, so `{ "hello/plugin" }` in Lua offers the string's
 contents, the string, and the table with no special case for any of them. Vim's
 `S` was `cc` spelled shorter, and `cc` still works. See
 [docs/specs/scopes.md](docs/specs/scopes.md).
+
+**Walking the structure** — `]]` and `[[` move through the parse tree's edges
+the way `w` moves through words: every start and end of a multi-line block is
+a stop, and so is every argument in a signature, so `]]` hops parameter to
+parameter. `:ts` shows the stops: the screen dims exactly as `s` dims it and
+every boundary lights up, staying on until `:ts` again. See
+[docs/specs/boundaries.md](docs/specs/boundaries.md).
 
 **Surroundings** — add, remove and change what is around something.
 
@@ -177,8 +191,8 @@ arrives whole, as one undo step.
 A search is a motion, so `d/foo`, `c/foo` and `y/foo` all work, and it is
 **exclusive** — `d/three` stops before the match. An all-lowercase pattern
 matches case-insensitively; a capital anywhere in it makes the search
-case-sensitive. A bare `/` repeats the last pattern. Regular expressions and
-`:s` are not built yet.
+case-sensitive. A bare `/` repeats the last pattern. Regular expressions are
+not built yet; `:s` is — see the ex commands below.
 
 Matches are **not** highlighted, which is vim's default and not the thing you
 want while reading code; `:hls` turns highlighting on and `:noh` off again.
@@ -273,6 +287,7 @@ every one of them is typeable without its key and rebindable by name
 | `gr` | every reference, in a results pane — `:replace //new/` over it is a rename |
 | `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
 | `K` | what the server knows about the cursor, floated beside it |
+| `:peek` | the definition in a vertical split, focus on it — the call site stays put |
 
 Diagnostics wear their severity's colour on the text, a `•` in the gutter,
 and the message at the end of the cursor's line; `:set diagnostics false`
@@ -490,11 +505,18 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:lsp` | where this buffer stands with its language server; `restart` and `stop` manage it |
 | `:definition` `:def` | `gd` — jump to the definition the server names |
+| `:peek` | the definition in a vertical split, focus on it |
 | `:references` `:refs` | `gr` — every reference, in a results pane; `:replace //new/` over it is a rename |
 | `:format` `:fmt` | the whole file, by the server, as one undo step |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
+| `:s/a/b/g` | substitute over a range — `:%s//new/g` takes the last search |
+| `:&` `:&&` | the last substitute again, flags included; `&` / `g&` are the keys |
+| `:g/pat/cmd` `:v/pat/cmd` | run a command on every line that matches / does not |
+| `:normal {keys}` | replay keys as typed — once per line under a range |
+| `:d` | delete the lines a range names; `:delete` still takes a path |
+| `:ts` | toggle the tree-sitter boundary marks |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
@@ -525,6 +547,24 @@ It respells every *identifier* in range and leaves what is between them
 alone, so `foo_bar baz_qux` in camel is `fooBar bazQux`. With nothing selected
 it takes the word under the cursor, which is what renaming one usually is. See
 [docs/specs/case.md](docs/specs/case.md).
+
+`:s/old/new/` substitutes — literal patterns until regex lands, any delimiter,
+smartcase with `i`/`I` to override, `g` for every match on a line, `n` to
+count without changing, and an empty pattern means the last search. No range
+is the cursor's line, which is why `%` is the most typed character in the
+command. `&` repeats the last substitute on the cursor's line — flags
+included, where vim drops them — `g&` over the whole file, and `:2,5&&` under
+any range. See [docs/specs/substitute.md](docs/specs/substitute.md).
+
+`:g/pattern/cmd` runs a command on every matching line — `:g/TODO/d` deletes
+them, `:g/^use /m 0` herds the imports, `:g/fixme/normal A !` appends to each
+— and `:v` (or `:g!`) takes the lines that do *not* match. The scan finishes
+before the first command runs, so nothing chases its own output; the whole
+run is one undo step; and the sub-command is one of `d`, `s`, `&`, `m`,
+`case`, `retab`, `normal`, refused by name otherwise — the failure mode of
+anything looser is `:g/x/q` closing the editor. `:normal {keys}` replays keys
+as typed, once per line under a range, so `:%normal I// ` comments the file.
+See [docs/specs/global.md](docs/specs/global.md).
 
 ### Windows and buffers
 
@@ -1169,13 +1209,13 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   links, code spans) is a second grammar reached the same way, so it is
   unhighlighted too. No indent queries either, so `o` and `Enter` copy the
   indent of the line above rather than working out what the language wants,
-  and there is no `=`. See `docs/specs/tree-sitter.md`.
-- No regular expressions in search, and no `:s`. See
+  and `=` reindents by bracket depth rather than by what the language would
+  say. See `docs/specs/tree-sitter.md`.
+- No regular expressions in search or `:s`. See
   [docs/specs/search.md](docs/specs/search.md).
 - No marks (`m{a}`, `` `{a} ``), and no `gn`.
-- No git and no LSP, though both are the point — see
-  [RECOMMENDATION.md](RECOMMENDATION.md). LSP hangs off `Editor::sync_syntax`,
-  the same edit drain tree-sitter uses.
+- No git, though it is half the point — see
+  [RECOMMENDATION.md](RECOMMENDATION.md).
 
 ### Architectural, and cheaper to fix now than later
 
