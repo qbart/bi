@@ -263,6 +263,24 @@ session is one step, including the newline `o` opened before it. Undo is a
 tree, so undoing and then typing keeps the old branch rather than discarding it
 — though nothing reaches those branches yet.
 
+**Language server** — each key abbreviates an ex command, like `ga` does, so
+every one of them is typeable without its key and rebindable by name
+(`definition`, `references`, `diagnostic_next`, `diagnostic_prev`, `hover`).
+
+| Key | Does |
+|---|---|
+| `gd` | go to the definition, opening the file it lives in |
+| `gr` | every reference, in a results pane — `:replace` over it is a rename |
+| `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
+| `K` | what the server knows about the cursor, floated beside it |
+
+Diagnostics wear their severity's colour on the text, a `●` in the gutter,
+and the message at the end of the cursor's line; `:set diagnostics false`
+hides the marks without forgetting them. `:lsp` says where a buffer stands,
+`:format` reformats the file as one undo step, and completion opens by
+itself in insert mode. See [docs/specs/lsp.md](docs/specs/lsp.md) and the
+specs beside it.
+
 **Other**
 
 | Key | Does |
