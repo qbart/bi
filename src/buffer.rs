@@ -691,12 +691,7 @@ impl Buffer {
     /// the range are context: walked for their bracket depth, never touched.
     /// Says where the cursor goes — the first non-blank of the last row
     /// touched. `None` when every line already sat where it should.
-    pub fn reindent_rows(
-        &mut self,
-        first: usize,
-        last: usize,
-        indent: &Indent,
-    ) -> Option<Cursor> {
+    pub fn reindent_rows(&mut self, first: usize, last: usize, indent: &Indent) -> Option<Cursor> {
         let last = last.min(self.line_count().saturating_sub(1));
         let lines: Vec<String> = (0..=last).map(|row| self.line(row)).collect();
         let new = indent::reindent(&lines, first, indent);

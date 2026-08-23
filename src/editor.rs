@@ -10849,11 +10849,7 @@ mod tests {
         assert_eq!(ed.session.status, "3 matching lines");
 
         ed.apply(cmd(Action::Undo));
-        assert_eq!(
-            rope_of(&ed),
-            "foo one\nkeep\nfoo two\nkeep\nfoo three\n",
-            "one `u`, not three"
-        );
+        assert_eq!(rope_of(&ed), "foo one\nkeep\nfoo two\nkeep\nfoo three\n", "one `u`, not three");
     }
 
     #[test]

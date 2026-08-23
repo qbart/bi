@@ -980,9 +980,7 @@ impl Input {
                 // `gq` — the format operator. Under a pending `gq` this same
                 // key is the doubled form's tail, so `gqgq` covers the line
                 // the way `gqq` does. See `docs/specs/reflow.md`.
-                'q' if self.operator == Some(Operator::Reflow) => {
-                    self.resolve(Motion::CurrentLine)
-                }
+                'q' if self.operator == Some(Operator::Reflow) => self.resolve(Motion::CurrentLine),
                 'q' if self.operator.is_none() => {
                     self.operator = Some(Operator::Reflow);
                     None
