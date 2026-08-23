@@ -2113,29 +2113,54 @@ impl Editor {
     /// Sets no status: startup and `:reload` have different things to say
     /// about the result, so that is left to the caller.
     fn read_config(&mut self, source: &dyn ConfigSource) -> Result<Vec<Diagnostic>, Diagnostic> {
-        let text = match source.config() {
-            Ok(Some(text)) => text,
+        let mut problems = Vec::new();
+
+        let mut config = match source.config() {
+            Ok(Some(text)) => match crate::config::parse(&text, Config::default()) {
+                Ok((config, main_problems)) => {
+                    problems = main_problems;
+                    config
+                }
+                // Unsalvageable: the running config stays exactly as it was.
+                Err(problem) => return Err(problem),
+            },
             // No file is not an error, but it is still a fact about the
             // world that can change between calls — a file present at
-            // startup can be gone by `:reload`. Applying the defaults here,
-            // rather than leaving whatever was last applied, is what keeps
-            // this path agreeing with startup on an editor that has never
-            // seen a file at all.
-            Ok(None) => return Ok(self.apply_config(Config::default(), Some(source))),
+            // startup can be gone by `:reload`. Starting from the defaults
+            // here, rather than from whatever was last applied, is what
+            // keeps this path agreeing with startup on an editor that has
+            // never seen a file at all.
+            Ok(None) => Config::default(),
             Err(e) => return Err(Diagnostic { line: 1, message: e.to_string() }),
         };
 
-        match crate::config::parse(&text, Config::default()) {
-            Ok((config, mut problems)) => {
-                // Theme problems join config problems: both came out of
-                // loading, and a frontend that reports one should report the
-                // other without learning there were two files.
-                problems.extend(self.apply_config(config, Some(source)));
-                Ok(problems)
+        // The project's say, laid over the main config the way the main
+        // config lay over the defaults — an option it does not mention keeps
+        // what was already decided. The lookup was silent by contract; a
+        // file that was *found* reports its mistakes like any config does,
+        // each prefixed with the path so `:reload` names which file. One
+        // that does not parse at all reports and changes nothing — the main
+        // config stays whole, never half of each.
+        // See `docs/specs/local-config.md`.
+        if let Some((path, text)) = source.local() {
+            let at = |line: usize, message: String| Diagnostic {
+                line,
+                message: format!("{}: {message}", path.display()),
+            };
+            match crate::config::parse_local(&text, config.clone()) {
+                Ok((local, local_problems)) => {
+                    config = local;
+                    problems.extend(local_problems.into_iter().map(|p| at(p.line, p.message)));
+                }
+                Err(problem) => problems.push(at(problem.line, problem.message)),
             }
-            // Unsalvageable: the running config stays exactly as it was.
-            Err(problem) => Err(problem),
         }
+
+        // Theme problems join config problems: both came out of loading, and
+        // a frontend that reports one should report the other without
+        // learning how many files there were.
+        problems.extend(self.apply_config(config, Some(source)));
+        Ok(problems)
     }
 
     fn apply_config(
@@ -8127,6 +8152,93 @@ mod tests {
         fn config(&self) -> anyhow::Result<Option<String>> {
             Ok(self.0.map(str::to_string))
         }
+    }
+
+    /// A source with both layers, for the project-config tests.
+    struct TwoLayers {
+        main: Option<&'static str>,
+        local: Option<&'static str>,
+    }
+
+    impl crate::config::ConfigSource for TwoLayers {
+        fn config(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.main.map(str::to_string))
+        }
+
+        fn local(&self) -> Option<(std::path::PathBuf, String)> {
+            self.local.map(|text| (std::path::PathBuf::from("/proj/.bi.toml"), text.to_string()))
+        }
+    }
+
+    #[test]
+    fn a_local_config_overrides_only_what_it_mentions() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(TwoLayers {
+            main: Some("[options]\nnumber = 5\ntab_width = 2\n"),
+            local: Some("[options]\ntab_width = 8\n"),
+        });
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(ed.session.options.tab_width, 8, "the project said so");
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the project said nothing");
+    }
+
+    #[test]
+    fn a_local_config_works_with_no_main_config_at_all() {
+        let mut ed = Editor::empty();
+        let problems =
+            ed.load_config(TwoLayers { main: None, local: Some("[options]\nnumber = -1\n") });
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(ed.session.options.number, LineNumbers::Relative);
+    }
+
+    #[test]
+    fn a_local_configs_mistakes_are_reported_with_its_path() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(TwoLayers {
+            main: Some("[options]\nnumber = 5\n"),
+            local: Some("[options]\nnmber = 9\n"),
+        });
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("/proj/.bi.toml"), "{}", problems[0].message);
+        assert!(problems[0].message.contains("nmber"), "{}", problems[0].message);
+        assert_eq!(ed.session.options.number, LineNumbers::Every(5), "the good layer applied");
+    }
+
+    #[test]
+    fn an_unparseable_local_config_reports_and_changes_nothing() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(TwoLayers {
+            main: Some("[options]\nnumber = 5\n"),
+            local: Some("[options\nbroken"),
+        });
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains(".bi.toml"), "{}", problems[0].message);
+        assert_eq!(
+            ed.session.options.number,
+            LineNumbers::Every(5),
+            "the main config stays whole, never half of each"
+        );
+    }
+
+    /// The two refusals that make a project config safe to read at all —
+    /// see `docs/specs/local-config.md`.
+    #[test]
+    fn a_local_config_cannot_name_a_binary_or_a_key() {
+        let mut ed = Editor::empty();
+        let problems = ed.load_config(TwoLayers {
+            main: None,
+            local: Some(
+                "[keys.normal]\n\"j\" = \"left\"\n\n\
+                 [lsp.servers.rust-analyzer]\ncommand = [\"evil\"]\nroots = [\"rust-project.json\"]\n",
+            ),
+        });
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.message.contains("keys are not read")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.message.contains("command is not read")), "{problems:?}");
+        let ra = &ed.config().lsp.servers["rust-analyzer"];
+        assert_eq!(ra.command, ["rust-analyzer"], "the built-in command survives");
+        assert_eq!(ra.roots, ["rust-project.json"], "the harmless field is read");
+        assert!(ed.config().keys.is_empty(), "no binding landed");
     }
 
     #[test]

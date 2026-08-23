@@ -12,7 +12,7 @@ mod keys;
 mod parse;
 
 pub use keys::{Bind, KeyMode, Keymap, Lookup, listing, parse_key, parse_keys, spell};
-pub use parse::parse;
+pub use parse::{parse, parse_local};
 
 /// Where a frontend gets config text from.
 ///
@@ -26,6 +26,19 @@ pub use parse::parse;
 /// `Err` means there was one and it could not be read, which is.
 pub trait ConfigSource {
     fn config(&self) -> anyhow::Result<Option<String>>;
+
+    /// The nearest project-local config — `.bi.toml` in the working
+    /// directory or the closest ancestor holding one — as its path and text.
+    ///
+    /// `Option`, not `Result`, and that is the contract: a missing file, an
+    /// unreadable one, a directory the lookup may not enter are all just
+    /// "keep looking", and none of them is worth a word. What *parses* badly
+    /// is the caller's to report — this only fetches. The default is an
+    /// embedder that wants no project config, which is nothing to implement.
+    /// See `docs/specs/local-config.md`.
+    fn local(&self) -> Option<(std::path::PathBuf, String)> {
+        None
+    }
 
     /// The text of `themes/<name>.toml`, if the frontend has one.
     ///
@@ -44,6 +57,10 @@ impl<T: ConfigSource> ConfigSource for std::rc::Rc<T> {
 
     fn theme(&self, name: &str) -> anyhow::Result<Option<String>> {
         (**self).theme(name)
+    }
+
+    fn local(&self) -> Option<(std::path::PathBuf, String)> {
+        (**self).local()
     }
 }
 

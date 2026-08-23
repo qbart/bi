@@ -14,6 +14,24 @@ use crate::key::Key;
 /// records a [`Diagnostic`], and carries on. A config file is edited by hand
 /// and will be wrong sometimes; refusing to start is the wrong answer.
 pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagnostic> {
+    parse_with(src, base, false)
+}
+
+/// Parses a **project's** `.bi.toml` as a patch over `base` — the same reader
+/// with two refusals switched on: `[keys]`, and a server's `command`. A
+/// repository that could name the binary bi spawns on open, or the ex line a
+/// key runs, would be arbitrary code execution by `git clone`. Each refusal
+/// is a diagnostic with the offending line, never a silence.
+/// See `docs/specs/local-config.md`.
+pub fn parse_local(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagnostic> {
+    parse_with(src, base, true)
+}
+
+fn parse_with(
+    src: &str,
+    base: Config,
+    local: bool,
+) -> Result<(Config, Vec<Diagnostic>), Diagnostic> {
     let doc: Document<&str> = Document::parse(src).map_err(|e| Diagnostic {
         line: e.span().map_or(1, |span| line_of(src, span.start)),
         message: e.to_string(),
@@ -35,10 +53,14 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
 
         match key {
             "options" => read_options(src, table, &mut config, &mut problems),
+            "keys" if local => problems.push(Diagnostic {
+                line,
+                message: "keys are not read from a project config".into(),
+            }),
             "keys" => read_keys(src, table, &mut config, &mut problems),
             "filetype" => read_filetypes(src, table, &mut config, &mut problems),
             "alternate" => read_alternates(src, table, &mut config, &mut problems),
-            "lsp" => read_lsp(src, table, &mut config, &mut problems),
+            "lsp" => read_lsp(src, table, &mut config, &mut problems, local),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -152,7 +174,13 @@ fn read_alternates(src: &str, table: &Table, config: &mut Config, problems: &mut
 
 /// `[lsp]`: `enabled`, and `[lsp.servers.<name>]` sections. See
 /// `docs/specs/lsp.md`.
-fn read_lsp(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+fn read_lsp(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
     for (key, item) in table.iter() {
         let line = line_for(table, key, src);
         match key {
@@ -163,7 +191,7 @@ fn read_lsp(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Di
                 }
             },
             "servers" => match item.as_table() {
-                Some(servers) => read_servers(src, servers, config, problems),
+                Some(servers) => read_servers(src, servers, config, problems, local),
                 None => problems.push(Diagnostic {
                     line,
                     message: "servers holds [lsp.servers.<name>] sections".into(),
@@ -179,7 +207,13 @@ fn read_lsp(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Di
 /// One `[lsp.servers.<name>]` merges **field-wise** over the built-in server
 /// of the same name — the same patch promise the rest of the file makes, so
 /// overriding `command` alone keeps the default filetypes and roots.
-fn read_servers(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
+fn read_servers(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
     for (name, item) in table.iter() {
         let line = line_for(table, name, src);
         let Some(server) = item.as_table() else {
@@ -198,6 +232,12 @@ fn read_servers(src: &str, table: &Table, config: &mut Config, problems: &mut Ve
                     None => problems
                         .push(Diagnostic { line, message: "enabled is true or false".into() }),
                 },
+                // The refusal that makes a project config safe to read at
+                // all: a repository does not get to name the binary bi runs.
+                "command" if local => problems.push(Diagnostic {
+                    line,
+                    message: "command is not read from a project config".into(),
+                }),
                 "command" | "filetypes" | "roots" => match string_list(item) {
                     Some(list) => match field {
                         "command" => entry.command = list,
@@ -717,6 +757,44 @@ mod tests {
         assert!(!config.lsp.servers["gopls"].enabled);
         assert_eq!(config.lsp.servers["gopls"].command, ["gopls"], "definition kept, just off");
         assert!(config.lsp.enabled, "the master switch is untouched");
+    }
+
+    fn ok_local(src: &str) -> (Config, Vec<String>) {
+        let (config, problems) =
+            super::parse_local(src, Config::default()).expect("document parses");
+        (config, problems.into_iter().map(|d| format!("{}: {}", d.line, d.message)).collect())
+    }
+
+    #[test]
+    fn a_local_config_patches_like_the_main_one() {
+        let (config, problems) = ok_local("[options]\ntab_width = 8\n\n[lsp]\nenabled = false\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.options.tab_width, 8);
+        assert!(!config.lsp.enabled);
+        assert_eq!(config.options.number, LineNumbers::Every(1), "unmentioned keeps the default");
+    }
+
+    /// The refusals carry the offending line, never a silence — the whole
+    /// point of threading them through the parser instead of sanitising
+    /// afterwards.
+    #[test]
+    fn a_local_config_is_refused_the_dangerous_keys_by_line() {
+        let (config, problems) = ok_local("[keys.normal]\n\"j\" = \"left\"\n");
+        assert_eq!(problems, ["1: keys are not read from a project config"]);
+        assert!(config.keys.is_empty());
+
+        let src = "[lsp.servers.gopls]\nroots = [\"go.mod\"]\ncommand = [\"evil\"]\n";
+        let (config, problems) = ok_local(src);
+        assert_eq!(problems, ["3: command is not read from a project config"]);
+        assert_eq!(config.lsp.servers["gopls"].command, ["gopls"], "the built-in survives");
+        assert_eq!(config.lsp.servers["gopls"].roots, ["go.mod"], "the harmless field is read");
+    }
+
+    #[test]
+    fn the_main_config_still_reads_what_a_local_one_may_not() {
+        let (config, problems) = ok("[lsp.servers.gopls]\ncommand = [\"gopls\", \"-remote\"]\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.lsp.servers["gopls"].command, ["gopls", "-remote"]);
     }
 
     #[test]

@@ -241,9 +241,30 @@ impl XdgConfig {
     }
 }
 
+/// The nearest `.bi.toml`, walking up from `start` — one file, first found
+/// wins, no layering of several. Every kind of lookup trouble is `None`:
+/// missing, unreadable, a directory this process may not enter — the
+/// `ConfigSource::local` contract, spelled here as "any failed read is just
+/// the next parent's turn". See `docs/specs/local-config.md`.
+fn local_config_from(start: &Path) -> Option<(PathBuf, String)> {
+    for dir in start.ancestors() {
+        let path = dir.join(".bi.toml");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return Some((path, text));
+        }
+    }
+    None
+}
+
 impl ConfigSource for XdgConfig {
     fn config(&self) -> Result<Option<String>> {
         self.read(Path::new("config.toml"))
+    }
+
+    /// From the working directory: where bi was started is the project it is
+    /// in — process state, which is the frontend's to know.
+    fn local(&self) -> Option<(PathBuf, String)> {
+        local_config_from(&std::env::current_dir().ok()?)
     }
 
     /// `themes/<name>.toml`, which is why the config location is a directory
@@ -572,6 +593,44 @@ mod tests {
 
         let err = config_edit_path(&missing).expect_err("nothing to edit yet");
         assert!(err.to_string().contains("bi config init"), "{err}");
+    }
+
+    #[test]
+    fn the_local_config_walk_takes_the_nearest_and_swallows_all_lookup_trouble() {
+        let dir = std::env::temp_dir().join(format!("bi-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outer/inner/deep")).unwrap();
+        std::fs::write(dir.join("outer/.bi.toml"), "outer").unwrap();
+        std::fs::write(dir.join("outer/inner/.bi.toml"), "inner").unwrap();
+
+        // The nearest one wins — no layering of several.
+        let (path, text) = local_config_from(&dir.join("outer/inner/deep")).unwrap();
+        assert_eq!(path, dir.join("outer/inner/.bi.toml"));
+        assert_eq!(text, "inner");
+
+        // A directory in the way that is not readable is just the next
+        // parent's turn: the deep dir holds a .bi.toml that is itself a
+        // directory, which no read_to_string can love.
+        std::fs::create_dir(dir.join("outer/inner/deep/.bi.toml")).unwrap();
+        let (path, _) = local_config_from(&dir.join("outer/inner/deep")).unwrap();
+        assert_eq!(path, dir.join("outer/inner/.bi.toml"), "skipped in silence");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_local_config_anywhere_is_simply_none() {
+        let dir = std::env::temp_dir().join(format!("bi-nolocal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The walk continues into /tmp and / above the test dir; none of
+        // those should hold one either, but if some machine's does, finding
+        // it is the correct answer rather than a failure — so the assertion
+        // allows only "none, or something above the test dir".
+        if let Some((path, _)) = local_config_from(&dir) {
+            assert!(!path.starts_with(&dir), "{}", path.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

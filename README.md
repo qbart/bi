@@ -683,7 +683,18 @@ own — a config file appears because you asked for one.
 
 The file is a *patch* over bi's compiled-in defaults, never a replacement:
 an option you never mention keeps doing what bi already does, including
-whatever a later version adds. `[options]` **is** the `:set` namespace — one key per option, spelled identically, so
+whatever a later version adds.
+
+A project gets a say too: `.bi.toml`, found in the working directory or the
+nearest ancestor holding one, is laid over the main config the same way —
+only what it mentions wins. The lookup is silent (missing, unreadable, and
+forbidden all just mean "keep walking up"), a found file's mistakes are
+reported with its path, and two sections are refused with a diagnostic
+rather than read: `[keys]`, and a server's `command` — a repository does not
+get to name the binary bi runs or the ex line a key fires. See
+[docs/specs/local-config.md](docs/specs/local-config.md).
+
+`[options]` **is** the `:set` namespace — one key per option, spelled identically, so
 `:set number 5` and `number = 5` reach one setting:
 
 ```toml
