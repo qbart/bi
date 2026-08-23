@@ -46,6 +46,7 @@ pub mod registers;
 pub mod resize;
 pub mod results;
 pub mod selection;
+pub mod sort;
 pub mod substitute;
 pub mod surround;
 pub mod syntax;

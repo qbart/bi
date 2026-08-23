@@ -1435,6 +1435,12 @@ enum ExLine {
         scope: Option<Scope>,
         how: crate::substitute::Substitute,
     },
+    /// `:[scope]sort [flags]` — order the rows, the whole file when nothing
+    /// narrows it. See `docs/specs/sort.md`.
+    Sort {
+        scope: Option<Scope>,
+        how: crate::sort::Sort,
+    },
     /// `:[scope]case snake` — respell what is named, or the word under each
     /// cursor when nothing is.
     ///
@@ -1594,7 +1600,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
     if scope.is_some()
-        && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case")
+        && !matches!(name, "m" | "move" | "s" | "substitute" | "ret" | "retab" | "case" | "sort")
     {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
     }
@@ -1700,6 +1706,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "replace" => ExLine::Replace(arg.into()),
         "res" | "resize" => match crate::resize::parse(arg) {
             Ok(how) => ExLine::Resize(how),
+            Err(message) => ExLine::Error(message),
+        },
+        "sort" => match crate::sort::parse(arg, force) {
+            Ok(how) => ExLine::Sort { scope, how },
             Err(message) => ExLine::Error(message),
         },
         "case" => match crate::case::Style::parse(arg) {
@@ -4844,6 +4854,9 @@ impl Editor {
             ExLine::PasteAs(path) => self.run_paste(Some(path.into())),
             ExLine::Move { scope, to } => {
                 self.in_view(|view| view.move_to(scope, shape, to));
+            }
+            ExLine::Sort { scope, how } => {
+                self.in_view(|view| view.sort_rows(scope, shape, &how));
             }
             ExLine::Case { scope, style } => {
                 self.in_view(|view| view.recase(scope, shape, style));
@@ -8056,6 +8069,57 @@ impl View<'_> {
     /// **Not on write.** Trimming touches the lines you edited; this touches
     /// every indented line in the file, and turning a one-line fix into a
     /// whole-file diff is not a thing a save should do behind you.
+    /// `:[scope]sort [flags]` — orders the rows the scope names, the whole
+    /// file when nothing narrows it.
+    ///
+    /// Whole rows only: there is no sorting half a line, so a scope that is
+    /// not whole rows widens to the rows it touches and says so, exactly as
+    /// `:m` and `:retab` do. The ordering itself lives in `crate::sort`,
+    /// which has never heard of a buffer. See `docs/specs/sort.md`.
+    fn sort_rows(&mut self, scope: Option<Scope>, shape: Option<Shape>, how: &crate::sort::Sort) {
+        let region = match self.region(scope, shape, Fallback::File) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let Some((first, last)) = self.whole_rows(region) else { return };
+        if last - first < 1 {
+            self.session.status = "nothing to sort".into();
+            return;
+        }
+
+        let lines: Vec<String> = (first..=last).map(|row| self.buffer.line(row)).collect();
+        let (sorted, dropped) = crate::sort::sort_lines(lines.clone(), how);
+        if sorted == lines {
+            // No edit and no undo entry: an unchanged buffer with a revision
+            // in its history is a `u` that appears to do nothing.
+            self.session.status = "already sorted".into();
+            return;
+        }
+
+        let before = self.selections.as_pairs();
+        let start = self.buffer.rope().line_to_char(first);
+        let stop = self.buffer.rope().line_to_char(last) + self.buffer.line_len(last);
+        self.buffer.replace_range(start, stop, &sorted.join("\n"));
+
+        // The block starts here, and the selection that named it has been
+        // consumed.
+        *self.selections = Selections::single(self.buffer.clamped(Cursor::at(start), false));
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        let rows = last - first + 1;
+        let mut report = format!("{rows} line{} sorted", if rows == 1 { "" } else { "s" });
+        if dropped > 0 {
+            report.push_str(&format!(
+                ", {dropped} duplicate{} dropped",
+                if dropped == 1 { "" } else { "s" }
+            ));
+        }
+        self.session.status = report;
+    }
+
     fn retab(&mut self, scope: Option<Scope>, shape: Option<Shape>) {
         // No scope is the whole file — see [`ExLine::Retab`]. Indentation is
         // a property of a line, so a scope that is not made of whole lines is
@@ -14620,6 +14684,100 @@ mod tests {
             "retab takes no argument — it follows tab_width and expandtab"
         );
         assert_eq!(text(&ed), "\ta;\n");
+    }
+
+    #[test]
+    fn sort_orders_the_whole_file_when_nothing_narrows_it() {
+        let mut ed = editor("banana\napple\ncherry\n");
+        ex(&mut ed, "sort");
+        assert_eq!(whole(&ed), "apple\nbanana\ncherry\n");
+        assert_eq!(ed.session.status, "3 lines sorted");
+    }
+
+    #[test]
+    fn sort_takes_a_range_and_touches_nothing_outside_it() {
+        let mut ed = editor("zeta\nbeta\nalpha\ngamma\n");
+        ex(&mut ed, "2,3sort");
+        assert_eq!(whole(&ed), "zeta\nalpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn sort_over_a_selection_takes_the_rows_it_touches() {
+        let mut ed = visual("delta\ncharlie\nbravo\nalpha\n", 0, Shape::Lines);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ex(&mut ed, "'v sort");
+
+        assert_eq!(whole(&ed), "bravo\ncharlie\ndelta\nalpha\n");
+        assert_eq!(ed.session.mode, Mode::Normal, "the selection was consumed");
+    }
+
+    #[test]
+    fn sort_bang_descends() {
+        let mut ed = editor("banana\napple\ncherry\n");
+        ex(&mut ed, "sort!");
+        assert_eq!(whole(&ed), "cherry\nbanana\napple\n");
+    }
+
+    #[test]
+    fn sort_n_compares_the_numbers_rather_than_the_digits() {
+        let mut ed = editor("item 12\nitem 9\nitem 100\n");
+        ex(&mut ed, "sort n");
+        assert_eq!(whole(&ed), "item 9\nitem 12\nitem 100\n");
+    }
+
+    #[test]
+    fn sort_u_drops_the_duplicate_and_counts_it() {
+        let mut ed = editor("b\na\nb\n");
+        ex(&mut ed, "sort u");
+        assert_eq!(whole(&ed), "a\nb\n");
+        assert_eq!(ed.session.status, "3 lines sorted, 1 duplicate dropped");
+    }
+
+    #[test]
+    fn sort_is_one_undo_step_and_lands_on_the_first_line() {
+        let mut ed = editor("banana\napple\ncherry\n");
+        ed.set_cursor(Cursor::at(10));
+
+        ex(&mut ed, "sort");
+        assert_eq!(ed.selections().unwrap().cursor().at, 0, "the block starts here");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), "banana\napple\ncherry\n", "one press, all of it back");
+    }
+
+    #[test]
+    fn sort_on_an_ordered_range_says_so_and_adds_no_history() {
+        let mut ed = editor("a\nb\nc\n");
+        ex(&mut ed, "sort");
+        assert_eq!(ed.session.status, "already sorted");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), "", "`u` reaches the typing — sort left no revision on top of it");
+    }
+
+    #[test]
+    fn sort_last_line_without_terminator_stays_terminatorless() {
+        let mut ed = editor("b\na");
+        ex(&mut ed, "sort");
+        assert_eq!(whole(&ed), "a\nb");
+    }
+
+    #[test]
+    fn sort_names_the_flag_it_does_not_have() {
+        let mut ed = editor("b\na\n");
+        ex(&mut ed, "sort x");
+        assert_eq!(ed.session.status, "`x` is not a sort flag — n, i, u");
+        assert_eq!(whole(&ed), "b\na\n", "and nothing changed");
+    }
+
+    #[test]
+    fn sort_refuses_a_line_that_is_not_there() {
+        let mut ed = editor("b\na\n");
+        ex(&mut ed, "2,99sort");
+        assert_eq!(ed.session.status, "no line 99");
+        assert_eq!(whole(&ed), "b\na\n");
     }
 
     #[test]

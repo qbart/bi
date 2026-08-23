@@ -495,6 +495,8 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
+| `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
+| `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
@@ -509,6 +511,13 @@ right. Go, C and C++ pairs are built in; a pattern you set replaces bi's.
 default, because bi's leader has no built-in meaning and the first binding to
 claim one should be yours. See
 [docs/specs/alternate.md](docs/specs/alternate.md).
+
+`:sort` orders whole rows — the file when nothing narrows it, the rows a range
+or the selection names otherwise. `n` compares the first number on each line,
+`u` drops lines that compare equal (and the report counts them), `i` folds
+case, and the flags combine in any order. The sort is stable, one undo step,
+and a range already in order says `already sorted` and touches nothing. See
+[docs/specs/sort.md](docs/specs/sort.md).
 
 `:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `dash` or
 `const` — one name each, no aliases.
