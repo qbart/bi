@@ -494,6 +494,13 @@ pub fn render(
     if matches!(ed.session.mode, Mode::Pick)
         && let Some(picker) = ed.session.picker.as_mut()
     {
+        // The graphics layer is the terminal's own and nothing drawn in cells
+        // can cover it, so a placement under the overlay is dropped for the
+        // frames the picker is up — `sync`'s diff deletes it and brings it
+        // back without any new mechanism. Only the ones it actually touches:
+        // an image in another pane keeps showing.
+        let rect = picker_rect(body);
+        places.retain(|p| !p.intersects(rect.x, rect.y, rect.width, rect.height));
         render_picker(frame, picker, body, &ui, tab);
         return;
     }
@@ -741,7 +748,17 @@ fn render_image(
             let rows = h.div_ceil(ch as u32).min(area.height as u32) as u16;
             let col = area.x + (area.width - cols) / 2;
             let row = area.y + (area.height - rows) / 2;
-            places.push(crate::tui::graphics::Place { id: img.id, col, row, crop: (sx, sy, w, h) });
+            places.push(crate::tui::graphics::Place {
+                id: img.id,
+                // The window's, made nonzero — kitty reads `p=0` as "no
+                // placement id", and window ids start at zero.
+                pid: id.0 + 1,
+                col,
+                row,
+                cols,
+                rows,
+                crop: (sx, sy, w, h),
+            });
         }
         _ => {
             // No pixels to draw with. The placeholder still says what this
@@ -1439,15 +1456,21 @@ fn row_label(text: &str, width: usize, tab_width: usize) -> String {
 ///
 /// Viewport-bounded like the main pass — only visible rows are formatted, no
 /// matter how deep the ring is.
-fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, tab_width: usize) {
+/// Where the picker overlay sits over `area` — shared with `render` so the
+/// image placements it would cover can be dropped for the frame.
+fn picker_rect(area: Rect) -> Rect {
     let w = (area.width * 3 / 5).clamp(24, area.width.saturating_sub(2).max(24));
     let h = (area.height * 3 / 5).clamp(6, area.height.saturating_sub(2).max(6));
-    let rect = Rect {
+    Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w.min(area.width),
         height: h.min(area.height),
-    };
+    }
+}
+
+fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, tab_width: usize) {
+    let rect = picker_rect(area);
 
     frame.render_widget(Clear, rect);
     // `Clear` resets cells to the terminal's own, which would punch a hole in
@@ -2342,5 +2365,40 @@ int main(void) {
         let line = fill_line(vec![Span::raw("a".repeat(30))], Some(CURSOR_LINE), 0, 10);
         let width: usize = line.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, 30);
+    }
+    /// The graphics layer rides above every cell, so the placement under the
+    /// picker is dropped for the frames the overlay is up — and only that
+    /// one: the diff in `sync` brings it back when the picker closes.
+    #[test]
+    fn a_placement_under_the_picker_is_dropped_for_the_frame() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("bi-render-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        image::RgbaImage::from_pixel(40, 40, image::Rgba([1, 2, 3, 255])).save(&path).unwrap();
+
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", path.display()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].pid, ed.focus().0 + 1, "the placement id is the window's");
+        assert_eq!(places[0].crop, (0, 0, 40, 40), "the whole image fits");
+
+        ed.session.picker = Some(Picker::new(
+            PickerKind::Buffer,
+            vec![bi::picker::Item { text: "x".into(), badge: None }],
+            0,
+        ));
+        ed.session.mode = Mode::Pick;
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        assert!(places.is_empty(), "covered by the picker: {places:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

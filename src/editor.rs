@@ -3501,6 +3501,12 @@ impl Editor {
             BufferCmd::Delete { force } => {
                 match current {
                     Some(id) => self.delete_buffer(id, force),
+                    // An image has no buffer to delete, but `:bd` still means
+                    // "take this away", and refusing it on a technicality is
+                    // exactly the detached feeling docs/specs/images.md exists
+                    // to avoid. Discarded rather than parked — that is what
+                    // delete means; `Ctrl-^` is the key that parks.
+                    None if self.window().img().is_some() => self.dismiss_image(focus),
                     // A tree pane shows no buffer, so there is nothing here to
                     // delete — unlike `:bn`, which is a request to show one.
                     None => self.session.status = "no buffer in this window".into(),
@@ -5093,6 +5099,31 @@ impl Editor {
             window.show(Content::Image(img));
         }
         self.sweep_scratch();
+    }
+
+    /// `:bd` on an image window: the alternate comes back when it still
+    /// exists, the most recent buffer otherwise. The image itself is
+    /// discarded, alternate included, because that is what delete means.
+    fn dismiss_image(&mut self, window: WindowId) {
+        let alt = self.window_mut_of(window).and_then(|w| w.alt.take());
+        // A parked buffer may have been `:bd`-ed since it was parked; showing
+        // it back would resurrect a dead id.
+        let alive = match &alt {
+            Some(Content::Text(text)) => self.buffers.iter().any(|b| b.id == text.buffer),
+            Some(_) => true,
+            None => false,
+        };
+        if alive && let Some(w) = self.window_mut_of(window) {
+            w.content = alt.expect("checked above");
+            return;
+        }
+        if let Some(&id) = self.mru_ids().first() {
+            self.show(window, id);
+            // `show` parked the image as the alternate; delete discards.
+            if let Some(w) = self.window_mut_of(window) {
+                w.alt = None;
+            }
+        }
     }
 
     /// The image a window shows, mutably. The frontend reports the room it
@@ -19665,6 +19696,67 @@ int main(void) {
         ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
         assert_eq!(ed.content_kind(), ContentKind::Image);
         assert_eq!(ed.window().img().unwrap().scroll(), (0, 5), "the crop survived");
+    }
+
+    /// `:bd` means "take this away", and refusing it on a technicality is
+    /// the detached feeling the design exists to avoid.
+    #[test]
+    fn bd_dismisses_an_image_and_brings_the_alternate_back() {
+        let d = PngDir::new("bd");
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", d.png().display()));
+        assert_eq!(ed.content_kind(), ContentKind::Image);
+
+        ed.run_ex("bd");
+
+        assert_eq!(ed.content_kind(), ContentKind::Text, "the alternate came back");
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.content_kind(), ContentKind::Text, "deleted, not parked");
+    }
+
+    /// The startup image has no alternate — `bi photo.png` was the session's
+    /// first content — so `:bd` shows the most recent buffer instead.
+    #[test]
+    fn bd_on_an_image_with_no_alternate_shows_a_buffer() {
+        let d = PngDir::new("bd-mru");
+        let mut ed = Editor::open(d.png()).unwrap();
+        assert_eq!(ed.content_kind(), ContentKind::Image);
+
+        ed.run_ex("bd");
+
+        assert_eq!(ed.content_kind(), ContentKind::Text);
+    }
+
+    /// A bare `:vs` clones the window, crop and all — and from there the two
+    /// panes are two views, which is the reason to open the second one.
+    #[test]
+    fn a_bare_split_on_an_image_gives_two_independent_crops() {
+        let d = PngDir::new("split");
+        let mut ed = Editor::empty();
+        sized(&mut ed);
+        ed.run_ex(&format!("e {}", d.png().display()));
+
+        ed.run_ex("vs");
+
+        let ids = ed.window_ids();
+        assert_eq!(ids.len(), 2);
+        let imgs: Vec<u64> = ids
+            .iter()
+            .filter_map(|&id| ed.window_of(id).and_then(Window::img).map(|img| img.id))
+            .collect();
+        assert_eq!(imgs.len(), 2, "both panes show the image");
+        assert_eq!(imgs[0], imgs[1], "the same pixels — one upload, two placements");
+
+        let focus = ed.focus();
+        ed.image_pane_mut(focus).unwrap().set_viewport(20, 20, 5);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        let scrolls: Vec<(u32, u32)> = ids
+            .iter()
+            .filter_map(|&id| ed.window_of(id).and_then(Window::img).map(|img| img.scroll()))
+            .collect();
+        assert!(scrolls.contains(&(0, 5)), "the focused crop moved: {scrolls:?}");
+        assert!(scrolls.contains(&(0, 0)), "the other did not: {scrolls:?}");
     }
 
     /// The command line still works over an image — `:` is how it closes.

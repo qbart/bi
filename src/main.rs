@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     let mut term = setup().context("entering raw mode")?;
     // After raw mode is on, before the event-reader thread takes stdin: the
     // handshake reads the terminal's answers itself. See src/tui/graphics.rs.
-    let kitty = tui::graphics::detect();
+    let graphics = tui::graphics::detect();
 
     if !problems.is_empty() {
         let n = problems.len();
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             format!("{n} config problem{}: {}", if n == 1 { "" } else { "s" }, problems[0].message);
     }
 
-    let result = run(&mut term, &mut editor, kitty);
+    let result = run(&mut term, &mut editor, graphics);
     // Before `restore`, not after: the servers get their shutdown while the
     // screen is still bi's, and a hung one is killed rather than waited on.
     editor.shutdown_lsp();
@@ -323,9 +323,9 @@ enum Wake {
     Lsp,
 }
 
-fn run(term: &mut Term, ed: &mut Editor, kitty: bool) -> Result<()> {
+fn run(term: &mut Term, ed: &mut Editor, graphics: tui::graphics::Support) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut gfx = tui::graphics::Graphics::new(kitty);
+    let mut gfx = tui::graphics::Graphics::new(graphics);
 
     // The terminal reader. Detached: it blocks in `event::read` with nothing
     // to interrupt it, and process exit is what ends it — the same blocking

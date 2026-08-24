@@ -89,6 +89,13 @@ text commands, so none of them needed changing, which is the point: closing
 an image and jumping out of its window are the keys you already press,
 because the window is an ordinary window.
 
+**`:bd` dismisses the image.** There is no buffer to delete, but the key
+means "take this away" and refusing it on a technicality is exactly the
+detached feeling this design exists to avoid. The alternate comes back if
+the window has one that still exists; failing that, the most recent buffer.
+The image is discarded rather than parked — that is what delete means, and
+`Ctrl-^` is the key that parks.
+
 **Modes do not exist here.** `i`, `v`, `R` and friends resolve against the
 view and find none, so they were already inert; the mode-entering commands
 that live on the session — `/`, `?`, `*`, `#`, `s`, `S` — are swallowed
@@ -126,10 +133,28 @@ raw mode and before the event-reader thread takes stdin: send a kitty
 graphics query (`ESC _G i=31,s=1,v=1,a=q,t=d,f=24 ; AAAA ESC \`) followed
 by a primary device attributes query (`ESC [ c`). Every terminal answers
 DA1, so the read cannot hang; a terminal that also answered `i=31;OK` speaks
-the protocol. `$TMUX` set means no — passthrough is a project of its own —
-and stdin or stdout not being a tty means the question cannot be asked.
-Environment sniffing (`$TERM`, `$KITTY_WINDOW_ID`) guesses wrong in both
-directions over SSH, which is exactly where a Raspberry Pi gets used.
+the protocol. Stdin or stdout not being a tty means the question cannot be
+asked. Environment sniffing (`$TERM`, `$KITTY_WINDOW_ID`) guesses wrong in
+both directions over SSH, which is exactly where a Raspberry Pi gets used.
+
+**tmux is the environment guess, because it has to be.** tmux answers DA1
+itself and drops the graphics reply, so the handshake cannot see through
+it. Instead tmux is asked about itself: `allow-passthrough` must be `on` or
+`all` (the option arriving in tmux 3.3 — older tmux fails the query and the
+answer is honestly no), and the attached client's `client_termname` must
+name a terminal that speaks the protocol. Every escape then rides the
+passthrough DCS (`ESC Ptmux;` … with inner escapes doubled), with the
+cursor move *inside* the wrapper in outer-terminal coordinates — the pane's
+position, asked of tmux when a placement is written, plus the cell. Cell
+size falls back to tmux's `client_cell_width`/`height` where the pane's
+own pty carries no pixel fields.
+
+The honest caveat: the outer terminal does not know tmux windows exist, so
+a placement drawn while you switch tmux windows stays on the glass until
+bi next changes it. `allow-passthrough on` (rather than `all`) softens
+this — tmux drops escapes from panes that are not visible — and the fix
+proper is the protocol's Unicode-placeholder mode, which is deliberately
+out until someone needs images and heavy tmux traffic at once.
 
 **Cell geometry** comes from `window_size()` — the TIOCGWINSZ pixel fields —
 re-read every frame because a font change mid-session is legal. Pixel fields
@@ -138,12 +163,29 @@ rather than to arithmetic on a guess.
 
 **Transmit once, place per frame.** Pixels go up PNG-encoded (`f=100`,
 direct transmission, 4KB base64 chunks) under the image's core `id`, once.
-Each frame the renderer emits *placements*: image id, a fixed placement id,
-the source crop in pixels, the destination cell. Re-creating a placement
-with the same placement id replaces it atomically, so moving or scrolling an
+Each frame the renderer emits *placements*: image id, a placement id, the
+source crop in pixels, the destination cell. Re-creating a placement with
+the same placement id replaces it atomically, so moving or scrolling an
 image is one escape sequence and no flicker. A placement whose window went
 away is deleted by id; the uploaded pixels stay, because `Ctrl-^` is about
 to want them and the terminal evicts its own store by quota anyway.
+
+**The placement id is the window's id**, not a constant, because a bare
+`:vs` clones the window — content, crop and all — and two panes then show
+one image. Two placements of one image under one placement id are one
+placement, and the first version of this keyed exactly that way: the second
+split came up blank. One window, one placement id, however many of them
+share the pixels.
+
+**Placements ride at `z=-1`** — under text glyphs, above background fills.
+The graphics layer is the terminal's own and ratatui cannot draw over it;
+at the default z-index a placement floats over every cell, which put the
+`Ctrl-P` picker *underneath* the photograph. At `-1` anything the renderer
+draws in those cells — window-pick letters, a float that strays into the
+pane — reads over the image. The picker gets more than that: a placement
+that intersects the overlay is dropped for the frames the picker is up,
+because text over a photograph is legible and still ugly; `sync`'s diff
+deletes it and brings it back without any new mechanism.
 
 The renderer draws blank cells under every placement — ratatui must own
 every cell it thinks it owns — and the graphics module writes its escapes
@@ -163,5 +205,11 @@ possible.
 - `i`, `v`, `/`, `s` in an image window leave the mode alone.
 - `Ctrl-^` out of an image and back restores the same scroll.
 - `:q` on a split closes the image pane like any pane.
+- `:bd` on an image window brings back the alternate, or the most recent
+  buffer when there is none — never a refusal.
+- A bare `:vs` on an image makes two panes with independent crops, and both
+  get a placement — the placement id is the window's.
+- The picker's rectangle suppresses the placements it intersects, and only
+  those, only while it is up.
 - The placeholder path: no graphics support still opens the image, and the
   status row still says the size.
