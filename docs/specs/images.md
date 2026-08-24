@@ -170,6 +170,13 @@ image is one escape sequence and no flicker. A placement whose window went
 away is deleted by id; the uploaded pixels stay, because `Ctrl-^` is about
 to want them and the terminal evicts its own store by quota anyway.
 
+**Quitting takes everything down.** Leaving the alternate screen does not
+delete a placement — the graphics layer is the terminal's, not the
+screen's — so before the terminal is restored, every image bi uploaded is
+deleted with its pixels (`d=I`, by bi's own ids, never another program's).
+An editor that quits leaving a photograph floating over the shell has not
+quit.
+
 **The placement id is the window's id**, not a constant, because a bare
 `:vs` clones the window — content, crop and all — and two panes then show
 one image. Two placements of one image under one placement id are one
@@ -211,5 +218,7 @@ possible.
   get a placement — the placement id is the window's.
 - The picker's rectangle suppresses the placements it intersects, and only
   those, only while it is up.
+- Quitting deletes every uploaded image from the terminal before the screen
+  is handed back — nothing floats over the shell.
 - The placeholder path: no graphics support still opens the image, and the
   status row still says the size.

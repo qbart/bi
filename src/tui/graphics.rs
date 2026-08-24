@@ -160,6 +160,26 @@ impl Graphics {
         Ok(())
     }
 
+    /// Takes every image bi put up back down — placements and pixels both.
+    ///
+    /// Called on the way out, while the screen is still bi's: leaving the
+    /// alternate screen does not delete placements, and an editor that quits
+    /// leaving a photograph floating over the shell has not quit. Uppercase
+    /// `I`, so the terminal's store is freed too — only what bi uploaded,
+    /// never another program's images.
+    pub fn clear(&mut self) -> std::io::Result<()> {
+        if self.support == Support::None || self.sent.is_empty() {
+            return Ok(());
+        }
+        let mut out = std::io::stdout().lock();
+        let ids: Vec<u64> = self.sent.drain().collect();
+        for id in ids {
+            self.write_seq(&mut out, &format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"))?;
+        }
+        self.placed.clear();
+        out.flush()
+    }
+
     /// Where the pane sits on the outer terminal — zero outside tmux, where
     /// the pane *is* the terminal.
     fn pane_offset(&self) -> (u16, u16) {

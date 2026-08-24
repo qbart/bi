@@ -69,6 +69,7 @@ fn main() -> Result<()> {
     // After raw mode is on, before the event-reader thread takes stdin: the
     // handshake reads the terminal's answers itself. See src/tui/graphics.rs.
     let graphics = tui::graphics::detect();
+    let mut gfx = tui::graphics::Graphics::new(graphics);
 
     if !problems.is_empty() {
         let n = problems.len();
@@ -76,10 +77,14 @@ fn main() -> Result<()> {
             format!("{n} config problem{}: {}", if n == 1 { "" } else { "s" }, problems[0].message);
     }
 
-    let result = run(&mut term, &mut editor, graphics);
+    let result = run(&mut term, &mut editor, &mut gfx);
     // Before `restore`, not after: the servers get their shutdown while the
     // screen is still bi's, and a hung one is killed rather than waited on.
     editor.shutdown_lsp();
+    // Also before `restore`, for the same reason: leaving the alternate
+    // screen does not take a kitty placement with it, and an editor that
+    // quits leaving a photograph floating over the shell has not quit.
+    let _ = gfx.clear();
     restore()?;
     result
 }
@@ -323,9 +328,8 @@ enum Wake {
     Lsp,
 }
 
-fn run(term: &mut Term, ed: &mut Editor, graphics: tui::graphics::Support) -> Result<()> {
+fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut gfx = tui::graphics::Graphics::new(graphics);
 
     // The terminal reader. Detached: it blocks in `event::read` with nothing
     // to interrupt it, and process exit is what ends it — the same blocking
