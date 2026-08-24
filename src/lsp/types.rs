@@ -147,6 +147,10 @@ pub struct Capabilities {
     /// Each provider is a bool or an options object; [`truthy`] reads both.
     #[serde(default, rename = "definitionProvider")]
     pub definition_provider: Option<Value>,
+    #[serde(default, rename = "declarationProvider")]
+    pub declaration_provider: Option<Value>,
+    #[serde(default, rename = "implementationProvider")]
+    pub implementation_provider: Option<Value>,
     #[serde(default, rename = "referencesProvider")]
     pub references_provider: Option<Value>,
     #[serde(default, rename = "documentFormattingProvider")]

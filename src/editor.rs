@@ -1580,6 +1580,12 @@ enum ExLine {
     Lsp(LspCmd),
     /// `:definition` — `gd`. See `docs/specs/lsp-requests.md`.
     Definition,
+    /// `:decl` — the declaration: the header's side of the question, where
+    /// the languages split the two.
+    Declaration,
+    /// `:impl` — the implementations: trait impls, overrides, the source
+    /// for a header.
+    Implementation,
     /// `:peek` — the definition in a fresh vertical split, focus on it. See
     /// `docs/specs/lsp-requests.md`.
     Peek,
@@ -1903,6 +1909,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             _ => ExLine::Error("lsp takes restart, stop, or nothing for status".into()),
         },
         "def" | "definition" => ExLine::Definition,
+        "decl" | "declaration" => ExLine::Declaration,
+        "impl" | "implementation" => ExLine::Implementation,
         "peek" => ExLine::Peek,
         "ts" => ExLine::TsMarks,
         "tssplit" => ExLine::TsSplit,
@@ -5367,7 +5375,9 @@ impl Editor {
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
-            ExLine::Definition => self.lsp_definition(),
+            ExLine::Definition => self.lsp_goto(lsp::Goto::Definition),
+            ExLine::Declaration => self.lsp_goto(lsp::Goto::Declaration),
+            ExLine::Implementation => self.lsp_goto(lsp::Goto::Implementation),
             ExLine::Peek => self.peek_definition(),
             ExLine::TsMarks => self.toggle_ts_marks(),
             ExLine::TsSplit => self.ts_split(),
@@ -6038,8 +6048,8 @@ impl Editor {
                 Some(lsp::Effect::Diagnostics { buffer, version, diagnostics, encoding }) => {
                     self.store_diagnostics(buffer, version, diagnostics, encoding)
                 }
-                Some(lsp::Effect::Definition { window, targets, encoding }) => {
-                    self.apply_definition(window, targets, encoding)
+                Some(lsp::Effect::Goto { kind, window, targets, encoding }) => {
+                    self.apply_goto(kind, window, targets, encoding)
                 }
                 Some(lsp::Effect::References { symbol, root, targets, encoding }) => {
                     self.apply_references(symbol, root, targets, encoding)
@@ -6144,15 +6154,16 @@ impl Editor {
         Some(lsp::pos::position_of(self.entry(id).buffer.rope(), at, encoding))
     }
 
-    /// `:definition` — `gd`. Files the request; the answer jumps this window
-    /// when it lands, through the pump.
-    fn lsp_definition(&mut self) {
+    /// `:definition` — `gd` — and `:decl`, `:impl`: one goto, three kinds.
+    /// Files the request; the answer jumps this window when it lands,
+    /// through the pump.
+    fn lsp_goto(&mut self, kind: lsp::Goto) {
         let sent = self.lsp_target().and_then(|(id, doc, caps)| {
-            if !caps.definition {
-                return Err("definition: this server does not offer it".into());
+            if !caps.offers(kind) {
+                return Err(format!("{}: this server does not offer it", kind.noun()));
             }
             let position = self.lsp_position(id, doc.server).ok_or("no cursor here")?;
-            self.lsp.definition(&doc, position, self.focus)
+            self.lsp.goto(kind, &doc, position, self.focus)
         });
         if let Err(status) = sent {
             self.session.status = status;
@@ -6184,7 +6195,7 @@ impl Editor {
         }
         // Focus is the new window now, and the request carries it — the
         // answer lands in the split, not where you were reading.
-        self.lsp_definition();
+        self.lsp_goto(lsp::Goto::Definition);
     }
 
     /// `]]` / `[[` — the next or previous boundary, starts and ends both
@@ -6395,15 +6406,16 @@ impl Editor {
         }
     }
 
-    /// A definition answer: open the first target where the request was made.
-    fn apply_definition(
+    /// A goto answer: open the first target where the request was made.
+    fn apply_goto(
         &mut self,
+        kind: lsp::Goto,
         window: WindowId,
         targets: Vec<(PathBuf, lsp::types::Range)>,
         encoding: lsp::pos::Encoding,
     ) {
         let Some((path, range)) = targets.first().cloned() else {
-            self.session.status = "no definition found".into();
+            self.session.status = format!("no {} found", kind.noun());
             return;
         };
         // The window that asked may have closed while the server thought.
@@ -6423,7 +6435,8 @@ impl Editor {
             text.selections = Selections::from_pairs(vec![(at, at)]);
         }
         if targets.len() > 1 {
-            self.session.status = format!("went to the first of {} definitions", targets.len());
+            self.session.status =
+                format!("went to the first of {} {}s", targets.len(), kind.noun());
         }
     }
 
@@ -18567,6 +18580,8 @@ int main(void) {
                 json!({ "positionEncoding": "utf-8",
                         "textDocumentSync": { "openClose": true, "change": 2, "save": true },
                         "definitionProvider": true,
+                        "declarationProvider": true,
+                        "implementationProvider": true,
                         "referencesProvider": true,
                         "documentFormattingProvider": true,
                         "hoverProvider": true,
@@ -18833,6 +18848,49 @@ int main(void) {
             ex(&mut ed, "definition");
             respond(&mut ed, &fake, id, "textDocument/definition", serde_json::Value::Null);
             assert_eq!(ed.session.status, "no definition found");
+        }
+
+        #[test]
+        fn decl_and_impl_are_gd_under_their_own_methods() {
+            let (_dir, mut ed, fake) = project("goto-kin");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            ex(&mut ed, "decl");
+            let sent = fake.last(id, "textDocument/declaration").unwrap();
+            assert_eq!(sent["params"]["position"], json!({ "line": 0, "character": 0 }));
+            let answer = json!({ "uri": uri,
+                "range": { "start": { "line": 0, "character": 3 },
+                           "end": { "line": 0, "character": 7 } } });
+            respond(&mut ed, &fake, id, "textDocument/declaration", answer);
+            assert_eq!(ed.cursor().unwrap().at, 3);
+
+            ex(&mut ed, "impl");
+            respond(&mut ed, &fake, id, "textDocument/implementation", serde_json::Value::Null);
+            assert_eq!(ed.session.status, "no implementation found");
+        }
+
+        #[test]
+        fn a_kind_the_server_did_not_claim_is_refused_by_name() {
+            let (_dir, mut ed, fake) = project("goto-uncl");
+            ed.settle();
+            let id = fake.spawned.lock().unwrap()[0].0;
+            // The whole sync block, but only `definitionProvider` — the old
+            // world, where `gd` works and the rest of the family does not.
+            fake.grant(
+                id,
+                json!({ "positionEncoding": "utf-8",
+                        "textDocumentSync": { "openClose": true, "change": 2, "save": true },
+                        "definitionProvider": true }),
+            );
+            ed.settle();
+
+            ex(&mut ed, "impl");
+            assert_eq!(ed.session.status, "implementation: this server does not offer it");
+            assert!(fake.last(id, "textDocument/implementation").is_none(), "nothing sent");
+
+            ex(&mut ed, "decl");
+            assert_eq!(ed.session.status, "declaration: this server does not offer it");
         }
 
         #[test]

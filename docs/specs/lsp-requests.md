@@ -26,8 +26,9 @@ returns an `Effect`; the editor applies it inside `settle`.
 
 Refusals are statuses, not errors: no server, server not running, or a
 capability the server did not claim (`definitionProvider`,
-`referencesProvider`, `documentFormattingProvider` — parsed truthy, since
-each may be a bool or an options object) each put one line on the status bar.
+`declarationProvider`, `implementationProvider`, `referencesProvider`,
+`documentFormattingProvider` — parsed truthy, since each may be a bool or an
+options object) each put one line on the status bar.
 
 A response that arrives after the world moved is the async trap, handled per
 feature by what correctness needs: formatting carries the document version it
@@ -45,6 +46,29 @@ a list of them, `LocationLink`s, or null — all four shapes normalise to
 through the same path `:e` uses (a buffer already open is reused, same file
 included) and the cursor lands on the range start; more than one target says
 `went to the first of N`. Nothing found says so.
+
+## `:decl`, `:impl` — the rest of the goto family
+
+`textDocument/declaration` and `textDocument/implementation` are
+`textDocument/definition` with a different method name: same params, same
+four response shapes, same jump. So they are not two more features but one
+`Goto` kind threaded through the machinery `gd` already built —
+`lsp::Goto::{Definition, Declaration, Implementation}` picks the method, the
+capability bit, and the word in every message (`no declaration found`,
+`implementation: this server does not offer it`), and everything downstream
+of the name is shared. A fourth member of the family would be one more
+variant, not one more pipeline.
+
+Why they exist: clangd's `definition` deliberately bounces — on a reference
+it goes to the definition *if indexed, else the declaration*, and on either
+end of a decl/def pair it jumps to the other — so C and C++ land in the
+header when you wanted the source often enough to want the explicit ask.
+`:decl` is the header's side of the question, `:impl` the bodies — which for
+Rust and friends also means trait implementations and overrides.
+
+Commands only, no default keys: `gd` earned its two letters by frequency,
+and these are the occasional precise question. `:declaration` and
+`:implementation` are the long spellings.
 
 ## `:peek` — the definition beside you
 

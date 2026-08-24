@@ -293,6 +293,7 @@ every one of them is typeable without its key and rebindable by name
 | `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
 | `K` | what the server knows about the cursor, floated beside it |
 | `:peek` | the definition in a vertical split, focus on it — the call site stays put |
+| `:decl` `:impl` | the declaration / the implementations — `gd`'s two siblings, for when `gd` lands in the header and you wanted the source, or the other way round |
 
 Diagnostics wear their severity's colour on the text, a `•` in the gutter,
 and the message at the end of the cursor's line; `:set diagnostics false`
@@ -512,6 +513,8 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:alt` | the other file — the test beside the implementation, the header beside the source |
 | `:lsp` | where this buffer stands with its language server; `restart` and `stop` manage it |
 | `:definition` `:def` | `gd` — jump to the definition the server names |
+| `:declaration` `:decl` | the declaration — the header's side, where the languages split the two |
+| `:implementation` `:impl` | the implementations: trait impls, overrides, the source for a header |
 | `:peek` | the definition in a vertical split, focus on it |
 | `:references` `:refs` | `gr` — every reference, in a results pane; `:replace //new/` over it is a rename |
 | `:format` `:fmt` | the whole file, by the server, as one undo step |

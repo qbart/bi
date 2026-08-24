@@ -60,10 +60,15 @@ pub enum Effect {
     /// A line for the status bar — a crash, or a `showMessage` at error or
     /// warning severity.
     Status(String),
-    /// A definition answer: where to jump `window`. Wire ranges still, since
-    /// the target file may not even be open yet — the editor converts after
-    /// loading it.
-    Definition { window: WindowId, targets: Vec<(PathBuf, types::Range)>, encoding: Encoding },
+    /// A goto answer — definition, declaration or implementation, as `kind`
+    /// says: where to jump `window`. Wire ranges still, since the target file
+    /// may not even be open yet — the editor converts after loading it.
+    Goto {
+        kind: super::Goto,
+        window: WindowId,
+        targets: Vec<(PathBuf, types::Range)>,
+        encoding: Encoding,
+    },
     /// A references answer, bound for a `Results` pane rooted at the
     /// client's workspace root.
     References {
@@ -307,18 +312,22 @@ impl Registry {
         }
     }
 
-    /// `textDocument/definition` for the symbol at `position`.
-    pub fn definition(
+    /// One of the goto family — `textDocument/definition`, `declaration` or
+    /// `implementation` — for the symbol at `position`. One method because
+    /// they are one request under three names; the kind is the whole of the
+    /// difference.
+    pub fn goto(
         &mut self,
+        kind: super::Goto,
         doc: &Doc,
         position: types::Position,
         window: WindowId,
     ) -> Result<(), String> {
         self.request(
             doc.server,
-            "textDocument/definition",
+            kind.method(),
             json!({ "textDocument": { "uri": doc.uri }, "position": position }),
-            Intent::Definition { window },
+            Intent::Goto { kind, window },
         )
     }
 
@@ -456,13 +465,14 @@ impl Registry {
                 // The answer to `shutdown` needs no action — `exit` already
                 // followed it out the door.
                 Intent::Shutdown => None,
-                Intent::Definition { window } => match result {
-                    Ok(value) => Some(Effect::Definition {
+                Intent::Goto { kind, window } => match result {
+                    Ok(value) => Some(Effect::Goto {
+                        kind,
                         window,
                         targets: locations(value),
                         encoding: client.encoding,
                     }),
-                    Err(e) => Some(Effect::Status(format!("definition: {}", e.message))),
+                    Err(e) => Some(Effect::Status(format!("{}: {}", kind.noun(), e.message))),
                 },
                 Intent::References { symbol } => match result {
                     Ok(value) => Some(Effect::References {
@@ -756,6 +766,7 @@ fn find_root(dir: &Path, markers: &[String]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::buffer::{Buffer, Cursor};
+    use crate::lsp::Goto;
     use crate::lsp::transport::fake::FakeSpawn;
     use crate::lsp::types::Position;
 
@@ -1174,7 +1185,7 @@ mod tests {
                 doc.server,
                 "textDocument/definition",
                 json!({}),
-                Intent::Definition { window },
+                Intent::Goto { kind: Goto::Definition, window },
             )
             .unwrap();
         let sent = rig.fake.last(doc.server, "textDocument/definition").unwrap();
@@ -1188,7 +1199,7 @@ mod tests {
         inbox.deliver(doc.server, Inbound::Response { id, result: Ok(single) });
         let (from, msg) = rig.registry.drain().pop().unwrap();
         match rig.registry.accept(from, msg) {
-            Some(Effect::Definition { window: w, targets, encoding }) => {
+            Some(Effect::Goto { window: w, targets, encoding, .. }) => {
                 assert_eq!(w, window);
                 assert_eq!(targets[0].0, PathBuf::from("/a.rs"));
                 assert_eq!(targets[0].1.start.line, 3);
@@ -1203,7 +1214,7 @@ mod tests {
                 doc.server,
                 "textDocument/definition",
                 json!({}),
-                Intent::Definition { window },
+                Intent::Goto { kind: Goto::Definition, window },
             )
             .unwrap();
         let id =
@@ -1224,7 +1235,7 @@ mod tests {
         inbox.deliver(doc.server, Inbound::Response { id, result: Ok(links) });
         let (from, msg) = rig.registry.drain().pop().unwrap();
         match rig.registry.accept(from, msg) {
-            Some(Effect::Definition { targets, .. }) => {
+            Some(Effect::Goto { targets, .. }) => {
                 assert_eq!(targets.len(), 1, "the foreign scheme dropped");
                 assert_eq!(targets[0].1.start, Position { line: 2, character: 7 }, "the symbol");
             }
@@ -1237,7 +1248,7 @@ mod tests {
                 doc.server,
                 "textDocument/definition",
                 json!({}),
-                Intent::Definition { window },
+                Intent::Goto { kind: Goto::Definition, window },
             )
             .unwrap();
         let id =
@@ -1245,8 +1256,34 @@ mod tests {
         inbox.deliver(doc.server, Inbound::Response { id, result: Ok(Value::Null) });
         let (from, msg) = rig.registry.drain().pop().unwrap();
         match rig.registry.accept(from, msg) {
-            Some(Effect::Definition { targets, .. }) => assert!(targets.is_empty()),
+            Some(Effect::Goto { targets, .. }) => assert!(targets.is_empty()),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_goto_kind_picks_the_method_and_survives_to_the_effect() {
+        let mut rig = rig("req-goto");
+        let (doc, _) = opened(&mut rig, incremental());
+        let window = WindowId(0);
+        let position = Position { line: 1, character: 2 };
+
+        for kind in [Goto::Definition, Goto::Declaration, Goto::Implementation] {
+            rig.registry.goto(kind, &doc, position, window).unwrap();
+            let sent = rig.fake.last(doc.server, kind.method()).unwrap();
+            assert_eq!(sent["params"]["position"]["line"], 1);
+            let id = sent["id"].as_i64().unwrap();
+
+            let inbox = rig.fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(doc.server, Inbound::Response { id, result: Ok(Value::Null) });
+            let (from, msg) = rig.registry.drain().pop().unwrap();
+            match rig.registry.accept(from, msg) {
+                Some(Effect::Goto { kind: k, targets, .. }) => {
+                    assert_eq!(k, kind);
+                    assert!(targets.is_empty());
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 
@@ -1263,7 +1300,7 @@ mod tests {
                 doc.server,
                 "textDocument/definition",
                 json!({}),
-                Intent::Definition { window: WindowId(0) },
+                Intent::Goto { kind: Goto::Definition, window: WindowId(0) },
             )
             .unwrap_err();
         assert!(err.contains("starting"), "{err}");
@@ -1276,7 +1313,7 @@ mod tests {
                 doc.server,
                 "textDocument/definition",
                 json!({}),
-                Intent::Definition { window: WindowId(0) },
+                Intent::Goto { kind: Goto::Definition, window: WindowId(0) },
             )
             .unwrap_err();
         assert!(err.contains(":lsp restart"), "{err}");

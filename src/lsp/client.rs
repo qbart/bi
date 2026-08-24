@@ -28,8 +28,10 @@ use crate::window::WindowId;
 pub enum Intent {
     Initialize,
     Shutdown,
-    /// `gd` — jump the window that asked.
-    Definition {
+    /// `gd`, `:decl`, `:impl` — jump the window that asked; the kind names
+    /// the request for the answer's messages.
+    Goto {
+        kind: super::Goto,
         window: WindowId,
     },
     /// `gr` — the symbol under the cursor at request time, for the pane's
@@ -69,11 +71,25 @@ pub enum Intent {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Caps {
     pub definition: bool,
+    pub declaration: bool,
+    pub implementation: bool,
     pub references: bool,
     pub formatting: bool,
     pub hover: bool,
     pub completion: bool,
     pub signature: bool,
+}
+
+impl Caps {
+    /// Whether the server claims `kind`'s side of the goto family — the one
+    /// place a [`Goto`] becomes a capability bit.
+    pub fn offers(&self, kind: super::Goto) -> bool {
+        match kind {
+            super::Goto::Definition => self.definition,
+            super::Goto::Declaration => self.declaration,
+            super::Goto::Implementation => self.implementation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +227,8 @@ impl Client {
         self.sync = SyncCaps::parse(parsed.capabilities.text_document_sync.as_ref());
         self.caps = Caps {
             definition: truthy(parsed.capabilities.definition_provider.as_ref()),
+            declaration: truthy(parsed.capabilities.declaration_provider.as_ref()),
+            implementation: truthy(parsed.capabilities.implementation_provider.as_ref()),
             references: truthy(parsed.capabilities.references_provider.as_ref()),
             formatting: truthy(parsed.capabilities.formatting_provider.as_ref()),
             hover: truthy(parsed.capabilities.hover_provider.as_ref()),

@@ -107,6 +107,39 @@ impl Severity {
     }
 }
 
+/// The goto family: three requests of one shape. The kind picks the wire
+/// method, the capability bit, and the word in every message; everything
+/// downstream of the name is shared. See `docs/specs/lsp-requests.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goto {
+    /// `gd`, `:def`.
+    Definition,
+    /// `:decl` — the header's side of the question, where the languages
+    /// split the two.
+    Declaration,
+    /// `:impl` — the bodies: trait impls, overrides, the source for a header.
+    Implementation,
+}
+
+impl Goto {
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::Definition => "textDocument/definition",
+            Self::Declaration => "textDocument/declaration",
+            Self::Implementation => "textDocument/implementation",
+        }
+    }
+
+    /// The word for messages: `no declaration found`.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::Declaration => "declaration",
+            Self::Implementation => "implementation",
+        }
+    }
+}
+
 /// One stored diagnostic, in **char offsets** into the buffer it annotates.
 ///
 /// Converted from wire positions on receipt — through the encoding the server
