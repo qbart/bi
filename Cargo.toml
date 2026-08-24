@@ -68,6 +68,14 @@ grep-regex = "0.1.14"
 grep-matcher = "0.1.9"
 ignore = "0.4.33"
 imara-diff = "0.2.0"
+# Image files open as images. Decoding is the core's — pixel dimensions are
+# core facts, and every frontend wants the same RGBA — so the crate sits here
+# rather than behind the terminal. Formats are named rather than defaulted:
+# the default set drags in AVIF and EXR decoders nobody asked a text editor
+# for. See docs/specs/images.md.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The kitty graphics protocol carries pixels as base64. Terminal frontend only.
+base64 = "0.22"
 
 [profile.release]
 lto = true

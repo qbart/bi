@@ -20,6 +20,11 @@ sign in the gutter for every line the index does not have, and a `+3 ~1 -2`
 numstat in the status row. `:diags` lists every stored diagnostic in a pane
 to jump from, and `:zen` strips the chrome — gutter, numbers, status rows —
 until you ask for it back.
+`Ctrl-P`, the file tree and `:find` all respect what `.gitignore` says is not
+the project's (`gh` in the tree shows everything anyway), and an image file
+opens as the picture it is where the terminal speaks the kitty graphics
+protocol — centered, scrolled with `hjkl`/`gg`/`G` when it does not fit, its
+size in the status row where `row:col` would be.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 

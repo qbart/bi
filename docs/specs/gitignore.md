@@ -27,9 +27,18 @@ gitignore = true
 ```
 
 Off, and the walk lists everything again — which is how you open a file the
-project ignores. Nothing else in bi consults it: `:e` on an ignored path has
-always worked and still does. This is a question about a *list*, not about
-what you are allowed to edit.
+project ignores. `:e` on an ignored path has always worked and still does.
+This is a question about a *list*, not about what you are allowed to edit.
+
+**Corrected.** "Nothing else in bi consults it" did not survive the file tree.
+The tree's pane, and the `gf`/`/` fuzzy list over it, now read the same
+`Rules` under the same option — a pane showing thousands of rows the picker
+refuses to list is two answers to one question about one project. The tree's
+`gh` shows everything, ignored files included, which is the per-pane escape
+hatch the picker never needed because `:e` already was one. `:find` honours
+the option too, through the `ignore` crate's own walker. The sentence this
+corrects survives as the rule it was really stating: nothing that *edits*
+consults it — only the lists do.
 
 ## Which files are read
 

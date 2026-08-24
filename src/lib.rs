@@ -34,6 +34,7 @@ pub mod find_in_files;
 pub mod git;
 pub mod gitignore;
 pub mod history;
+pub mod img;
 pub mod indent;
 pub mod input;
 pub mod key;

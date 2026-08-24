@@ -218,9 +218,21 @@ found it.
 does not sort away from `readme-draft.md`.
 
 **Hidden entries are those whose name starts with `.`,** filtered unless
-`show_hidden`. `.gitignore` is deliberately not consulted: it would make the
-tree's contents depend on a git dependency and a per-directory rule stack, and
-`target/` — the case that motivates it — is one collapsed row.
+`show_hidden`. `.gitignore` was deliberately not consulted at first: it would
+make the tree's contents depend on a per-directory rule stack, and `target/` —
+the case that motivates it — is one collapsed row.
+
+**Corrected.** The rule stack got built anyway, for `Ctrl-P` — see
+`docs/specs/gitignore.md` — and once it existed the argument inverted: the tree
+showing thousands of rows the picker refuses to list is two answers to one
+question about one project. The tree now consults the same `Rules`, pushed
+per directory exactly as the walk pushes them, under the same `gitignore`
+option. One collapsed `target/` row was the cheap version of this; it stops
+being cheap the moment you expand it looking for something the picker already
+knew was not yours. `gh` shows everything — dotfiles and ignored files both:
+it is the tree's "what is actually on disk" key, and two toggles that each
+reveal half of the truth would be a worse answer than one that reveals it
+all.
 
 **Symlinks are shown and never expanded.** A symlinked directory is a `Kind::Link`
 row that opening follows as a file. Following them into the tree means a cycle
@@ -328,9 +340,11 @@ boolean and one sentence: `gf` is the disk, `/` is the pane.
 
 The walk is bounded by the same limit `Ctrl-P` uses — a tree rooted at `/` is a
 real thing to do by accident — and obeys `gh`, so the list and the pane agree
-about whether dotfiles exist. It does *not* consult `.gitignore`, because the
-tree does not either: a list that offered files the pane refuses to show would
-be a list that cannot take you to half of what it names.
+about whether dotfiles exist. It consults `.gitignore` exactly when the pane
+does, for the same reason with the sign flipped: a list that offered files the
+pane refuses to show would be a list that cannot take you to half of what it
+names. When the pane hides what the project ignores, so does the list; `gh`
+turns both back on together.
 
 `-` and `+` are inverses, and the pair is the reason the tree does not only get
 wider as you use it: `+` scopes to the directory you are standing in — the one

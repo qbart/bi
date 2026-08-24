@@ -66,6 +66,9 @@ fn main() -> Result<()> {
     editor.set_git_baseline(bi::git::baseline);
 
     let mut term = setup().context("entering raw mode")?;
+    // After raw mode is on, before the event-reader thread takes stdin: the
+    // handshake reads the terminal's answers itself. See src/tui/graphics.rs.
+    let kitty = tui::graphics::detect();
 
     if !problems.is_empty() {
         let n = problems.len();
@@ -73,7 +76,7 @@ fn main() -> Result<()> {
             format!("{n} config problem{}: {}", if n == 1 { "" } else { "s" }, problems[0].message);
     }
 
-    let result = run(&mut term, &mut editor);
+    let result = run(&mut term, &mut editor, kitty);
     // Before `restore`, not after: the servers get their shutdown while the
     // screen is still bi's, and a hung one is killed rather than waited on.
     editor.shutdown_lsp();
@@ -320,8 +323,9 @@ enum Wake {
     Lsp,
 }
 
-fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
+fn run(term: &mut Term, ed: &mut Editor, kitty: bool) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut gfx = tui::graphics::Graphics::new(kitty);
 
     // The terminal reader. Detached: it blocks in `event::read` with nothing
     // to interrupt it, and process exit is what ends it — the same blocking
@@ -357,7 +361,15 @@ fn run(term: &mut Term, ed: &mut Editor) -> Result<()> {
             input.set_keys(ed.config().keys.clone());
         }
 
-        term.draw(|frame| tui::render::render(frame, ed, &input.pending_display()))?;
+        // Where every image pane wants pixels this frame, collected by the
+        // renderer and brought to the screen after ratatui's own draw — the
+        // escapes ride behind the frame, never through it.
+        let cell = gfx.cell_size();
+        let mut places = Vec::new();
+        term.draw(|frame| {
+            tui::render::render(frame, ed, &input.pending_display(), cell, &mut places)
+        })?;
+        gfx.sync(ed, &places)?;
 
         // Something on screen may go away on its own — the flash a yank left.
         // Waiting is the frontend's job and the clock is the editor's, so the

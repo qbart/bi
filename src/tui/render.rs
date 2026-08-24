@@ -408,7 +408,13 @@ fn to_tui(r: CoreRect) -> Rect {
     Rect { x: r.x, y: r.y, width: r.width, height: r.height }
 }
 
-pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
+pub fn render(
+    frame: &mut Frame,
+    ed: &mut Editor,
+    pending: &str,
+    cell: Option<(u16, u16)>,
+    places: &mut Vec<crate::tui::graphics::Place>,
+) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
@@ -452,7 +458,16 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
             false => Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rect),
         };
 
-        let at = render_window(frame, ed, id, body_area, id == focus);
+        let at = match ed.content_kind_of(id) {
+            // Mutably, unlike everything else here: the viewport report and
+            // the scroll clamp live in the core, and this is where the core
+            // hears what room the pane got.
+            Some(ContentKind::Image) => {
+                render_image(frame, ed, id, body_area, cell, places);
+                None
+            }
+            _ => render_window(frame, ed, id, body_area, id == focus),
+        };
         if id == focus {
             cursor_at = at;
         }
@@ -697,6 +712,57 @@ fn render_results(
     cursor_at
 }
 
+/// One window's image: a placement for the graphics module when the terminal
+/// draws pixels, a centered line about them when it does not.
+///
+/// The cells under a placement stay blank — ratatui owns every cell it thinks
+/// it owns, and the picture rides above them on the terminal's own layer.
+fn render_image(
+    frame: &mut Frame,
+    ed: &mut Editor,
+    id: WindowId,
+    area: Rect,
+    cell: Option<(u16, u16)>,
+    places: &mut Vec<crate::tui::graphics::Place>,
+) {
+    let ui = ed.theme().ui;
+    let Some(img) = ed.image_pane_mut(id) else { return };
+    match cell {
+        Some((cw, ch)) if cw > 0 && ch > 0 && area.width > 0 && area.height > 0 => {
+            let (vw, vh) = (area.width as u32 * cw as u32, area.height as u32 * ch as u32);
+            // One step is one text row's worth in both directions, so "a
+            // little" means the same distance it means in a file.
+            img.set_viewport(vw, vh, ch as u32);
+            let (sx, sy) = img.scroll();
+            let (w, h) = ((img.width - sx).min(vw), (img.height - sy).min(vh));
+            // Native size, never scaled: the crop occupies exactly the cells
+            // its pixels cover, centered along any axis with room to spare.
+            let cols = w.div_ceil(cw as u32).min(area.width as u32) as u16;
+            let rows = h.div_ceil(ch as u32).min(area.height as u32) as u16;
+            let col = area.x + (area.width - cols) / 2;
+            let row = area.y + (area.height - rows) / 2;
+            places.push(crate::tui::graphics::Place { id: img.id, col, row, crop: (sx, sy, w, h) });
+        }
+        _ => {
+            // No pixels to draw with. The placeholder still says what this
+            // is, which beats the rope of noise an image used to open as.
+            img.set_viewport(img.width, img.height, 1);
+            let name = img
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| img.path.display().to_string());
+            let label = format!("{name} — {}×{}", img.width, img.height);
+            let middle = Rect { y: area.y + area.height / 2, height: 1.min(area.height), ..area };
+            let line = Line::from(Span::styled(label, tui(ui.status_muted)));
+            frame.render_widget(
+                Paragraph::new(line).alignment(ratatui::layout::Alignment::Center),
+                middle,
+            );
+        }
+    }
+}
+
 /// One window's text. Returns where the terminal cursor belongs, when this is
 /// the window that has it.
 fn render_window(
@@ -721,6 +787,9 @@ fn render_window(
                 &ed.theme().ui,
             );
         }
+        // Routed to `render_image` before this is called — it needs the
+        // editor mutably, which one shared entry point cannot offer.
+        Pane::Image { .. } => return None,
     };
     let (scroll, selections) = (text.scroll, &text.selections);
 
@@ -1262,7 +1331,11 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     let row =
         if focused { tui(ed.theme().ui.statusline) } else { tui(ed.theme().ui.status_inactive) };
     let left = window_status_text(ed, id, focused);
-    let right = if focused { format!(" {} ", ed.session.mode.label()) } else { String::new() };
+    // An image pane has no mode segment: modes do not exist there, and the
+    // row should not claim otherwise. See docs/specs/images.md.
+    let image = matches!(ed.pane(id), Some(Pane::Image { .. }));
+    let right =
+        if focused && !image { format!(" {} ", ed.session.mode.label()) } else { String::new() };
 
     // The numstat, to the left of the mode: each part in its sign's colour on
     // the row's own background, absent at zero, so a clean file's status row
@@ -1292,7 +1365,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
         (width as usize).saturating_sub(left.chars().count() + stats_width + right.chars().count());
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     spans.extend(stats);
-    if focused {
+    if focused && !image {
         spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }
     spans
@@ -1312,6 +1385,16 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         // cursor position to report, so the left half carries the count.
         Some(Pane::Results { results, .. }) => {
             (results.title.clone(), format!("{} in {}", results.matches().len(), results.files()))
+        }
+        // An image says how big it is where a text pane says where you are —
+        // the size is the fact about a picture that position was about text.
+        Some(Pane::Image { img, .. }) => {
+            let name = img
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| img.path.display().to_string());
+            (name, format!("{}×{}", img.width, img.height))
         }
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
@@ -1754,7 +1837,7 @@ mod tests {
         ed.set_cursor(Cursor::at(0));
 
         let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
         let rows: Vec<String> = (0..4)
             .map(|y| {
@@ -1791,7 +1874,7 @@ mod tests {
             ed.set_cursor(Cursor::at(0));
             ed.run_ex(&format!("set gutter {gutter}"));
             let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
-            terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+            terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
             (0..12)
                 .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
                 .collect::<String>()
@@ -1818,7 +1901,7 @@ mod tests {
         ed.run_ex("whitespace");
 
         let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
         let rows: Vec<String> = (0..3)
             .map(|y| {
@@ -1859,12 +1942,12 @@ mod tests {
             ed.apply(Command { count: 1, action: Action::CommandChar(c) });
         }
 
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
         let end = terminal.get_cursor_position().unwrap();
         assert_eq!(end.x, 3, "past `:wq`");
 
         ed.apply(Command { count: 1, action: Action::CommandMove(CmdMove::Home) });
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
         let home = terminal.get_cursor_position().unwrap();
         assert_eq!((home.x, home.y), (1, end.y), "on the `w`, and on the same row");
     }
@@ -1885,9 +1968,9 @@ mod tests {
         ed.set_cursor(Cursor::at(0));
 
         let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
         ed.apply(Command { count: 1, action: Action::EnterVisual(Shape::Lines) });
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
         let bg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].style().bg;
         let selection = Some(color(ed.theme().ui.selection.bg.unwrap()));
@@ -1915,7 +1998,7 @@ mod tests {
         ed.set_cursor(Cursor::at(SOURCE.find("go()").unwrap()));
 
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
         let _ = std::fs::remove_file(&path);
 
         let rows: Vec<String> = (0..5)
@@ -1956,7 +2039,7 @@ int main(void) {
         ed.set_cursor(Cursor::at(SOURCE.find("e();").unwrap()));
 
         let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
         let _ = std::fs::remove_file(&path);
 
         let row = |y: u16| -> String {
@@ -1994,13 +2077,13 @@ int main(void) {
         let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
         // Once first, so the window learns how tall it is: `s` aims at the
         // viewport, and a window of nought rows is showing nothing.
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
         ed.apply(Command { count: 1, action: Action::EnterFind });
         for c in "beta".chars() {
             ed.apply(Command { count: 1, action: Action::FindChar(c) });
         }
-        terminal.draw(|frame| render(frame, &mut ed, "")).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
         let row: String = (0..24)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())

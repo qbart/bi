@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::gitignore::Rules;
+
 /// What a row is. Taken from `symlink_metadata`, so a symlink is never mistaken
 /// for the directory it points at — which is what keeps expansion acyclic
 /// without a visited set.
@@ -146,6 +148,11 @@ pub struct Tree {
     /// window's own scroll belongs to `Content::Text`.
     scroll: usize,
     show_hidden: bool,
+    /// Whether the project's `.gitignore` decides what a listing shows — the
+    /// same option, and the same `Rules`, as the `Ctrl-P` walk. `gh` shows
+    /// everything regardless, which is the tree's "what is actually on disk"
+    /// key. See `docs/specs/gitignore.md`.
+    gitignore: bool,
 }
 
 impl Tree {
@@ -155,7 +162,7 @@ impl Tree {
     /// `:e` decides between a file and a tree by asking the disk, so getting
     /// here with a file means the disk changed underneath and saying so is
     /// better than showing nothing.
-    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(root: impl AsRef<Path>, gitignore: bool) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
             anyhow::bail!("{} is not a directory", root.display());
@@ -171,9 +178,19 @@ impl Tree {
             selected: 0,
             scroll: 0,
             show_hidden: false,
+            gitignore,
         };
         tree.rebuild();
         Ok(tree)
+    }
+
+    /// Follows the option when it changes under a living tree — `:set
+    /// gitignore` should not need the pane reopened to mean anything.
+    pub fn set_gitignore(&mut self, on: bool) {
+        if self.gitignore != on {
+            self.gitignore = on;
+            self.rebuild();
+        }
     }
 
     /// Recomputes every visible row from the expansion set.
@@ -190,7 +207,8 @@ impl Tree {
             kind: Kind::Dir,
             open: true,
         }];
-        self.push_children(&self.root.clone(), 1, &mut rows);
+        let mut rules = self.rules();
+        self.push_children(&self.root.clone(), 1, &mut rows, rules.as_mut());
         self.rows = rows;
 
         // The selection is a path, not an index. A file appearing above it must
@@ -203,15 +221,41 @@ impl Tree {
     }
 
     /// Appends `dir`'s entries, descending into the ones that are expanded.
-    fn push_children(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
-        for mut row in children_of(dir, depth, self.show_hidden) {
+    ///
+    /// `rules` accumulates as the descent goes and is never popped, exactly as
+    /// `crate::files::walk` accumulates: a `.gitignore` only speaks about
+    /// paths under its own directory, so a sibling subtree's rules match
+    /// nothing here and lingering is harmless. What matters is order — a
+    /// deeper file arrives later and therefore wins, because the last match
+    /// decides.
+    fn push_children(
+        &self,
+        dir: &Path,
+        depth: usize,
+        rows: &mut Vec<Row>,
+        mut rules: Option<&mut Rules>,
+    ) {
+        if let Some(rules) = rules.as_deref_mut()
+            && let Ok(text) = std::fs::read_to_string(dir.join(".gitignore"))
+        {
+            rules.push(dir, &text);
+        }
+        for mut row in children_of(dir, depth, self.show_hidden, rules.as_deref()) {
             row.open = row.kind == Kind::Dir && self.expanded.contains(&row.path);
             let (open, path) = (row.open, row.path.clone());
             rows.push(row);
             if open {
-                self.push_children(&path, depth + 1, rows);
+                self.push_children(&path, depth + 1, rows, rules.as_deref_mut());
             }
         }
+    }
+
+    /// The rules in force at the root, or `None` when nothing filters — which
+    /// is `gitignore = false`, or `gh`: the key that shows dotfiles shows
+    /// ignored files too, because half of "what is actually here" is no
+    /// answer at all.
+    fn rules(&self) -> Option<Rules> {
+        (self.gitignore && !self.show_hidden).then(|| Rules::inherited(&self.root))
     }
 
     pub fn root(&self) -> &Path {
@@ -398,15 +442,23 @@ impl Tree {
     pub fn every_path(&self, limit: usize) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self.rows[1..].iter().map(|row| row.path.clone()).collect();
         let seen: BTreeSet<PathBuf> = out.iter().cloned().collect();
+        let mut rules = self.rules();
         // Breadth first, so what is left over is shallowest first: with two
         // equal matches and nothing else to separate them, the one nearer the
-        // root is the one you meant.
+        // root is the one you meant. A directory is dequeued before anything
+        // under it, so its `.gitignore` is pushed before its children are
+        // judged — the same order the depth-first walks keep.
         let mut queue = std::collections::VecDeque::from([self.root.clone()]);
         while let Some(dir) = queue.pop_front() {
             if out.len() >= limit {
                 break;
             }
-            for row in children_of(&dir, 0, self.show_hidden) {
+            if let Some(rules) = rules.as_mut()
+                && let Ok(text) = std::fs::read_to_string(dir.join(".gitignore"))
+            {
+                rules.push(&dir, &text);
+            }
+            for row in children_of(&dir, 0, self.show_hidden, rules.as_ref()) {
                 if row.kind == Kind::Dir {
                     queue.push_back(row.path.clone());
                 }
@@ -427,11 +479,10 @@ impl Tree {
         self.rebuild();
     }
 
-    /// Shows or hides entries whose name starts with a dot.
-    ///
-    /// `.gitignore` is deliberately not consulted for this: honouring it would
-    /// put a git dependency and a per-directory rule stack behind a listing,
-    /// and `target/` — the case that motivates it — is one collapsed row.
+    /// Shows or hides everything a listing filters: dotfiles, and what the
+    /// project's `.gitignore` names. One key for both, because two toggles
+    /// that each reveal half of what is on disk is a worse answer than one
+    /// that reveals it all. See `docs/specs/tree.md`.
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.rebuild();
@@ -456,9 +507,12 @@ fn name_of(path: &Path) -> String {
 
 /// One row per entry of `dir`, directories first and then by name.
 ///
+/// `rules`, when given, must already hold `dir`'s own `.gitignore` — the
+/// caller pushes on the way down, because only the caller knows the way.
+///
 /// An unreadable directory yields nothing rather than an error: one bad
 /// permission should not fail the tree around it.
-fn children_of(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Row> {
+fn children_of(dir: &Path, depth: usize, show_hidden: bool, rules: Option<&Rules>) -> Vec<Row> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
 
     let mut rows: Vec<Row> = entries
@@ -475,6 +529,10 @@ fn children_of(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Row> {
             };
             Row { name: name_of(&path), path, depth, kind, open: false }
         })
+        // A link is judged as the file it lists as, not the directory it may
+        // point at — the walk makes the same call, and never following links
+        // is what keeps both acyclic.
+        .filter(|row| rules.is_none_or(|r| !r.ignored(&row.path, row.kind == Kind::Dir)))
         .collect();
 
     rows.sort_by(|a, b| {
@@ -578,7 +636,7 @@ mod tests {
     #[test]
     fn a_new_tree_lists_the_root_children_with_directories_first() {
         let d = ScratchDir::new("new").file("README.md").dir("src").file("Cargo.toml");
-        let tree = Tree::new(d.path()).unwrap();
+        let tree = Tree::new(d.path(), true).unwrap();
 
         assert_eq!(shown(&tree), ["src/", "Cargo.toml", "README.md"]);
     }
@@ -586,7 +644,7 @@ mod tests {
     #[test]
     fn expanding_a_directory_inserts_its_children_below_it() {
         let d = ScratchDir::new("expand").file("src/lib.rs").file("src/tree.rs").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         assert_eq!(shown(&tree), ["src/", "Cargo.toml"]);
 
         tree.select(1);
@@ -604,7 +662,7 @@ mod tests {
     #[test]
     fn collapsing_an_ancestor_hides_every_descendant() {
         let d = ScratchDir::new("collapse").file("src/tui/render.rs").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
         expand_at(&mut tree, 2);
         assert_eq!(shown(&tree), ["src/", "  tui/", "    render.rs", "  lib.rs"]);
@@ -618,7 +676,7 @@ mod tests {
     #[test]
     fn collapsing_something_already_closed_goes_to_the_parent() {
         let d = ScratchDir::new("parent").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
 
         tree.select(2); // src/lib.rs, a file — nothing to close
@@ -630,7 +688,7 @@ mod tests {
     #[test]
     fn the_selection_moves_by_a_count_and_stops_at_both_ends() {
         let d = ScratchDir::new("step").file("a").file("b").file("c");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         assert_eq!(tree.selected(), 0, "the root row, to begin with");
 
         tree.step(true, 2);
@@ -646,7 +704,7 @@ mod tests {
     #[test]
     fn dotfiles_are_hidden_until_asked_for() {
         let d = ScratchDir::new("hidden").dir(".git").file(".gitignore").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         assert_eq!(shown(&tree), ["Cargo.toml"]);
 
         tree.toggle_hidden();
@@ -656,6 +714,94 @@ mod tests {
         assert_eq!(shown(&tree), ["Cargo.toml"]);
     }
 
+    fn write(d: &ScratchDir, rel: &str, text: &str) {
+        std::fs::write(d.path().join(rel), text).unwrap();
+    }
+
+    #[test]
+    fn what_the_project_ignores_is_not_shown() {
+        let d = ScratchDir::new("gitignore")
+            .file("keep.rs")
+            .file("debug.log")
+            .file("target/debug/thing")
+            .file("build/script.sh");
+        write(&d, ".gitignore", "*.log\ntarget/\n");
+        let mut tree = Tree::new(d.path(), true).unwrap();
+
+        assert_eq!(shown(&tree), ["build/", "keep.rs"], "and `build` is checked in");
+
+        expand_at(&mut tree, 1);
+        assert_eq!(shown(&tree), ["build/", "  script.sh", "keep.rs"]);
+    }
+
+    #[test]
+    fn a_nested_gitignore_applies_when_its_directory_expands() {
+        let d = ScratchDir::new("gitignore-nested").file("a.log").file("sub/b.log");
+        write(&d, ".gitignore", "*.log\n");
+        write(&d, "sub/.gitignore", "!*.log\n");
+        let mut tree = Tree::new(d.path(), true).unwrap();
+        assert_eq!(shown(&tree), ["sub/"], "a.log is ignored at the root");
+
+        expand_at(&mut tree, 1);
+
+        assert_eq!(shown(&tree), ["sub/", "  b.log"], "the deeper file re-included it");
+    }
+
+    /// `gh` is the tree's "what is actually on disk" key: dotfiles and
+    /// ignored files come back together.
+    #[test]
+    fn gh_shows_ignored_files_too() {
+        let d = ScratchDir::new("gitignore-gh").file("keep.rs").file("debug.log");
+        write(&d, ".gitignore", "*.log\n");
+        let mut tree = Tree::new(d.path(), true).unwrap();
+        assert_eq!(shown(&tree), ["keep.rs"]);
+
+        tree.toggle_hidden();
+        assert_eq!(shown(&tree), [".gitignore", "debug.log", "keep.rs"]);
+
+        tree.toggle_hidden();
+        assert_eq!(shown(&tree), ["keep.rs"]);
+    }
+
+    /// `gf` offers what the pane would show — a list naming files the pane
+    /// refuses to list cannot take you to half of what it names.
+    #[test]
+    fn every_path_skips_what_the_pane_hides() {
+        let d = ScratchDir::new("gitignore-gf")
+            .file("keep.rs")
+            .file("target/debug/thing")
+            .file("src/lib.rs");
+        write(&d, ".gitignore", "target/\n");
+        let tree = Tree::new(d.path(), true).unwrap();
+
+        let all = tree.every_path(1000);
+        assert!(all.iter().any(|p| p.ends_with("src/lib.rs")), "closed dirs are still walked");
+        assert!(!all.iter().any(|p| p.ends_with("thing")), "but not the ignored ones");
+    }
+
+    #[test]
+    fn gitignore_off_lists_everything() {
+        let d = ScratchDir::new("gitignore-off").file("keep.rs").file("debug.log");
+        write(&d, ".gitignore", "*.log\n");
+        let tree = Tree::new(d.path(), false).unwrap();
+
+        assert_eq!(shown(&tree), ["debug.log", "keep.rs"]);
+    }
+
+    #[test]
+    fn setting_the_option_rebuilds_a_living_tree() {
+        let d = ScratchDir::new("gitignore-set").file("keep.rs").file("debug.log");
+        write(&d, ".gitignore", "*.log\n");
+        let mut tree = Tree::new(d.path(), true).unwrap();
+        assert_eq!(shown(&tree), ["keep.rs"]);
+
+        tree.set_gitignore(false);
+        assert_eq!(shown(&tree), ["debug.log", "keep.rs"]);
+
+        tree.set_gitignore(true);
+        assert_eq!(shown(&tree), ["keep.rs"]);
+    }
+
     /// Not following them is what makes expansion acyclic by construction, so
     /// there is no visited set anywhere in here.
     #[cfg(unix)]
@@ -663,7 +809,7 @@ mod tests {
     fn a_symlinked_directory_is_a_link_and_never_expands() {
         let d = ScratchDir::new("link").file("src/lib.rs");
         std::os::unix::fs::symlink(d.path().join("src"), d.path().join("loop")).unwrap();
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         assert_eq!(shown(&tree), ["src/", "loop"], "a link sorts with the files");
 
         tree.select(2);
@@ -675,7 +821,7 @@ mod tests {
     #[test]
     fn refreshing_reads_the_disk_again_and_keeps_expansion() {
         let d = ScratchDir::new("refresh").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
         assert_eq!(shown(&tree), ["src/", "  lib.rs"]);
 
@@ -688,7 +834,7 @@ mod tests {
     #[test]
     fn the_selection_follows_its_path_when_rows_move_under_it() {
         let d = ScratchDir::new("follow").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
         tree.select(2);
 
@@ -702,7 +848,7 @@ mod tests {
     #[test]
     fn going_up_re_roots_at_the_parent_and_selects_where_it_came_from() {
         let d = ScratchDir::new("up").file("src/lib.rs").file("Cargo.toml");
-        let mut tree = Tree::new(d.path().join("src")).unwrap();
+        let mut tree = Tree::new(d.path().join("src"), true).unwrap();
         assert_eq!(shown(&tree), ["lib.rs"]);
 
         tree.up();
@@ -715,7 +861,7 @@ mod tests {
     #[test]
     fn enter_opens_and_closes_a_directory_without_moving() {
         let d = ScratchDir::new("toggle").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         tree.select(1);
 
         tree.toggle();
@@ -729,7 +875,7 @@ mod tests {
     #[test]
     fn the_selected_row_carries_the_path_and_the_kind() {
         let d = ScratchDir::new("selected").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         tree.select(1);
 
         let row = tree.selected_row().unwrap();
@@ -740,7 +886,7 @@ mod tests {
     #[test]
     fn scrolling_follows_the_selection() {
         let d = ScratchDir::new("scroll").file("a").file("b").file("c").file("e");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         tree.scroll_to_selected(2);
         assert_eq!(tree.scroll(), 0);
 
@@ -758,7 +904,7 @@ mod tests {
     /// feature exists for.
     #[test]
     fn a_relative_root_is_resolved_so_going_up_has_somewhere_to_go() {
-        let mut tree = Tree::new(".").unwrap();
+        let mut tree = Tree::new(".", true).unwrap();
         assert!(tree.root().is_absolute(), "resolved on the way in: {:?}", tree.root());
 
         let was = tree.root().to_path_buf();
@@ -770,7 +916,7 @@ mod tests {
     #[test]
     fn going_down_re_roots_at_the_selected_directory_and_keeps_expansion() {
         let d = ScratchDir::new("down").file("src/tui/render.rs").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
         expand_at(&mut tree, 2);
         assert_eq!(shown(&tree), ["src/", "  tui/", "    render.rs", "Cargo.toml"]);
@@ -788,7 +934,7 @@ mod tests {
     #[test]
     fn going_down_on_a_file_takes_the_directory_holding_it() {
         let d = ScratchDir::new("down-file").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         expand_at(&mut tree, 1);
 
         tree.select(2);
@@ -800,7 +946,7 @@ mod tests {
     #[test]
     fn going_down_at_the_root_has_nowhere_to_go() {
         let d = ScratchDir::new("down-root").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         let was = tree.root().to_path_buf();
 
         tree.select(0);
@@ -818,7 +964,7 @@ mod tests {
     #[test]
     fn revealing_opens_every_directory_down_to_the_file_and_selects_it() {
         let d = ScratchDir::new("reveal").file("src/tui/render.rs").file("Cargo.toml");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         assert_eq!(shown(&tree), ["src/", "Cargo.toml"]);
 
         tree.reveal(&d.0.join("src/tui/render.rs"));
@@ -832,7 +978,7 @@ mod tests {
     #[test]
     fn revealing_something_outside_the_root_changes_nothing() {
         let d = ScratchDir::new("reveal-outside").file("src/lib.rs");
-        let mut tree = Tree::new(d.path()).unwrap();
+        let mut tree = Tree::new(d.path(), true).unwrap();
         let (was, rows) = (tree.root().to_path_buf(), shown(&tree));
 
         tree.reveal(Path::new("/etc/hosts"));
@@ -914,7 +1060,7 @@ mod tests {
     #[test]
     fn a_tree_needs_a_directory() {
         let d = ScratchDir::new("notdir").file("Cargo.toml");
-        assert!(Tree::new(d.path().join("Cargo.toml")).is_err());
-        assert!(Tree::new(d.path().join("nothing-here")).is_err());
+        assert!(Tree::new(d.path().join("Cargo.toml"), true).is_err());
+        assert!(Tree::new(d.path().join("nothing-here"), true).is_err());
     }
 }

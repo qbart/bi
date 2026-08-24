@@ -7,5 +7,6 @@
 //! this module, not a rewrite of the core.
 
 pub mod clipboard;
+pub mod graphics;
 pub mod keys;
 pub mod render;

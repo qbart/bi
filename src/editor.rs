@@ -14,6 +14,7 @@ use crate::cmd_history::History;
 use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
 use crate::history::Cursors;
+use crate::img::Img;
 use crate::lsp;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
@@ -2177,6 +2178,9 @@ pub struct Editor {
     previous: Option<WindowId>,
     next_buffer: u32,
     next_window: u32,
+    /// Counts opened images, so each carries a stable id a frontend can
+    /// upload pixels under once. See `docs/specs/images.md`.
+    next_image: u64,
     /// The area and chrome the frontend last laid out in.
     ///
     /// Splitting, resizing and directional switching are all geometry
@@ -2239,6 +2243,10 @@ pub enum Pane<'a> {
     Results {
         window: &'a Window,
         results: &'a crate::results::Results,
+    },
+    Image {
+        window: &'a Window,
+        img: &'a crate::img::Img,
     },
 }
 
@@ -2312,13 +2320,24 @@ impl Editor {
         let path = path.as_ref();
         if path.is_dir() {
             let mut editor = Self::empty();
-            let tree = Tree::new(path)?;
+            let tree = Tree::new(path, editor.options().gitignore)?;
             // The directory bi was pointed at is the session's root from here
             // on, whatever displaces the tree later.
             editor.session.tree_root = Some(tree.root().to_path_buf());
             // Assigned rather than shown: there was nothing here before, so
             // there is no alternate to remember.
             editor.window_mut().content = Content::Tree(tree);
+            return Ok(editor);
+        }
+        // An image opens as the image it is, exactly as a directory opens a
+        // tree — and a failed decode falls through to the bytes as text,
+        // which is what an image path always used to open as.
+        if crate::img::looks_like_image(path)
+            && let Ok(img) = crate::img::Img::open(path, 1)
+        {
+            let mut editor = Self::empty();
+            editor.next_image = 2;
+            editor.window_mut().content = Content::Image(img);
             return Ok(editor);
         }
         Ok(Self::with_buffer(Buffer::open(path)?))
@@ -2568,6 +2587,7 @@ impl Editor {
             previous: None,
             next_buffer: 1,
             next_window: 1,
+            next_image: 1,
             area: Rect::default(),
             chrome: Chrome::default(),
             session: Session::default(),
@@ -2664,6 +2684,7 @@ impl Editor {
         Some(match &window.content {
             Content::Tree(tree) => Pane::Tree { window, tree },
             Content::Results(results) => Pane::Results { window, results },
+            Content::Image(img) => Pane::Image { window, img },
             Content::Text(text) => {
                 let entry = self.entry(text.buffer);
                 Pane::Text {
@@ -3425,7 +3446,10 @@ impl Editor {
         // Checked before taking: a buffer alternate must stay where it is, and
         // `take` on a failed pattern would still have emptied the slot.
         if cmd == BufferCmd::Alternate
-            && matches!(self.window().alt, Some(Content::Tree(_) | Content::Results(_)))
+            && matches!(
+                self.window().alt,
+                Some(Content::Tree(_) | Content::Results(_) | Content::Image(_))
+            )
         {
             let parked = self.window_mut().alt.take().expect("checked above");
             return self.window_mut().show(parked);
@@ -4325,7 +4349,11 @@ impl Editor {
             }
             return;
         }
+        // The option may have moved since the pane opened — `:set gitignore`
+        // reaches a living tree through here rather than asking for a reopen.
+        let gitignore = self.options().gitignore;
         let Some(tree) = self.window_mut().tree_mut() else { return };
+        tree.set_gitignore(gitignore);
 
         // Everything the tree can answer without leaving itself.
         match cmd {
@@ -4376,6 +4404,10 @@ impl Editor {
 
         let path = row.path.clone();
         let target = self.open_target();
+        if let Ok(Some(img)) = self.decode_image(&path) {
+            self.show_image(target, img);
+            return self.set_focus(target);
+        }
         match self.open_path(&path.to_string_lossy()) {
             Ok(id) => {
                 self.show(target, id);
@@ -4485,7 +4517,7 @@ impl Editor {
                     // than beside this pane, and never in the direction `:sp`
                     // named. See `docs/specs/tree.md`.
                     Some(path) if std::path::Path::new(path).is_dir() => {
-                        match Tree::new(path) {
+                        match Tree::new(path, self.options().gitignore) {
                             Ok(tree) => {
                                 self.open_tree_pane(tree);
                             }
@@ -4493,13 +4525,24 @@ impl Editor {
                         }
                         return;
                     }
-                    Some(path) => match self.open_path(path) {
-                        Ok(id) => Some(id),
-                        Err(e) => {
-                            self.session.status = format!("{e:#}");
+                    Some(path) => {
+                        // An image splits like anything else, decoded before
+                        // the split for the same reason the buffer is opened
+                        // before it: a failure must not leave a pane showing
+                        // the wrong thing.
+                        if let Ok(Some(img)) = self.decode_image(std::path::Path::new(path)) {
+                            let Some(new) = self.split_focus(dir) else { return };
+                            self.show_image(new, img);
                             return;
                         }
-                    },
+                        match self.open_path(path) {
+                            Ok(id) => Some(id),
+                            Err(e) => {
+                                self.session.status = format!("{e:#}");
+                                return;
+                            }
+                        }
+                    }
                 };
 
                 let Some(new) = self.split_focus(dir) else { return };
@@ -4541,7 +4584,7 @@ impl Editor {
                 // being made.
                 let path = self.buffer().and_then(|b| b.path.clone());
                 let root = self.tree_root(path.as_deref());
-                let tree = match Tree::new(&root) {
+                let tree = match Tree::new(&root, self.options().gitignore) {
                     Ok(tree) => tree,
                     Err(e) => {
                         self.session.status = format!("{e:#}");
@@ -4640,6 +4683,41 @@ impl Editor {
     /// run anything in. Without this `:q` cannot leave `bi .`.
     ///
     /// Returns whether it handled the action.
+    /// The normal keymap, re-read as pixels, for a window holding an image.
+    ///
+    /// No `KeyMode::Image` and no bindings of its own — closing an image and
+    /// jumping out of its window are the keys you already press, because the
+    /// window is an ordinary window. Motions move the crop; the mode-entering
+    /// commands that live on the session are swallowed, because a search line
+    /// over a picture is a promise the pane cannot keep; everything else
+    /// falls through to what it already did. See `docs/specs/images.md`.
+    fn run_image_action(&mut self, cmd: &Command) -> bool {
+        let count = cmd.count.max(1);
+        let steps = count as i64;
+        let Some(img) = self.window_mut().img_mut() else { return false };
+        match &cmd.action {
+            Action::Move(Motion::Left) => img.step_by(-steps, 0),
+            Action::Move(Motion::Right) => img.step_by(steps, 0),
+            Action::Move(Motion::Up) => img.step_by(0, -steps),
+            Action::Move(Motion::Down) => img.step_by(0, steps),
+            Action::Move(Motion::FirstLine) => img.to_edge_y(true),
+            Action::Move(Motion::LastLine | Motion::Line(_)) => img.to_edge_y(false),
+            Action::Move(Motion::LineStart | Motion::FirstNonBlank) => img.to_edge_x(true),
+            Action::Move(Motion::LineEnd | Motion::LastNonBlank) => img.to_edge_x(false),
+            Action::ScrollHalfPage { down } => img.half_page(*down, count),
+            Action::ScrollLine { down } => img.step_by(0, if *down { steps } else { -steps }),
+            // Swallowed rather than run: each of these moves the session into
+            // a mode that reads the buffer this window does not have.
+            Action::EnterFind
+            | Action::EnterSearch { .. }
+            | Action::SearchWord { .. }
+            | Action::ShowScopes
+            | Action::EnterVisual(_) => {}
+            _ => return false,
+        }
+        true
+    }
+
     fn run_session_action(&mut self, action: &Action) -> bool {
         match action {
             Action::EnterCommandMode => {
@@ -4943,11 +5021,22 @@ impl Editor {
             return self.show_tree(path);
         }
         let target = self.open_target();
+        let fallback = match self.decode_image(std::path::Path::new(path)) {
+            Ok(Some(img)) => {
+                self.show_image(target, img);
+                return self.set_focus(target);
+            }
+            Ok(None) => None,
+            Err(why) => Some(why),
+        };
         match self.open_path(path) {
             Ok(id) => {
                 self.show(target, id);
                 self.set_focus(target);
-                self.session.status = format!("\"{}\" loaded", self.name_of(id));
+                self.session.status = match fallback {
+                    Some(why) => format!("\"{}\" opened as text — {why}", self.name_of(id)),
+                    None => format!("\"{}\" loaded", self.name_of(id)),
+                };
             }
             Err(e) => self.session.status = format!("{e:#}"),
         }
@@ -4966,9 +5055,61 @@ impl Editor {
         }
     }
 
+    /// `path` decoded, when it is an image at all.
+    ///
+    /// `Ok(None)` is "not an image — this was never for you"; `Err` is a
+    /// decode failure worth telling, and the caller opens the bytes as the
+    /// text they always were. See `docs/specs/images.md`.
+    fn decode_image(&mut self, path: &Path) -> std::result::Result<Option<Img>, String> {
+        if !crate::img::looks_like_image(path) {
+            return Ok(None);
+        }
+        match Img::open(path, self.next_image) {
+            Ok(img) => {
+                self.next_image += 1;
+                Ok(Some(img))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// Points `window` at an image, parking what it held — the same
+    /// bookkeeping `show_tree` does, for the same reasons: the buffer being
+    /// left records where this window was in it, and `Ctrl-^` brings the
+    /// image back with its crop intact because `alt` carries whole contents.
+    fn show_image(&mut self, window: WindowId, img: Img) {
+        if let Some(text) = self.window_of(window).and_then(Window::text) {
+            let (buffer, pairs) = (text.buffer, text.selections.as_pairs());
+            self.entry_mut(buffer).last = pairs;
+        }
+        let name = img
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| img.path.display().to_string());
+        self.session.status = format!("\"{name}\" {}×{}", img.width, img.height);
+        self.park_results(window);
+        if let Some(window) = self.window_mut_of(window) {
+            window.show(Content::Image(img));
+        }
+        self.sweep_scratch();
+    }
+
+    /// The image a window shows, mutably. The frontend reports the room it
+    /// gave the pane through this, the way `size_window` reports rows.
+    pub fn image_pane_mut(&mut self, id: WindowId) -> Option<&mut Img> {
+        self.window_mut_of(id)?.img_mut()
+    }
+
+    /// An image by its stable id, wherever it is showing — what a frontend
+    /// that uploads pixels once looks them up by.
+    pub fn image_with_id(&self, id: u64) -> Option<&Img> {
+        self.windows.iter().find_map(|w| w.img().filter(|img| img.id == id))
+    }
+
     /// Points the focused window at a tree on `root`, parking what it held.
     fn show_tree(&mut self, root: &str) {
-        let tree = match Tree::new(root) {
+        let tree = match Tree::new(root, self.options().gitignore) {
             Ok(tree) => tree,
             Err(e) => {
                 self.session.status = format!("{e:#}");
@@ -5821,8 +5962,11 @@ impl Editor {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
             }
             _ => {
-                // What is left needs the rope, and a tree window has none.
-                if !self.run_session_action(&cmd.action)
+                // A picture reads a handful of these as pixels and swallows
+                // the mode-entering ones; the rest of what is left needs the
+                // rope, and neither a tree nor an image window has one.
+                if self.run_image_action(&cmd) {
+                } else if !self.run_session_action(&cmd.action)
                     && let Some(mut view) = self.focused()
                 {
                     view.apply(cmd);
@@ -19408,5 +19552,130 @@ int main(void) {
             ex(&mut ed, "lsp");
             assert!(ed.session.status.contains("stopped"), "{}", ed.session.status);
         }
+    }
+    /// A real PNG in a scratch directory, for the image-pane tests.
+    struct PngDir(std::path::PathBuf);
+
+    impl PngDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("bi-ed-img-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// A 50×40 PNG named `photo.png`.
+        fn png(&self) -> std::path::PathBuf {
+            let path = self.0.join("photo.png");
+            image::RgbaImage::from_pixel(50, 40, image::Rgba([9, 9, 9, 255])).save(&path).unwrap();
+            path
+        }
+    }
+
+    impl Drop for PngDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_image_path_opens_as_an_image_not_a_buffer() {
+        let d = PngDir::new("open");
+        let mut ed = Editor::empty();
+        let buffers = ed.buffer_ids().len();
+
+        ed.run_ex(&format!("e {}", d.png().display()));
+
+        assert_eq!(ed.content_kind(), ContentKind::Image);
+        assert!(ed.session.status.contains("50×40"), "{}", ed.session.status);
+        assert_eq!(ed.buffer_ids().len(), buffers, "the buffer list gained nothing");
+    }
+
+    #[test]
+    fn opening_bi_on_an_image_shows_the_image() {
+        let d = PngDir::new("startup");
+        let ed = Editor::open(d.png()).unwrap();
+        assert_eq!(ed.content_kind(), ContentKind::Image);
+    }
+
+    #[test]
+    fn a_corrupt_image_falls_back_to_text_and_says_why() {
+        let d = PngDir::new("corrupt");
+        let path = d.0.join("broken.png");
+        std::fs::write(&path, "not a png").unwrap();
+        let mut ed = Editor::empty();
+
+        ed.run_ex(&format!("e {}", path.display()));
+
+        assert_eq!(ed.content_kind(), ContentKind::Text, "the bytes as they are");
+        assert!(ed.session.status.contains("opened as text"), "{}", ed.session.status);
+    }
+
+    #[test]
+    fn motions_scroll_the_image_and_counts_multiply() {
+        let d = PngDir::new("scroll");
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", d.png().display()));
+        let focus = ed.focus();
+        ed.image_pane_mut(focus).unwrap().set_viewport(20, 20, 5);
+
+        ed.apply(Command { count: 2, action: Action::Move(Motion::Down) });
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        assert_eq!(ed.window().img().unwrap().scroll(), (5, 10));
+
+        ed.apply(cmd(Action::Move(Motion::LastLine)));
+        ed.apply(cmd(Action::Move(Motion::LineEnd)));
+        assert_eq!(ed.window().img().unwrap().scroll(), (30, 20), "the far corner");
+
+        ed.apply(cmd(Action::Move(Motion::FirstLine)));
+        ed.apply(cmd(Action::Move(Motion::LineStart)));
+        assert_eq!(ed.window().img().unwrap().scroll(), (0, 0));
+    }
+
+    /// `i`, `v`, `/`, `s` — a search line over a picture is a promise the
+    /// pane cannot keep, so none of them get to move the mode.
+    #[test]
+    fn modes_do_not_exist_in_an_image_window() {
+        let d = PngDir::new("modes");
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", d.png().display()));
+
+        ed.apply(cmd(Action::EnterInsert));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        ed.apply(cmd(Action::EnterFind));
+        ed.apply(cmd(Action::EnterSearch { forward: true, operator: None, count: 1 }));
+        ed.apply(cmd(Action::ShowScopes));
+
+        assert!(matches!(ed.session.mode, Mode::Normal), "{:?}", ed.session.mode);
+    }
+
+    #[test]
+    fn ctrl_caret_swaps_an_image_out_and_back_with_its_crop() {
+        let d = PngDir::new("alt");
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", d.png().display()));
+        let focus = ed.focus();
+        ed.image_pane_mut(focus).unwrap().set_viewport(20, 20, 5);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        assert_eq!(ed.window().img().unwrap().scroll(), (0, 5));
+
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.content_kind(), ContentKind::Text, "back to what it displaced");
+
+        ed.apply(cmd(Action::Buffer(BufferCmd::Alternate)));
+        assert_eq!(ed.content_kind(), ContentKind::Image);
+        assert_eq!(ed.window().img().unwrap().scroll(), (0, 5), "the crop survived");
+    }
+
+    /// The command line still works over an image — `:` is how it closes.
+    #[test]
+    fn the_ex_line_still_opens_over_an_image() {
+        let d = PngDir::new("ex");
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", d.png().display()));
+
+        ed.apply(cmd(Action::EnterCommandMode));
+
+        assert!(matches!(ed.session.mode, Mode::Command(_)));
     }
 }

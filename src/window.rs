@@ -7,6 +7,7 @@
 //! See `docs/specs/windows.md`.
 
 use crate::buffer::BufferId;
+use crate::img::Img;
 use crate::selection::Selections;
 use crate::tree::Tree;
 
@@ -34,6 +35,11 @@ pub enum Content {
     /// would share a selection, and wanting a different one is why you opened
     /// the second.
     Results(Box<crate::results::Results>),
+    /// A picture — see `docs/specs/images.md`. In the window for the tree's
+    /// reason again: what an image carries beyond its pixels is a crop
+    /// position, which is view state, and two panes wanting different crops
+    /// is why you would open the second.
+    Image(Img),
 }
 
 /// Which keymap a window wants, and which renderer.
@@ -45,6 +51,7 @@ pub enum ContentKind {
     Text,
     Tree,
     Results,
+    Image,
 }
 
 impl Content {
@@ -53,6 +60,7 @@ impl Content {
             Content::Text(_) => ContentKind::Text,
             Content::Tree(_) => ContentKind::Tree,
             Content::Results(_) => ContentKind::Results,
+            Content::Image(_) => ContentKind::Image,
         }
     }
 
@@ -60,7 +68,7 @@ impl Content {
     pub fn buffer(&self) -> Option<BufferId> {
         match self {
             Content::Text(text) => Some(text.buffer),
-            Content::Tree(_) | Content::Results(_) => None,
+            Content::Tree(_) | Content::Results(_) | Content::Image(_) => None,
         }
     }
 }
@@ -157,6 +165,20 @@ impl Window {
     pub fn results_mut(&mut self) -> Option<&mut crate::results::Results> {
         match &mut self.content {
             Content::Results(results) => Some(results),
+            _ => None,
+        }
+    }
+
+    pub fn img(&self) -> Option<&Img> {
+        match &self.content {
+            Content::Image(img) => Some(img),
+            _ => None,
+        }
+    }
+
+    pub fn img_mut(&mut self) -> Option<&mut Img> {
+        match &mut self.content {
+            Content::Image(img) => Some(img),
             _ => None,
         }
     }

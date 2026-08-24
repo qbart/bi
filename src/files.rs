@@ -23,7 +23,7 @@ pub const LIMIT: usize = 20_000;
 /// `docs/specs/gitignore.md`.
 pub fn walk(root: &Path, limit: usize, gitignore: bool) -> Vec<String> {
     let mut rules = match gitignore {
-        true => inherited(root),
+        true => Rules::inherited(root),
         false => Rules::default(),
     };
     let mut out = Vec::new();
@@ -69,53 +69,6 @@ pub fn walk(root: &Path, limit: usize, gitignore: bool) -> Vec<String> {
     }
     out.sort();
     out
-}
-
-/// The ignore files that apply to `root` from above it.
-///
-/// Up to the repository — the first directory with a `.git` in it — and no
-/// further, because a `.gitignore` in a directory that happens to be an
-/// ancestor of one repository is not a rule about another. Outermost first, so
-/// that the nearer file wins.
-///
-/// `core.excludesFile`, the global one, is not read: it lives behind `git
-/// config`, which means parsing git's config file and its includes, and it is
-/// the one of the four that nearly nobody sets for anything but editor backup
-/// files.
-fn inherited(root: &Path) -> Rules {
-    let mut rules = Rules::default();
-    // The repository `root` sits in — the first ancestor with a `.git`, root
-    // itself included. `.git` may be a file rather than a directory, which is
-    // what a worktree and a submodule have, so this asks whether it is there
-    // rather than what it is.
-    let Some(repo) = root.ancestors().find(|dir| dir.join(".git").exists()) else {
-        // Nothing above an ordinary directory is a rule about it.
-        return rules;
-    };
-
-    // Outside the project's own file, and below it in precedence.
-    if let Ok(text) = std::fs::read_to_string(repo.join(".git/info/exclude")) {
-        rules.push(repo, &text);
-    }
-
-    // Every directory from the repository down to — but not including —
-    // `root`, whose own `.gitignore` the walk reads in its turn. Outermost
-    // first, so that the nearer file wins.
-    let mut above: Vec<&Path> = Vec::new();
-    if repo != root {
-        for dir in root.ancestors().skip(1) {
-            above.push(dir);
-            if dir == repo {
-                break;
-            }
-        }
-    }
-    for dir in above.iter().rev() {
-        if let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) {
-            rules.push(*dir, &text);
-        }
-    }
-    rules
 }
 
 #[cfg(test)]
