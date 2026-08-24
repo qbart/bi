@@ -21,7 +21,8 @@ Three marks per diagnostic, all through machinery that already exists:
   without one reads as syntax. A theme is free to disagree.
 - **A sign in the gutter cell** — the cell `gutter = 1` has held open since
   the day it was reserved "for a git sign, a diagnostic, a breakpoint";
-  diagnostics are its first client. `•` in the severity's colour — and only
+  diagnostics were its first client, git signs its second
+  (`docs/specs/git-signs.md`), and the diagnostic wins the cell. `•` in the severity's colour — and only
   the colour: the underline the range styles carry comes off, since it marks
   a span of text and this is a mark about the line — the worst
   severity on the row winning. The core exposes
@@ -49,7 +50,23 @@ without a key, and `<leader>`-bindable through the names `diagnostic_next` /
 claimed only when no operator is pending, so `di[` still reads as the text
 object it always was.
 
+## The list — `:diags`
+
+The pane `Results` was built to hold one day, holding one. `:diags` collects
+the stored diagnostics of every open buffer — most-severe first within a file,
+buffer order across them — into the same pane `:find` and `:references` fill:
+Enter jumps to the diagnosed span, `Ctrl-^` brings the file back, `:results`
+reopens the list later. Each row is the offending line with the diagnosed span
+highlighted, and the first line of the message appended after `▸` — the line
+says where, the tail says what, and jumping is what the pane is for.
+
+Open buffers only, because that is what the store holds: bi's diagnostics
+arrive by `textDocument/publishDiagnostics`, which speaks about open
+documents. A project-wide list would mean pulling `workspace/diagnostic` —
+protocol the core does not speak, for a list that would mostly repeat what
+`cargo build` already prints. Not out of the box, so not here.
+
 ## Deliberately not here
 
-Severity filtering, a diagnostics list pane (`Results` can hold one later),
-virtual lines, and counts in the statusline.
+Severity filtering, workspace-pull diagnostics, virtual lines, and counts in
+the statusline.

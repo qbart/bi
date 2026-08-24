@@ -166,6 +166,11 @@ pub struct Options {
     pub diagnostics: bool,
     /// Whether a colour literal is drawn in the colour it names.
     pub color_swatches: bool,
+    /// Whether the diff against git's index is *drawn* — the gutter sign per
+    /// touched line and the numstat in the status row. Never gates the
+    /// computing, so turning it back on costs nothing. See
+    /// `docs/specs/git-signs.md`.
+    pub git_signs: bool,
     /// How many enclosing blocks repeat their opening line after the line that
     /// closes them, innermost first. 0 is off — the honest spelling, since a
     /// feature whose size is a number needs no second option saying whether
@@ -220,6 +225,7 @@ impl Default for Options {
             todo_comments: true,
             diagnostics: true,
             color_swatches: true,
+            git_signs: true,
             context_depth: 1,
             context_header_depth: 1,
             context_min_lines: 1,
@@ -283,6 +289,8 @@ impl Options {
             ("todo_comments", _) => return Err("todo_comments takes true or false".into()),
             ("diagnostics", OptionValue::Bool(on)) => self.diagnostics = on,
             ("diagnostics", _) => return Err("diagnostics takes true or false".into()),
+            ("git_signs", OptionValue::Bool(on)) => self.git_signs = on,
+            ("git_signs", _) => return Err("git_signs takes true or false".into()),
             ("color_swatches", OptionValue::Bool(on)) => self.color_swatches = on,
             ("color_swatches", _) => return Err("color_swatches takes true or false".into()),
             ("context_depth", OptionValue::Int(n)) if n >= 0 => self.context_depth = n as usize,
@@ -348,6 +356,7 @@ impl Options {
             "whitespace" => OptionValue::Bool(self.whitespace),
             "todo_comments" => OptionValue::Bool(self.todo_comments),
             "diagnostics" => OptionValue::Bool(self.diagnostics),
+            "git_signs" => OptionValue::Bool(self.git_signs),
             "color_swatches" => OptionValue::Bool(self.color_swatches),
             "context_depth" => OptionValue::Int(self.context_depth as i64),
             "context_header_depth" => OptionValue::Int(self.context_header_depth as i64),

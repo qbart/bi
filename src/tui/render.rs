@@ -422,6 +422,9 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
     for &(id, rect) in &panes {
         let height = match ed.content_kind_of(id) {
             Some(ContentKind::Tree) => rect.height,
+            // Zen gives the status row back to the text — see
+            // docs/specs/zen.md.
+            _ if ed.session.zen => rect.height,
             _ => rect.height.saturating_sub(1),
         };
         ed.size_window(id, rect.width as usize, height as usize);
@@ -443,7 +446,8 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
 
     for &(id, rect) in &panes {
         let tree = ed.content_kind_of(id) == Some(ContentKind::Tree);
-        let [body_area, status] = match tree {
+        let chromeless = tree || ed.session.zen;
+        let [body_area, status] = match chromeless {
             true => [rect, Rect { height: 0, ..rect }],
             false => Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rect),
         };
@@ -452,7 +456,7 @@ pub fn render(frame: &mut Frame, ed: &mut Editor, pending: &str) {
         if id == focus {
             cursor_at = at;
         }
-        if !tree {
+        if !chromeless {
             let row = window_status(ed, id, id == focus, status.width);
             frame.render_widget(Paragraph::new(Line::from(row)), status);
         }
@@ -725,8 +729,11 @@ fn render_window(
     // disagree about how wide a tab is.
     let tab = options.tab_width;
     let total = buffer.line_count();
-    let gutter = gutter_width(options, buffer);
-    let numbers = options.number_width(total);
+    // Zen takes the columns back without pretending the options changed —
+    // see docs/specs/zen.md.
+    let zen = ed.session.zen;
+    let gutter = if zen { 0 } else { gutter_width(options, buffer) };
+    let numbers = if zen { 0 } else { options.number_width(total) };
     let cursor = selections.cursor();
     let cursor_row = buffer.row_at(cursor);
 
@@ -762,7 +769,7 @@ fn render_window(
         // came with diagnostics. Then the number, or a blank cell where one
         // is not due so the text stays put.
         let mut spans = Vec::new();
-        if options.gutter > 0 {
+        if !zen && options.gutter > 0 {
             match signs.get(&row) {
                 Some((sign, style)) => spans.push(Span::styled(
                     format!("{sign}{}", " ".repeat(options.gutter - 1)),
@@ -1257,8 +1264,34 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     let left = window_status_text(ed, id, focused);
     let right = if focused { format!(" {} ", ed.session.mode.label()) } else { String::new() };
 
-    let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
+    // The numstat, to the left of the mode: each part in its sign's colour on
+    // the row's own background, absent at zero, so a clean file's status row
+    // is exactly what it was. See docs/specs/git-signs.md.
+    let ui = ed.theme().ui;
+    let stats: Vec<Span> = match focused {
+        true => ed.git_stats(id).filter(|stats| !stats.is_clean()),
+        false => None,
+    }
+    .map(|stats| {
+        [
+            (stats.added, '+', ui.git_add),
+            (stats.changed, '~', ui.git_change),
+            (stats.removed, '-', ui.git_delete),
+        ]
+        .into_iter()
+        .filter(|&(n, ..)| n > 0)
+        .map(|(n, mark, style)| {
+            Span::styled(format!("{mark}{n} "), tui(ThemeStyle { fg: style.fg, ..ui.statusline }))
+        })
+        .collect()
+    })
+    .unwrap_or_default();
+    let stats_width: usize = stats.iter().map(|s| s.content.chars().count()).sum();
+
+    let pad =
+        (width as usize).saturating_sub(left.chars().count() + stats_width + right.chars().count());
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
+    spans.extend(stats);
     if focused {
         spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }

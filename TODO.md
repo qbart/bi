@@ -8,12 +8,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ### documentation of code
 
-### peek defintion
-
-### semantic splitjoin
-
-### git signs
-
 ### debugger
 
 ### tree sitter navigation

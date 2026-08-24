@@ -61,6 +61,9 @@ fn main() -> Result<()> {
     // holds the trait, and spawning processes is a fact about the host. An
     // editor whose frontend never calls this attaches nothing.
     editor.set_lsp_spawner(bi::lsp::transport::ProcessSpawn);
+    // Git arrives the same way: the library computes the diff, and running
+    // `git` is a fact about the host. See docs/specs/git-signs.md.
+    editor.set_git_baseline(bi::git::baseline);
 
     let mut term = setup().context("entering raw mode")?;
 

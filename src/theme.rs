@@ -187,6 +187,13 @@ pub struct Ui {
     pub diag_info: Style,
     pub diag_hint: Style,
 
+    /// The gutter's word on a line since the index: added, changed, or with
+    /// lines gone from under it — and the same three colours carry the
+    /// numstat in the status row. See `docs/specs/git-signs.md`.
+    pub git_add: Style,
+    pub git_change: Style,
+    pub git_delete: Style,
+
     /// The float surface — hover and the completion menu. One key: the
     /// menu's selection and badges reuse `picker_selected` / `picker_badge`,
     /// so choosing looks the same everywhere bi offers a choice.
@@ -246,6 +253,9 @@ impl Ui {
         "diag_warning",
         "diag_info",
         "diag_hint",
+        "git_add",
+        "git_change",
+        "git_delete",
         "popup",
         "mode_normal",
         "mode_insert",
@@ -297,6 +307,9 @@ impl Ui {
             "diag_warning" => self.diag_warning = style,
             "diag_info" => self.diag_info = style,
             "diag_hint" => self.diag_hint = style,
+            "git_add" => self.git_add = style,
+            "git_change" => self.git_change = style,
+            "git_delete" => self.git_delete = style,
             "popup" => self.popup = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,

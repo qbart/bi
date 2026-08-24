@@ -33,9 +33,10 @@ indent_guides = true
 syntax = "auto"
 
 # Cells to the left of the line numbers, held for a mark about the line rather
-# than in it — a git sign, a diagnostic, a breakpoint. Nothing draws one yet;
-# the column is reserved now so that the day something does, the file does not
-# shift sideways under you. 0 gives the cell back.
+# than in it — a git sign, a diagnostic, a breakpoint. Diagnostics and git
+# signs both draw there now, the diagnostic winning the cell; the column is
+# held open either way so the file does not shift sideways when the first
+# mark of the session lands. 0 gives the cell back.
 gutter = 1
 
 # Every space as `·`, every tab as `→`, every newline as `¶`, and a
@@ -56,6 +57,13 @@ todo_comments = true
 # `:lsp` still counts, and `]d` / `[d` still jump.
 # See docs/specs/diagnostics.md.
 diagnostics = true
+
+# A sign in the gutter cell for every line the index does not have — added,
+# changed, or with lines gone from under it — and a numstat (+3 ~1 -2) in the
+# status row. Off hides both without forgetting them. The colours are the
+# theme's `git_add`, `git_change` and `git_delete`.
+# See docs/specs/git-signs.md.
+git_signs = true
 
 # #fb4934, rgb(251,73,52) and rgb(0.5f,0.1f,0.1) drawn in the colour they name,
 # with black or white text over them — whichever can be read.

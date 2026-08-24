@@ -31,6 +31,7 @@ pub mod editor;
 pub mod editorconfig;
 pub mod files;
 pub mod find_in_files;
+pub mod git;
 pub mod gitignore;
 pub mod history;
 pub mod indent;

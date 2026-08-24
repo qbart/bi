@@ -67,6 +67,7 @@ grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 grep-matcher = "0.1.9"
 ignore = "0.4.33"
+imara-diff = "0.2.0"
 
 [profile.release]
 lto = true

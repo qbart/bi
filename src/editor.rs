@@ -733,6 +733,9 @@ pub struct Session {
     /// Whether `:ts` has the boundaries on show — a toggle, recomputed each
     /// frame from the live tree. See `docs/specs/boundaries.md`.
     pub ts_marks: bool,
+    /// Whether the chrome is off — see `docs/specs/zen.md`. Session state
+    /// exactly as `ts_marks` is: a way of looking, not a fact about a file.
+    pub zen: bool,
     /// Everything `:set` can change, and everything `[options]` can say.
     ///
     /// One struct rather than a field each so that a new option is one line in
@@ -937,6 +940,20 @@ struct BufferEntry {
     /// remembers — there is no better answer, and it costs nothing to say
     /// which one wins.
     last: Cursors,
+    /// Where this buffer stands with git: the index's copy of the file and
+    /// the diff against it. `None` until a loader is installed and has
+    /// something to say — no repository, an untracked file, an embedder that
+    /// never calls [`Editor::set_git_baseline`]. See `docs/specs/git-signs.md`.
+    git: Option<GitState>,
+}
+
+/// The baseline and the diff against it, cached beside the buffer the same
+/// way the parse tree is: derived state, refreshed at the drain.
+struct GitState {
+    baseline: String,
+    /// `Buffer::edits` when `diff` was computed — moved means stale.
+    seen: u64,
+    diff: crate::git::Diff,
 }
 
 impl BufferEntry {
@@ -952,6 +969,7 @@ impl BufferEntry {
             options: Options::default(),
             last: Vec::new(),
             lsp: lsp::Attach::Unresolved,
+            git: None,
         }
     }
 }
@@ -1567,6 +1585,17 @@ enum ExLine {
     Peek,
     /// `:ts` — toggle the boundary marks. See `docs/specs/boundaries.md`.
     TsMarks,
+    /// `:tssplit` — the bracketed list around the cursor, one element per
+    /// line. See `docs/specs/splitjoin.md`.
+    TsSplit,
+    /// `:tsjoin` — the same list back onto one line.
+    TsJoin,
+    /// `:zen` — the chrome off: gutter, numbers, status rows. The command
+    /// line stays. See `docs/specs/zen.md`.
+    Zen,
+    /// `:diags` — every open buffer's diagnostics, as a `Results` pane. See
+    /// `docs/specs/diagnostics.md`.
+    Diags,
     /// `:references` — `gr`, into a `Results` pane.
     References,
     /// `:format` — the whole file, by the server, as one undo step.
@@ -1876,6 +1905,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "def" | "definition" => ExLine::Definition,
         "peek" => ExLine::Peek,
         "ts" => ExLine::TsMarks,
+        "tssplit" => ExLine::TsSplit,
+        "tsjoin" => ExLine::TsJoin,
+        "zen" => ExLine::Zen,
+        // Plural like `:symbols`, and for the same reason.
+        "diags" | "diagnostics" => ExLine::Diags,
         "refs" | "references" => ExLine::References,
         "fmt" | "format" if arg.is_empty() => ExLine::Format,
         "fmt" | "format" => {
@@ -2171,6 +2205,11 @@ pub struct Editor {
     /// running the replayer is a loop with a keyboard in it. See
     /// `docs/specs/global.md`.
     replaying_normal: bool,
+    /// How a buffer's git baseline is fetched — the index's copy of the file.
+    /// `None` is an embedder or a test that wants no git, and every failure
+    /// inside the loader is `None` too: there is nothing to say about a file
+    /// git holds no copy of. See `docs/specs/git-signs.md`.
+    git_baseline: Option<Box<dyn Fn(&Path) -> Option<String>>>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2535,6 +2574,7 @@ impl Editor {
             signature_want: None,
             signature_seq: 0,
             replaying_normal: false,
+            git_baseline: None,
         };
         editor.resolve_options();
         editor
@@ -3272,6 +3312,7 @@ impl Editor {
         let buffer = Buffer::open(path)?;
         let id = self.fresh_buffer_id();
         self.buffers.push(BufferEntry::new(id, buffer));
+        self.refresh_git(id);
         self.resolve_options();
         Ok(id)
     }
@@ -4351,6 +4392,7 @@ impl Editor {
         let buffer = Buffer::empty();
         let id = self.fresh_buffer_id();
         self.buffers.push(BufferEntry::new(id, buffer));
+        self.refresh_git(id);
         self.resolve_options();
         id
     }
@@ -5328,6 +5370,10 @@ impl Editor {
             ExLine::Definition => self.lsp_definition(),
             ExLine::Peek => self.peek_definition(),
             ExLine::TsMarks => self.toggle_ts_marks(),
+            ExLine::TsSplit => self.ts_split(),
+            ExLine::TsJoin => self.ts_join(),
+            ExLine::Zen => self.toggle_zen(),
+            ExLine::Diags => self.show_diagnostics(),
             ExLine::References => self.lsp_references(),
             ExLine::Format => self.lsp_format(),
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
@@ -5346,6 +5392,11 @@ impl Editor {
             }
             ExLine::Revert { force } => {
                 self.in_view(|view| view.edit(force));
+                // The file on disk moved under the buffer; its standing with
+                // the index may have moved the same way.
+                if let Some(id) = self.window().buffer() {
+                    self.refresh_git(id);
+                }
             }
             ExLine::Goto(address) => {
                 self.in_view(|view| view.goto(address));
@@ -5857,6 +5908,15 @@ impl Editor {
                 syntax.update(entry.buffer.rope(), &edits);
             }
 
+            // The drain's git consumer: the signs follow the text within the
+            // keystroke, exactly as the parse tree does.
+            if let Some(git) = &mut entry.git
+                && git.seen != entry.buffer.edits()
+            {
+                git.diff = crate::git::diff(&git.baseline, &entry.buffer.rope().to_string());
+                git.seen = entry.buffer.edits();
+            }
+
             // The drain's second consumer, promised since the field was
             // designed: the server's copy follows the text, and the stored
             // diagnostics follow it exactly as the selections below do.
@@ -5943,7 +6003,13 @@ impl Editor {
 
     /// `didSave` for every write since the last settle.
     fn flush_saves(&mut self) {
-        for id in std::mem::take(&mut self.session.pending_saves) {
+        let saved = std::mem::take(&mut self.session.pending_saves);
+        // A write is one of the moments the file's standing with the index
+        // can have moved — `git add -p` between saves, most commonly.
+        for &id in &saved {
+            self.refresh_git(id);
+        }
+        for id in saved {
             let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { continue };
             let lsp::Attach::Doc(doc) = &mut entry.lsp else { continue };
             let current = entry
@@ -6154,6 +6220,141 @@ impl Editor {
             if self.session.ts_marks { "boundaries on" } else { "boundaries off" }.into();
     }
 
+    /// `:zen` — the chrome off, and back. The frontend reads the flag; what
+    /// stops being drawn was always the frontend's. See `docs/specs/zen.md`.
+    fn toggle_zen(&mut self) {
+        self.session.zen = !self.session.zen;
+        self.session.status = if self.session.zen { "zen on" } else { "zen off" }.into();
+    }
+
+    /// `:tssplit` — the bracketed list around the cursor, one element per
+    /// line, reindented by the machinery `=` uses. See
+    /// `docs/specs/splitjoin.md`.
+    fn ts_split(&mut self) {
+        self.in_view(|view| {
+            let Some(syntax) = view.syntax.as_ref() else {
+                view.session.status = "no syntax tree here".into();
+                return;
+            };
+            let rope = view.buffer.rope();
+            let cursor = view.selections.cursor().at.min(rope.len_chars());
+            let Some(list) = syntax.list_at(rope.char_to_byte(cursor)) else {
+                view.session.status = "no brackets around the cursor".into();
+                return;
+            };
+            // Everything in chars, before the first edit moves anything.
+            let open = rope.byte_to_char(list.open_end);
+            let commas: Vec<usize> = list.commas.iter().map(|&b| rope.byte_to_char(b)).collect();
+            let close = rope.byte_to_char(list.close_start);
+
+            // A break point is skipped when a newline is already doing its
+            // job — nothing but blanks between it and the break either way —
+            // so a half-split list splits the rest of the way rather than
+            // gaining blank lines.
+            let blank_to_eol = |at: usize| {
+                rope.chars_at(at).take_while(|&c| c != '\n').all(|c| matches!(c, ' ' | '\t' | '\r'))
+            };
+            let blank_from_bol = |at: usize| {
+                let start = rope.line_to_char(rope.char_to_line(at));
+                rope.slice(start..at).chars().all(|c| matches!(c, ' ' | '\t'))
+            };
+            let mut points: Vec<usize> = Vec::new();
+            if !blank_to_eol(open) {
+                points.push(open);
+            }
+            points.extend(commas.iter().copied().filter(|&at| !blank_to_eol(at)));
+            if !blank_from_bol(close) {
+                points.push(close);
+            }
+            if points.is_empty() {
+                view.session.status = "already split".into();
+                return;
+            }
+
+            let before = view.selections.as_pairs();
+            let applied_from = view.buffer.pending_edits.len();
+            // Back to front, so a break cannot move the ones still to come.
+            for &at in points.iter().rev() {
+                view.buffer.insert_str(Cursor::at(at), "\n");
+            }
+            // Every insertion sat at or before the closer, so its new home is
+            // known without asking. The opening line keeps its own indent —
+            // it is the anchor the rows under it are computed from.
+            let first = view.buffer.row_at(Cursor::at(open.saturating_sub(1)));
+            let last = view.buffer.row_at(Cursor::at(close + points.len()));
+            let indent = view.options.indent();
+            view.buffer.reindent_rows(first + 1, last, &indent);
+
+            // The focused window's selections are this command's to carry —
+            // `settle` deliberately skips them.
+            let applied = view.buffer.pending_edits[applied_from..].to_vec();
+            let across = move |at: usize| applied.iter().fold(at, |at, e| e.map(at));
+            let mapped: Vec<Selection> = view
+                .selections
+                .all()
+                .iter()
+                .map(|s| Selection {
+                    anchor: Cursor::at(across(s.anchor.at)),
+                    head: Cursor::at(across(s.head.at)),
+                })
+                .collect();
+            view.selections.set(mapped);
+            view.buffer.commit_undo(before, view.selections.as_pairs());
+        });
+    }
+
+    /// `:tsjoin` — the same list back onto one line: each line trimmed and
+    /// joined with a space, nothing against the brackets, and a trailing
+    /// comma left pressed against the closer comes off. See
+    /// `docs/specs/splitjoin.md`.
+    fn ts_join(&mut self) {
+        self.in_view(|view| {
+            let Some(syntax) = view.syntax.as_ref() else {
+                view.session.status = "no syntax tree here".into();
+                return;
+            };
+            let rope = view.buffer.rope();
+            let cursor = view.selections.cursor().at.min(rope.len_chars());
+            let Some(list) = syntax.list_at(rope.char_to_byte(cursor)) else {
+                view.session.status = "no brackets around the cursor".into();
+                return;
+            };
+            let open = rope.byte_to_char(list.open_end);
+            let close = rope.byte_to_char(list.close_start);
+            let inner = rope.slice(open..close).to_string();
+            if !inner.contains('\n') {
+                view.session.status = "already one line".into();
+                return;
+            }
+            let mut joined = inner
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.ends_with(',') {
+                joined.pop();
+            }
+
+            let before = view.selections.as_pairs();
+            let applied_from = view.buffer.pending_edits.len();
+            view.buffer.replace_range(open, close, &joined);
+            let applied = view.buffer.pending_edits[applied_from..].to_vec();
+            let across = move |at: usize| applied.iter().fold(at, |at, e| e.map(at));
+            let mapped: Vec<Selection> = view
+                .selections
+                .all()
+                .iter()
+                .map(|s| Selection {
+                    anchor: Cursor::at(across(s.anchor.at)),
+                    head: Cursor::at(across(s.head.at)),
+                })
+                .collect();
+            view.selections.set(mapped);
+            view.buffer.commit_undo(before, view.selections.as_pairs());
+        });
+    }
+
     /// `:references` — `gr`. The answer becomes a `Results` pane.
     fn lsp_references(&mut self) {
         let sent = self.lsp_target().and_then(|(id, doc, caps)| {
@@ -6300,6 +6501,76 @@ impl Editor {
         let results =
             crate::results::Results::new(format!("references: {symbol}"), query, root, matches);
         self.show_results(results);
+        self.session.status = report;
+    }
+
+    /// `:diags` — every open buffer's stored diagnostics, as the pane
+    /// `find-in-files.md` promised them: Enter jumps to the diagnosed span,
+    /// and the first line of the message rides after the text. Open buffers
+    /// only, because that is what the store holds. See
+    /// `docs/specs/diagnostics.md`.
+    fn show_diagnostics(&mut self) {
+        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let mut matches: Vec<crate::find_in_files::Match> = Vec::new();
+        let mut files = 0;
+        for entry in &self.buffers {
+            let lsp::Attach::Doc(doc) = &entry.lsp else { continue };
+            let Some(path) = &entry.buffer.path else { continue };
+            if doc.diagnostics.is_empty() {
+                continue;
+            }
+            files += 1;
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+            let mut sorted: Vec<&lsp::Diag> = doc.diagnostics.iter().collect();
+            // Worst first within a file, reading order within a severity —
+            // the list is for jumping, and the error outranks the hint.
+            sorted.sort_by_key(|d| (d.severity, d.start));
+            for d in sorted {
+                let row = entry.buffer.row_at(Cursor::at(d.start));
+                let start = entry.buffer.rope().line_to_char(row);
+                let line = entry.buffer.rope().line(row).to_string();
+                let line = line.trim_end_matches(['\n', '\r']);
+                let col = d.start - start;
+                // A range that runs past its line counts to the line's end;
+                // the row is still the answer — `apply_references`' rule.
+                let len = match entry.buffer.row_at(Cursor::at(d.end)) == row {
+                    true => d.end - d.start,
+                    false => line.chars().count().saturating_sub(col),
+                }
+                .max(1);
+                let sev = match d.severity {
+                    lsp::Severity::Error => "E",
+                    lsp::Severity::Warning => "W",
+                    lsp::Severity::Info => "I",
+                    lsp::Severity::Hint => "H",
+                };
+                let message = d.message.lines().next().unwrap_or("");
+                matches.push(crate::find_in_files::Match {
+                    path: rel.clone(),
+                    line: row + 1,
+                    col,
+                    len,
+                    text: format!("{line}  ▸ {sev}: {message}"),
+                });
+            }
+        }
+        if matches.is_empty() {
+            self.session.status = "no diagnostics".into();
+            return;
+        }
+        let report = format!(
+            "{} diagnostic{} in {files} file{}",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+        );
+        let query = crate::find_in_files::Query {
+            pattern: String::new(),
+            regex: false,
+            gitignore: self.options().gitignore,
+            ..Default::default()
+        };
+        self.show_results(crate::results::Results::new("diagnostics".into(), query, root, matches));
         self.session.status = report;
     }
 
@@ -6916,6 +7187,35 @@ impl Editor {
         self.lsp.shutdown_all();
     }
 
+    /// Installs how git baselines are fetched — [`crate::git::baseline`] from
+    /// the TUI, a closure returning fixed text from a test, never anything
+    /// from an embedder that does not call this. Fetches for every buffer
+    /// already open, so it can be installed after the files are.
+    pub fn set_git_baseline(&mut self, loader: impl Fn(&Path) -> Option<String> + 'static) {
+        self.git_baseline = Some(Box::new(loader));
+        let ids: Vec<BufferId> = self.buffers.iter().map(|b| b.id).collect();
+        for id in ids {
+            self.refresh_git(id);
+        }
+    }
+
+    /// Re-reads the baseline and rediffs — the open/revert/save moments, when
+    /// the file's relationship to the repository can have moved. Never per
+    /// keystroke: edits rediff against the baseline already held, at the
+    /// drain.
+    fn refresh_git(&mut self, id: BufferId) {
+        let Some(loader) = &self.git_baseline else { return };
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return };
+        let Some(path) = &entry.buffer.path else {
+            entry.git = None;
+            return;
+        };
+        entry.git = loader(path).map(|baseline| {
+            let diff = crate::git::diff(&baseline, &entry.buffer.rope().to_string());
+            GitState { baseline, seen: entry.buffer.edits(), diff }
+        });
+    }
+
     /// The theme's style for a severity.
     fn diag_style(&self, severity: lsp::Severity) -> crate::theme::Style {
         match severity {
@@ -6926,11 +7226,23 @@ impl Editor {
         }
     }
 
+    /// The theme's style for a git sign.
+    fn git_style(&self, sign: crate::git::Sign) -> crate::theme::Style {
+        match sign {
+            crate::git::Sign::Add => self.theme.ui.git_add,
+            crate::git::Sign::Change => self.theme.ui.git_change,
+            crate::git::Sign::Delete | crate::git::Sign::DeleteTop => self.theme.ui.git_delete,
+        }
+    }
+
     /// The gutter cell's marks for the rows on screen: `(row, sign, style)`.
     ///
     /// Its own call rather than a decoration, because the gutter has always
     /// been the frontend's to draw — a decoration names columns of the text
-    /// area. The worst severity on a row wins its one cell.
+    /// area. Two tenants, one cell: the git sign underneath, the diagnostic
+    /// over it — the mark that says *wrong* beats the mark that says
+    /// *different* — and the worst severity on a row wins its one cell. See
+    /// `docs/specs/git-signs.md`.
     pub fn gutter_signs(
         &self,
         window: WindowId,
@@ -6939,27 +7251,51 @@ impl Editor {
         let Some(Pane::Text { buffer, options, .. }) = self.pane(window) else {
             return Vec::new();
         };
-        if options.gutter == 0 || !options.diagnostics {
+        if options.gutter == 0 {
             return Vec::new();
         }
         let Some(id) = self.window_of(window).and_then(Window::buffer) else { return Vec::new() };
-        let mut worst: std::collections::BTreeMap<usize, lsp::Severity> = Default::default();
-        for d in self.diagnostics(id) {
-            let row = buffer.row_at(Cursor::at(d.start));
-            if rows.contains(&row) {
-                let sev = worst.entry(row).or_insert(d.severity);
-                *sev = (*sev).min(d.severity);
+        let mut cells: std::collections::BTreeMap<usize, (char, crate::theme::Style)> =
+            Default::default();
+        if options.git_signs
+            && let Some(git) = self.buffers.iter().find(|b| b.id == id).and_then(|b| b.git.as_ref())
+        {
+            for &(row, sign) in &git.diff.signs {
+                if rows.contains(&row) {
+                    cells.insert(row, (sign.glyph(), self.git_style(sign)));
+                }
             }
         }
-        worst
-            .into_iter()
-            .map(|(row, sev)| {
+        if options.diagnostics {
+            let mut worst: std::collections::BTreeMap<usize, lsp::Severity> = Default::default();
+            for d in self.diagnostics(id) {
+                let row = buffer.row_at(Cursor::at(d.start));
+                if rows.contains(&row) {
+                    let sev = worst.entry(row).or_insert(d.severity);
+                    *sev = (*sev).min(d.severity);
+                }
+            }
+            for (row, sev) in worst {
                 // The underline comes off, as it does on the EOL message: it
                 // marks a range of text, and this is a mark about the line.
                 let style = crate::theme::Style { underline: false, ..self.diag_style(sev) };
-                (row, '•', style)
-            })
-            .collect()
+                cells.insert(row, ('•', style));
+            }
+        }
+        cells.into_iter().map(|(row, (sign, style))| (row, sign, style)).collect()
+    }
+
+    /// The numstat for the buffer a window shows — `None` where git has no
+    /// baseline (or `git_signs` is off), `Some` and clean where it does and
+    /// nothing differs. The frontend puts it in the status row; see
+    /// `docs/specs/git-signs.md`.
+    pub fn git_stats(&self, window: WindowId) -> Option<crate::git::Stats> {
+        let Some(Pane::Text { options, .. }) = self.pane(window) else { return None };
+        if !options.git_signs {
+            return None;
+        }
+        let id = self.window_of(window).and_then(Window::buffer)?;
+        Some(self.buffers.iter().find(|b| b.id == id)?.git.as_ref()?.diff.stats)
     }
 
     /// The stored diagnostics for a buffer, in buffer order — empty until a
@@ -11249,6 +11585,175 @@ mod tests {
             !repaints(&ed, other).iter().any(|(_, style)| *style == dim),
             "the unfocused window reads normally"
         );
+    }
+
+    // ---- splitjoin: :tssplit, :tsjoin ---------------------------------------
+
+    #[test]
+    fn tssplit_breaks_the_list_and_reindents_like_equals() {
+        let mut ed = editor("fn add(a: i32, b: i32) {}\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(8));
+
+        ex(&mut ed, "tssplit");
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "fn add(\n    a: i32,\n    b: i32\n) {}\n"
+        );
+    }
+
+    #[test]
+    fn tssplit_finishes_a_half_split_list_without_blank_lines() {
+        let mut ed = editor("fn add(\n    a: i32, b: i32) {}\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(12));
+
+        ex(&mut ed, "tssplit");
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().to_string(),
+            "fn add(\n    a: i32,\n    b: i32\n) {}\n"
+        );
+    }
+
+    #[test]
+    fn tsjoin_flattens_the_list_and_drops_the_trailing_comma() {
+        let mut ed = editor("fn add(\n    a: i32,\n    b: i32,\n) {}\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(12));
+
+        ex(&mut ed, "tsjoin");
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn add(a: i32, b: i32) {}\n");
+    }
+
+    #[test]
+    fn tssplit_then_tsjoin_is_one_undo_step_each() {
+        let mut ed = editor("call(a, b)\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(6));
+
+        ex(&mut ed, "tssplit");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "call(\n    a,\n    b\n)\n");
+        // The settle every keystroke gets: the tree follows the edit before
+        // the next command reads it.
+        ed.settle();
+        ex(&mut ed, "tsjoin");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "call(a, b)\n");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "call(\n    a,\n    b\n)\n");
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "call(a, b)\n");
+    }
+
+    #[test]
+    fn splitjoin_says_why_it_did_nothing() {
+        let mut ed = editor("plain text\n");
+        ex(&mut ed, "tssplit");
+        assert_eq!(ed.session.status, "no syntax tree here");
+
+        let mut ed = rust_editor();
+        ex(&mut ed, "tsjoin");
+        assert_eq!(ed.session.status, "no brackets around the cursor");
+
+        let mut ed = editor("call(a, b)\n");
+        ex(&mut ed, "set syntax rust");
+        ed.set_cursor(Cursor::at(6));
+        ex(&mut ed, "tsjoin");
+        assert_eq!(ed.session.status, "already one line");
+    }
+
+    // ---- zen ----------------------------------------------------------------
+
+    #[test]
+    fn zen_toggles_both_ways_and_reports() {
+        let mut ed = editor("x\n");
+        assert!(!ed.session.zen);
+
+        ex(&mut ed, "zen");
+        assert!(ed.session.zen);
+        assert_eq!(ed.session.status, "zen on");
+
+        ex(&mut ed, "zen");
+        assert!(!ed.session.zen);
+        assert_eq!(ed.session.status, "zen off");
+    }
+
+    // ---- git signs: the gutter, the numstat ---------------------------------
+
+    #[test]
+    fn git_signs_follow_edits_through_the_drain() {
+        let f = Scratch::new("git-signs", "a\nb\nc\n");
+        let mut ed = opened(&f);
+        ed.set_git_baseline(|_| Some("a\nb\nc\n".into()));
+
+        assert!(ed.gutter_signs(ed.focus(), 0..3).is_empty(), "clean file, no signs");
+        assert!(ed.git_stats(ed.focus()).unwrap().is_clean());
+
+        // Rewrite row 1: the sign lands with the settle, like the parse tree.
+        ed.buffer_mut().unwrap().replace_range(2, 3, "B");
+        ed.settle();
+
+        let signs = ed.gutter_signs(ed.focus(), 0..3);
+        assert_eq!(signs.len(), 1);
+        assert_eq!((signs[0].0, signs[0].1), (1, '▎'));
+        assert_eq!(signs[0].2, ed.theme.ui.git_change);
+        let stats = ed.git_stats(ed.focus()).unwrap();
+        assert_eq!((stats.added, stats.changed, stats.removed), (0, 1, 0));
+    }
+
+    #[test]
+    fn no_baseline_means_no_signs_and_no_numstat() {
+        let f = Scratch::new("git-untracked", "a\n");
+        let mut ed = opened(&f);
+        ed.set_git_baseline(|_| None);
+
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+        ed.settle();
+
+        assert!(ed.gutter_signs(ed.focus(), 0..1).is_empty());
+        assert!(ed.git_stats(ed.focus()).is_none());
+    }
+
+    #[test]
+    fn set_git_signs_false_hides_the_lot_without_forgetting_it() {
+        let f = Scratch::new("git-off", "a\n");
+        let mut ed = opened(&f);
+        ed.set_git_baseline(|_| Some("different\n".into()));
+        assert!(!ed.gutter_signs(ed.focus(), 0..1).is_empty());
+
+        ex(&mut ed, "set git_signs false");
+        assert!(ed.gutter_signs(ed.focus(), 0..1).is_empty());
+        assert!(ed.git_stats(ed.focus()).is_none());
+
+        ex(&mut ed, "set git_signs true");
+        assert!(!ed.gutter_signs(ed.focus(), 0..1).is_empty(), "and back, nothing recomputed");
+    }
+
+    #[test]
+    fn a_revert_rereads_the_baseline() {
+        let f = Scratch::new("git-revert", "a\n");
+        let mut ed = opened(&f);
+        // A loader whose answer changes: the index moved between calls.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        ed.set_git_baseline(move |_| {
+            counted.set(counted.get() + 1);
+            Some("a\n".into())
+        });
+        assert_eq!(calls.get(), 1, "installing fetches");
+
+        ex(&mut ed, "e");
+        assert_eq!(calls.get(), 2, "reverting fetches again");
+    }
+
+    #[test]
+    fn diags_with_nothing_stored_says_so() {
+        let mut ed = editor("x\n");
+        ex(&mut ed, "diags");
+        assert_eq!(ed.session.status, "no diagnostics");
     }
 
     #[test]
@@ -18506,6 +19011,74 @@ int main(void) {
             assert!(ed.gutter_signs(ed.focus(), 0..2).is_empty());
             let buffer = ed.window().buffer().unwrap();
             assert_eq!(ed.diagnostics(buffer).len(), 1, "but not forgotten");
+        }
+
+        #[test]
+        fn diags_lists_the_stored_diagnostics_worst_first_in_a_results_pane() {
+            let (_dir, mut ed, fake) = project("diags");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({
+                    "uri": uri, "version": 1,
+                    "diagnostics": [
+                        { "range": { "start": { "line": 0, "character": 3 },
+                                     "end": { "line": 0, "character": 7 } },
+                          "severity": 2, "message": "dubious\nsecond line" },
+                        { "range": { "start": { "line": 1, "character": 0 },
+                                     "end": { "line": 1, "character": 1 } },
+                          "severity": 1, "message": "broken" },
+                    ]
+                }),
+            );
+
+            ex(&mut ed, "diags");
+
+            let results = ed.window().results().expect("a results pane");
+            assert_eq!(results.title, "diagnostics");
+            assert_eq!(results.matches().len(), 2);
+            // The error on line 2 outranks the warning on line 1.
+            assert_eq!(results.matches()[0].line, 2);
+            assert_eq!(results.matches()[0].text, "}  ▸ E: broken");
+            // The message's first line only, after the text it is about.
+            assert_eq!(results.matches()[1].line, 1);
+            assert_eq!(results.matches()[1].text, "fn main() {  ▸ W: dubious");
+            assert_eq!((results.matches()[1].col, results.matches()[1].len), (3, 4));
+            assert_eq!(ed.session.status, "2 diagnostics in 1 file");
+        }
+
+        #[test]
+        fn the_diagnostic_wins_the_gutter_cell_over_the_git_sign() {
+            let (_dir, mut ed, fake) = project("cell");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+            // Row 0 differs from the index — a git change sign.
+            ed.set_git_baseline(|_| Some("x\n}\n".into()));
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert_eq!((signs.len(), signs[0].1), (1, '▎'));
+
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({
+                    "uri": uri, "version": 1,
+                    "diagnostics": [{ "range": { "start": { "line": 0, "character": 0 },
+                                                 "end": { "line": 0, "character": 2 } },
+                                      "severity": 1, "message": "nope" }]
+                }),
+            );
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert_eq!((signs.len(), signs[0].1), (1, '•'), "one cell, the diagnostic over it");
+
+            // Hiding the diagnostics uncovers the git sign under them.
+            ex(&mut ed, "set diagnostics false");
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert_eq!((signs.len(), signs[0].1), (1, '▎'));
         }
 
         #[test]

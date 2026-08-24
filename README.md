@@ -14,7 +14,12 @@ signature with the parameter you are on highlighted.
 Batch edits run through `:g`/`:v`/`:normal`, `:s` substitutes and `&` repeats
 it, `gq` reflows comments to `textwidth`, `=` reindents, `]]`/`[[` walk the
 parse tree's boundaries (`:ts` paints them), and `:peek` opens a definition
-in a split beside you.
+in a split beside you. `:tssplit`/`:tsjoin` break the bracketed list at the
+cursor onto a line per element and back. Git is built in the minimal way: a
+sign in the gutter for every line the index does not have, and a `+3 ~1 -2`
+numstat in the status row. `:diags` lists every stored diagnostic in a pane
+to jump from, and `:zen` strips the chrome — gutter, numbers, status rows —
+until you ask for it back.
 See [RECOMMENDATION.md](RECOMMENDATION.md) for why the stack is what it is, and
 [docs/specs](docs/specs) for the designs behind each piece.
 
@@ -291,7 +296,9 @@ every one of them is typeable without its key and rebindable by name
 
 Diagnostics wear their severity's colour on the text, a `•` in the gutter,
 and the message at the end of the cursor's line; `:set diagnostics false`
-hides the marks without forgetting them. `:lsp` says where a buffer stands,
+hides the marks without forgetting them, and `:diags` lists what every open
+buffer's server has found — worst first, message beside the line — in the
+same results pane a search fills. `:lsp` says where a buffer stands,
 `:format` reformats the file as one undo step, and completion opens by
 itself in insert mode. See [docs/specs/lsp.md](docs/specs/lsp.md) and the
 specs beside it.
@@ -517,6 +524,9 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:normal {keys}` | replay keys as typed — once per line under a range |
 | `:d` | delete the lines a range names; `:delete` still takes a path |
 | `:ts` | toggle the tree-sitter boundary marks |
+| `:tssplit` `:tsjoin` | the bracketed list at the cursor: one element per line, or back onto one |
+| `:diags` | every open buffer's diagnostics in a results pane, worst first |
+| `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
@@ -892,11 +902,26 @@ One cell to the left of the line numbers, held open whether or not there is
 anything in it. `:set gutter 0` gives it back, and a larger number reserves
 more — it is a width, not a switch.
 
-Nothing draws a sign yet. Reserving it now is the whole feature: a column that
-appeared the first time a git hunk or a diagnostic wanted one would shift every
-line of the file sideways at the moment you most wanted to read it. The theme's
-`gutter` and `gutter_current` are still the *numbers*' colours; a sign will
-bring its own.
+Two things draw in it: a git sign for every line the index does not have —
+a `▎` in `git_add`'s or `git_change`'s colour, a `▁` under-mark for lines
+gone from under a row — and a `•` for a diagnostic, which wins the cell when
+both want it. Reserving the column
+whether or not anything is in it is still the point: it does not shift the
+file sideways the moment the first sign lands. The theme's `gutter` and
+`gutter_current` are the *numbers*' colours; the signs bring their own —
+`git_add`, `git_change`, `git_delete` and the `diag_*` keys.
+
+#### Git signs
+
+The minimum of git an editor owes you: which lines differ from what `git
+add` would take, and by how much. The diff is against the *index*, so the
+signs read "what a commit would still be missing"; a `+3 ~1 -2` numstat sits
+in the focused window's status row, each part in its sign's colour and absent
+at zero. Untracked files, directories outside any repository, and machines
+without git all mean the same thing: no signs, no numstat, no error. `:set
+git_signs false` hides the lot; `:e` re-reads the baseline after a `git add`
+elsewhere. Deliberately minimal — no hunk motions, no staging, no blame. See
+[docs/specs/git-signs.md](docs/specs/git-signs.md).
 
 #### Showing the whitespace
 

@@ -546,6 +546,38 @@ fn first_identifier(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     }
 }
 
+/// A bracketed list, as [`Syntax::list_at`] found it: where a break belongs.
+/// One shape for call arguments, parameters, arrays, tuples, struct literals
+/// and blocks alike — no table of node kinds, the same wager `boundaries`
+/// makes. See `docs/specs/splitjoin.md`.
+pub struct List {
+    /// Just past the opening delimiter.
+    pub open_end: usize,
+    /// Just past each `,` that is a direct child of the list.
+    pub commas: Vec<usize>,
+    /// The closing delimiter's first byte.
+    pub close_start: usize,
+}
+
+/// `node` as a bracketed list, if that is what it is.
+fn as_list(node: tree_sitter::Node) -> Option<List> {
+    let count = u32::try_from(node.child_count()).ok()?;
+    if count < 2 {
+        return None;
+    }
+    let open = node.child(0)?;
+    let close = node.child(count - 1)?;
+    if !matches!((open.kind(), close.kind()), ("(", ")") | ("[", "]") | ("{", "}")) {
+        return None;
+    }
+    let commas = (1..count - 1)
+        .filter_map(|i| node.child(i))
+        .filter(|child| child.kind() == ",")
+        .map(|child| child.end_byte())
+        .collect();
+    Some(List { open_end: open.end_byte(), commas, close_start: close.start_byte() })
+}
+
 impl Syntax {
     /// Parses `rope` for the grammar matching `file` — a file name, or a bare
     /// extension. `None` when no grammar is known: an unrecognised file is
@@ -616,6 +648,20 @@ impl Syntax {
             }
         }
         out
+    }
+
+    /// The innermost bracketed list around `byte` — the node whose first
+    /// child is `(`, `[` or `{` and whose last is the matching closer. What
+    /// `:tssplit` and `:tsjoin` work on; byte offsets, like everything the
+    /// tree says. See `docs/specs/splitjoin.md`.
+    pub fn list_at(&self, byte: usize) -> Option<List> {
+        let mut node = self.tree.root_node().descendant_for_byte_range(byte, byte)?;
+        loop {
+            if let Some(list) = as_list(node) {
+                return Some(list);
+            }
+            node = node.parent()?;
+        }
     }
 
     /// The block and argument-list nodes — what `:ts` paints and `]]`/`[[`
