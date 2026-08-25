@@ -1,14 +1,17 @@
-# forest — greens and teals on a near-black frame, with one warm accent kept
-# for the things that are trying to get your attention. After
-# https://github.com/lighthaus-theme/vim-lighthaus, read out of that project's
-# `colors/lighthaus.vim` and `autoload/lightline/colorscheme/lighthaus.vim`.
+# lighthaus — greens and teals on a near-black frame, with one warm accent
+# kept for the things that are trying to get your attention. Read out of that
+# project's `colors/lighthaus.vim` and its lightline theme.
 #
-# Compiled into the binary; a file at <config dir>/themes/forest.toml is a
+# Based on https://github.com/lighthaus-theme/vim-lighthaus
+#
+# Compiled into the binary; a file at <config dir>/themes/lighthaus.toml is a
 # PATCH over this one, so changing a single colour does not mean copying the
-# rest. `:set theme forest`, or `lighthaus`. See docs/specs/theme.md.
+# rest. `:set theme lighthaus`, or `forest`, which is what it looks like and
+# the name this shipped under first. See docs/specs/theme.md.
 #
-# THE NAME IS A CLAIM AND A TEST HOLDS IT TO ONE. Every colour that paints
-# code here has more green in it than red; every colour that paints attention
+# GREEN WHERE IT IS CODE, WARM WHERE IT IS ATTENTION, and a test holds the
+# file to it. Every colour that paints code here has more green in it than
+# red; every colour that paints attention
 # — a match, a flash, a jump label, the selection — has at least as much red
 # as green. A green canopy, and warmth only where something wants looking at.
 # A second test fences every value below to lighthaus's own palette:

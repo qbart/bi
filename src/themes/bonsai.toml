@@ -1,0 +1,123 @@
+# bonsai — a cool, low-glare dark theme: near-black frame with a green cast,
+# mint strings, cornflower functions and a teal that does most of the marking
+# out. Quiet in the way a well-pruned tree is quiet.
+#
+# Based on https://github.com/ricardoraposo/bonsai.nvim
+#
+# Compiled into the binary; a file at <config dir>/themes/bonsai.toml is a
+# PATCH over this one. `:set theme bonsai`. See docs/specs/theme.md.
+#
+# Read out of `lua/bonsai/palette.lua` and `highlights.lua` with the plugin's
+# shipped defaults in force — comments and keywords italic, functions and
+# variables plain, `sidebars` and `floats` set to `dark`. Almost nothing here
+# had to be invented: bonsai defines every treesitter capture bi asks for, a
+# five-colour `@comment.*` vocabulary that maps straight onto the TODO badges,
+# and its own gitsigns and diagnostics.
+
+[syntax]
+keyword     = { fg = "#B29CE7", italic = true }      # purple, source's own
+operator    = "#B7C7CB"                              # fg_dark, its @operator
+label       = "#6394F3"                              # blue, its @label
+
+function    = "#8DAEF6"                              # blue2
+constructor = "#66DCCE"                              # cyan, its @constructor
+type        = "#66DCCE"                              # cyan
+module      = "#66DCCE"
+tag         = "#66DCCE"                              # its own @tag
+
+string      = "#8DE5DA"                              # cyan1
+character   = "#8DE5DA"
+escape      = "#8DE5DA"                              # its @string.escape
+
+comment     = { fg = "#7C98A1", italic = true }      # comment
+
+constant    = "#FCA78D"                              # orange
+number      = "#FCA78D"
+float       = "#FCA78D"
+boolean     = "#FCA78D"
+
+attribute   = "#B29CE7"                              # purple, its @attribute
+
+punctuation = "#B7C7CB"                              # its @punctuation.bracket
+delimiter   = "#B7C7CB"                              # its @punctuation.delimiter
+
+property                = "#ADECE5"                  # cyan3, its @property
+"string.special.key"    = "#ADECE5"
+"string.special.symbol" = "#ADECE5"
+"string.special.regex"  = "#FC98AB"                  # magenta, its @string.regexp
+
+"text.title"     = { fg = "#6394F3", bold = true }   # its @markup.heading
+"text.literal"   = "#8DE5DA"                         # its @markup.raw
+"text.uri"       = { fg = "#66DCCE", underline = true }
+"text.reference" = "#66DCCE"                         # its @markup.link
+
+[ui]
+background = "#151E23"                               # bg
+foreground = "#E6FAF7"                               # fg
+
+cursorline = { bg = "#1A2A2E" }                      # bg_highlight
+selection  = { bg = "#1C4D47" }                      # bg_visual / teal
+search     = { fg = "#E6FAF7", bg = "#4A3A1A" }      # bg_search, its own Search
+flash      = { fg = "#0A1419", bg = "#FCA78D" }      # its IncSearch
+# cyan2, which is bonsai's own "this one": its border_highlight, its
+# TabLineSel, its `@comment.todo`. Not the flash's orange, because `s` draws
+# the letter touching the match it belongs to.
+label      = { fg = "#0A1419", bg = "#40CAB6", bold = true }
+cursor_alt = { fg = "#151E23", bg = "#E6FAF7" }      # its own Cursor
+dim        = "#7C98A1"                               # comment
+
+gutter         = "#406A76"                           # fg_gutter, its LineNr
+gutter_current = { fg = "#40CAB6", bold = true }     # its CursorLineNr
+rule           = "#2A3A42"                           # border, its WinSeparator
+filler         = "#151E23"                           # its EndOfBuffer: `~` hidden
+indent_guide   = "#2A3A42"                           # its IblIndent
+whitespace     = "#406A76"                           # its own Whitespace
+context        = "#2A3A42"
+context_header = { fg = "#B7C7CB", bg = "#1A2830" }  # bg_popup
+
+popup = { fg = "#E6FAF7", bg = "#1A2830" }           # its Pmenu
+
+# All five are bonsai's own `@comment.*` vocabulary, which happens to be
+# exactly the five meanings docs/specs/todo-comments.md names — error,
+# warning, todo, info and note. The only built-in here that could look up all
+# five rather than build any.
+todo_fix   = { fg = "#151E23", bg = "#FA5371", bold = true }   # @comment.error
+todo_warn  = { fg = "#151E23", bg = "#FDD351", bold = true }   # @comment.warning
+todo_todo  = { fg = "#151E23", bg = "#40CAB6", bold = true }   # @comment.todo
+todo_perf  = { fg = "#151E23", bg = "#6394F3", bold = true }   # @comment.info
+todo_note  = { fg = "#151E23", bg = "#4EC685", bold = true }   # @comment.note
+
+# Its own Diagnostic groups, which are its own semantic palette entries.
+diag_error   = { fg = "#FA5371", underline = true }
+diag_warning = { fg = "#FDD351", underline = true }
+diag_info    = { fg = "#6394F3", underline = true }
+diag_hint    = { fg = "#4EC685", underline = true }
+
+# Its own GitSigns groups. See docs/specs/git-signs.md.
+git_add      = "#4EC685"
+git_change   = "#6394F3"
+git_delete   = "#FA5371"
+
+# Built rather than looked up: the repo ships no statusline theme. Normal
+# takes the source's own TabLineSel — the colour it already uses for "this is
+# the active one" — and insert and pick follow the palette's green and purple.
+mode_normal = { fg = "#0A1419", bg = "#40CAB6", bold = true }
+mode_insert = { fg = "#0A1419", bg = "#4EC685", bold = true }
+mode_pick   = { fg = "#0A1419", bg = "#B29CE7", bold = true }
+
+status          = "#B7C7CB"                          # fg_dark
+status_muted    = "#7C98A1"
+status_inactive = { fg = "#406A76", bg = "#0D1B22" } # its StatusLineNC
+statusline      = { fg = "#B7C7CB", bg = "#0D1B22" } # its StatusLine
+
+tree_dir  = "#6394F3"                                # its Directory
+tree_link = "#66DCCE"
+mark_copy = "#4EC685"
+mark_cut  = "#FA5371"
+
+picker_border   = "#40CAB6"                          # its TelescopeBorder
+picker_prompt   = "#40CAB6"
+picker_selected = { fg = "#E6FAF7", bg = "#1A2A2E", bold = true }  # its TelescopeSelection
+picker_badge    = "#7C98A1"
+picker_divider  = "#2A3A42"
+picker_preview  = "#B7C7CB"

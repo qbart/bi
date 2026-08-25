@@ -1,0 +1,139 @@
+# ferra — warm and dusty: a brown-black frame under blush text, with coral,
+# rose, honey and sage doing the work. The only dark theme here whose greys
+# have red in them, which is what makes it read as warm rather than as cold
+# with warm accents.
+#
+# Based on https://github.com/gloridifice/ferra.nvim
+#
+# Compiled into the binary; a file at <config dir>/themes/ferra.toml is a
+# PATCH over this one. `:set theme ferra`. See docs/specs/theme.md.
+#
+# Read out of `lua/ferra/palettes/ferra.lua` and the `groups/` modules with
+# the plugin's shipped defaults in force: comments and conditionals italic,
+# `weaken_delimiters` off, no transparency. There is one flavour, `ferra`, so
+# there is nothing to choose. Its palette names — blush, coral, rose, mist,
+# ember, honey, sage — are kept in the comments.
+
+[syntax]
+keyword     = "#D1D1E0"                              # mist
+operator    = "#D1D1E0"
+label       = "#D1D1E0"                              # its @label
+tag         = "#D1D1E0"                              # its own @tag
+
+function    = "#ffa07a"                              # coral
+constructor = "#F5D76E"                              # honey, its @constructor
+type        = "#F6B6C9"                              # rose
+module      = { fg = "#fecdb2", italic = true }      # blush, its own @module
+
+string      = "#B1B695"                              # sage
+character   = "#B1B695"
+escape      = "#F6B6C9"                              # rose, its @string.escape
+
+comment     = { fg = "#6F5D63", italic = true }      # bg3
+
+constant    = "#ffa07a"                              # coral
+number      = "#ffa07a"
+float       = "#ffa07a"
+boolean     = "#ffa07a"
+
+attribute   = "#ffa07a"                              # its @attribute
+
+# Blush, which is also the foreground — ferra deliberately does not weaken its
+# delimiters, and ships a `weaken_delimiters` switch, off by default, for
+# anyone who disagrees. Kept as the source has it.
+punctuation = "#fecdb2"
+delimiter   = "#fecdb2"
+property    = "#fecdb2"                              # its @property / @field
+
+# Rose, which is what ferra paints every `@string.special*` — a key, a symbol
+# and a regex alike. It does not separate a symbol from a pattern, and this
+# file does not invent a separation it has no colour for; what matters is that
+# none of the three comes out the sage that string literals wear.
+"string.special"       = "#F6B6C9"
+"string.special.regex" = "#F6B6C9"                   # its @string.regexp
+
+"text.title"     = { fg = "#ffa07a", bold = true }   # its @markup.heading.markdown
+"text.literal"   = "#B1B695"                         # its @markup.raw
+"text.uri"       = { fg = "#ffa07a", italic = true, underline = true }
+"text.reference" = "#F6B6C9"                         # its @markup.link
+
+[ui]
+background = "#2b292d"                               # bgbase
+foreground = "#fecdb2"                               # blush
+
+cursorline = { bg = "#333135" }                      # its own CursorLine
+selection  = { bg = "#4d424b" }                      # bg2, its Visual
+# A DEPARTURE, and a required one. ferra's `Search`, `IncSearch` and
+# `CurSearch` all name a background of `#383539` and no foreground at all —
+# one step off the frame, with italic and bold carrying the whole signal. A
+# match you have to find by its slant is the failure theme.md names, so this
+# takes honey, which the source already spends on things it wants read.
+search     = { fg = "#2b292d", bg = "#F5D76E" }
+# Coral, which is what ferra means by "here": its own `Todo` background, its
+# `MatchParen`, its `TelescopeMatching`.
+flash      = { fg = "#2b292d", bg = "#ffa07a" }
+label      = { fg = "#2b292d", bg = "#F6B6C9", bold = true }  # rose
+cursor_alt = { fg = "#2b292d", bg = "#fecdb2" }
+dim        = "#6F5D63"                               # bg3, its Comment / NonText
+
+gutter         = "#4d424b"                           # bg2, its LineNr
+gutter_current = { fg = "#F6B6C9", bold = true }     # its CursorLineNr
+# bg2 rather than the source's `WinSeparator`, which is the frame's own
+# colour — an invisible split, which works when the split is a filled column
+# and not when it is a single `│`.
+rule           = "#4d424b"
+filler         = "#4d424b"                           # its EndOfBuffer
+indent_guide   = "#383539"                           # bg1, its IblIndent
+# One step up from the source's `Whitespace`: a mark you asked for and then
+# have to squint at answers nothing.
+whitespace     = "#6F5D63"
+context        = "#4d424b"
+context_header = { fg = "#fecdb2", bg = "#383539" }  # its NormalFloat
+
+popup = { fg = "#fecdb2", bg = "#383539" }           # its NormalFloat
+
+# Five of ferra's own markdown-heading rainbow, which is the only place it
+# spends all its accents at once — and coral is its own `Todo`.
+# See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#2b292d", bg = "#e06b75", bold = true }   # ember
+todo_warn  = { fg = "#2b292d", bg = "#F5D76E", bold = true }   # honey
+todo_todo  = { fg = "#2b292d", bg = "#ffa07a", bold = true }   # coral, its Todo
+todo_perf  = { fg = "#2b292d", bg = "#D1D1E0", bold = true }   # mist
+todo_note  = { fg = "#2b292d", bg = "#B1B695", bold = true }   # sage
+
+# Its own Diagnostic groups' colours. ferra marks severity with italics; every
+# built-in here underlines, because a slant is hard to see under a colour that
+# is already doing the talking. See docs/specs/diagnostics.md.
+diag_error   = { fg = "#e06b75", underline = true }  # ember
+diag_warning = { fg = "#F5D76E", underline = true }  # honey
+diag_info    = { fg = "#D1D1E0", underline = true }  # mist
+diag_hint    = { fg = "#B1B695", underline = true }  # sage
+
+# Its own GitSigns groups. See docs/specs/git-signs.md.
+git_add      = "#B1B695"
+git_change   = "#F5D76E"
+git_delete   = "#e06b75"
+
+# The lualine theme's normal, insert and visual mode blocks, verbatim —
+# including the asymmetry that normal's foreground is bg1 while the others'
+# is bgbase, which is what the source says.
+mode_normal = { fg = "#383539", bg = "#ffa07a", bold = true }
+mode_insert = { fg = "#2b292d", bg = "#B1B695", bold = true }
+mode_pick   = { fg = "#2b292d", bg = "#D1D1E0", bold = true }
+
+status          = "#fecdb2"
+status_muted    = "#6F5D63"
+status_inactive = { fg = "#4d424b", bg = "#383539" } # its StatusLineNC
+statusline      = { fg = "#fecdb2", bg = "#383539" } # its StatusLine
+
+tree_dir  = "#ffa07a"                                # its Directory
+tree_link = "#F6B6C9"
+mark_copy = "#B1B695"
+mark_cut  = "#e06b75"
+
+picker_border   = "#ffa07a"                          # its TelescopeBorder
+picker_prompt   = "#ffa07a"                          # its TelescopePromptPrefix
+picker_selected = { fg = "#ffa07a", bg = "#383539", bold = true }
+picker_badge    = "#6F5D63"
+picker_divider  = "#4d424b"
+picker_preview  = "#D1D1E0"                          # mist

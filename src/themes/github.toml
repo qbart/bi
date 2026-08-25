@@ -1,0 +1,148 @@
+# github — GitHub's "dimmed" dark theme: a soft slate frame with the palette
+# GitHub itself uses to read diffs, so a file in bi looks like the same file
+# in a pull request.
+#
+# Based on https://github.com/zoomlogo/github-dimmed.vim
+#
+# Compiled into the binary; a file at <config dir>/themes/github.toml is a
+# PATCH over this one. `:set theme github`, or `github-dimmed`.
+# See docs/specs/theme.md.
+#
+# The source is one 150-line file with a named palette at the top and no
+# treesitter groups, no statusline, no diagnostics and no git signs — so about
+# a third of bi's furniture had to be built from that palette rather than
+# looked up. Where that happened it is marked. The palette names below are the
+# source's own `s:` variables.
+
+[syntax]
+keyword     = "#f47067"                              # keyword, its Keyword
+operator    = "#f47067"                              # its own Operator
+# `Label` is plain foreground in the source, which is a capture painted the
+# colour of nothing. A label names a place you jump to, so it joins the
+# keywords rather than the prose.
+label       = "#f47067"
+
+function    = "#dcbdfb"                              # func
+constructor = "#dcbdfb"
+type        = "#f69d50"                              # type
+module      = "#f69d50"
+# The source's own: `Tag`, `htmlStatement` and `htmlSpecialTagName` are all
+# the keyword coral, so an element name here reads as markup rather than as a
+# kind of node. Kept — it is one of the few language-specific opinions the
+# file actually has.
+tag         = "#f47067"
+
+string      = "#96d0ff"                              # str
+character   = "#6cb6ff"                              # const, its own Character
+escape      = "#dcbdfb"                              # builtin
+
+comment     = "#768390"                              # comment
+
+constant    = "#6cb6ff"                              # const
+number      = "#6cb6ff"
+float       = "#6cb6ff"
+boolean     = "#6cb6ff"
+
+attribute   = "#dcbdfb"                              # its rubyAttribute
+
+# fg2, one step down from the text. The source sets no `Delimiter` at all, and
+# fg2 is what it puts on the things you are not reading — line numbers, the
+# `Todo` word, special keys.
+punctuation = "#9fabb7"                              # fg2
+delimiter   = "#9fabb7"
+
+property                = "#6cb6ff"                  # const
+"string.special.key"    = "#6cb6ff"
+"string.special.symbol" = "#6cb6ff"
+"string.special.regex"  = "#dcbdfb"                  # builtin
+
+# GitHub renders markdown headings in blue wherever it renders markdown, and
+# `const` is that blue. The source's own `Title` is plain foreground.
+"text.title"     = { fg = "#6cb6ff", bold = true }
+"text.literal"   = "#dcbdfb"                         # its mkdCode
+"text.uri"       = { fg = "#adbac7", underline = true }  # its htmlLink
+"text.reference" = "#96d0ff"                         # str
+
+[ui]
+background = "#22272e"                               # bg
+foreground = "#adbac7"                               # fg
+
+cursorline = { bg = "#34383f" }                      # bg2, its CursorLine
+# The source sets no `Visual` at all; bg3 is what it puts under `PmenuSel`,
+# which is the same idea one surface up.
+selection  = { bg = "#454a4f" }                      # bg3
+# Its `Search` is a bare underline with no colours, which theme.md rules out
+# — a match has to name both halves. Its `IncSearch` names both, and does.
+search     = { fg = "#22272e", bg = "#f47067" }      # keyword coral
+flash      = { fg = "#22272e", bg = "#ff8800" }      # warning2, its MatchParen
+label      = { fg = "#22272e", bg = "#6cb6ff", bold = true }  # const
+cursor_alt = { fg = "#22272e", bg = "#adbac7" }      # its own Cursor
+dim        = "#768390"                               # comment
+
+# The source pairs a fairly bright number (fg3) with a *darker* gutter strip,
+# so the column reads as set back. bi paints no gutter background, so the
+# contrast has to come out of the number instead: the comment grey, which is
+# where the source's own eye level for "not the code" already sits.
+gutter         = "#768390"
+gutter_current = { fg = "#96d0ff", bold = true }     # its CursorLineNr
+rule           = "#454a4f"                           # bg3, its VertSplit
+filler         = "#575b60"                           # bg4, its NonText
+indent_guide   = "#454a4f"
+whitespace     = "#768390"
+context        = "#454a4f"
+context_header = { fg = "#adbac7", bg = "#34383f" }  # its Pmenu
+
+popup = { fg = "#adbac7", bg = "#34383f" }           # its Pmenu
+
+# Built rather than looked up: the source's `Todo` is one inverted grey word.
+# The five take the palette's five accents, coral first because coral is what
+# GitHub means by danger. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#22272e", bg = "#f47067", bold = true }   # keyword
+todo_warn  = { fg = "#22272e", bg = "#ff8800", bold = true }   # warning2
+todo_todo  = { fg = "#22272e", bg = "#6cb6ff", bold = true }   # const
+todo_perf  = { fg = "#22272e", bg = "#dcbdfb", bold = true }   # builtin
+todo_note  = { fg = "#22272e", bg = "#f69d50", bold = true }   # type
+
+# The source's `warning` is a literal `#ff0000` — the one value in a theme
+# called *dimmed* that is not dimmed, and it lands on `ErrorMsg`. Worn by the
+# text of every error an LSP finds, it fights the frame rather than marking
+# anything, so this takes the palette's coral: GitHub's own danger colour, and
+# already the keyword. `warning2` is the source's own, unchanged.
+# See docs/specs/diagnostics.md.
+diag_error   = { fg = "#f47067", underline = true }
+diag_warning = { fg = "#ff8800", underline = true }  # warning2
+diag_info    = { fg = "#6cb6ff", underline = true }  # const
+diag_hint    = { fg = "#768390", underline = true }  # comment
+
+# THIS PALETTE HAS NO GREEN. GitHub's dimmed diff colours live in
+# backgrounds — `#123d0f` under an added line — and a gutter glyph needs a
+# foreground, so the three signs come from the three accents that exist
+# instead. An addition is blue here, and that is the palette's doing.
+# See docs/specs/git-signs.md.
+git_add      = "#6cb6ff"                             # const
+git_change   = "#f69d50"                             # type
+git_delete   = "#f47067"                             # keyword
+
+# Built rather than looked up: the repo ships no statusline theme of any kind
+# and does not even set `StatusLine`. Neutral for normal, blue for insert —
+# new text, the same hue as an addition — and orange for pick.
+mode_normal = { fg = "#22272e", bg = "#768390", bold = true }
+mode_insert = { fg = "#22272e", bg = "#6cb6ff", bold = true }
+mode_pick   = { fg = "#22272e", bg = "#f69d50", bold = true }
+
+status          = "#adbac7"
+status_muted    = "#768390"
+status_inactive = { fg = "#768390", bg = "#34383f" }
+statusline      = { fg = "#adbac7", bg = "#34383f" }
+
+tree_dir  = "#6cb6ff"                                # its Directory
+tree_link = "#96d0ff"                                # str
+mark_copy = "#6cb6ff"
+mark_cut  = "#f47067"
+
+picker_border   = "#454a4f"
+picker_prompt   = "#6cb6ff"
+picker_selected = { fg = "#adbac7", bg = "#454a4f", bold = true }  # its PmenuSel
+picker_badge    = "#768390"
+picker_divider  = "#454a4f"
+picker_preview  = "#9fabb7"                          # fg2

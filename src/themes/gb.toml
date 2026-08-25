@@ -1,5 +1,7 @@
-# gb — a Game Boy's screen: dark forest green on a greenish cream LCD, after
-# the `mfd-paper` variant of https://github.com/kungfusheep/mfd.nvim.
+# gb — a Game Boy's screen: dark forest green on a greenish cream LCD, from
+# the `mfd-paper` variant.
+#
+# Based on https://github.com/kungfusheep/mfd.nvim
 #
 # Compiled into the binary; a file at <config dir>/themes/gb.toml is a PATCH
 # over this one, so changing a single colour does not mean copying the rest.

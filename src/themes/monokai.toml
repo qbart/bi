@@ -1,0 +1,136 @@
+# monokai — Molokai, Tomas Restrepo's Vim port of Wimer Hazenberg's Monokai:
+# hot pink keywords, chartreuse function names, sky-blue types and sand
+# strings on near-black. The palette most editors have shipped a version of.
+#
+# Based on https://github.com/tomasr/molokai
+#
+# Compiled into the binary; a file at <config dir>/themes/monokai.toml is a
+# PATCH over this one. `:set theme monokai`, or `molokai`.
+# See docs/specs/theme.md.
+#
+# The default variant — molokai's own `g:molokai_original` unset, which is the
+# darker `#1B1D1E` frame rather than Monokai's original `#272822`. The source
+# is pre-treesitter and defines no language-specific groups at all, so bi's
+# newer captures are placed by reading what molokai does with the Vim group
+# nearest in meaning; each of those is marked.
+
+[syntax]
+keyword     = { fg = "#F92672", bold = true }        # its Keyword / Statement
+operator    = "#F92672"                              # its own Operator
+label       = "#E6DB74"                              # its own Label
+
+function    = "#A6E22E"                              # its Function
+constructor = "#A6E22E"
+type        = "#66D9EF"                              # its Type
+module      = "#66D9EF"                              # its Structure / Typedef
+# The source's own `Tag`, italic and all — one of the few opinions a
+# pre-treesitter file volunteers, and the one place monokai leans on slant.
+tag         = { fg = "#F92672", italic = true }
+
+string      = "#E6DB74"                              # its String
+character   = "#E6DB74"
+escape      = { fg = "#F92672", bold = true }        # its SpecialChar
+
+comment     = "#7E8E91"                              # its Comment
+
+constant    = { fg = "#AE81FF", bold = true }        # its Constant
+number      = "#AE81FF"
+float       = "#AE81FF"
+boolean     = "#AE81FF"
+
+# Orange is molokai's `Identifier` and `StorageClass` — what it paints a name
+# that is neither a call nor a type. A property and an attribute are both
+# that, so both take it.
+attribute   = "#FD971F"
+property    = "#FD971F"
+"string.special.key"    = "#FD971F"
+"string.special.symbol" = "#FD971F"
+# The source's own `Special`, italic included: a pattern is not a literal, and
+# the fallback walk would otherwise land it on the sand that strings wear.
+"string.special.regex"  = { fg = "#66D9EF", italic = true }
+
+punctuation = "#8F8F8F"                              # its own Delimiter
+delimiter   = "#8F8F8F"
+
+"text.title"     = "#ef5939"                         # its Title, lowercase and all
+"text.literal"   = "#E6DB74"
+"text.uri"       = { fg = "#808080", underline = true }  # its Underlined
+"text.reference" = "#66D9EF"
+
+[ui]
+background = "#1B1D1E"
+foreground = "#F8F8F2"
+
+cursorline = { bg = "#293739" }
+selection  = { bg = "#403D3D" }                      # its Visual
+search     = { fg = "#000000", bg = "#FFE792" }      # its own Search
+# Its `IncSearch` is tan text on pure black, which on a `#1B1D1E` frame is a
+# flash you cannot see. Its `MatchParen` — black on orange — is what molokai
+# actually does when it means "this one", so the flash takes that instead.
+flash      = { fg = "#000000", bg = "#FD971F" }
+label      = { fg = "#000000", bg = "#A6E22E", bold = true }
+cursor_alt = { fg = "#000000", bg = "#F8F8F0" }      # its own Cursor
+dim        = "#7E8E91"                               # its Comment grey
+
+# The source pairs its line numbers with a `#232526` strip; bi paints no
+# gutter background, so these take the foregrounds alone.
+gutter         = "#465457"                           # its LineNr
+gutter_current = { fg = "#FD971F", bold = true }     # its CursorLineNr
+rule           = "#808080"                           # its VertSplit's own fg
+filler         = "#465457"                           # its NonText
+indent_guide   = "#465457"
+whitespace     = "#465457"                           # its SpecialKey
+context        = "#465457"
+context_header = { fg = "#66D9EF", bg = "#232526" }
+
+popup = { fg = "#66D9EF", bg = "#000000" }           # its own Pmenu
+
+# Molokai's `Todo` is one white bold word. These are its five accents, which
+# is as close to a native answer as a 2006 colorscheme has.
+# See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#1B1D1E", bg = "#F92672", bold = true }   # its ErrorMsg pink
+todo_warn  = { fg = "#1B1D1E", bg = "#FD971F", bold = true }   # orange
+todo_todo  = { fg = "#1B1D1E", bg = "#E6DB74", bold = true }   # sand
+todo_perf  = { fg = "#1B1D1E", bg = "#AE81FF", bold = true }   # purple
+todo_note  = { fg = "#1B1D1E", bg = "#66D9EF", bold = true }   # cyan
+
+diag_error   = { fg = "#F92672", underline = true }  # its ErrorMsg
+diag_warning = { fg = "#FD971F", underline = true }
+diag_info    = { fg = "#66D9EF", underline = true }
+diag_hint    = { fg = "#7E8E91", underline = true }
+
+# Its `SignColumn` is already chartreuse — the gutter colour it chose for
+# marks — and change and delete follow the accents. Its own `DiffDelete` fg is
+# `#960050`, a maroon meant to sit on a dark red band; alone in a gutter cell
+# it is nearly unreadable, so the sign takes the pink instead.
+# See docs/specs/git-signs.md.
+git_add      = "#A6E22E"
+git_change   = "#66D9EF"
+git_delete   = "#F92672"
+
+mode_normal = { fg = "#1B1D1E", bg = "#66D9EF", bold = true }
+mode_insert = { fg = "#1B1D1E", bg = "#A6E22E", bold = true }
+mode_pick   = { fg = "#1B1D1E", bg = "#F92672", bold = true }
+
+status          = "#F8F8F2"
+status_muted    = "#7E8E91"
+status_inactive = { fg = "#808080", bg = "#080808" } # its StatusLineNC
+# A DEPARTURE, and a reluctant one: molokai's `StatusLine` is `guibg=fg`, a
+# near-white bar with slate text, which is its most striking single choice.
+# bi draws the git numstat on this row in `git_add` / `git_change` /
+# `git_delete`, and chartreuse and sand on `#F8F8F2` are illegible — so the
+# bar goes dark and keeps the numbers readable. The white bar is one
+# `themes/monokai.toml` away for anyone who wants it back.
+statusline      = { fg = "#F8F8F2", bg = "#293739" }
+
+tree_dir  = { fg = "#A6E22E", bold = true }          # its own Directory
+tree_link = "#66D9EF"
+mark_copy = "#A6E22E"
+mark_cut  = "#F92672"
+
+picker_border   = "#465457"
+picker_prompt   = "#A6E22E"
+picker_selected = { fg = "#F8F8F2", bg = "#808080", bold = true }  # its PmenuSel
+picker_badge    = "#7E8E91"
+picker_divider  = "#232526"
+picker_preview  = "#8F8F8F"

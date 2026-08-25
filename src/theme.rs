@@ -347,13 +347,68 @@ pub struct Theme {
 pub const DEFAULT_THEME: &str = "main";
 
 const MAIN: &str = include_str!("themes/main.toml");
-const GRUVBOX_DARK: &str = include_str!("themes/gruvbox-dark.toml");
-const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
-const PASCAL: &str = include_str!("themes/pascal.toml");
-const ANSI: &str = include_str!("themes/ansi.toml");
-const VESPER: &str = include_str!("themes/vesper.toml");
-const GB: &str = include_str!("themes/gb.toml");
-const FOREST: &str = include_str!("themes/forest.toml");
+
+/// One built-in: the name it is listed under, the other spellings that reach
+/// it, and the file itself.
+struct Builtin {
+    name: &'static str,
+    /// Alternate spellings. A name is not a palette, so letting two names
+    /// reach one file costs nothing to keep in sync — but only `name` is
+    /// listed, because an editor that answers `:set theme ?` with two
+    /// spellings of the same screen is answering a question nobody asked.
+    aliases: &'static [&'static str],
+    source: &'static str,
+}
+
+/// Every built-in, in one table.
+///
+/// It was three lists — a `const` per file, an arm per name, and an array of
+/// names — and adding a theme meant touching all three, with the failure mode
+/// being a theme that `:set` finds and `:set theme ?` does not. That is the
+/// argument `Ui::set` already makes about a `[ui]` key existing for the parser
+/// and not for the drawing, one level up.
+const BUILTINS: &[Builtin] = &[
+    Builtin { name: DEFAULT_THEME, aliases: &[], source: MAIN },
+    Builtin {
+        name: "gruvbox-dark",
+        aliases: &[],
+        source: include_str!("themes/gruvbox-dark.toml"),
+    },
+    Builtin {
+        name: "gruvbox-light",
+        aliases: &[],
+        source: include_str!("themes/gruvbox-light.toml"),
+    },
+    Builtin { name: "pascal", aliases: &[], source: include_str!("themes/pascal.toml") },
+    Builtin { name: "ansi", aliases: &[], source: include_str!("themes/ansi.toml") },
+    Builtin { name: "vesper", aliases: &[], source: include_str!("themes/vesper.toml") },
+    // `gb` is what it is listed as; `gameboy` is what it looks like.
+    Builtin { name: "gb", aliases: &["gameboy"], source: include_str!("themes/gb.toml") },
+    // `lighthaus` is where the palette came from; `forest` is what it looks
+    // like, and the name this shipped under before it was renamed — so it
+    // keeps working rather than becoming an unknown theme.
+    Builtin {
+        name: "lighthaus",
+        aliases: &["forest"],
+        source: include_str!("themes/lighthaus.toml"),
+    },
+    Builtin { name: "kanagawa", aliases: &[], source: include_str!("themes/kanagawa.toml") },
+    Builtin { name: "xcode", aliases: &["xcodedark"], source: include_str!("themes/xcode.toml") },
+    Builtin {
+        name: "purple",
+        aliases: &["shades-of-purple"],
+        source: include_str!("themes/purple.toml"),
+    },
+    Builtin {
+        name: "github",
+        aliases: &["github-dimmed"],
+        source: include_str!("themes/github.toml"),
+    },
+    Builtin { name: "bonsai", aliases: &[], source: include_str!("themes/bonsai.toml") },
+    Builtin { name: "monokai", aliases: &["molokai"], source: include_str!("themes/monokai.toml") },
+    Builtin { name: "nordark", aliases: &["nord"], source: include_str!("themes/nordark.toml") },
+    Builtin { name: "ferra", aliases: &[], source: include_str!("themes/ferra.toml") },
+];
 
 impl Default for Theme {
     /// The shipped `main`, parsed.
@@ -373,24 +428,9 @@ impl Theme {
     }
 
     /// The source of a built-in theme, or `None` if there is no such name.
+    /// Alternate spellings resolve here too — `gameboy` is `gb`.
     pub fn builtin(name: &str) -> Option<&'static str> {
-        match name {
-            DEFAULT_THEME => Some(MAIN),
-            "gruvbox-dark" => Some(GRUVBOX_DARK),
-            "gruvbox-light" => Some(GRUVBOX_LIGHT),
-            "pascal" => Some(PASCAL),
-            "ansi" => Some(ANSI),
-            "vesper" => Some(VESPER),
-            // Two spellings of one theme: `gb` is what it is listed as, and
-            // `gameboy` is what it looks like. A name is not a palette, so
-            // there is nothing to keep in sync by letting both reach it.
-            "gb" | "gameboy" => Some(GB),
-            // Likewise: `forest` is what the palette is, `lighthaus` is where
-            // it came from, and someone who knows one should not have to
-            // learn the other to find it.
-            "forest" | "lighthaus" => Some(FOREST),
-            _ => None,
-        }
+        BUILTINS.iter().find(|b| b.name == name || b.aliases.contains(&name)).map(|b| b.source)
     }
 
     /// The names of every built-in, for `:set theme` to complain with.
@@ -400,16 +440,9 @@ impl Theme {
     /// it are different decisions, and only the first one is available.
     /// `gruvbox-dark` is here for a different reason: it *was* the default,
     /// and a theme losing that job is not a theme being withdrawn.
-    pub const BUILTINS: &'static [&'static str] = &[
-        DEFAULT_THEME,
-        "gruvbox-dark",
-        "gruvbox-light",
-        "pascal",
-        "ansi",
-        "vesper",
-        "gb",
-        "forest",
-    ];
+    pub fn builtins() -> impl Iterator<Item = &'static str> {
+        BUILTINS.iter().map(|b| b.name)
+    }
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -505,7 +538,7 @@ impl Theme {
             }
             None if user.is_some() => Theme::default(),
             None => {
-                let known = Theme::BUILTINS.join(", ");
+                let known = Theme::builtins().collect::<Vec<_>>().join(", ");
                 return (
                     Theme::default(),
                     vec![Diagnostic {
@@ -598,7 +631,7 @@ mod tests {
     /// list walks itself against every built-in.
     #[test]
     fn every_builtin_sets_every_required_ui_colour() {
-        for name in Theme::BUILTINS {
+        for name in Theme::builtins() {
             let src = Theme::builtin(name).unwrap();
             let doc: Document<&str> = Document::parse(src).expect("built-in must parse");
             let ui = doc["ui"].as_table().expect("[ui] section");
@@ -614,7 +647,7 @@ mod tests {
     /// background `search` painted. The match was there and invisible.
     #[test]
     fn a_search_match_names_both_halves_and_neither_is_the_dim() {
-        for name in Theme::BUILTINS {
+        for name in Theme::builtins() {
             let ui = parsed(name).ui;
             assert!(ui.search.fg.is_some(), "{name}: a match with no foreground of its own");
             assert!(ui.search.bg.is_some(), "{name}: a match with no background of its own");
@@ -832,7 +865,7 @@ mod tests {
     /// whose files render blank.
     #[test]
     fn every_builtin_fills_the_roles_that_carry_a_file() {
-        for name in Theme::BUILTINS {
+        for name in Theme::builtins() {
             let theme = parsed(name);
             for role in ["keyword", "string", "comment", "type", "property", "tag"] {
                 assert!(theme.style(role).is_some(), "{name} leaves {role} unpainted");
@@ -847,15 +880,21 @@ mod tests {
     /// pipeline: there the query had to be told two captures differ, here the
     /// theme has to be told two colours do.
     ///
-    /// `ansi` is deliberately exempt. It promises the colours bi had before it
-    /// had themes, and before it had themes these fell through to `string`.
+    /// Three built-ins are deliberately exempt. `ansi` promises the colours bi
+    /// had before it had themes, and before it had themes these fell through
+    /// to `string`. `pascal` had sixteen colours and did not spend two of them
+    /// telling one kind of literal from another. `ferra` paints every
+    /// `@string.special*` one rose — so a symbol still does not look like a
+    /// string, which is what the rule is protecting, but a symbol and a regex
+    /// look like each other, and inventing a colour it does not have would be
+    /// this file overruling its source on a point the source is entitled to.
     #[test]
     fn a_symbol_and_a_regex_are_not_just_strings() {
         // `gb` is the interesting member: it has no second colour to separate
         // the two with, so it separates them with weight and slant instead —
         // and because this compares `Style`s rather than colours, it cannot
         // tell the difference. Which is the point.
-        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper", "gb", "forest"] {
+        for name in Theme::builtins().filter(|n| !matches!(*n, "ansi" | "pascal" | "ferra")) {
             let theme = parsed(name);
             let string = theme.style("string");
             for special in ["string.special.symbol", "string.special.regex"] {
@@ -969,11 +1008,11 @@ mod tests {
     /// The name is a claim, so this is the test that holds it to one: the
     /// canopy is green, and the warmth is only where something wants looking
     /// at. Two sentences, and between them they are the whole shape of the
-    /// theme — including the answer to why a palette called `forest` is
+    /// theme — including the answer to why a palette this green is
     /// allowed a `#E25600` in it at all.
     #[test]
-    fn forest_is_green_where_it_is_code_and_warm_where_it_is_attention() {
-        let forest = parsed("forest");
+    fn lighthaus_is_green_where_it_is_code_and_warm_where_it_is_attention() {
+        let lighthaus = parsed("lighthaus");
 
         for role in [
             "keyword",
@@ -988,10 +1027,10 @@ mod tests {
             "string",
             "character",
         ] {
-            let Some(Color::Rgb(r, g, _)) = forest.style(role).and_then(|s| s.fg) else {
-                panic!("forest leaves {role} unpainted, or paints it something other than rgb")
+            let Some(Color::Rgb(r, g, _)) = lighthaus.style(role).and_then(|s| s.fg) else {
+                panic!("lighthaus leaves {role} unpainted, or paints it something other than rgb")
             };
-            assert!(g > r, "forest: {role} is warmer than the canopy it is part of");
+            assert!(g > r, "lighthaus: {role} is warmer than the canopy it is part of");
         }
 
         // And the other half, which is what makes the first half mean
@@ -1001,22 +1040,73 @@ mod tests {
         // the reverse of that, warm text in a hole darker than the page.
         let warm = |c: Option<Color>| matches!(c, Some(Color::Rgb(r, g, _)) if r >= g);
         for (role, style) in [
-            ("search", forest.ui.search),
-            ("flash", forest.ui.flash),
-            ("label", forest.ui.label),
-            ("selection", forest.ui.selection),
+            ("search", lighthaus.ui.search),
+            ("flash", lighthaus.ui.flash),
+            ("label", lighthaus.ui.label),
+            ("selection", lighthaus.ui.selection),
         ] {
             assert!(
                 warm(style.fg) || warm(style.bg),
-                "forest: {role} is asking for attention in a canopy colour"
+                "lighthaus: {role} is asking for attention in a canopy colour"
             );
         }
 
-        assert_eq!(forest.ui.background, Some(Color::Rgb(0x18, 0x19, 0x1e)));
-        assert_eq!(forest.ui.foreground, Some(Color::Rgb(0xff, 0xfa, 0xde)));
+        assert_eq!(lighthaus.ui.background, Some(Color::Rgb(0x18, 0x19, 0x1e)));
+        assert_eq!(lighthaus.ui.foreground, Some(Color::Rgb(0xff, 0xfa, 0xde)));
 
         // Two spellings, one theme.
-        assert_eq!(Theme::builtin("lighthaus"), Theme::builtin("forest"));
+        assert_eq!(Theme::builtin("forest"), Theme::builtin("lighthaus"));
+    }
+
+    /// What each ported theme claims, in one table.
+    ///
+    /// `main`, `pascal`, `gb` and `lighthaus` get tests of their own because
+    /// each has a constraint that *is* the theme — a palette to stay inside,
+    /// one hue, a canopy — and pinning that constraint is worth the code.
+    /// These eight do not: they are palettes rather than arguments, and the
+    /// only thing worth pinning is the frame, which is what a wrong `#`
+    /// anywhere else in the file would most likely take with it. Everything
+    /// else about them is already checked by the tests that walk every
+    /// built-in.
+    #[test]
+    fn every_ported_theme_claims_the_frame_its_source_does() {
+        const FRAMES: &[(&str, u32, u32)] = &[
+            ("kanagawa", 0x1F1F28, 0xDCD7BA),
+            ("xcode", 0x292a30, 0xdfdfe0),
+            ("purple", 0x2D2B55, 0xE1EFFF),
+            ("github", 0x22272e, 0xadbac7),
+            ("bonsai", 0x151E23, 0xE6FAF7),
+            ("monokai", 0x1B1D1E, 0xF8F8F2),
+            ("nordark", 0x2E3440, 0x93a4c3),
+            ("ferra", 0x2b292d, 0xfecdb2),
+        ];
+        let rgb = |v: u32| Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
+        for (name, bg, fg) in FRAMES {
+            let theme = parsed(name);
+            assert_eq!(theme.ui.background, rgb(*bg), "{name}: frame moved");
+            assert_eq!(theme.ui.foreground, rgb(*fg), "{name}: text colour moved");
+        }
+    }
+
+    /// Every alias reaches the theme it is an alias of, and none of them is
+    /// also a listed name — two rows for one screen is an answer to a question
+    /// nobody asked, and an alias that shadows a real theme is worse.
+    #[test]
+    fn an_alias_reaches_its_theme_and_is_not_itself_listed() {
+        for builtin in BUILTINS {
+            for alias in builtin.aliases {
+                assert_eq!(
+                    Theme::builtin(alias),
+                    Some(builtin.source),
+                    "`{alias}` does not reach `{}`",
+                    builtin.name
+                );
+                assert!(
+                    !Theme::builtins().any(|n| n == *alias),
+                    "`{alias}` is an alias and is also listed as a theme"
+                );
+            }
+        }
     }
 
     /// `pascal`'s fence in a third palette. "Sourced rather than sampled" is
@@ -1024,7 +1114,7 @@ mod tests {
     /// eye, so the twenty-odd `s:` variables in `colors/lighthaus.vim` are
     /// written out here and the file is held to them.
     #[test]
-    fn forest_uses_nothing_but_lighthaus_own_palette() {
+    fn lighthaus_uses_nothing_but_its_own_palette() {
         const LIGHTHAUS: &[&str] = &[
             "21252d", // black
             "8e8d8d", // grey
@@ -1050,7 +1140,7 @@ mod tests {
             "ff4d00", // hl_orange
             "090b26", // hl_bg
         ];
-        let src = Theme::builtin("forest").expect("forest is built in");
+        let src = Theme::builtin("lighthaus").expect("lighthaus is built in");
         for (line, text) in src.lines().enumerate() {
             for (at, _) in text.match_indices('#') {
                 let rest = &text[at + 1..];
@@ -1060,7 +1150,7 @@ mod tests {
                 let hex = rest[..6].to_ascii_lowercase();
                 assert!(
                     LIGHTHAUS.contains(&hex.as_str()),
-                    "forest.toml:{}: #{hex} is not one of lighthaus's own",
+                    "lighthaus.toml:{}: #{hex} is not one of lighthaus's own",
                     line + 1
                 );
             }

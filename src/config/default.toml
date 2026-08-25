@@ -99,8 +99,8 @@ yank_flash = 150
 gitignore = true
 
 # The palette. A name in themes/ beside this file wins, then a built-in of the
-# same name, then this one. Built in: main, gruvbox-dark, gruvbox-light,
-# pascal, ansi, vesper.
+# same name, then this one. Sixteen are built in; several answer to a second
+# name, given in brackets. Each theme file names its source at the top.
 #
 # `main` is the default: a near-black frame with cool accents, from IBM Carbon.
 # `gruvbox-dark` was the default before it and is unchanged.
@@ -109,14 +109,19 @@ gitignore = true
 # `pascal` is Borland Turbo Pascal 7, in the sixteen EGA colours.
 # `ansi` is bi's pre-theme colours in the sixteen ANSI names, so it uses YOUR
 # terminal palette and its background rather than bringing its own.
-# `vesper` is near-black with one warm and one cool accent, after
-# github.com/nexxeln/vesper.nvim.
-# `gb` (or `gameboy`) is a Game Boy's screen — dark green on a cream LCD, one
-# hue from end to end, with bold, italic and underline doing the work colour
-# usually does. After the `mfd-paper` variant of github.com/kungfusheep/mfd.nvim.
-# `forest` (or `lighthaus`) is greens and teals on a near-black frame, with one
-# warm accent kept for a match, a flash and a selection. After
-# github.com/lighthaus-theme/vim-lighthaus.
+# `vesper` is near-black with one warm and one cool accent.
+# `gb` (`gameboy`) is a Game Boy's screen — dark green on a cream LCD, one hue
+#   from end to end, with bold, italic and underline doing colour's work.
+# `lighthaus` (`forest`) is greens and teals on near-black, warm only where
+#   something wants looking at.
+# `kanagawa` is ink-blue and muted, the `wave` variant.
+# `xcode` (`xcodedark`) is Xcode 12 dark — salmon strings, dimmed punctuation.
+# `purple` (`shades-of-purple`) is deep indigo, with comments in violet.
+# `github` (`github-dimmed`) is the colours of a pull request.
+# `bonsai` is a cool near-black with a green cast.
+# `monokai` (`molokai`) is pink, chartreuse, sky and sand on near-black.
+# `nordark` (`nord`) is Nord's polar night and frost.
+# `ferra` is warm — the only dark theme here whose greys have red in them.
 # See docs/specs/theme.md.
 theme = "main"
 

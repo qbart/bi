@@ -1,0 +1,135 @@
+# xcode — Apple's Xcode 12 "Default (Dark)", as a terminal editor. Salmon
+# strings, pink keywords, purple library names against a slate frame, and
+# punctuation deliberately dimmed out of the way.
+#
+# Based on https://github.com/lunacookies/vim-colors-xcode
+#
+# Compiled into the binary; a file at <config dir>/themes/xcode.toml is a
+# PATCH over this one. `:set theme xcode`, or `xcodedark`.
+# See docs/specs/theme.md.
+#
+# The `xcodedark` variant, read out of `colors/xcodedark.vim` and the
+# colortemplate it is generated from, with the plugin's own defaults in force:
+# `emph_types = 1` (so a library type is the lighter purple), `emph_funcs = 0`,
+# `dim_punctuation = 1` (so operators and delimiters step back to base6), and
+# `green_comments = 0`. Xcode's own two-tier naming survives in the comments —
+# `Library*` is something the SDK gave you, `Local*` something this file did.
+
+[syntax]
+keyword     = { fg = "#ff7ab2", bold = true }        # pink, its Statement
+label       = { fg = "#ff7ab2", bold = true }
+# Dimmed on purpose: `dim_punctuation` is the plugin's default, and Xcode
+# itself greys the scaffolding so the names stand out. base6, not base7 —
+# still not the foreground, so the capture is doing something.
+operator    = "#a3b1bf"
+punctuation = "#a3b1bf"
+delimiter   = "#a3b1bf"
+
+function    = "#b281eb"                              # purple, LibraryFunc
+constructor = "#b281eb"
+type        = "#dabaff"                              # light_purple, LibraryType
+module      = "#dabaff"
+tag         = "#78c2b3"                              # teal, its Tag -> Special
+
+# Xcode's most recognisable single choice: strings are salmon, not green.
+string      = "#ff8170"                              # red
+character   = "#d9c97c"                              # yellow, its own Character
+escape      = "#78c2b3"                              # teal, its SpecialChar
+
+comment     = "#7f8c98"                              # base5
+
+constant    = "#b281eb"                              # purple, LibraryIdent
+number      = "#d9c97c"                              # yellow
+float       = "#d9c97c"
+boolean     = { fg = "#ff7ab2", bold = true }        # its Boolean -> Statement
+
+attribute   = "#ffa14f"                              # orange, its PreProc
+
+# LocalIdent: a property is a name this file owns rather than one the SDK
+# handed over, which is exactly the distinction Xcode's two tiers draw.
+property                = "#78c2b3"                  # teal
+"string.special.key"    = "#78c2b3"
+"string.special.symbol" = "#78c2b3"
+# Yellow, with the other literals — a pattern is closer to a number than to
+# the prose in a string, and salmon is already spoken for.
+"string.special.regex"  = "#d9c97c"
+
+"text.title"     = { fg = "#dfdfe0", bold = true }   # its Title
+"text.literal"   = { fg = "#dabaff", bg = "#393b44" }  # its markdownCode
+"text.uri"       = { fg = "#6bdfff", underline = true } # its Underlined
+"text.reference" = "#78c2b3"                         # its markdownDelimiter
+
+[ui]
+background = "#292a30"                               # base0
+foreground = "#dfdfe0"                               # base7
+
+cursorline = { bg = "#2f3037" }                      # base1
+selection  = { bg = "#414453" }                      # base3, its Visual
+# Xcode has two: a grey `Search` that is the same base3 as the selection, and
+# a deep_yellow `IncSearch` for the one you are standing on. bi has a single
+# `search` key, and the one worth having is the one you can find.
+search     = { fg = "#292a30", bg = "#fef937" }      # deep_yellow
+# deep_blue0, which is what Xcode paints everything it has picked out for you
+# — MatchParen, PmenuSel, QuickFixLine, WildMenu.
+flash      = { fg = "#dfdfe0", bg = "#0f5bca" }
+label      = { fg = "#292a30", bg = "#ffa14f", bold = true }  # orange
+cursor_alt = { fg = "#292a30", bg = "#dfdfe0" }      # its own Cursor
+dim        = "#7f8c98"                               # base5
+
+gutter         = "#53606e"                           # base4, its LineNr
+gutter_current = { fg = "#dfdfe0", bold = true }     # its CursorLineNr
+rule           = "#393b44"                           # base2, its VertSplit
+filler         = "#292a30"                           # its EndOfBuffer: `~` hidden
+indent_guide   = "#53606e"                           # its indentLine colour
+whitespace     = "#53606e"                           # its Whitespace -> Ignore
+context        = "#53606e"
+context_header = { fg = "#dfdfe0", bg = "#393b44" }  # its Pmenu
+
+popup = { fg = "#dfdfe0", bg = "#393b44" }           # its Pmenu
+
+# Xcode's `Todo` is one grey bold word rather than five badges, so these are
+# built from the palette's five accents — red for the one that is broken,
+# orange for the one that is warning, and so on down to the teal that is only
+# a note. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#292a30", bg = "#ff8170", bold = true }   # red
+todo_warn  = { fg = "#292a30", bg = "#ffa14f", bold = true }   # orange
+todo_todo  = { fg = "#292a30", bg = "#d9c97c", bold = true }   # yellow
+todo_perf  = { fg = "#292a30", bg = "#b281eb", bold = true }   # purple
+todo_note  = { fg = "#292a30", bg = "#78c2b3", bold = true }   # teal
+
+# ErrorMsg and WarningMsg are the source's own; info and hint take the two
+# blues, which no syntax role here claims.
+diag_error   = { fg = "#ff8170", underline = true }
+diag_warning = { fg = "#ffa14f", underline = true }
+diag_info    = { fg = "#4eb0cc", underline = true }
+diag_hint    = { fg = "#7f8c98", underline = true }
+
+# The source paints all three signify signs one blue, which is three signs
+# saying the same thing. Its own Diff groups do distinguish them — green,
+# orange, red — so the gutter takes those instead.
+# See docs/specs/git-signs.md.
+git_add      = "#84b360"                             # green
+git_change   = "#ffa14f"                             # orange, its DiffChange
+git_delete   = "#ff8170"                             # red, its DiffDelete
+
+# The airline theme's normal, insert and visual sections, verbatim.
+mode_normal = { fg = "#292a30", bg = "#7f8c98", bold = true }
+mode_insert = { fg = "#292a30", bg = "#d9c97c", bold = true }
+mode_pick   = { fg = "#292a30", bg = "#ff7ab2", bold = true }
+
+status          = "#dfdfe0"
+status_muted    = "#7f8c98"
+status_inactive = { fg = "#7f8c98", bg = "#393b44" } # its StatusLineNC
+statusline      = { fg = "#dfdfe0", bg = "#414453" } # its StatusLine
+
+tree_dir  = "#6bdfff"                                # light_blue, its Directory
+tree_link = "#4eb0cc"                                # blue
+mark_copy = "#84b360"
+mark_cut  = "#ff8170"
+
+picker_border   = "#53606e"
+picker_prompt   = "#ff7ab2"
+picker_selected = { fg = "#dfdfe0", bg = "#0f5bca", bold = true }  # its PmenuSel
+picker_badge    = "#7f8c98"
+picker_divider  = "#393b44"
+picker_preview  = "#a3b1bf"                          # base6

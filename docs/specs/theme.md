@@ -270,9 +270,26 @@ without changing the type.
 
 ## The built-ins
 
-Eight, compiled in with `include_str!`, and parsed through the same parser a
-user file goes through — so a malformed built-in fails a test rather than
+Sixteen, compiled in with `include_str!`, and parsed through the same parser
+a user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
+
+**They live in one table rather than three lists.** Adding a theme used to
+mean a `const` for the file, an arm in `Theme::builtin`, and an entry in the
+`BUILTINS` array — three places, with the failure mode being a theme that
+`:set theme x` finds and the "built in: …" message does not. `BUILTINS` is now
+a single `&[Builtin]` of `{ name, aliases, source }`, `Theme::builtin` scans
+it and `Theme::builtins()` maps over it. That is the argument `Ui::set` makes
+about a `[ui]` key existing for the parser and not for the drawing, one level
+up.
+
+**Some have a second name.** `gameboy` is `gb`, `molokai` is `monokai`,
+`lighthaus` answers to `forest`, and each ported theme answers to the name its
+source ships under — `xcodedark`, `shades-of-purple`, `github-dimmed`, `nord`.
+A name is not a palette, so two names reaching one file costs nothing to keep
+in sync. Only the primary is listed: an editor that answers "what themes are
+there" with two spellings of one screen is answering a question nobody asked.
+A test checks both halves of that.
 
 ### `main`
 
@@ -551,13 +568,14 @@ source's colour for the same reason it needed one — `git_add` and
 `git_delete` are one ramp step apart, and the gutter glyph should not be
 doing all the work alone.
 
-### `forest`
+### `lighthaus`
 
 Greens and teals on a near-black frame, with one warm accent kept for the
 things that are trying to get your attention. After
 [lighthaus-theme/vim-lighthaus](https://github.com/lighthaus-theme/vim-lighthaus),
 read out of that project's `colors/lighthaus.vim` and its lightline theme.
-`:set theme forest`, or `lighthaus`, which is the name the palette came under.
+`:set theme lighthaus`, or `forest`, which is what it looks like and the name
+it shipped under before being renamed to match its source.
 
 | | |
 |---|---|
@@ -573,13 +591,14 @@ read out of that project's `colors/lighthaus.vim` and its lightline theme.
 | background / foreground | `#18191E` / `#FFFADE` |
 | search | `#18191E` on orange `#E25600` |
 
-**The name is a claim, so a test holds it to one.** Every colour that paints
-*code* — keyword, function, type, module, tag, string, character, boolean,
-operator, label — has more green in it than red. Every colour that paints
-*attention* — a search match, a yank flash, a jump label, the selection — has
-at least as much red as green. That is the whole shape of the theme in two
-sentences: a green canopy, and warmth only where something wants looking at.
-It is also the answer to why this palette can afford `#E25600` at all. A
+**Green where it paints code, warm where it paints attention, and a test
+holds the file to it.** Every colour that paints *code* — keyword, function,
+type, module, tag, string, character, boolean, operator, label — has more
+green in it than red. Every colour that paints *attention* — a search match, a
+yank flash, a jump label, the selection — has at least as much red as green.
+That is the whole shape of the theme in two sentences: a green canopy, and
+warmth only where something wants looking at. It is also the answer to why
+this palette can afford `#E25600` at all. A
 second test fences every value in the file to lighthaus's own twenty-odd `s:`
 variables, the way `pascal`'s does the EGA sixteen, so "sourced rather than
 sampled" stays true after the next edit.
@@ -621,6 +640,117 @@ kept because it is the most recognisable thing about lighthaus on screen, and
 because `#090B26` is darker than the frame: the selection reads as a hole cut
 in the page with the text glowing in it.
 
+### The eight ports
+
+`kanagawa`, `xcode`, `purple`, `github`, `bonsai`, `monokai`, `nordark` and
+`ferra` arrived together and are described together, because what is
+interesting about them is mostly the same thing eight times: **how much of
+bi's furniture a colorscheme built for Vim or Neovim actually has an answer
+for, and what to do where it has none.**
+
+Each file names its source in a `Based on <url>` line at the top, and the
+palette's own variable names survive in the comments — `sumiInk3` and
+`carpYellow`, `contrast` and `objectKeys`, `blush` and `ember` — because a
+name says what a colour is *for* in a way `#FAD000` never will.
+
+| | frame | the thing you notice |
+|---|---|---|
+| `kanagawa` | `#1F1F28` | ink-blue, muted; the `wave` variant |
+| `xcode` | `#292a30` | salmon strings, dimmed punctuation; `xcodedark` |
+| `purple` | `#2D2B55` | deep indigo, and comments in violet |
+| `github` | `#22272e` | GitHub dimmed — the colours of a pull request |
+| `bonsai` | `#151E23` | cool near-black with a green cast |
+| `monokai` | `#1B1D1E` | Molokai: pink, chartreuse, sky, sand |
+| `nordark` | `#2E3440` | Nord's polar night and frost |
+| `ferra` | `#2b292d` | warm — the greys have red in them |
+
+**The spread of how much was there to find is the interesting part.**
+`bonsai` is the extreme at one end: it defines every treesitter capture bi
+asks for, its own gitsigns and diagnostics, and a five-colour `@comment.*`
+vocabulary that lands exactly on the five TODO badges — the only built-in here
+that could look up all five rather than build any. `kanagawa` is close behind,
+with a lualine theme for the mode badges and three of the five badges in its
+own `@comment.error` / `.warning` / `.note`. At the other end, `github` is one
+150-line file with no treesitter groups, no statusline, no diagnostics and no
+git signs, so about a third of its furniture is built from the palette rather
+than found; `monokai` predates treesitter entirely and takes no position on
+any language, so bi's newer captures are placed by reading what it does with
+the Vim group nearest in meaning. Everything built rather than found is
+marked in the file it is built in.
+
+**Four departures repeat across the ports, and each has the same cause.**
+
+*A split drawn as a filled bar is not a split drawn as a glyph.* Vim colours
+`VertSplit` knowing it will paint a whole column, so `kanagawa` makes it
+*darker* than the frame and `ferra` makes it the frame's own colour — a
+deliberately invisible seam. bi draws one `│`, and an invisible glyph is no
+split, so those take the palette's "structure you are not reading" grey
+instead. Same for indent guides, which several sources paint as filled
+columns.
+
+*A search match has to name both halves.* `github`'s `Search` is a bare
+underline with no colours at all; `ferra`'s names a background one step off
+the frame and leans on italic; `purple`'s and `xcode`'s are the same colour as
+their own selection, so a match landing inside one disappears. In each case
+the source's *other* search group — `IncSearch`, the one you are standing on —
+does the job, and that is what `search` takes. bi has one search colour, and
+the one worth having is the one you can find.
+
+*A gutter number tuned against a gutter strip is not tuned against the frame.*
+`github` and `monokai` and `kanagawa` all pair a fairly bright `LineNr` with a
+darker background behind it. bi paints no gutter background, so the contrast
+has to come out of the number.
+
+*A sign needs a foreground.* `xcode` paints all three signify signs one blue,
+which is three signs saying the same thing, so the gutter takes its `DiffAdd`
+/ `DiffChange` / `DiffDelete` colours instead. `github`'s palette contains **no
+green at all** — GitHub's dimmed diff colours live entirely in backgrounds —
+so an addition there is blue, and that is the palette's doing rather than a
+choice. `monokai`'s own `DiffDelete` foreground is a maroon meant to sit on a
+dark red band and is unreadable alone in a gutter cell.
+
+**Three departures are one-offs, and each is worth naming.**
+
+`nordark`'s `dark` style — the plugin's default, and the only one of its six
+that is actually Nord — has a variable named `red` whose value is `#ECEFF4`,
+Nord's near-white *nord6*. Everything routed through it comes out the colour
+of text. For its `Operator` that reads as a choice and is kept; for a cursor
+block it is *better* than a real red and is kept gladly. For `GitSignsDelete`
+it is not a choice: a deletion marked the colour of ordinary text, sitting
+next to an addition and a change that both have colours, is a sign that does
+not sign. That one takes the style's own `dark_red`.
+
+`github`'s `warning` is a literal `#ff0000` — the one value in a theme called
+*dimmed* that is not dimmed — and it lands on `ErrorMsg`. Worn by the text of
+every diagnostic an LSP finds, it fights the frame rather than marking
+anything, so `diag_error` takes the palette's coral, which is GitHub's own
+danger colour and already the keyword.
+
+`monokai`'s `StatusLine` is `guibg=fg`: a near-white bar with slate text, and
+its most striking single choice. bi draws the git numstat on that row in
+`git_add` / `git_change` / `git_delete`, and chartreuse and sand on `#F8F8F2`
+are illegible — so the bar goes dark and the numbers stay readable. This is
+the one departure here made for bi's sake rather than the source's, and a
+three-line `themes/monokai.toml` puts the white bar back.
+
+**Two places the ports read their source harder than it reads itself.**
+`purple`'s generic `Function` group is the same orange as its keywords, but
+every language-specific rule it ships — `jsFuncName`, `jsFuncCall`,
+`jsArrowFunction` — paints a function `contrast` yellow; the generic group is
+Vim's fallback rather than the scheme's intent, so the yellow is what this
+takes. And `nordark`'s own `Tag` is the same green as its `String`, which
+would render an XML document one colour from element name to attribute value —
+the exact failure this spec records `tag` being added for — so it joins the
+types, as `gruvbox-dark`'s does.
+
+**No fences.** `pascal`, `gb` and `lighthaus` each get a test that pins the
+constraint that *is* the theme — sixteen EGA colours, one hue, a green canopy.
+These eight get no such test, because they have no such constraint: they are
+palettes rather than arguments, and a fence around a palette only makes the
+next adjustment a fight. What they get instead is one table asserting the
+frame each claims, which is what a stray `#` anywhere else in the file would
+most likely take down with it.
+
 ## Testing
 
 - every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
@@ -656,25 +786,36 @@ in the page with the text glowing in it.
 - `main` is the default, claims `#161616`, and keeps its greys on Carbon's own
   ramp — the theme-identity test each built-in gets, and the same shape as
   `pascal`'s
-- `vesper`'s `string.special.symbol` and `string.special.regex` are not just
-  `string` either, alongside `main` and both gruvbox themes — sourced from a
-  different palette, held to the same rule. `gb` is in that list too, and is
-  the interesting member: it has no second colour to separate them with, so it
-  separates them with weight and slant instead, and the test cannot tell the
-  difference — which is the point of it comparing `Style`s rather than colours
+- `string.special.symbol` and `string.special.regex` are not just `string`,
+  for **every** built-in but three. It used to be a hand-kept list of four
+  names and is now the whole set minus its exemptions, so a new theme is in it
+  by default rather than by remembering. The exemptions are `ansi` (which
+  promises the colours bi had before it had themes, and before it had themes
+  these fell through), `pascal` (sixteen colours, and it did not spend two of
+  them telling one kind of literal from another) and `ferra` (which paints
+  every `@string.special*` one rose — so a symbol still does not look like a
+  string, which is what the rule protects, but a symbol and a regex look like
+  each other, and inventing a colour the source does not have would be the
+  port overruling it on a point it is entitled to). `gb` is the interesting
+  member of the set that *is* covered: it has no second colour to separate
+  them with, so it separates them with weight and slant instead, and the test
+  cannot tell the difference — which is the point of it comparing `Style`s
+  rather than colours
 - `gb` is one hue from end to end — every `#rrggbb` in the file has strictly
   more green in it than red or blue. `pascal`'s test in a different palette,
   for the same reason: the constraint is the theme, and a single off-hue value
   would not be a tweak to it
-- `gb` and `gameboy` name the same built-in, and it is listed under `gb`
-- `forest` is green where it paints code and warm where it paints attention —
-  the two sentences its name is a claim about, checked against the roles
-  rather than asserted in a comment
-- every value in `forest` is one of lighthaus's own `s:` variables, so
+- `lighthaus` is green where it paints code and warm where it paints
+  attention — the two sentences the theme is a claim about, checked against
+  the roles rather than asserted in a comment
+- every value in `lighthaus` is one of that scheme's own `s:` variables, so
   "sourced rather than sampled" survives the next edit. `pascal`'s fence
   again, and `gb`'s, in a third palette
-- `forest` and `lighthaus` name the same built-in, and it is listed under
-  `forest`
+- every alias reaches the theme it is an alias of, and no alias is *also* a
+  listed name — the two halves of the aliasing rule above, and the reason
+  adding a spelling cannot quietly shadow a theme
+- each of the eight ports claims the frame its source does, in one table.
+  They get no fence of their own: see "No fences" above
 
 ## Deferred
 

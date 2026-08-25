@@ -1,0 +1,137 @@
+# kanagawa — Katsushika Hokusai's wave, as a dark editor: ink-blue frame,
+# paper-white text, and accents that stay muted rather than neon. The `wave`
+# variant, which is the plugin's own default.
+#
+# Based on https://github.com/rebelot/kanagawa.nvim
+#
+# Compiled into the binary; a file at <config dir>/themes/kanagawa.toml is a
+# PATCH over this one. `:set theme kanagawa`. See docs/specs/theme.md.
+#
+# Read out of `lua/kanagawa/colors.lua` (the raw palette), `themes.lua` (the
+# wave variant's semantic names) and the highlight modules, with the plugin's
+# own defaults in force: comments and keywords italic, statements bold.
+# Kanagawa's palette names are kept in the comments — sumiInk is the ink the
+# frame is made of, and the accents are named for what they are: springGreen,
+# sakuraPink, carpYellow, waveAqua.
+
+[syntax]
+keyword     = { fg = "#957FB8", italic = true }      # oniViolet, source's own
+operator    = "#C0A36E"                              # boatYellow2
+label       = "#7FB4CA"                              # springBlue
+
+function    = "#7E9CD8"                              # crystalBlue
+constructor = "#7FB4CA"                              # springBlue, its @constructor
+type        = "#7AA89F"                              # waveAqua2
+module      = "#7AA89F"
+# The source leaves `@tag` to Neovim's own chain, which lands it on Special —
+# so an element name is springBlue here rather than the type colour the other
+# built-ins give it. Kept, because that is what a kanagawa user sees.
+tag         = "#7FB4CA"
+
+string      = "#98BB6C"                              # springGreen
+character   = "#98BB6C"
+escape      = { fg = "#C0A36E", bold = true }        # its own @string.escape
+
+comment     = { fg = "#727169", italic = true }      # fujiGray
+
+constant    = "#FFA066"                              # surimiOrange
+number      = "#D27E99"                              # sakuraPink
+float       = "#D27E99"
+boolean     = { fg = "#FFA066", bold = true }        # source's own Boolean
+
+attribute   = "#FFA066"                              # its @attribute -> Constant
+
+punctuation = "#9CABCA"                              # springViolet2
+delimiter   = "#9CABCA"
+
+# carpYellow, which is the source's own `@variable.member` — a field and a
+# key are the same idea, and `@string.special.symbol` is *literally* this
+# colour in kanagawa's own file.
+property                = "#E6C384"
+"string.special.key"    = "#E6C384"
+"string.special.symbol" = "#E6C384"
+"string.special.regex"  = "#C0A36E"                  # its own @string.regexp
+
+# Markdown: @markup.heading, @markup.raw and @markup.link.url, in that order.
+# The undercurl on the URL becomes an underline, which is the nearest thing
+# bi's `Style` can say.
+"text.title"     = { fg = "#7E9CD8", bold = true }
+"text.literal"   = "#98BB6C"
+"text.uri"       = { fg = "#7FB4CA", underline = true }
+"text.reference" = "#b8b4d0"                         # oniViolet2
+
+[ui]
+background = "#1F1F28"                               # sumiInk3
+foreground = "#DCD7BA"                               # fujiWhite
+
+cursorline = { bg = "#363646" }                      # sumiInk5
+selection  = { bg = "#223249" }                      # waveBlue1, its Visual
+search     = { fg = "#DCD7BA", bg = "#2D4F67" }      # waveBlue2, its Search
+flash      = { fg = "#223249", bg = "#FF9E3B" }      # roninYellow, its IncSearch
+# carpYellow rather than the flash's roninYellow: `s` draws the letter
+# touching the match, and one colour across both reads as one thing.
+label      = { fg = "#1F1F28", bg = "#E6C384", bold = true }
+# The source's own Cursor is fujiWhite; a second cursor takes oldWhite, one
+# step down, so the primary stays the brightest thing on screen.
+cursor_alt = { fg = "#1F1F28", bg = "#C8C093" }
+dim        = "#727169"                               # fujiGray
+
+# The source pairs its line numbers with a sumiInk4 strip; bi paints no
+# gutter background, so these take the foregrounds alone.
+gutter         = "#54546D"                           # sumiInk6, its LineNr
+gutter_current = { fg = "#FF9E3B", bold = true }     # its CursorLineNr
+# sumiInk6 rather than the source's WinSeparator, which is *darker* than the
+# frame — a deliberately invisible split in a window manager that fills a
+# whole column. bi draws one `│` glyph, and an invisible glyph is no split.
+rule           = "#54546D"
+filler         = "#1F1F28"                           # its EndOfBuffer: `~` hidden
+indent_guide   = "#54546D"                           # its IblIndent
+whitespace     = "#54546D"                           # its own Whitespace
+context        = "#54546D"
+context_header = { fg = "#C8C093", bg = "#2A2A37" }  # oldWhite on sumiInk4
+
+popup = { fg = "#DCD7BA", bg = "#223249" }           # its Pmenu
+
+# Four of the five are kanagawa's own: @comment.error, its Todo,
+# @comment.warning and @comment.note. Only PERF had to be found, and it takes
+# sakuraPink — the number colour, unclaimed by any other badge.
+# See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#DCD7BA", bg = "#E82424", bold = true }   # samuraiRed
+todo_warn  = { fg = "#223249", bg = "#FF9E3B", bold = true }   # roninYellow
+todo_todo  = { fg = "#223249", bg = "#658594", bold = true }   # dragonBlue
+todo_perf  = { fg = "#1F1F28", bg = "#D27E99", bold = true }   # sakuraPink
+todo_note  = { fg = "#223249", bg = "#6A9589", bold = true }   # waveAqua1
+
+# theme.diag, verbatim. See docs/specs/diagnostics.md.
+diag_error   = { fg = "#E82424", underline = true }
+diag_warning = { fg = "#FF9E3B", underline = true }
+diag_info    = { fg = "#658594", underline = true }
+diag_hint    = { fg = "#6A9589", underline = true }
+
+# theme.vcs, verbatim — autumnGreen, autumnYellow, autumnRed.
+# See docs/specs/git-signs.md.
+git_add      = "#76946A"
+git_change   = "#DCA561"
+git_delete   = "#C34043"
+
+# The lualine theme's normal, insert and visual rows, verbatim.
+mode_normal = { fg = "#16161D", bg = "#7E9CD8", bold = true }
+mode_insert = { fg = "#1F1F28", bg = "#98BB6C", bold = true }
+mode_pick   = { fg = "#1F1F28", bg = "#957FB8", bold = true }
+
+status          = "#C8C093"                          # oldWhite
+status_muted    = "#727169"
+status_inactive = { fg = "#54546D", bg = "#16161D" } # its StatusLineNC
+statusline      = { fg = "#C8C093", bg = "#16161D" } # its StatusLine
+
+tree_dir  = "#7E9CD8"                                # its Directory
+tree_link = "#7FB4CA"
+mark_copy = "#98BB6C"
+mark_cut  = "#C34043"
+
+picker_border   = "#54546D"                          # its TelescopeBorder
+picker_prompt   = "#938AA9"                          # its TelescopeTitle
+picker_selected = { fg = "#DCD7BA", bg = "#363646", bold = true }
+picker_badge    = "#727169"
+picker_divider  = "#2A2A37"
+picker_preview  = "#C8C093"

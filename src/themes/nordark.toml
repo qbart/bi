@@ -1,0 +1,141 @@
+# nordark — Nord's arctic palette as a dark editor: polar-night greys under
+# frost blues, aurora green and a single orange. Cool almost everywhere, and
+# deliberately low-contrast.
+#
+# Based on https://github.com/jackm-morgan/nordark.nvim
+#
+# Compiled into the binary; a file at <config dir>/themes/nordark.toml is a
+# PATCH over this one. `:set theme nordark`, or `nord`.
+# See docs/specs/theme.md.
+#
+# The `dark` style, which is the plugin's own default and the only one of its
+# six that is actually Nord — `#2E3440` is nord0, `#A3BE8C` is nord14,
+# `#EBCB8B` is nord13, `#5E81AC` is nord10.
+#
+# ONE THING ABOUT THIS SOURCE IS WORTH KNOWING BEFORE READING THE FILE. In the
+# `dark` column the variable named `red` is `#ECEFF4` — Nord's near-white
+# nord6, not a red at all. Everything the plugin routes through it comes out
+# the colour of text: its `Operator`, its `Special`, its `Todo`, and its
+# `GitSignsDelete`. For most of those that reads as a choice, and this file
+# keeps it. For a deletion sign it does not: see `git_delete` below.
+
+[syntax]
+keyword     = "#88C0D0"                              # its Keyword
+# Near-white, and this is the `red` above doing its most defensible work: an
+# operator at nord6 is brighter than the text around it rather than the same
+# as it, which is the bar docs/specs/tree-sitter.md sets.
+operator    = "#ECEFF4"
+label       = "#ECEFF4"                              # its TSLabel
+
+function    = "#63ADC2"                              # blue, its Function
+constructor = "#EBCB8B"                              # yellow, its TSConstructor
+type        = "#EBCB8B"                              # its Type
+# The type colour. The source's own `Tag` is the same green as `String`, so
+# an XML document would come out one colour from element name to attribute
+# value — the failure docs/specs/theme.md records `tag` being added for.
+tag         = "#EBCB8B"
+# Its TSNamespace is plain foreground, which is a capture that may as well
+# not have fired, so a module joins the types.
+module      = "#EBCB8B"
+
+string      = "#A3BE8C"                              # green, its String
+character   = "#D08770"                              # orange, its own Character
+escape      = "#ECEFF4"                              # its TSStringEscape
+
+comment     = "#616E88"                              # grey
+
+constant    = "#88C0D0"                              # its Constant
+number      = "#D08770"                              # orange
+float       = "#D08770"
+boolean     = "#D08770"
+
+attribute   = "#88C0D0"                              # its TSAttribute
+
+# grey, not the plain foreground its TSPunctBracket names — brackets are on
+# every line and should recede, and this palette's one neutral is the only
+# thing here quieter than the text.
+punctuation = "#616E88"
+delimiter   = "#616E88"
+
+property                = "#88C0D0"                  # its TSProperty / TSField
+"string.special.key"    = "#88C0D0"
+"string.special.symbol" = "#88C0D0"
+"string.special.regex"  = "#D08770"                  # its own TSStringRegex
+
+"text.title"     = { fg = "#88C0D0", bold = true }   # its Title
+"text.literal"   = "#A3BE8C"                         # its TSLiteral
+"text.uri"       = { fg = "#93a4c3", underline = true }  # its TSURI
+"text.reference" = "#B48EAD"                         # dark_purple
+
+[ui]
+background = "#2E3440"                               # bg0, nord0
+foreground = "#93a4c3"                               # fg
+
+cursorline = { bg = "#3B4252" }                      # bg1, nord1
+selection  = { bg = "#4C566A" }                      # bg3, its Visual
+search     = { fg = "#2E3440", bg = "#EBCB8B" }      # its own Search
+flash      = { fg = "#2E3440", bg = "#D08770" }      # its IncSearch
+label      = { fg = "#2E3440", bg = "#88C0D0", bold = true }
+# The `red` again, and its best use in the whole palette: nord6 is what Nord
+# paints a cursor, and a block of it is unmistakably a cursor.
+cursor_alt = { fg = "#2E3440", bg = "#ECEFF4" }
+dim        = "#616E88"                               # grey
+
+gutter         = "#616E88"                           # its LineNr
+gutter_current = { fg = "#93a4c3", bold = true }     # its CursorLineNr
+rule           = "#3B4252"                           # its VertSplit
+filler         = "#434C5E"                           # bg2, its EndOfBuffer
+indent_guide   = "#3B4252"
+whitespace     = "#616E88"                           # its own Whitespace
+context        = "#434C5E"
+context_header = { fg = "#93a4c3", bg = "#3B4252" }  # its Pmenu
+
+popup = { fg = "#93a4c3", bg = "#3B4252" }           # its Pmenu
+
+# The source's `Todo` is the near-white `red`, which is one badge and bi needs
+# five. These are the palette's five accents, ordered warm to cool by how much
+# each is entitled to interrupt. See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#2E3440", bg = "#D08770", bold = true }   # orange / dark_red
+todo_warn  = { fg = "#2E3440", bg = "#EBCB8B", bold = true }   # yellow
+todo_todo  = { fg = "#2E3440", bg = "#88C0D0", bold = true }   # cyan
+todo_perf  = { fg = "#2E3440", bg = "#B48EAD", bold = true }   # dark_purple
+todo_note  = { fg = "#2E3440", bg = "#A3BE8C", bold = true }   # green
+
+# Its own LspDiagnosticsDefault* groups, which are the only place the plugin
+# spends its `dark_*` ramp. See docs/specs/diagnostics.md.
+diag_error   = { fg = "#D08770", underline = true }  # dark_red
+diag_warning = { fg = "#EBCB8B", underline = true }  # dark_yellow
+diag_info    = { fg = "#81A1C1", underline = true }  # dark_cyan, nord9
+diag_hint    = { fg = "#B48EAD", underline = true }  # dark_purple, nord15
+
+# Add and change are its own GitSigns. Delete is not: the source paints it
+# `red`, which in this style is the near-white nord6 — a deletion marked the
+# colour of ordinary text, next to an addition and a change that both have
+# colours. It takes the palette's own `dark_red` instead, which is the closest
+# thing to a red this style has. See docs/specs/git-signs.md.
+git_add      = "#A3BE8C"
+git_change   = "#63ADC2"
+git_delete   = "#D08770"
+
+# Built rather than looked up: the repo ships no statusline theme. Normal
+# takes nord10, the frost blue the source already uses under `PmenuSel`.
+mode_normal = { fg = "#2E3440", bg = "#5E81AC", bold = true }
+mode_insert = { fg = "#2E3440", bg = "#A3BE8C", bold = true }
+mode_pick   = { fg = "#2E3440", bg = "#B48EAD", bold = true }
+
+status          = "#93a4c3"
+status_muted    = "#616E88"
+status_inactive = { fg = "#616E88", bg = "#3B4252" } # its StatusLineNC
+statusline      = { fg = "#93a4c3", bg = "#434C5E" } # its StatusLine
+
+tree_dir  = "#63ADC2"                                # its Directory
+tree_link = "#81A1C1"                                # dark_cyan
+mark_copy = "#A3BE8C"
+mark_cut  = "#D08770"
+
+picker_border   = "#A3BE8C"                          # its TelescopeBorder
+picker_prompt   = "#63ADC2"                          # its TelescopePromptPrefix
+picker_selected = { fg = "#93a4c3", bg = "#434C5E", bold = true }
+picker_badge    = "#616E88"
+picker_divider  = "#3B4252"
+picker_preview  = "#93a4c3"
