@@ -38,7 +38,7 @@ type        = "#47A8A1"
 module      = "#47A8A1"
 # The type colour, not lighthaus's `Tag` group — vim's `Tag` means "you can
 # press CTRL-] on this", which is not what a tree-sitter `@tag` is. An element
-# name names a kind of node, and gruvbox-dark reached the same place.
+# name names a kind of node, and gruvbox reached the same place.
 tag         = "#47A8A1"
 boolean     = "#47A8A1"                              # source's own Boolean
 
@@ -53,7 +53,7 @@ escape      = "#FFEE79"                              # fg_alt
 # program made up.
 constant    = "#FFEE79"
 
-# A DEPARTURE, and the same argument gruvbox-dark's orange operators make.
+# A DEPARTURE, and the same argument gruvbox's orange operators make.
 # lighthaus paints Comment in white2 #CCCCCC, one step off plain foreground,
 # so prose reads at nearly the weight of the code explaining it. `grey` is the
 # palette's own neutral — LineNr and jsonQuote already wear it and no syntax
@@ -129,7 +129,7 @@ filler         = "#373C45"                           # source's NonText
 # The source has this at non_text too, and theme.md's rule wins: a mark you
 # asked for and then have to squint at answers nothing. One step up, to grey.
 whitespace     = "#8E8D8D"
-# Furniture, and the quietest of it — gruvbox-dark's reading rather than
+# Furniture, and the quietest of it — gruvbox's reading rather than
 # main's, so it is a shape you notice when you go looking and not before.
 context        = "#373C45"
 # Chrome rather than furniture: it replaces a row of code, so it is the

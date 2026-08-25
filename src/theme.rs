@@ -276,6 +276,67 @@ impl Ui {
         "picker_preview",
     ];
 
+    /// Every style on the screen, to be changed in bulk.
+    ///
+    /// This is a third list of the same field names as `set` and `REQUIRED`,
+    /// which is a wart. It is not paid for a fourth time: the test that guards
+    /// it italicises every key in `REQUIRED`, drops italics, and looks for
+    /// `italic: true` in the `Debug` of the result — so a field left out here
+    /// fails without anyone having remembered to add a name.
+    ///
+    /// `background` and `foreground` are absent because they are `Color`s
+    /// rather than `Style`s: there is no attribute on either to change.
+    fn styles_mut(&mut self) -> impl Iterator<Item = &mut Style> {
+        [
+            &mut self.cursorline,
+            &mut self.selection,
+            &mut self.search,
+            &mut self.cursor_alt,
+            &mut self.flash,
+            &mut self.label,
+            &mut self.dim,
+            &mut self.gutter,
+            &mut self.gutter_current,
+            &mut self.rule,
+            &mut self.filler,
+            &mut self.indent_guide,
+            &mut self.whitespace,
+            &mut self.context,
+            &mut self.context_header,
+            &mut self.todo_fix,
+            &mut self.todo_todo,
+            &mut self.todo_warn,
+            &mut self.todo_perf,
+            &mut self.todo_note,
+            &mut self.diag_error,
+            &mut self.diag_warning,
+            &mut self.diag_info,
+            &mut self.diag_hint,
+            &mut self.git_add,
+            &mut self.git_change,
+            &mut self.git_delete,
+            &mut self.popup,
+            &mut self.mode_normal,
+            &mut self.mode_insert,
+            &mut self.mode_pick,
+            &mut self.status,
+            &mut self.status_muted,
+            &mut self.status_inactive,
+            &mut self.statusline,
+            &mut self.tree_dir,
+            &mut self.tree_link,
+            &mut self.mark_copy,
+            &mut self.mark_cut,
+            &mut self.picker_border,
+            &mut self.picker_prompt,
+            &mut self.picker_selected,
+            &mut self.picker_badge,
+            &mut self.picker_divider,
+            &mut self.picker_preview,
+        ]
+        .into_iter()
+    }
+
     /// The single place a `[ui]` key becomes a field, so a key cannot exist
     /// for the parser and not for the drawing — the same argument
     /// `Options::set` makes.
@@ -369,10 +430,12 @@ struct Builtin {
 /// and not for the drawing, one level up.
 const BUILTINS: &[Builtin] = &[
     Builtin { name: DEFAULT_THEME, aliases: &[], source: MAIN },
+    // `gruvbox-dark` was its name until the pair stopped needing a suffix to
+    // tell them apart: the dark one is the gruvbox, and the light one says so.
     Builtin {
-        name: "gruvbox-dark",
-        aliases: &[],
-        source: include_str!("themes/gruvbox-dark.toml"),
+        name: "gruvbox",
+        aliases: &["gruvbox-dark"],
+        source: include_str!("themes/gruvbox.toml"),
     },
     Builtin {
         name: "gruvbox-light",
@@ -427,6 +490,24 @@ impl Theme {
         Theme { syntax: BTreeMap::new(), ui: Ui::default() }
     }
 
+    /// Drop every italic in the palette, syntax and furniture alike.
+    ///
+    /// A terminal without italic does not necessarily *ignore* `SGR 3` —
+    /// several render it as reverse video, which does not degrade a slant, it
+    /// paints the foreground a theme chose as a block behind inverted text.
+    /// bi cannot ask a terminal which kind it is, so this is an option rather
+    /// than a guess, and it defaults to off. The theme files keep their
+    /// italics either way: what a theme means and what a terminal can draw are
+    /// different questions. See `docs/specs/theme.md`.
+    pub fn drop_italics(&mut self) {
+        for style in self.syntax.values_mut() {
+            style.italic = false;
+        }
+        for style in self.ui.styles_mut() {
+            style.italic = false;
+        }
+    }
+
     /// The source of a built-in theme, or `None` if there is no such name.
     /// Alternate spellings resolve here too — `gameboy` is `gb`.
     pub fn builtin(name: &str) -> Option<&'static str> {
@@ -438,7 +519,7 @@ impl Theme {
     /// `gruvbox-light` is here and is not the default, because bi has no way
     /// to ask the terminal whether it is light. Shipping it and defaulting to
     /// it are different decisions, and only the first one is available.
-    /// `gruvbox-dark` is here for a different reason: it *was* the default,
+    /// `gruvbox` is here for a different reason: it *was* the default,
     /// and a theme losing that job is not a theme being withdrawn.
     pub fn builtins() -> impl Iterator<Item = &'static str> {
         BUILTINS.iter().map(|b| b.name)
@@ -643,7 +724,7 @@ mod tests {
 
     /// A match has to be legible on whatever it lands on, and while `s` is
     /// aiming that is dimmed text — so a `search` with no foreground of its
-    /// own wears `dim`'s, and gruvbox-dark's `dim` was the same colour as the
+    /// own wears `dim`'s, and gruvbox's `dim` was the same colour as the
     /// background `search` painted. The match was there and invisible.
     #[test]
     fn a_search_match_names_both_halves_and_neither_is_the_dim() {
@@ -798,7 +879,7 @@ mod tests {
     fn a_theme_file_is_a_patch_over_the_builtin_it_shadows() {
         // One key, and everything else still comes from the built-in.
         let (theme, problems) =
-            Theme::resolve("gruvbox-dark", Some("[syntax]\nkeyword = \"#ffffff\"\n"));
+            Theme::resolve("gruvbox", Some("[syntax]\nkeyword = \"#ffffff\"\n"));
         assert_eq!(problems, []);
         assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(255, 255, 255))));
         assert_eq!(theme.ui.background, Some(Color::Rgb(0x28, 0x28, 0x28)));
@@ -831,7 +912,7 @@ mod tests {
         let light = parsed("gruvbox-light");
         // Its own counterpart, which is no longer the default — the pair is
         // two ends of one palette, and the default moving does not change that.
-        let dark = parsed("gruvbox-dark");
+        let dark = parsed("gruvbox");
 
         assert_eq!(light.ui.background, Some(Color::Rgb(0xfb, 0xf1, 0xc7)));
         assert_eq!(light.ui.foreground, Some(Color::Rgb(0x3c, 0x38, 0x36)));
@@ -1056,6 +1137,33 @@ mod tests {
 
         // Two spellings, one theme.
         assert_eq!(Theme::builtin("forest"), Theme::builtin("lighthaus"));
+    }
+
+    /// `Ui::styles_mut` is a third list of the same field names as `set` and
+    /// `REQUIRED`, and a field left out of it would keep an italic that every
+    /// other role lost — a hole nobody would look for, in a theme that already
+    /// looks nearly right.
+    ///
+    /// So the guard does not write the list a fourth time. It builds a theme
+    /// that italicises every key in `REQUIRED`, drops italics, and reads the
+    /// `Debug` of the result: a surviving `italic: true` anywhere is the
+    /// missing field, whatever it is called.
+    #[test]
+    fn dropping_italics_reaches_every_style_on_the_screen() {
+        let mut src = String::from("[syntax]\nkeyword = { fg = \"#ff0000\", italic = true }\n");
+        src.push_str("[ui]\n");
+        for key in Ui::REQUIRED {
+            src.push_str(&format!("{key} = {{ fg = \"#ff0000\", italic = true }}\n"));
+        }
+        let (mut theme, problems) = Theme::parse(&src, Theme::empty()).expect("must parse");
+        assert_eq!(problems, [], "the generated theme is not the thing under test");
+        assert!(format!("{theme:?}").contains("italic: true"), "nothing to drop");
+
+        theme.drop_italics();
+        assert!(
+            !format!("{theme:?}").contains("italic: true"),
+            "a style kept its italic — `Ui::styles_mut` is missing a field"
+        );
     }
 
     /// What each ported theme claims, in one table.

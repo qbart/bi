@@ -117,6 +117,17 @@ pub struct Options {
     /// default is the light theme, which no local session gets by default, so
     /// the distinction is visible out of the box.
     pub ssh_theme: String,
+    /// Whether an `italic` in the theme survives resolution.
+    ///
+    /// **Off by default**, and the reason is that the failure mode is not a
+    /// degraded style but a wrong one: a terminal without italic may ignore
+    /// `SGR 3`, but several render it as *reverse video*, which paints the
+    /// foreground a theme chose as a block behind inverted text. bi has no
+    /// portable way to ask which kind of terminal it is on, and the two wrong
+    /// guesses do not cost the same — a missing slant against a screen of
+    /// inverted blocks. The theme files keep their italics either way.
+    /// See `docs/specs/theme.md`.
+    pub italics: bool,
     /// Off unless asked for: vim does not light the buffer up on a plain
     /// `/`, and the status line's `[3/17]` says how many matches there are
     /// without painting them.
@@ -214,6 +225,7 @@ impl Default for Options {
             syntax: String::new(),
             theme: crate::theme::DEFAULT_THEME.to_string(),
             ssh_theme: "gruvbox-light".to_string(),
+            italics: false,
             tab_width: indent.tab_width,
             expandtab: indent.expandtab,
             shiftwidth: indent.shiftwidth,
@@ -259,6 +271,8 @@ impl Options {
             ("syntax", _) => return Err("syntax takes the name of a language".into()),
             ("theme", OptionValue::Str(name)) => self.theme = name,
             ("theme", _) => return Err("theme takes the name of a theme, in quotes".into()),
+            ("italics", OptionValue::Bool(on)) => self.italics = on,
+            ("italics", _) => return Err("italics takes true or false".into()),
             ("ssh_theme", OptionValue::Str(name)) => self.ssh_theme = name,
             ("ssh_theme", _) => {
                 return Err("ssh_theme takes the name of a theme, in quotes".into());
@@ -346,6 +360,7 @@ impl Options {
             "syntax" => OptionValue::Str(self.syntax.clone()),
             "theme" => OptionValue::Str(self.theme.clone()),
             "ssh_theme" => OptionValue::Str(self.ssh_theme.clone()),
+            "italics" => OptionValue::Bool(self.italics),
             "tab_width" => OptionValue::Int(self.tab_width as i64),
             "shiftwidth" => OptionValue::Int(self.shiftwidth as i64),
             "expandtab" => OptionValue::Bool(self.expandtab),

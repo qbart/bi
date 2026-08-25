@@ -1,7 +1,7 @@
 # gruvbox dark, medium contrast — bi's default theme.
 #
 # Palette from github.com/morhetz/gruvbox. Compiled into the binary; a file at
-# <config dir>/themes/gruvbox-dark.toml is a PATCH over this one, so changing a
+# <config dir>/themes/gruvbox.toml is a PATCH over this one, so changing a
 # single colour does not mean copying the rest. See docs/specs/theme.md.
 
 [syntax]

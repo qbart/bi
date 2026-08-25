@@ -626,7 +626,7 @@ recorded here so the difference is not a surprise:
 - **The default is `main`, not `ansi`.** This file argued the shipped default
   should reproduce today's colours exactly so that installing the step changed
   nothing on screen. It does change what you see now. Today's colours survive
-  as the `ansi` built-in. (`gruvbox-dark` held the default first and still
+  as the `ansi` built-in. (`gruvbox` held the default first and still
   ships; the swap to `main` cost one line, which is the point of the name
   being an option.)
 - **`[ui]` has twenty-five required keys, not eight**, plus `background` and

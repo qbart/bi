@@ -103,7 +103,7 @@ gitignore = true
 # name, given in brackets. Each theme file names its source at the top.
 #
 # `main` is the default: a near-black frame with cool accents, from IBM Carbon.
-# `gruvbox-dark` was the default before it and is unchanged.
+# `gruvbox` (`gruvbox-dark`) was the default before it and is unchanged.
 # `gruvbox-light` is that theme at the other end of its palette; it is not the
 # default because bi cannot ask the terminal whether it is light.
 # `pascal` is Borland Turbo Pascal 7, in the sixteen EGA colours.
@@ -124,6 +124,16 @@ gitignore = true
 # `ferra` is warm — the only dark theme here whose greys have red in them.
 # See docs/specs/theme.md.
 theme = "main"
+
+# Whether an `italic` in the theme survives. OFF BY DEFAULT, because a terminal
+# without italic does not necessarily ignore it: several render it as REVERSE
+# VIDEO, which paints the foreground colour a theme chose as a block behind
+# inverted text. bi cannot ask a terminal which kind it is, and the two wrong
+# guesses do not cost the same — a missing slant against a screen of inverted
+# blocks. Nine of the sixteen themes use italic somewhere, mostly on comments
+# and keywords. If yours renders italics properly, turn this on and get them.
+# The theme files keep their italics either way.
+italics = false
 
 # The theme for a session that is editing from somewhere else — bi uses this
 # instead of `theme` when SSH_CONNECTION is set. A second name rather than a

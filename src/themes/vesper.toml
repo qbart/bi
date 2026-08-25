@@ -83,7 +83,7 @@ rule           = "#282828"                           # border
 filler         = "#101010"                           # source hides the `~` entirely
 indent_guide   = "#282828"
 whitespace     = "#7E7E7E"                           # fg_dim, source's own
-# One step up from the frame, quiet like gruvbox-dark's: furniture recedes
+# One step up from the frame, quiet like gruvbox's: furniture recedes
 # until you go looking for it.
 context        = "#1A1A1A"
 context_header = { fg = "#A0A0A0", bg = "#1A1A1A" }

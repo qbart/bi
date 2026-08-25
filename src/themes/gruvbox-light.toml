@@ -1,6 +1,6 @@
 # gruvbox light, medium contrast.
 #
-# Palette from github.com/morhetz/gruvbox. The same roles as gruvbox-dark, in
+# Palette from github.com/morhetz/gruvbox. The same roles as gruvbox, in
 # the light palette's *faded* column — on a light background the bright accents
 # that carry a dark theme have nothing to be bright against, so red is #9d0006
 # here where it is #fb4934 there. Compiled into the binary; a file at

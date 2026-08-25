@@ -2522,7 +2522,21 @@ impl Editor {
         let user = source.and_then(|s| s.theme(&name).ok().flatten());
         let (theme, problems) = Theme::resolve(&name, user.as_deref());
         self.theme = theme;
+        self.apply_italics();
         problems
+    }
+
+    /// Keeps `self.theme` in step with `options.italics`.
+    ///
+    /// The palette is what the theme says; whether its italics survive is what
+    /// the terminal can draw. Two questions, so the file keeps its
+    /// `italic = true` and this decides whether it lands — in one place,
+    /// called from the two that can move either half: a theme being resolved,
+    /// and an editor being built with a theme it did not resolve.
+    fn apply_italics(&mut self) {
+        if !self.session.options.italics {
+            self.theme.drop_italics();
+        }
     }
 
     /// The resolved palette. A frontend maps [`crate::theme::Color`] to
@@ -2628,6 +2642,7 @@ impl Editor {
             git_baseline: None,
         };
         editor.resolve_options();
+        editor.apply_italics();
         editor
     }
 
@@ -5977,6 +5992,7 @@ impl Editor {
         };
 
         let was = self.session.options.active_theme(self.remote).to_string();
+        let was_italics = self.session.options.italics;
         if let Err(message) = self.session.options.set(name, parsed.clone()) {
             // A real option given a bad value gets the value echoed — you
             // want to see what you fat-fingered. An unknown option does not:
@@ -5995,13 +6011,24 @@ impl Editor {
         self.resolve_options();
 
         // A name is not a palette. `:set theme ansi` that left `self.theme`
-        // alone would report success and change nothing on screen.
-        if self.session.options.active_theme(self.remote) != was {
+        // alone would report success and change nothing on screen — and
+        // `:set italics` is the same failure, since the palette is where the
+        // slants were dropped.
+        if self.session.options.active_theme(self.remote) != was
+            || self.session.options.italics != was_italics
+        {
             let source = self.config_source.take();
             let problems = self.resolve_theme(source.as_deref());
             self.config_source = source;
             self.session.status = match problems.first() {
                 Some(problem) => problem.message.clone(),
+                // Echo back the theme actually in force rather than the name
+                // that was typed — over SSH `:set theme` moves the one that is
+                // not live, and saying so is the point. `:set italics` echoes
+                // itself, because the theme did not change.
+                None if name == "italics" => {
+                    format!("italics={}", self.session.options.italics)
+                }
                 None => format!("{name}={}", self.session.options.active_theme(self.remote)),
             };
         }
@@ -10573,8 +10600,43 @@ mod tests {
     fn the_default_theme_is_main() {
         let ed = Editor::empty();
         assert_eq!(ed.session.options.theme, crate::theme::DEFAULT_THEME);
-        assert_eq!(ed.theme(), &Theme::default());
+        assert_eq!(ed.theme(), &main_on_screen());
         assert!(ed.theme().ui.background.is_some(), "main claims the background");
+    }
+
+    /// `main` as an editor actually shows it, which is not the same thing as
+    /// `main` as its file writes it: `italics` is off by default, so the slant
+    /// on `comment` and `context` does not survive resolution. See
+    /// `docs/specs/theme.md`.
+    fn main_on_screen() -> Theme {
+        let mut theme = Theme::default();
+        theme.drop_italics();
+        theme
+    }
+
+    /// The option's own test, and the reason the helper above exists: a theme
+    /// file keeps its italics, an editor with `italics` off does not show
+    /// them, and `:set italics true` gets them back without the name of the
+    /// theme having moved.
+    #[test]
+    fn italics_are_off_by_default_and_set_puts_them_back() {
+        let faithful = Theme::default();
+        assert!(faithful.style("comment").unwrap().italic, "main.toml still says italic");
+
+        let mut ed = Editor::empty();
+        assert!(!ed.session.options.italics, "off by default — see docs/specs/theme.md");
+        assert!(!ed.theme().style("comment").unwrap().italic, "the slant reached the screen");
+
+        // A `:set` that reports success and changes nothing on screen is the
+        // failure this re-resolve exists to prevent — the same one `:set
+        // theme` has.
+        ex(&mut ed, "set italics true");
+        assert_eq!(ed.session.status, "italics=true");
+        assert!(ed.theme().style("comment").unwrap().italic, "italics did not come back");
+        assert_eq!(ed.theme(), &faithful, "and nothing else moved with them");
+
+        ex(&mut ed, "set italics false");
+        assert!(!ed.theme().style("comment").unwrap().italic);
     }
 
     /// A name is not a palette. `:set theme ansi` that moved the string and
@@ -10656,7 +10718,7 @@ mod tests {
         ex(&mut ed, "set theme nosuch");
         assert!(ed.session.status.contains("nosuch"), "{}", ed.session.status);
         // Fell back rather than leaving the screen colourless.
-        assert_eq!(ed.theme(), &Theme::default());
+        assert_eq!(ed.theme(), &main_on_screen());
     }
 
     #[test]
@@ -10673,7 +10735,7 @@ mod tests {
         let problems = ed.load_config(ConfigText(Some("[options]\ntheme = 7\n")));
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].message.contains("theme"), "{:?}", problems[0].message);
-        assert_eq!(ed.theme(), &Theme::default());
+        assert_eq!(ed.theme(), &main_on_screen());
     }
 
     /// A directory under the temp dir, gone when the test ends.

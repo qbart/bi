@@ -22,7 +22,7 @@ like anything, and "looks right out of the box" is worth more than "matches
 your terminal out of the box". Both are still available. Only the default
 moved.
 
-It moved twice. `gruvbox-dark` held it first and still ships unchanged; `main`
+It moved twice. `gruvbox` held it first and still ships unchanged; `main`
 took it later and is described below. What that swap cost is one line in
 `theme.rs` and one in `default.toml`, which is the point of the name being an
 ordinary option — and every test that says "the default" says `DEFAULT_THEME`
@@ -160,7 +160,7 @@ the syntax gave the text show through. `search` cannot be, and this is the
 rule rather than a preference: while `s` is aiming, everything on screen is
 wearing `dim`'s foreground, so a match with no foreground of its own is a
 match drawn in the colour of the text it is supposed to stand out from.
-gruvbox-dark got this exactly wrong — `search` was a `#665c54` background and
+gruvbox got this exactly wrong — `search` was a `#665c54` background and
 `dim` was a `#665c54` foreground, so a match was painted its own colour and
 disappeared.
 
@@ -189,7 +189,7 @@ the whole point of naming `green` is to get the terminal's green, and the
 terminal's background comes with it. Neither is the "right" answer, so the
 theme says which it is rather than a flag elsewhere deciding for it.
 
-`ansi` omits it. `main` sets `#161616`, `gruvbox-dark` `#282828`.
+`ansi` omits it. `main` sets `#161616`, `gruvbox` `#282828`.
 
 ## Two names, and which one is live
 
@@ -223,6 +223,54 @@ browser has no `SSH_CONNECTION` to consult and gets to answer for itself.
 after `load_config`. That is not tidiness: `main.rs` has to pick an order, and
 a rule that only works one way round is a bug waiting for the day someone
 reorders two lines.
+
+## Italics, and the terminal that has none
+
+`italics` is an option, it defaults to **off**, and when it is off every
+`italic` in the resolved palette is dropped — syntax and furniture alike.
+
+**The reason it is an option rather than a detail of each theme is that the
+failure mode is not a degraded style, it is a wrong one.** A terminal without
+italic that simply ignores `SGR 3` loses a slant and nothing else. Several
+terminals do not ignore it: they render it as **reverse video**, which takes
+the foreground colour a theme carefully chose and paints it as a block behind
+inverted text. tmux under a `TERM` whose terminfo has no `sitm` is the common
+way to arrive there, and it is not rare.
+
+That is not a small difference. Nine of the sixteen built-ins use italic
+somewhere, and where they use it is exactly where it hurts most: `comment` in
+six of them, `keyword` in `kanagawa` and `bonsai`, and in `gb` — whose whole
+hierarchy is weight and slant because it has only one hue — `string`,
+`tree_link`, `mark_cut`, `diag_hint` and `string.special.regex` as well. On
+such a terminal `gb` does not lose its strings, it fills them in.
+
+**It defaults to off, and that is the asymmetric-failure argument this file
+already makes about guessing a light background.** bi has no portable way to
+ask a terminal whether its italic is an italic, and the two wrong guesses do
+not cost the same: default on and the worst case is a screen of inverted
+blocks, default off and the worst case is a missing slant on a terminal that
+would have rendered one. `italics = true` is one line for anyone whose
+terminal is fine, and it is worth more than making the other case debug their
+config.
+
+**The themes keep their italics.** `main.toml` still says
+`comment = { fg = "#6f6f6f", italic = true }`, because that is what the theme
+means and what its source says; the option decides whether the slant survives
+resolution. So turning italics on is not re-editing sixteen files, and a
+theme stays a faithful record of the palette it was ported from — which is the
+whole reason the ports carry a `Based on` line.
+
+`Theme::drop_italics` does the walk, over `syntax`'s values and `Ui`'s styles.
+`Ui::styles_mut` is a third list of the same field names as `Ui::set` and
+`Ui::REQUIRED`, which is a wart — so the test that guards it does not repeat
+the list a fourth time. It builds a theme file that italicises every key in
+`REQUIRED`, drops italics, and asserts the `Debug` of the result contains no
+`italic: true` anywhere. A field left out of `styles_mut` fails it without
+anyone having remembered to add a name.
+
+`:set italics false` re-resolves, for the reason `:set theme` does: the option
+is not the palette, and a `:set` that reports success and changes nothing on
+screen is the failure worth engineering against.
 
 ## Resolution
 
@@ -343,7 +391,7 @@ rule on purpose — see below.
 **`context` is loud here, and every other built-in's is quiet.** The rule in
 `docs/specs/tree-sitter-context.md` is that the annotation marks structure
 rather than naming anything, so it should be a shape you notice when you look
-for it and not before. `gruvbox-dark` reads that as "one step below the
+for it and not before. `gruvbox` reads that as "one step below the
 frame"; on a `#161616` frame the same reading gives `#0d0d0d`, which is not a
 shape you notice when you look for it — it is one you cannot find when you go
 looking, and an annotation that answers "what does this brace close" with
@@ -357,12 +405,21 @@ Unlike `pascal`, no test fences this theme into a palette. `pascal`'s
 constraint *is* the theme; `main` is a theme that happens to have been drawn
 from one, and pinning it would only make the next adjustment a fight.
 
-### `gruvbox-dark`
+### `gruvbox`
 
 From the palette in
 [morhetz/gruvbox](https://github.com/morhetz/gruvbox), dark, medium contrast.
 It was the default before `main` and is unchanged by having stopped being it —
-one `:set theme gruvbox-dark` away, the same way `ansi` is.
+one `:set theme gruvbox` away, the same way `ansi` is.
+
+**It was `gruvbox-dark` until the pair stopped needing a suffix to tell them
+apart.** The dark one is *the* gruvbox — it is what the name means everywhere
+else, it is the one that held bi's default, and a suffix that only exists to
+distinguish it from a sibling is a suffix the sibling can carry on its own.
+`gruvbox-light` keeps its name, because a light theme naming itself light is
+saying something rather than disambiguating. `gruvbox-dark` remains as an
+alias, so a config that already names it keeps working — which is the whole
+reason aliases exist.
 
 | | |
 |---|---|
@@ -612,7 +669,7 @@ are `GitGutterAdd`, `GitGutterChange` and `GitGutterDelete`; `tree_dir` is
 rows. Where `vesper` had to build a mode badge out of a palette that had no
 concept of one, this one could look it up.
 
-**Comments are the departure, and it is the same argument gruvbox-dark's
+**Comments are the departure, and it is the same argument gruvbox's
 orange operators make.** lighthaus paints `Comment` in `white2` `#CCCCCC`,
 one step off plain foreground — so a comment reads at very nearly the weight
 of the code it is explaining. That is "a capture styled the colour of nothing"
@@ -624,7 +681,7 @@ to no syntax role, so the departure costs no new colour.
 Three smaller ones, all marked in the file. `tag` takes the type colour rather
 than vim's `Tag` group — vim's `Tag` means "you can press CTRL-] on this",
 which is not what a tree-sitter `@tag` is, and the reasoning that put element
-names on the type colour in `gruvbox-dark` applies unchanged. `rule`,
+names on the type colour in `gruvbox` applies unchanged. `rule`,
 `indent_guide` and `whitespace` come from `non_text` rather than from the
 source's own answers, because lighthaus draws its split as a filled dark bar
 and its indent guides as filled columns, and bi draws both as a single `│`
@@ -741,7 +798,7 @@ Vim's fallback rather than the scheme's intent, so the yellow is what this
 takes. And `nordark`'s own `Tag` is the same green as its `String`, which
 would render an XML document one colour from element name to attribute value —
 the exact failure this spec records `tag` being added for — so it joins the
-types, as `gruvbox-dark`'s does.
+types, as `gruvbox`'s does.
 
 **No fences.** `pascal`, `gb` and `lighthaus` each get a test that pins the
 constraint that *is* the theme — sixteen EGA colours, one hue, a green canopy.
