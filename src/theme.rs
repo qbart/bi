@@ -352,6 +352,7 @@ const GRUVBOX_LIGHT: &str = include_str!("themes/gruvbox-light.toml");
 const PASCAL: &str = include_str!("themes/pascal.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
 const VESPER: &str = include_str!("themes/vesper.toml");
+const GB: &str = include_str!("themes/gb.toml");
 
 impl Default for Theme {
     /// The shipped `main`, parsed.
@@ -379,6 +380,10 @@ impl Theme {
             "pascal" => Some(PASCAL),
             "ansi" => Some(ANSI),
             "vesper" => Some(VESPER),
+            // Two spellings of one theme: `gb` is what it is listed as, and
+            // `gameboy` is what it looks like. A name is not a palette, so
+            // there is nothing to keep in sync by letting both reach it.
+            "gb" | "gameboy" => Some(GB),
             _ => None,
         }
     }
@@ -391,7 +396,7 @@ impl Theme {
     /// `gruvbox-dark` is here for a different reason: it *was* the default,
     /// and a theme losing that job is not a theme being withdrawn.
     pub const BUILTINS: &'static [&'static str] =
-        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi", "vesper"];
+        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi", "vesper", "gb"];
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -833,7 +838,11 @@ mod tests {
     /// had themes, and before it had themes these fell through to `string`.
     #[test]
     fn a_symbol_and_a_regex_are_not_just_strings() {
-        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper"] {
+        // `gb` is the interesting member: it has no second colour to separate
+        // the two with, so it separates them with weight and slant instead —
+        // and because this compares `Style`s rather than colours, it cannot
+        // tell the difference. Which is the point.
+        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper", "gb"] {
             let theme = parsed(name);
             let string = theme.style("string");
             for special in ["string.special.symbol", "string.special.regex"] {
@@ -894,6 +903,54 @@ mod tests {
                 line + 1
             );
         }
+    }
+
+    /// `pascal`'s test in a different palette, for the same reason: the
+    /// constraint is the theme. A DMG had one green and four levels of it, so
+    /// a single off-hue value here would not be a tweak to `gb` — it would be
+    /// the end of it, and the hierarchy it spends weight, slant and underline
+    /// on would quietly stop being necessary.
+    ///
+    /// Unlike `pascal`'s, this walks every value on a line rather than the
+    /// first: half the furniture here names both a foreground and a
+    /// background, and the second one is exactly where a stray red would go.
+    /// Header comments are walked too — the ramp is written out up there, and
+    /// it should be held to the same rule as the values under it.
+    #[test]
+    fn gb_is_one_hue_from_end_to_end() {
+        let src = Theme::builtin("gb").expect("gb is built in");
+        for (line, text) in src.lines().enumerate() {
+            for (at, _) in text.match_indices('#') {
+                let rest = &text[at + 1..];
+                if rest.len() < 6 || !rest.as_bytes()[..6].iter().all(u8::is_ascii_hexdigit) {
+                    continue; // prose after a `#`, not a colour
+                }
+                let hex = &rest[..6];
+                let Ok(Color::Rgb(r, g, b)) = Color::parse(&format!("#{hex}")) else { continue };
+                assert!(
+                    g > r && g > b,
+                    "gb.toml:{}: #{hex} has a hue in it — the theme is one green",
+                    line + 1
+                );
+            }
+        }
+
+        // Two spellings, one theme — `:set theme gameboy` is not an unknown
+        // name that quietly falls back to `main`.
+        assert_eq!(Theme::builtin("gameboy"), Theme::builtin("gb"));
+
+        // And what it is, so the frame cannot drift off the LCD it names.
+        let gb = parsed("gb");
+        assert_eq!(gb.ui.background, Some(Color::Rgb(0xbb, 0xc5, 0xb7)));
+        assert_eq!(gb.ui.foreground, Some(Color::Rgb(0x00, 0x26, 0x11)));
+
+        // The hierarchy the missing hue is paid for with: a keyword is the one
+        // capture that leaves the text's colour, and the three attributes do
+        // the rest of the separating.
+        assert_eq!(gb.style("keyword").unwrap().fg, Some(Color::Rgb(0x00, 0x10, 0x08)));
+        assert!(gb.style("string").unwrap().italic, "strings are the italic ones");
+        assert!(gb.style("type").unwrap().underline, "a type is a shape, and gets a rule");
+        assert!(gb.style("function").unwrap().bold);
     }
 
     /// The theme is only worth having if it looks like the thing, and the two

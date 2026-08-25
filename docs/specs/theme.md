@@ -270,7 +270,7 @@ without changing the type.
 
 ## The built-ins
 
-Six, compiled in with `include_str!`, and parsed through the same parser a
+Seven, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
@@ -481,6 +481,76 @@ the source has no equivalent at all — the mode badge, the five-way TODO
 palette, a second cursor's colour — those roles are built from the same six
 colours rather than introducing new ones.
 
+### `gb`
+
+A Game Boy's screen: dark forest green on a greenish cream LCD, after
+[kungfusheep/mfd.nvim](https://github.com/kungfusheep/mfd.nvim)'s `mfd-paper`,
+read out of that project's own `colors/mfd-paper.lua` and
+`lua/lualine/themes/mfd-paper.lua` rather than sampled off a screenshot.
+`:set theme gb`, or `gameboy`, which is the same theme under the name that
+says what it looks like.
+
+**It has one hue, and that constraint *is* the theme** — the same way sixteen
+colours is `pascal`. A DMG had one green phosphor-lit LCD and four levels of
+it, and this file has twelve levels of one green and nothing else: from
+`#001008` at the near-black end, through `#002611` (the text), to `#BBC5B7`
+(the frame) and `#C5CFC2` (a float). A test walks the file and fails on any
+value whose green channel is not strictly the largest of the three, because a
+single red error underline or blue keyword would not be a tweak to this theme,
+it would be the end of it.
+
+**So the hierarchy is weight, slant and underline rather than colour**, which
+is the source's whole idea and the reason it can be monotone without being
+flat:
+
+| | |
+|---|---|
+| keyword | `#001008` bold — the one step darker than the text |
+| function, constructor, tag, boolean, escape, label | fg bold |
+| type, module | fg underlined — a type is a shape, and a shape gets a rule under it |
+| string | fg *italic* |
+| `string.special` (a JSON key, a Ruby symbol) | fg bold |
+| `string.special.regex` | fg bold *and* italic — a string that is also special |
+| comment | `#8A9A88` italic |
+| everything else — constant, number, property, operator, punctuation | plain fg |
+| background / foreground | `#BBC5B7` / `#002611` |
+| search | `#BBC5B7` on `#002611` bold — the source's own `Search`, reversed out |
+
+**The `string.special` rule survives here without a colour to spend on it.**
+`theme.md` requires a symbol and a regex not to fall through to `string`, and
+the reason is Ruby: 59% of a file coming out one green. This theme has one
+green *everywhere*, so the fix cannot be a second one — instead `string` is
+italic, `string.special` is bold, and a regex is both. A JSON file reads as
+bold keys against italic values, which is the distinction the rule was asking
+for. `gb` is therefore in that test alongside `main` and the gruvbox pair.
+
+**The rule that operators must not be plain foreground is the one departure**,
+and it is not one this theme can take. `docs/specs/tree-sitter.md` says a
+capture painted the colour of the text around it is a capture that did not
+happen — true, and in a theme where every capture is that colour it stops
+being an argument about operators. The alternative is bolding `&`, `=` and `.`
+on every line, which is worse than the disease. The source keeps `@operator`
+and `@punctuation` plain and so does this.
+
+**Where bi has furniture the source has none of, the ramp is spent rather than
+extended** — vesper's policy, for vesper's reason. The five TODO badges are
+the interesting case: with no hue to separate them, they are five rungs of the
+ladder, ordered by how much each is entitled to shout. `FIX:` is cream on
+`#001008` and `NOTE:` is dark on `#A5B2A2`, barely off the page; `WARN:`,
+`TODO:` and `PERF:` sit between. The word in the badge already says which one
+it is, so the paint only has to say how loud.
+
+**`statusline` is bold, which no other built-in bothers with.** The focused
+status row and an unfocused one share a background here (`#B0BAB0`, the
+source's own `StatusLine` and `StatusLineNC`), so weight is the only thing
+left to tell them apart — the same job `reverse` does in `ansi`. Two smaller
+departures are marked in the file: `whitespace` is lifted from the source's
+`Whitespace` to the comment green, because `theme.md` says a mark you have to
+squint at answers nothing, and `git_delete` gains a bold on top of the
+source's colour for the same reason it needed one — `git_add` and
+`git_delete` are one ramp step apart, and the gutter glyph should not be
+doing all the work alone.
+
 ## Testing
 
 - every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
@@ -518,7 +588,15 @@ colours rather than introducing new ones.
   `pascal`'s
 - `vesper`'s `string.special.symbol` and `string.special.regex` are not just
   `string` either, alongside `main` and both gruvbox themes — sourced from a
-  different palette, held to the same rule
+  different palette, held to the same rule. `gb` is in that list too, and is
+  the interesting member: it has no second colour to separate them with, so it
+  separates them with weight and slant instead, and the test cannot tell the
+  difference — which is the point of it comparing `Style`s rather than colours
+- `gb` is one hue from end to end — every `#rrggbb` in the file has strictly
+  more green in it than red or blue. `pascal`'s test in a different palette,
+  for the same reason: the constraint is the theme, and a single off-hue value
+  would not be a tweak to it
+- `gb` and `gameboy` name the same built-in, and it is listed under `gb`
 
 ## Deferred
 

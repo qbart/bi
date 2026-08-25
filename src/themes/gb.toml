@@ -1,0 +1,182 @@
+# gb — a Game Boy's screen: dark forest green on a greenish cream LCD, after
+# the `mfd-paper` variant of https://github.com/kungfusheep/mfd.nvim.
+#
+# Compiled into the binary; a file at <config dir>/themes/gb.toml is a PATCH
+# over this one, so changing a single colour does not mean copying the rest.
+# `:set theme gb`, or `gameboy`. See docs/specs/theme.md.
+#
+# ONE HUE, and that is the theme rather than a detail of it — a DMG had one
+# green and four levels of it. Every colour below is a rung of a single ramp
+# taken from the source's own palette:
+#
+#   #001008  #002611  #0A3018  #1A3620  #6A7A68  #8A9A88
+#   #95A592  #A0B0A0  #A5B2A2  #B0BAB0  #BBC5B7  #C5CFC2
+#
+# A test walks this file and fails on any value whose green channel is not
+# strictly the largest, because a red error underline or a blue keyword would
+# not be a tweak here — it would be the end of the theme.
+#
+# So the hierarchy is weight, slant and underline instead: keywords are the
+# one step darker than the text and bold, functions and tags are bold, types
+# are underlined, strings are italic, comments are the faded green. That is
+# the source's whole idea and the reason it can be monotone without being
+# flat.
+
+[syntax]
+# The words that are the language rather than the program: the darkest rung,
+# and the only capture that leaves the text's own colour.
+keyword     = { fg = "#001008", bold = true }
+
+function    = { fg = "#002611", bold = true }
+constructor = { fg = "#002611", bold = true }
+
+# A type is a shape, and a shape gets a rule under it. Source's own `Type`
+# and `@type`, which underline where everything else bolds.
+type        = { fg = "#002611", underline = true }
+module      = "#002611"
+# An element name names a kind of node — but underlining every `<div>` in an
+# HTML file draws a line under half the document, so tags take the source's
+# own `@tag`, which is bold.
+tag         = { fg = "#002611", bold = true }
+
+string      = { fg = "#002611", italic = true }
+character   = "#002611"
+# The source's own `@string.escape`: an escape sequence is meant to interrupt
+# the string it sits in, and bold is what interrupting looks like here.
+escape      = { fg = "#002611", bold = true }
+
+comment     = { fg = "#8A9A88", italic = true }
+
+constant    = "#002611"
+number      = "#002611"
+float       = "#002611"
+boolean     = { fg = "#002611", bold = true }
+
+attribute   = "#002611"
+label       = { fg = "#002611", bold = true }
+
+# Plain, and this is the one place `docs/specs/tree-sitter.md`'s rule about
+# operators cannot be kept: it says a capture painted the colour of the text
+# around it is a capture that did not happen, which stops being an argument
+# in a theme where every capture is that colour. The alternative is bolding
+# `&`, `=` and `.` on every line, which is worse than the disease.
+operator    = "#002611"
+punctuation = "#002611"
+delimiter   = "#002611"
+
+property    = "#002611"
+
+# theme.md requires a symbol and a regex not to fall through to `string`, and
+# the reason is Ruby: `:phases`, `class_name:` and `/\A[a-z_]+\z/` coming out
+# the same as `'Time & Material'`. There is no second colour here to fix that
+# with, so the fix is the source's own `@string.special`, which is bold where
+# `@string` is italic — and a regex is a string that is also special, so it is
+# both. A JSON file reads as bold keys against italic values, which is the
+# distinction the rule was asking for.
+"string.special"       = { fg = "#002611", bold = true }
+"string.special.regex" = { fg = "#002611", bold = true, italic = true }
+
+# Markdown, whose captures are all text.*
+"text.title"     = { fg = "#001008", bold = true }
+"text.literal"   = "#002611"
+"text.uri"       = { fg = "#002611", underline = true }
+"text.reference" = { fg = "#002611", italic = true }
+
+[ui]
+background = "#BBC5B7"                               # the LCD
+foreground = "#002611"                               # dark forest green
+
+cursorline = { bg = "#B0BAB0" }                      # source's CursorLine
+selection  = { bg = "#A0B0A0" }                      # source's Visual
+# The source's own `Search`, reversed out of the page — both halves, as
+# theme.md requires, so a match is legible on dimmed text rather than wearing
+# the colour it is supposed to stand out from.
+search     = { fg = "#BBC5B7", bg = "#002611", bold = true }
+# Background only: the text under a second cursor keeps its own colour, and
+# on a light frame the darker rung is what reads as a block.
+cursor_alt = { bg = "#8A9A88" }
+# The source's `IncSearch` / `CurSearch`: the darkest rung, which is this
+# palette's one "look here".
+flash      = { fg = "#BBC5B7", bg = "#001008" }
+label      = { fg = "#BBC5B7", bg = "#001008", bold = true }
+dim        = "#8A9A88"
+
+gutter         = "#A5B2A2"                           # source's LineNr
+gutter_current = { fg = "#002611", bold = true }     # source's CursorLineNr
+rule           = "#95A592"                           # source's WinSeparator
+filler         = "#A5B2A2"                           # source's EndOfBuffer
+indent_guide   = "#A5B2A2"
+# A departure: the source paints `Whitespace` the same faint rung as the
+# indent guide, and theme.md says a mark you asked for and then have to
+# squint at answers nothing. Lifted one rung, to the comment green.
+whitespace     = "#8A9A88"
+# Furniture, and the quietest of it — a shape you notice when you look for it
+# and not before.
+context        = "#95A592"
+# Chrome rather than furniture: it replaces a row of code, so it has to be
+# legible and has to read as not being part of the file.
+context_header = { fg = "#002611", bg = "#A5B2A2" }
+
+# Five rungs of the ladder, ordered by how much each is entitled to shout —
+# there is no hue to separate them with, and the word in the badge already
+# says which one it is, so the paint only has to say how loud. FIX is cream
+# on the darkest rung; NOTE is dark on a rung barely off the page.
+# See docs/specs/todo-comments.md.
+todo_fix   = { fg = "#BBC5B7", bg = "#001008", bold = true }
+todo_warn  = { fg = "#BBC5B7", bg = "#002611", bold = true }
+todo_todo  = { fg = "#BBC5B7", bg = "#1A3620", bold = true }
+todo_perf  = { fg = "#002611", bg = "#8A9A88", bold = true }
+todo_note  = { fg = "#002611", bg = "#A5B2A2", bold = true }
+
+# What the language server found wrong, worn by the text it names. The colour
+# cannot carry four severities here, so the ramp carries them and the
+# underline says "this is not syntax" — the source's own reading, which
+# bolds an error and italicises a hint.
+diag_error   = { fg = "#001008", bold = true, underline = true }
+diag_warning = { fg = "#002611", underline = true }
+diag_info    = { fg = "#6A7A68", underline = true }
+diag_hint    = { fg = "#8A9A88", italic = true, underline = true }
+
+# What a line has done since the index — the source's own GitSignsAdd,
+# GitSignsChange and GitSignsDelete. The bold on `git_delete` is added: added
+# and deleted are one rung apart, and the gutter glyph should not be doing all
+# the work alone. See docs/specs/git-signs.md.
+git_add      = "#002611"
+git_change   = "#8A9A88"
+git_delete   = { fg = "#001008", bold = true }
+
+# The float surface — hover, and the completion menu. The source's
+# NormalFloat, one rung lighter than the page so a float sits above it.
+popup = { fg = "#002611", bg = "#C5CFC2" }
+
+# The source's own lualine theme, which is where mfd-paper says what a mode
+# badge looks like: normal and insert reversed out at two darknesses, and
+# visual — the nearest thing to bi's pick — filled with a mid rung instead.
+mode_normal = { fg = "#BBC5B7", bg = "#002611", bold = true }
+mode_insert = { fg = "#BBC5B7", bg = "#001008", bold = true }
+mode_pick   = { fg = "#001008", bg = "#95A592", bold = true }
+
+status          = "#002611"
+status_muted    = "#8A9A88"
+status_inactive = { fg = "#8A9A88", bg = "#B0BAB0" }
+# Bold, which no other built-in bothers with: the focused row and an
+# unfocused one share a background here — the source's own StatusLine and
+# StatusLineNC — so weight is the only thing left to tell them apart. It is
+# the job `reverse` does in `ansi`.
+statusline      = { fg = "#002611", bg = "#B0BAB0", bold = true }
+
+tree_dir  = { fg = "#002611", bold = true }          # source's Directory
+tree_link = { fg = "#002611", italic = true }
+# A copied row is marked and stays; a cut row is on its way out, so it fades.
+# `render.rs` bolds both, so the difference has to be somewhere else.
+mark_copy = { fg = "#002611", underline = true }
+mark_cut  = { fg = "#8A9A88", italic = true }
+
+picker_border   = "#8A9A88"                          # source's FloatBorder
+picker_prompt   = { fg = "#002611", bold = true }
+picker_selected = { fg = "#002611", bg = "#A0B0A0", bold = true }
+picker_badge    = "#8A9A88"
+picker_divider  = "#95A592"
+# One rung off the buffer's own foreground: still a body of text you read,
+# but not the colour of the file you are looking for.
+picker_preview  = "#0A3018"
