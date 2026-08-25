@@ -226,9 +226,9 @@ named must not fall off the back of anything.
 
 **Capture first, name after.** `"n{operator}{motion}` runs the operator as
 ever, sink `Named`; when the command has settled its modes, the editor opens
-the `:` line prefilled with `name ` — the same prefilled-line prompt the tree
+the `:` line prefilled with `yname ` — the same prefilled-line prompt the tree
 uses for `rename`, because a prompt bi already has beats prompt machinery it
-does not. `Enter` on `:name a` files the capture under `a`. The prompt opens
+does not. `Enter` on `:yname a` files the capture under `a`. The prompt opens
 *after* the whole command, not inside `capture`: a visual operator ends
 visual mode after capturing, and a prompt opened mid-command would not
 survive it.
@@ -237,10 +237,10 @@ survive it.
 editing the line into some other command — sends the held capture to the
 ring, where an unnamed capture would have gone. `"ndd` then `Esc` is a
 delete, not a data loss. The capture never survives leaving the prompt:
-`:name` consumes it, everything else releases it to the ring.
+`:yname` consumes it, everything else releases it to the ring.
 
-**A name means one thing.** `:name a` over an existing `a` replaces it;
-renaming is re-yanking. `:name` with nothing held says so.
+**A name means one thing.** `:yname a` over an existing `a` replaces it;
+renaming is re-yanking. `:yname` with nothing held says so.
 
 **Paste is a choice, not a slot.** `"np` / `"nP` open the picker over the
 names, most recently named first — the row is the name, the entry rides in

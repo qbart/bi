@@ -627,8 +627,8 @@ pub struct Session {
     /// A paste waiting on a name for the file it stopped at.
     pub pasting: Option<Pasting>,
     /// A capture waiting on its register name — the text `"n{operator}` took,
-    /// held while the `:name ` prompt is up. Never survives leaving the
-    /// prompt: `:name` consumes it, anything else sends it to the ring.
+    /// held while the `:yname ` prompt is up. Never survives leaving the
+    /// prompt: `:yname` consumes it, anything else sends it to the ring.
     pending_named: Option<Entry>,
     /// The world's clipboard, when a frontend has supplied one. `None` is an
     /// embedder that has not, and every test: `"+y` then says so and changes
@@ -809,7 +809,7 @@ impl Session {
             // Nothing ever reaches the black hole, which is the point of it.
             Sink::BlackHole => {}
             // Held, not stored: the name is asked for once the command is
-            // done — `Editor::apply` opens the `:name ` prompt when it sees
+            // done — `Editor::apply` opens the `:yname ` prompt when it sees
             // the capture waiting, because opening it here would be undone by
             // the mode changes the rest of the command still makes.
             Sink::Named => self.pending_named = Some(entry),
@@ -1501,7 +1501,7 @@ enum ExLine {
     /// seen it, and typing the value both times is typing the wrong one.
     Whitespace(Option<bool>),
     Set(String),
-    /// `:name <register>` — stores the capture waiting on a name. Typed by
+    /// `:yname <register>` — stores the capture waiting on a name. Typed by
     /// the prompt `"n` prefills far more often than by hand.
     Name(String),
     Create(String),
@@ -1859,8 +1859,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
-        "name" => match arg {
-            "" => ExLine::Error("name it what? `:name {register}`".into()),
+        "yname" => match arg {
+            "" => ExLine::Error("name it what? `:yname {register}`".into()),
             name => ExLine::Name(name.into()),
         },
         // `on`/`off` as well as `true`/`false`: this one is spelled as a
@@ -4182,9 +4182,20 @@ impl Editor {
 
     fn open_buffer_picker(&mut self) {
         let ids = self.mru_ids();
+        // Relative to the session's root where a path is under it — what you
+        // would have typed, and a column of identical prefixes says nothing.
+        // The file picker's rule; a path outside the root stays whole.
+        let root = self.tree_root(None);
         let items = ids
             .iter()
-            .map(|&id| Item { text: self.name_of(id), badge: self.is_modified(id).then_some('+') })
+            .map(|&id| {
+                let name = self.name_of(id);
+                let text = Path::new(&name)
+                    .strip_prefix(&root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(name);
+                Item { text, badge: self.is_modified(id).then_some('+') }
+            })
             .collect();
         // No length floor: a file named `a` is a file, and hiding it behind
         // `Ctrl-A` is the register ring's problem, not this list's.
@@ -4805,7 +4816,7 @@ impl Editor {
                 self.session.mode = Mode::Normal;
                 // The one `:` line that means something when abandoned.
                 self.abandon_paste();
-                // Backing out of the `:name ` prompt must not lose the text —
+                // Backing out of the `:yname ` prompt must not lose the text —
                 // it goes where an unnamed capture always goes.
                 if let Some(entry) = self.session.pending_named.take() {
                     self.session.registers.push(entry);
@@ -4832,7 +4843,7 @@ impl Editor {
                 self.session.cmd_history.push(&line);
                 self.run_ex_over(&line, shape);
                 self.revive_visual(shape);
-                // `:name` consumed it; any other line typed over the prompt
+                // `:yname` consumed it; any other line typed over the prompt
                 // leaves it, and it goes to the ring rather than lingering
                 // into the next capture.
                 if let Some(entry) = self.session.pending_named.take() {
@@ -5875,7 +5886,7 @@ impl Editor {
     /// *where the cursor is*, not the session's: that is the one you can see,
     /// and flipping the one behind it would turn the mark off in a window that
     /// never had it on.
-    /// `:name {register}` — stores the capture the `"n` prompt is holding.
+    /// `:yname {register}` — stores the capture the `"n` prompt is holding.
     ///
     /// Renaming is re-yanking: an existing name is simply replaced, because a
     /// prompt that stops to ask "are you sure" about a register is slower
@@ -6063,7 +6074,7 @@ impl Editor {
         // *after* capturing, and a prompt opened inside would not survive it.
         if self.session.pending_named.is_some() && !matches!(self.session.mode, Mode::Command(_)) {
             self.session.status.clear();
-            self.session.mode = Mode::Command("name ".into());
+            self.session.mode = Mode::Command("yname ".into());
         }
     }
 
@@ -14754,7 +14765,7 @@ mod tests {
     // ---- named registers ---------------------------------------------------
 
     /// `"nyy` captures first and asks after: the prompt opens prefilled once
-    /// the command is done, and `:name a` files the capture under the name —
+    /// the command is done, and `:yname a` files the capture under the name —
     /// in the named space, not on the ring.
     #[test]
     fn a_named_capture_prompts_and_the_name_stores_it() {
@@ -14767,7 +14778,7 @@ mod tests {
             sink: Sink::Named,
         }));
         assert!(
-            matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "name "),
+            matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "yname "),
             "the prompt opened prefilled"
         );
 
@@ -14826,7 +14837,7 @@ mod tests {
     #[test]
     fn naming_with_nothing_pending_reports() {
         let mut ed = editor("x");
-        ed.run_ex("name a");
+        ed.run_ex("yname a");
         assert!(ed.session.registers.named().is_empty());
         assert_eq!(ed.session.status, "nothing to name — `\"n` captures first");
     }
@@ -18955,6 +18966,27 @@ int main(void) {
         ed.apply(cmd(Action::Buffer(BufferCmd::List)));
 
         assert_eq!(names(&ed), ["c.txt", "b.txt", "a.txt"]);
+    }
+
+    /// The rows are paths relative to the session's root — what you would
+    /// have typed, the file picker's rule. A path outside the root stays
+    /// whole rather than sprouting `../`s.
+    #[test]
+    fn the_switcher_shows_paths_relative_to_the_root() {
+        let (files, mut ed) = three("mru-relative");
+        ed.session.tree_root = Some(files.0.clone());
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+
+        let rows: Vec<&str> = ed
+            .session
+            .picker
+            .as_ref()
+            .expect("the list is up")
+            .items()
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(rows, ["c.txt", "b.txt", "a.txt"], "no absolute prefixes");
     }
 
     /// Opened *and taken* is a switch: the row it starts on is the buffer you
