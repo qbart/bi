@@ -114,6 +114,9 @@ gitignore = true
 # `gb` (or `gameboy`) is a Game Boy's screen — dark green on a cream LCD, one
 # hue from end to end, with bold, italic and underline doing the work colour
 # usually does. After the `mfd-paper` variant of github.com/kungfusheep/mfd.nvim.
+# `forest` (or `lighthaus`) is greens and teals on a near-black frame, with one
+# warm accent kept for a match, a flash and a selection. After
+# github.com/lighthaus-theme/vim-lighthaus.
 # See docs/specs/theme.md.
 theme = "main"
 

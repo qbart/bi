@@ -353,6 +353,7 @@ const PASCAL: &str = include_str!("themes/pascal.toml");
 const ANSI: &str = include_str!("themes/ansi.toml");
 const VESPER: &str = include_str!("themes/vesper.toml");
 const GB: &str = include_str!("themes/gb.toml");
+const FOREST: &str = include_str!("themes/forest.toml");
 
 impl Default for Theme {
     /// The shipped `main`, parsed.
@@ -384,6 +385,10 @@ impl Theme {
             // `gameboy` is what it looks like. A name is not a palette, so
             // there is nothing to keep in sync by letting both reach it.
             "gb" | "gameboy" => Some(GB),
+            // Likewise: `forest` is what the palette is, `lighthaus` is where
+            // it came from, and someone who knows one should not have to
+            // learn the other to find it.
+            "forest" | "lighthaus" => Some(FOREST),
             _ => None,
         }
     }
@@ -395,8 +400,16 @@ impl Theme {
     /// it are different decisions, and only the first one is available.
     /// `gruvbox-dark` is here for a different reason: it *was* the default,
     /// and a theme losing that job is not a theme being withdrawn.
-    pub const BUILTINS: &'static [&'static str] =
-        &[DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "pascal", "ansi", "vesper", "gb"];
+    pub const BUILTINS: &'static [&'static str] = &[
+        DEFAULT_THEME,
+        "gruvbox-dark",
+        "gruvbox-light",
+        "pascal",
+        "ansi",
+        "vesper",
+        "gb",
+        "forest",
+    ];
 
     /// The style for a capture name, walking down one dotted segment at a
     /// time: `string.special.key` asks for `string.special`, then `string`.
@@ -842,7 +855,7 @@ mod tests {
         // the two with, so it separates them with weight and slant instead —
         // and because this compares `Style`s rather than colours, it cannot
         // tell the difference. Which is the point.
-        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper", "gb"] {
+        for name in [DEFAULT_THEME, "gruvbox-dark", "gruvbox-light", "vesper", "gb", "forest"] {
             let theme = parsed(name);
             let string = theme.style("string");
             for special in ["string.special.symbol", "string.special.regex"] {
@@ -951,6 +964,107 @@ mod tests {
         assert!(gb.style("string").unwrap().italic, "strings are the italic ones");
         assert!(gb.style("type").unwrap().underline, "a type is a shape, and gets a rule");
         assert!(gb.style("function").unwrap().bold);
+    }
+
+    /// The name is a claim, so this is the test that holds it to one: the
+    /// canopy is green, and the warmth is only where something wants looking
+    /// at. Two sentences, and between them they are the whole shape of the
+    /// theme — including the answer to why a palette called `forest` is
+    /// allowed a `#E25600` in it at all.
+    #[test]
+    fn forest_is_green_where_it_is_code_and_warm_where_it_is_attention() {
+        let forest = parsed("forest");
+
+        for role in [
+            "keyword",
+            "operator",
+            "label",
+            "function",
+            "constructor",
+            "type",
+            "module",
+            "tag",
+            "boolean",
+            "string",
+            "character",
+        ] {
+            let Some(Color::Rgb(r, g, _)) = forest.style(role).and_then(|s| s.fg) else {
+                panic!("forest leaves {role} unpainted, or paints it something other than rgb")
+            };
+            assert!(g > r, "forest: {role} is warmer than the canopy it is part of");
+        }
+
+        // And the other half, which is what makes the first half mean
+        // anything: the roles that exist to interrupt you are the ones
+        // allowed to be warm. Either half may be the warm one — a match and a
+        // flash are warm blocks under dark text, and lighthaus's selection is
+        // the reverse of that, warm text in a hole darker than the page.
+        let warm = |c: Option<Color>| matches!(c, Some(Color::Rgb(r, g, _)) if r >= g);
+        for (role, style) in [
+            ("search", forest.ui.search),
+            ("flash", forest.ui.flash),
+            ("label", forest.ui.label),
+            ("selection", forest.ui.selection),
+        ] {
+            assert!(
+                warm(style.fg) || warm(style.bg),
+                "forest: {role} is asking for attention in a canopy colour"
+            );
+        }
+
+        assert_eq!(forest.ui.background, Some(Color::Rgb(0x18, 0x19, 0x1e)));
+        assert_eq!(forest.ui.foreground, Some(Color::Rgb(0xff, 0xfa, 0xde)));
+
+        // Two spellings, one theme.
+        assert_eq!(Theme::builtin("lighthaus"), Theme::builtin("forest"));
+    }
+
+    /// `pascal`'s fence in a third palette. "Sourced rather than sampled" is
+    /// the kind of claim that stays true until someone nudges one value by
+    /// eye, so the twenty-odd `s:` variables in `colors/lighthaus.vim` are
+    /// written out here and the file is held to them.
+    #[test]
+    fn forest_uses_nothing_but_lighthaus_own_palette() {
+        const LIGHTHAUS: &[&str] = &[
+            "21252d", // black
+            "8e8d8d", // grey
+            "373c45", // non_text
+            "18191e", // bg
+            "282c34", // gutter_bg
+            "fc2929", // red
+            "ff5050", // red2
+            "44b273", // green
+            "50c16e", // green2
+            "e25600", // orange
+            "ed722e", // orange2
+            "1d918b", // blue
+            "47a8a1", // blue2
+            "d16bb7", // purple
+            "d68eb2", // purple2
+            "00bfa4", // cyan
+            "5ad1aa", // cyan2
+            "cccccc", // white2
+            "fffade", // white, and fg
+            "ffee79", // fg_alt
+            "ffff00", // hl_yellow
+            "ff4d00", // hl_orange
+            "090b26", // hl_bg
+        ];
+        let src = Theme::builtin("forest").expect("forest is built in");
+        for (line, text) in src.lines().enumerate() {
+            for (at, _) in text.match_indices('#') {
+                let rest = &text[at + 1..];
+                if rest.len() < 6 || !rest.as_bytes()[..6].iter().all(u8::is_ascii_hexdigit) {
+                    continue; // prose after a `#`, not a colour
+                }
+                let hex = rest[..6].to_ascii_lowercase();
+                assert!(
+                    LIGHTHAUS.contains(&hex.as_str()),
+                    "forest.toml:{}: #{hex} is not one of lighthaus's own",
+                    line + 1
+                );
+            }
+        }
     }
 
     /// The theme is only worth having if it looks like the thing, and the two

@@ -270,7 +270,7 @@ without changing the type.
 
 ## The built-ins
 
-Seven, compiled in with `include_str!`, and parsed through the same parser a
+Eight, compiled in with `include_str!`, and parsed through the same parser a
 user file goes through — so a malformed built-in fails a test rather than
 being a second code path that cannot be wrong.
 
@@ -551,6 +551,76 @@ source's colour for the same reason it needed one — `git_add` and
 `git_delete` are one ramp step apart, and the gutter glyph should not be
 doing all the work alone.
 
+### `forest`
+
+Greens and teals on a near-black frame, with one warm accent kept for the
+things that are trying to get your attention. After
+[lighthaus-theme/vim-lighthaus](https://github.com/lighthaus-theme/vim-lighthaus),
+read out of that project's `colors/lighthaus.vim` and its lightline theme.
+`:set theme forest`, or `lighthaus`, which is the name the palette came under.
+
+| | |
+|---|---|
+| keyword, operator, label | cyan `#5AD1AA` |
+| function, constructor, type, module, tag, boolean | teal `#47A8A1` |
+| string, character | green `#50C16E` |
+| comment | grey `#8E8D8D` |
+| constant, escape | warm yellow `#FFEE79` |
+| number, float | dusty pink `#D68EB2` |
+| property, attribute, `string.special.key`, `.symbol` | magenta `#D16BB7` |
+| `string.special.regex` | cyan `#5AD1AA`, the source's own `TSStringRegex` |
+| punctuation, delimiter | `#CCCCCC` |
+| background / foreground | `#18191E` / `#FFFADE` |
+| search | `#18191E` on orange `#E25600` |
+
+**The name is a claim, so a test holds it to one.** Every colour that paints
+*code* — keyword, function, type, module, tag, string, character, boolean,
+operator, label — has more green in it than red. Every colour that paints
+*attention* — a search match, a yank flash, a jump label, the selection — has
+at least as much red as green. That is the whole shape of the theme in two
+sentences: a green canopy, and warmth only where something wants looking at.
+It is also the answer to why this palette can afford `#E25600` at all. A
+second test fences every value in the file to lighthaus's own twenty-odd `s:`
+variables, the way `pascal`'s does the EGA sixteen, so "sourced rather than
+sampled" stays true after the next edit.
+
+**bi's furniture is other plugins' furniture, and lighthaus themed all of
+them.** This is the built-in that needed the least invention: the picker is
+`FZF_border`, `FZF_prompt`, `FZF_info` and `PmenuSel`; the four diagnostic
+severities are the four `Coc*Highlight`/`Coc*Sign` groups; the three git signs
+are `GitGutterAdd`, `GitGutterChange` and `GitGutterDelete`; `tree_dir` is
+`NerdTreeDir`; the three mode badges are lightline's normal, insert and visual
+rows. Where `vesper` had to build a mode badge out of a palette that had no
+concept of one, this one could look it up.
+
+**Comments are the departure, and it is the same argument gruvbox-dark's
+orange operators make.** lighthaus paints `Comment` in `white2` `#CCCCCC`,
+one step off plain foreground — so a comment reads at very nearly the weight
+of the code it is explaining. That is "a capture styled the colour of nothing"
+arriving from the other side: the capture fires, and the reader still cannot
+tell prose from program. This file takes the palette's own `grey` `#8E8D8D`
+instead, which lighthaus already uses for `LineNr` and `jsonQuote` and gives
+to no syntax role, so the departure costs no new colour.
+
+Three smaller ones, all marked in the file. `tag` takes the type colour rather
+than vim's `Tag` group — vim's `Tag` means "you can press CTRL-] on this",
+which is not what a tree-sitter `@tag` is, and the reasoning that put element
+names on the type colour in `gruvbox-dark` applies unchanged. `rule`,
+`indent_guide` and `whitespace` come from `non_text` rather than from the
+source's own answers, because lighthaus draws its split as a filled dark bar
+and its indent guides as filled columns, and bi draws both as a single `│`
+glyph — a colour chosen to be a bar is either invisible or deafening as a
+glyph. `whitespace` is then lifted one step to `grey` for the reason `gb`'s
+was: a mark you asked for and have to squint at answers nothing.
+
+**Selected text goes orange, which no other built-in does.** `selection` is
+the source's own `Visual` — `#FF4D00` on `#090B26` — and it names a
+foreground, so selecting a range repaints it rather than tinting what is
+underneath. Every other theme here leaves the syntax showing through. It is
+kept because it is the most recognisable thing about lighthaus on screen, and
+because `#090B26` is darker than the frame: the selection reads as a hole cut
+in the page with the text glowing in it.
+
 ## Testing
 
 - every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
@@ -597,6 +667,14 @@ doing all the work alone.
   for the same reason: the constraint is the theme, and a single off-hue value
   would not be a tweak to it
 - `gb` and `gameboy` name the same built-in, and it is listed under `gb`
+- `forest` is green where it paints code and warm where it paints attention —
+  the two sentences its name is a claim about, checked against the roles
+  rather than asserted in a comment
+- every value in `forest` is one of lighthaus's own `s:` variables, so
+  "sourced rather than sampled" survives the next edit. `pascal`'s fence
+  again, and `gb`'s, in a third palette
+- `forest` and `lighthaus` name the same built-in, and it is listed under
+  `forest`
 
 ## Deferred
 
