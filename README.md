@@ -162,7 +162,7 @@ pulling the next line up.
 | `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise — over a selection they replace it |
 | `"p` `"P` | open the picker to choose from everything captured, then paste |
 | `"_` | black hole prefix — `"_dd` deletes without capturing |
-| `"n` | the named space: `"nyy` captures and then asks `:yname {register}`; `"np` picks among the names |
+| `"n` | the named space: `"nyy` captures and then asks `:yname {register}`; `"np` picks among the names. `:{range}yname x` yanks the range straight in |
 | `"+y` `"+p` | the system clipboard; `"*` is a spelling of the same register |
 
 Every `y`, `d`, `c` and `x` captures automatically into a 4096-deep ring, so

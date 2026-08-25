@@ -240,7 +240,15 @@ delete, not a data loss. The capture never survives leaving the prompt:
 `:yname` consumes it, everything else releases it to the ring.
 
 **A name means one thing.** `:yname a` over an existing `a` replaces it;
-renaming is re-yanking. `:yname` with nothing held says so.
+renaming is re-yanking.
+
+**`:yname` takes a range.** `:1,5yname a`, or `'v` over a selection, is a
+scoped yank straight into the named space — the name is already on the line,
+so there is nothing to prompt for, and the ring is not involved. The region's
+own shape travels with the text, exactly as a capture's does. No range and
+nothing held falls back to the cursor's line, the answer every line-scoped
+`:` command gives; the capture the prompt is holding wins a bare `:yname`,
+because that *is* the prompt flow.
 
 **Paste is a choice, not a slot.** `"np` / `"nP` open the picker over the
 names, most recently named first — the row is the name, the entry rides in

@@ -1502,8 +1502,13 @@ enum ExLine {
     Whitespace(Option<bool>),
     Set(String),
     /// `:yname <register>` — stores the capture waiting on a name. Typed by
-    /// the prompt `"n` prefills far more often than by hand.
-    Name(String),
+    /// the prompt `"n` prefills far more often than by hand. With a range or
+    /// a selection it is a scoped yank instead: the region goes straight into
+    /// the named space, no prompt — the name is already on the line.
+    Name {
+        scope: Option<Scope>,
+        name: String,
+    },
     Create(String),
     Rename {
         from: String,
@@ -1816,6 +1821,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 | "&"
                 | "&&"
                 | "d"
+                | "yname"
                 | "normal"
                 | "norm"
         )
@@ -1861,7 +1867,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "set" => ExLine::Set(arg.into()),
         "yname" => match arg {
             "" => ExLine::Error("name it what? `:yname {register}`".into()),
-            name => ExLine::Name(name.into()),
+            name => ExLine::Name { scope, name: name.into() },
         },
         // `on`/`off` as well as `true`/`false`: this one is spelled as a
         // command rather than as a setting, and a command reads better with the
@@ -5556,7 +5562,16 @@ impl Editor {
             ExLine::Highlight(on) => self.session.options.hlsearch = on,
             ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
-            ExLine::Name(name) => self.name_pending(&name),
+            ExLine::Name { scope, name } => {
+                // The capture the `"n` prompt is holding wins a bare
+                // `:yname` — that is the prompt flow. A range, a selection,
+                // or nothing held yanks the region the way `:d` deletes it.
+                if scope.is_none() && shape.is_none() && self.session.pending_named.is_some() {
+                    self.name_pending(&name);
+                } else {
+                    self.in_view(|view| view.yank_named(scope, shape, &name));
+                }
+            }
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Rename { from, to } => self.rename_path(&from, &to),
             ExLine::Delete { path, force } => self.delete_path(&path, force),
@@ -9589,6 +9604,22 @@ impl View<'_> {
 
     /// `:[range]d` — the rows, gone. The cursor's line by default. See
     /// `docs/specs/global.md`.
+    /// `:yname {register}` with a range or a selection — a scoped yank into
+    /// the named space. The region's own shape travels with the text, so a
+    /// charwise selection pastes back inline and a line range as lines.
+    fn yank_named(&mut self, scope: Option<Scope>, shape: Option<Shape>, name: &str) {
+        let region = match self.region(scope, shape, Fallback::CursorRow) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let entry = Entry { text: region.text(self.buffer), kind: region.shape() };
+        self.session.registers.set_named(name, entry);
+        self.session.status = format!("named \"{name}\"");
+    }
+
     fn delete_rows(&mut self, scope: Option<Scope>, shape: Option<Shape>) {
         let region = match self.region(scope, shape, Fallback::CursorRow) {
             Ok(region) => region,
@@ -14834,12 +14865,46 @@ mod tests {
         assert_eq!(ed.session.status, "no named registers");
     }
 
+    /// `:yname` takes a range, the way `:d` does: the region goes straight
+    /// into the named space — the name is already on the line, so there is
+    /// nothing to prompt for.
     #[test]
-    fn naming_with_nothing_pending_reports() {
-        let mut ed = editor("x");
+    fn yname_with_a_range_yanks_the_lines_into_the_name() {
+        let mut ed = editor("one\ntwo\nthree\n");
+        ed.run_ex("1,2yname a");
+
+        let entry = ed.session.registers.named_at(0).unwrap();
+        assert_eq!(entry.text, "one\ntwo\n");
+        assert_eq!(entry.kind, Shape::Lines);
+        assert!(ed.session.registers.is_empty(), "the ring is not involved");
+    }
+
+    /// No range and nothing held is the cursor's line — the same fallback
+    /// every line-scoped `:` command answers with.
+    #[test]
+    fn a_bare_yname_with_nothing_held_yanks_the_cursor_line() {
+        let mut ed = editor("one\ntwo\n");
+        ed.set_cursor(Cursor::at(0));
         ed.run_ex("yname a");
-        assert!(ed.session.registers.named().is_empty());
-        assert_eq!(ed.session.status, "nothing to name — `\"n` captures first");
+
+        let entry = ed.session.registers.named_at(0).unwrap();
+        assert_eq!(entry.text, "one\n");
+        assert_eq!(entry.kind, Shape::Lines);
+    }
+
+    /// Over a selection — the `'v` scope the `:` line prefills from visual —
+    /// it takes the selection with its own shape, so what was charwise
+    /// pastes back inline.
+    #[test]
+    fn yname_over_a_selection_keeps_its_shape() {
+        let mut ed = visual("one two", 4, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.apply(cmd(Action::Move(Motion::Right)));
+        ed.run_ex("'vyname a");
+
+        let entry = ed.session.registers.named_at(0).unwrap();
+        assert_eq!(entry.kind, Shape::Chars);
+        assert_eq!(entry.text, "two");
     }
 
     // ---- replace mode ------------------------------------------------------
