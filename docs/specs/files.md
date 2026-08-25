@@ -1,15 +1,18 @@
-# `Ctrl-P` — open a file by typing part of its name
+# `gf` — open a file by typing part of its name
 
 The tree is for looking around. When you already know the name, walking a tree
 to it is four keys too many.
 
 ## Status
 
-**Built.**
+**Built.** Opened by `gf` since the keys were rearranged — `gf` goes to a
+file, `gb` goes to a buffer — and `Ctrl-P` no longer opens it from a text
+window. A tree pane still answers `Ctrl-P`, because `gf` there is the walk
+over the tree's own rows (`docs/specs/tree.md`) and the letter was taken.
 
 ## What it is
 
-`Ctrl-P` opens the picker over every file under the session's root, filtered as
+`gf` opens the picker over every file under the session's root, filtered as
 you type, and opens the one you choose in the focused window. It is the same
 overlay the register ring and `:ls` use — the widget was written to be shared,
 and this is its third client.

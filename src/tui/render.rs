@@ -13,7 +13,7 @@ use bi::buffer::Cursor;
 use bi::config::Options;
 use bi::decoration::{Decoration, Layer};
 use bi::editor::{Editor, Mode, Pane};
-use bi::indent::{display_col, expand_tabs};
+use bi::indent::{char_width, display_col, expand_tabs};
 use bi::picker::{Picker, PickerKind};
 use bi::region::Shape;
 use bi::selection::Selections;
@@ -117,7 +117,7 @@ fn paint_range(
     let mut col = 0usize;
     for span in spans {
         let text = span.content.to_string();
-        let width = text.chars().count();
+        let width = span_width(&text);
         let (start, end) = (col, col + width);
         col = end;
 
@@ -125,17 +125,29 @@ fn paint_range(
             out.push(span);
             continue;
         }
-        let lo = cols.start.saturating_sub(start);
-        let hi = (cols.end - start).min(width);
-        let take =
-            |from: usize, to: usize| -> String { text.chars().take(to).skip(from).collect() };
-
-        if lo > 0 {
-            out.push(Span::styled(take(0, lo), span.style));
+        // Cell by cell rather than by char index, because a wide char is two
+        // cells and a combining mark is none. A char is painted when any of
+        // its cells fall in the range; a zero-width char goes with its base.
+        let (mut before, mut mid, mut after) = (String::new(), String::new(), String::new());
+        let mut at = start;
+        for ch in text.chars() {
+            let w = char_width(ch);
+            let piece = if at + w <= cols.start || (w == 0 && at <= cols.start) {
+                &mut before
+            } else if at < cols.end {
+                &mut mid
+            } else {
+                &mut after
+            };
+            piece.push(ch);
+            at += w;
         }
-        out.push(Span::styled(take(lo, hi), span.style.patch(over)));
-        if hi < width {
-            out.push(Span::styled(take(hi, width), span.style));
+        if !before.is_empty() {
+            out.push(Span::styled(before, span.style));
+        }
+        out.push(Span::styled(mid, span.style.patch(over)));
+        if !after.is_empty() {
+            out.push(Span::styled(after, span.style));
         }
     }
     out
@@ -151,24 +163,47 @@ fn split_at_col(spans: Vec<Span<'static>>, col: usize) -> (Vec<Span<'static>>, V
     let mut at = 0usize;
     for span in spans {
         let text = span.content.to_string();
-        let width = text.chars().count();
-        if at + width <= col {
+        let width = span_width(&text);
+        // A zero-width span sitting exactly on the cut stays left while
+        // nothing has gone right — a combining mark belongs to the base
+        // char before it.
+        let zero_on_cut = at == col && width == 0 && right.is_empty();
+        if at + width <= col && (at < col || width > 0 || zero_on_cut) {
             at += width;
             left.push(span);
         } else if at >= col {
             at += width;
             right.push(span);
         } else {
-            let cut = col - at;
+            // Cell walk: a wide char straddling the cut goes right whole —
+            // half a glyph is not a thing a terminal can draw — and a
+            // zero-width char follows whatever its base did.
+            let (mut a, mut b) = (String::new(), String::new());
+            let mut cell = at;
+            for ch in text.chars() {
+                let w = char_width(ch);
+                if cell + w <= col || (w == 0 && cell <= col && b.is_empty()) {
+                    a.push(ch);
+                } else {
+                    b.push(ch);
+                }
+                cell += w;
+            }
             at += width;
-            left.push(Span::styled(text.chars().take(cut).collect::<String>(), span.style));
-            right.push(Span::styled(text.chars().skip(cut).collect::<String>(), span.style));
+            left.push(Span::styled(a, span.style));
+            right.push(Span::styled(b, span.style));
         }
     }
     if at < col && right.is_empty() {
         left.push(Span::raw(" ".repeat(col - at)));
     }
     (left, right)
+}
+
+/// How many cells a span's text occupies. Tabs are already expanded by the
+/// time text is a span, so every char answers for itself.
+fn span_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
 }
 
 /// Draws `text` over the cells at `col`, replacing as many as it is wide.
@@ -182,7 +217,7 @@ fn overlay(
     style: ThemeStyle,
 ) -> Vec<Span<'static>> {
     let (mut out, rest) = split_at_col(spans, col);
-    let (_replaced, right) = split_at_col(rest, text.chars().count());
+    let (_replaced, right) = split_at_col(rest, span_width(text));
     out.push(Span::styled(text.to_string(), tui(style)));
     out.extend(right);
     out
@@ -220,7 +255,7 @@ fn insert_inline(
         out.push(Span::styled(text.to_string(), tui(style)));
         out.extend(right);
         spans = out;
-        shift += text.chars().count();
+        shift += span_width(text);
     }
     spans
 }
@@ -234,7 +269,7 @@ fn inline_shift(decorations: &[Decoration], row: usize, col: usize) -> usize {
         .iter()
         .filter_map(|d| match d {
             Decoration::Inline { row: at, col: c, text, .. } if *at == row && *c <= col => {
-                Some(text.chars().count())
+                Some(span_width(text))
             }
             _ => None,
         })
@@ -307,7 +342,7 @@ fn fill_line(
     width: usize,
 ) -> Vec<Span<'static>> {
     let Some(bg) = bg.map(color) else { return spans };
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = spans.iter().map(|s| span_width(&s.content)).sum();
     let (mut out, rest) = split_at_col(spans, from);
     out.extend(rest.into_iter().map(|s| {
         // Only where nothing is painted yet: a selection on the cursor's own
@@ -356,7 +391,7 @@ fn styled_line(
                 *col += n;
             } else {
                 expanded.push(ch);
-                *col += 1;
+                *col += char_width(ch);
             }
         }
         out.push(Span::styled(expanded, style));
@@ -808,7 +843,7 @@ fn render_window(
         // editor mutably, which one shared entry point cannot offer.
         Pane::Image { .. } => return None,
     };
-    let (scroll, selections) = (text.scroll, &text.selections);
+    let (scroll, left, selections) = (text.scroll, text.left, &text.selections);
 
     // The one number the core owns and the renderer used to guess — and this
     // buffer's, not the session's, so a Makefile and the file beside it can
@@ -986,6 +1021,16 @@ fn render_window(
         // column above this point is a column of the text as it stands.
         spans = insert_inline(spans, &line, &decorations);
 
+        // The horizontal scroll, after every pass that speaks in absolute
+        // columns: the gutter stays, the next `left` columns of text go, so
+        // nothing above ever learns the window slid sideways.
+        if left > 0 {
+            let (head, rest) = split_at_col(spans, gutter);
+            let (_hidden, visible) = split_at_col(rest, left);
+            spans = head;
+            spans.extend(visible);
+        }
+
         // A linewise selection reaches the edge of the pane, past the gutter —
         // it wins over the cursor line, which is the weaker statement about the
         // same row. The cursor line itself is lit only in the focused window,
@@ -1016,10 +1061,32 @@ fn render_window(
     if let Some(hover) = &ed.session.hover
         && hover.window == id
     {
-        render_hover(frame, hover, buffer, ed.theme(), scroll, last_row, gutter, tab, text_area);
+        render_hover(
+            frame,
+            hover,
+            buffer,
+            ed.theme(),
+            scroll,
+            last_row,
+            gutter,
+            left,
+            tab,
+            text_area,
+        );
     }
     if focused && let Some(menu) = &ed.session.completion {
-        render_menu(frame, menu, buffer, &ed.theme().ui, scroll, last_row, gutter, tab, text_area);
+        render_menu(
+            frame,
+            menu,
+            buffer,
+            &ed.theme().ui,
+            scroll,
+            last_row,
+            gutter,
+            left,
+            tab,
+            text_area,
+        );
     }
     // Above the cursor while the menu sits below the word — both at once is
     // exactly the moment both are wanted: picking an argument while being
@@ -1033,26 +1100,28 @@ fn render_window(
             scroll,
             last_row,
             gutter,
+            left,
             tab,
             text_area,
         );
     }
 
     focused.then(|| {
-        (
-            text_area.x + (gutter + cursor_screen_col) as u16,
-            text_area.y + (cursor_row.saturating_sub(scroll)) as u16,
-        )
+        let col = (gutter + cursor_screen_col.saturating_sub(left))
+            .min(text_area.width.saturating_sub(1) as usize);
+        (text_area.x + col as u16, text_area.y + (cursor_row.saturating_sub(scroll)) as u16)
     })
 }
 
 /// The screen cell a char offset occupies, when it is on screen at all.
+#[allow(clippy::too_many_arguments, reason = "a pane's geometry is this many facts")]
 fn anchor_cell(
     buffer: &bi::buffer::Buffer,
     anchor: usize,
     scroll: usize,
     last_row: usize,
     gutter: usize,
+    left: usize,
     tab: usize,
     area: Rect,
 ) -> Option<(u16, u16)> {
@@ -1061,7 +1130,12 @@ fn anchor_cell(
     if !(scroll..last_row).contains(&row) {
         return None;
     }
-    let col = display_col(&buffer.line(row), buffer.col_at(at), tab) + gutter;
+    let col = display_col(&buffer.line(row), buffer.col_at(at), tab);
+    // Scrolled off to the left is off screen the same as scrolled off above.
+    if col < left {
+        return None;
+    }
+    let col = col - left + gutter;
     Some((
         area.x + (col.min(area.width.saturating_sub(1) as usize)) as u16,
         area.y + (row - scroll) as u16,
@@ -1106,12 +1180,13 @@ fn render_hover(
     scroll: usize,
     last_row: usize,
     gutter: usize,
+    left: usize,
     tab: usize,
     area: Rect,
 ) {
     use bi::editor::HoverLine;
 
-    let Some(anchor) = anchor_cell(buffer, hover.anchor, scroll, last_row, gutter, tab, area)
+    let Some(anchor) = anchor_cell(buffer, hover.anchor, scroll, last_row, gutter, left, tab, area)
     else {
         return;
     };
@@ -1201,10 +1276,12 @@ fn render_menu(
     scroll: usize,
     last_row: usize,
     gutter: usize,
+    left: usize,
     tab: usize,
     area: Rect,
 ) {
-    let Some(anchor) = anchor_cell(buffer, menu.replace.start, scroll, last_row, gutter, tab, area)
+    let Some(anchor) =
+        anchor_cell(buffer, menu.replace.start, scroll, last_row, gutter, left, tab, area)
     else {
         return;
     };
@@ -1213,7 +1290,7 @@ fn render_menu(
     if total == 0 {
         return;
     }
-    let label_width = menu.matches().take(100).map(|i| i.label.chars().count()).max().unwrap_or(0);
+    let label_width = menu.matches().take(100).map(|i| span_width(&i.label)).max().unwrap_or(0);
     let width = (label_width + 4).clamp(8, area.width as usize) as u16;
     let height = total.min(8) as u16;
     let Some(rect) = float_rect(anchor, (width, height), area, false) else { return };
@@ -1258,10 +1335,12 @@ fn render_signature(
     scroll: usize,
     last_row: usize,
     gutter: usize,
+    left: usize,
     tab: usize,
     area: Rect,
 ) {
-    let Some(anchor) = anchor_cell(buffer, sig.anchor, scroll, last_row, gutter, tab, area) else {
+    let Some(anchor) = anchor_cell(buffer, sig.anchor, scroll, last_row, gutter, left, tab, area)
+    else {
         return;
     };
     let data = &sig.data;
@@ -1295,9 +1374,19 @@ fn render_signature(
 }
 
 fn truncate(text: &str, width: usize) -> String {
-    match text.chars().count() > width {
+    match span_width(text) > width {
         true => {
-            let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+            let budget = width.saturating_sub(1);
+            let mut used = 0;
+            let mut out = String::new();
+            for ch in text.chars() {
+                let w = char_width(ch);
+                if used + w > budget {
+                    break;
+                }
+                out.push(ch);
+                used += w;
+            }
             out.push('…');
             out
         }
@@ -1376,10 +1465,9 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
         .collect()
     })
     .unwrap_or_default();
-    let stats_width: usize = stats.iter().map(|s| s.content.chars().count()).sum();
+    let stats_width: usize = stats.iter().map(|s| span_width(&s.content)).sum();
 
-    let pad =
-        (width as usize).saturating_sub(left.chars().count() + stats_width + right.chars().count());
+    let pad = (width as usize).saturating_sub(span_width(&left) + stats_width + span_width(&right));
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     spans.extend(stats);
     if focused && !image {
@@ -1446,10 +1534,23 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
 fn row_label(text: &str, width: usize, tab_width: usize) -> String {
     let first = text.lines().next().unwrap_or("");
     let expanded = expand_tabs(first, tab_width);
-    if expanded.chars().count() <= width {
+    if span_width(&expanded) <= width {
         return expanded;
     }
-    expanded.chars().take(width.saturating_sub(1)).chain(std::iter::once('…')).collect()
+    // By cells, not chars: a row of CJK overflows at half the char count.
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut out = String::new();
+    for ch in expanded.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 /// A centred box over the buffer: query, match list, preview.
@@ -1481,6 +1582,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
         .border_style(tui(ui.picker_border))
         .title(match picker.kind {
             PickerKind::Register { .. } => " registers ",
+            PickerKind::Named { .. } => " named registers ",
             PickerKind::Buffer => " buffers ",
             PickerKind::File => " files ",
             PickerKind::TreeRow => " tree ",
@@ -1567,10 +1669,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
 
 /// After the `> ` prompt, at the end of what has been typed.
 fn set_picker_cursor(frame: &mut Frame, picker: &Picker, query_area: Rect) {
-    frame.set_cursor_position((
-        query_area.x + 2 + picker.query().chars().count() as u16,
-        query_area.y,
-    ));
+    frame.set_cursor_position((query_area.x + 2 + span_width(picker.query()) as u16, query_area.y));
 }
 
 fn status_line(
@@ -1619,8 +1718,7 @@ fn status_spans(
             Some((at, total)) => format!("[{at}/{total}] "),
             None => String::new(),
         };
-        let pad =
-            (width as usize).saturating_sub(left.content.chars().count() + right.chars().count());
+        let pad = (width as usize).saturating_sub(span_width(&left.content) + span_width(&right));
         return vec![
             left,
             Span::raw(" ".repeat(pad)),
@@ -1641,8 +1739,8 @@ fn status_spans(
     // The mode lives on the focused window's row now, beside the position it
     // applies to. What is left here is the session's: messages, half-typed
     // keys, and the `:` and `/` lines above.
-    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad = (width as usize).saturating_sub(left_width + keys.chars().count());
+    let left_width: usize = spans.iter().map(|s| span_width(&s.content)).sum();
+    let pad = (width as usize).saturating_sub(left_width + span_width(&keys));
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(keys, tui(ed.theme().ui.status_muted)));
 

@@ -30,6 +30,9 @@ pub struct Item {
 pub enum PickerKind {
     /// `before` mirrors `p` versus `P`.
     Register { before: bool },
+    /// `"np` — the named registers, most recently named first. The row is
+    /// the name; the entry rides in the preview. See `docs/specs/registers.md`.
+    Named { before: bool },
     /// `:ls` over the open buffers, in list order.
     ///
     /// Vim prints a table you read a number out of and retype into `:b`; here
@@ -76,7 +79,7 @@ impl PickerKind {
     /// to it — so its first line says nothing you needed and costs the list a
     /// third of its rows to say it.
     pub fn wants_preview(&self) -> bool {
-        matches!(self, PickerKind::Register { .. })
+        matches!(self, PickerKind::Register { .. } | PickerKind::Named { .. })
     }
 
     /// Whether typed characters have to appear *in order* rather than as

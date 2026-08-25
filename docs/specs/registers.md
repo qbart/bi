@@ -8,8 +8,7 @@ time, where a fuzzy picker can search it.
 
 ## Status
 
-Steps 1 and 2 are **built**. Steps 3–4 are recorded here because their
-decisions shape the data model, not because they are being built yet.
+All four steps are **built**.
 
 The picker matches by **substring**, not fuzzily: register entries are prose and
 code, where "these letters appear in order" matches nearly everything. Matches
@@ -19,8 +18,8 @@ keep ring order, so recency is the ranking.
 |---|---|---|
 | **1** ✅ | Ring, auto-capture on `y`/`d`/`c`/`x`, `p`/`P`, `"_` | nothing new |
 | **2** ✅ | Picker over the ring, `"p` / `"P` | a general overlay UI |
-| 3 | Named registers, `"n` | step 2 + a name prompt |
-| 4 | System clipboard, `"+` / `"*` | a clipboard backend |
+| **3** ✅ | Named registers, `"n` | step 2 + a name prompt |
+| **4** ✅ | System clipboard, `"+` / `"*` | a clipboard backend |
 
 ## Model
 
@@ -218,6 +217,39 @@ displaced on the front of the ring, and repeating a swap swaps again. This is
 not a special case for `.` to correct: `.` replays the command, and reading the
 ring's front is what the command does.
 
+## Named registers
+
+The named space is the "I will paste this eleven times" case that a
+search-based workflow serves badly. It is separate from the ring and outside
+its budget: every entry here was asked for by name, and a register someone
+named must not fall off the back of anything.
+
+**Capture first, name after.** `"n{operator}{motion}` runs the operator as
+ever, sink `Named`; when the command has settled its modes, the editor opens
+the `:` line prefilled with `name ` — the same prefilled-line prompt the tree
+uses for `rename`, because a prompt bi already has beats prompt machinery it
+does not. `Enter` on `:name a` files the capture under `a`. The prompt opens
+*after* the whole command, not inside `capture`: a visual operator ends
+visual mode after capturing, and a prompt opened mid-command would not
+survive it.
+
+**Nothing is lost on the way out.** Backing out of the prompt — `Esc`, or
+editing the line into some other command — sends the held capture to the
+ring, where an unnamed capture would have gone. `"ndd` then `Esc` is a
+delete, not a data loss. The capture never survives leaving the prompt:
+`:name` consumes it, everything else releases it to the ring.
+
+**A name means one thing.** `:name a` over an existing `a` replaces it;
+renaming is re-yanking. `:name` with nothing held says so.
+
+**Paste is a choice, not a slot.** `"np` / `"nP` open the picker over the
+names, most recently named first — the row is the name, the entry rides in
+the preview, and the shape badge (`¶`, `▚`) still says how it will paste. The
+chosen entry is pushed to the ring's front before pasting, exactly as the
+ring picker does, so `.` and a later bare `p` repeat the entry you chose.
+Over a selection it replaces it, with `P` the no-capture spelling — the same
+rules as every other paste.
+
 ## Grammar
 
 `"` introduces a register reference and takes exactly one key of lookahead. The
@@ -351,14 +383,7 @@ The picker hides entries below a length threshold by default with a key to
 reveal them, and offers promoting a highlighted entry to a named register —
 which is what removes the last reason to name anything at yank time.
 
-**Step 3 — named registers.** `"n{operator}{motion}` yanks, then prompts for a
-name *after* the text is captured, reusing the `:` command-line machinery.
-`"np` fuzzy-picks among names. Named registers are a separate space from the
-ring; they are the "I will paste this eleven times" case that a search-based
-workflow serves badly.
+**Step 3 — named registers** is built; see the section above.
 
-**Step 4 — clipboard.** `"+` is CLIPBOARD, `"*` is PRIMARY, matching Vim rather
-than swapping them — `"+y` is too ingrained to redefine. Both collapse to the
-one system clipboard on Windows and macOS. Needs a backend decision: `arboard`
-requires a display server, OSC 52 works over SSH, and a terminal editor
-probably wants both.
+**Step 4 — clipboard** is built over OSC 52; the decisions and their costs
+live in [clipboard.md](clipboard.md).

@@ -38,6 +38,10 @@ pub enum Sink {
     /// a copy, and exporting every `dd` to the desktop is a surprise in the
     /// direction that cannot be undone.
     System,
+    /// `"n` — the named space. The name itself is not here: it is asked for
+    /// *after* the capture, which is the whole argument of registers.md —
+    /// at yank time you do not know yet what a thing is worth calling.
+    Named,
 }
 
 pub struct Registers {
@@ -46,11 +50,21 @@ pub struct Registers {
     bytes: usize,
     capacity: usize,
     byte_budget: usize,
+    /// The named space, most recently set first. Separate from the ring and
+    /// outside its budget: every entry here was asked for by name, and a
+    /// register someone named must not fall off the back of anything.
+    named: Vec<(String, Entry)>,
 }
 
 impl Default for Registers {
     fn default() -> Self {
-        Self { ring: VecDeque::new(), bytes: 0, capacity: 4096, byte_budget: 64 << 20 }
+        Self {
+            ring: VecDeque::new(),
+            bytes: 0,
+            capacity: 4096,
+            byte_budget: 64 << 20,
+            named: Vec::new(),
+        }
     }
 }
 
@@ -104,6 +118,23 @@ impl Registers {
     /// By position in that same order, which is what the picker hands back.
     pub fn get(&self, i: usize) -> Option<&Entry> {
         self.ring.get(i)
+    }
+
+    /// Stores `entry` under `name`, replacing what held the name before —
+    /// a name means one thing, and renaming is re-yanking.
+    pub fn set_named(&mut self, name: &str, entry: Entry) {
+        self.named.retain(|(held, _)| held != name);
+        self.named.insert(0, (name.to_string(), entry));
+    }
+
+    /// Most recently named first — the order the picker lists them in.
+    pub fn named(&self) -> &[(String, Entry)] {
+        &self.named
+    }
+
+    /// By position in that same order, which is what the picker hands back.
+    pub fn named_at(&self, i: usize) -> Option<&Entry> {
+        self.named.get(i).map(|(_, entry)| entry)
     }
 }
 
@@ -172,6 +203,31 @@ mod tests {
         r.push(chars("ccccc"));
         assert_eq!(r.len(), 2, "the oldest made room");
         assert_eq!(r.front(), Some(&chars("ccccc")));
+    }
+
+    #[test]
+    fn a_name_holds_one_thing_and_naming_again_replaces_it() {
+        let mut r = Registers::default();
+        r.set_named("a", chars("first"));
+        r.set_named("b", chars("other"));
+        r.set_named("a", chars("second"));
+
+        assert_eq!(r.named().len(), 2, "not a third slot");
+        assert_eq!(r.named_at(0), Some(&chars("second")), "renamed to the front");
+        assert_eq!(r.named_at(1), Some(&chars("other")));
+    }
+
+    /// The named space is not the ring: naming evicts nothing and the
+    /// budget's evictions never reach a name.
+    #[test]
+    fn named_entries_live_outside_the_ring_and_its_budget() {
+        let mut r = small(1, 10);
+        r.set_named("keep", chars("a much longer entry than the budget allows"));
+        r.push(chars("bbbbb"));
+        r.push(chars("ccccc"));
+
+        assert_eq!(r.len(), 1, "the ring evicted as it always does");
+        assert_eq!(r.named_at(0), Some(&chars("a much longer entry than the budget allows")));
     }
 
     /// Truncating what someone copied is worse than forgetting it, so an entry

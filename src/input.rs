@@ -820,9 +820,6 @@ impl Input {
                 Some(Command { count: 1, action: Action::CollapseCursors })
             }
             KeyCode::Char('r') if ctrl => self.plain(Action::Redo),
-            // The picker over every file under the session's root — see
-            // `docs/specs/files.md`.
-            KeyCode::Char('p') if ctrl => self.plain(Action::OpenPicker(PickerKind::File)),
             KeyCode::Char('n') if ctrl => self.plain(Action::AddCursorNextMatch),
             KeyCode::Char('x') if ctrl => self.plain(Action::SkipCursorToNextMatch),
             KeyCode::Char('v') if ctrl => self.plain(Action::EnterVisual(Shape::Block)),
@@ -923,6 +920,13 @@ impl Input {
                 self.sink = Sink::System;
                 return None;
             }
+            // The named space. `"n{operator}` captures and asks for the name
+            // afterwards; `"np` reaches the paste arm below carrying the sink
+            // and opens the picker over the names.
+            if c == 'n' {
+                self.sink = Sink::Named;
+                return None;
+            }
             // Nothing ever reaches the black hole, so nothing comes out of it.
             if (c == 'p' || c == 'P') && self.sink != Sink::BlackHole {
                 self.reset();
@@ -970,12 +974,16 @@ impl Input {
                 // and a leader binding can spell it `<leader>a` instead.
                 // See `docs/specs/alternate.md`.
                 'a' => self.plain(Action::Ex { line: "alt".into(), run: true }),
-                // The buffer switcher, for the terminals that cannot tell
-                // `Ctrl-Tab` from `Tab`. Vim's `gf` opens the file named under
-                // the cursor; bi has no such command, and the letter is the
-                // one people reach for when they mean "go to a file".
+                // The picker over every file under the session's root. Vim's
+                // `gf` opens the file named under the cursor; bi has no such
+                // command, and the letter is the one people reach for when
+                // they mean "go to a file". See `docs/specs/files.md`.
+                'f' => self.plain(Action::OpenPicker(PickerKind::File)),
+                // The buffer switcher, beside `gf` the way the lists sit
+                // beside each other: files under `f`, buffers under `b`.
+                // Also under `Ctrl-Tab`, for the terminals that send it.
                 // See `docs/specs/buffers.md`.
-                'f' => self.plain(Action::Buffer(BufferCmd::List)),
+                'b' => self.plain(Action::Buffer(BufferCmd::List)),
                 // The two LSP jumps, as the ex commands they abbreviate —
                 // the same shape as `ga`. See `docs/specs/lsp-requests.md`.
                 'd' => self.plain(Action::Ex { line: "definition".into(), run: true }),
@@ -2139,13 +2147,13 @@ leader = \" \"
         assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
     }
 
-    /// The two keys under the `g` prefix that go somewhere rather than move
-    /// the cursor. Both are sequences vim spends on something bi does not
-    /// have, so neither cost anything to take.
+    /// The keys under the `g` prefix that go somewhere rather than move
+    /// the cursor: the other file, the file picker, the buffer list.
     #[test]
-    fn the_g_prefix_reaches_the_other_file_and_the_buffer_list() {
+    fn the_g_prefix_reaches_the_other_file_and_the_two_lists() {
         assert_eq!(typed("ga").action, Action::Ex { line: "alt".into(), run: true });
-        assert_eq!(typed("gf").action, Action::Buffer(BufferCmd::List));
+        assert_eq!(typed("gf").action, Action::OpenPicker(PickerKind::File));
+        assert_eq!(typed("gb").action, Action::Buffer(BufferCmd::List));
     }
 
     /// The LSP jumps ride the same rail as `ga`: a key that abbreviates an ex
@@ -2787,6 +2795,30 @@ leader = \" \"
         assert_eq!(
             typed("\"+2P").action,
             Action::Paste { before: true, count: 2, sink: Sink::System }
+        );
+    }
+
+    /// `"n` names the sink and the rest of the command is unchanged: an
+    /// operator captures into the named space, `p` opens the picker over the
+    /// names by riding the ordinary paste action there.
+    #[test]
+    fn quote_n_reaches_both_the_operator_and_the_paste() {
+        assert_eq!(
+            typed("\"nyy").action,
+            Action::Operate {
+                op: Operator::Yank,
+                target: Target::Motion(Motion::CurrentLine),
+                count: 1,
+                sink: Sink::Named
+            }
+        );
+        assert_eq!(
+            typed("\"np").action,
+            Action::Paste { before: false, count: 1, sink: Sink::Named }
+        );
+        assert_eq!(
+            typed("\"nP").action,
+            Action::Paste { before: true, count: 1, sink: Sink::Named }
         );
     }
 

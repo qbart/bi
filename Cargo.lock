@@ -115,6 +115,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-xml",
  "tree-sitter-yaml",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -11,6 +11,9 @@ ropey = "1.6"
 # docs/specs/lsp.md for why.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Display width in cells, not chars — a CJK char is two columns and a
+# combining mark is none, and the cursor lands wrong without knowing that.
+unicode-width = "0.2"
 # crossterm is re-exported as `ratatui::crossterm` — depending on it directly
 # invites a version skew that shows up as confusing trait mismatches.
 ratatui = "0.29"

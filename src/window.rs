@@ -85,6 +85,10 @@ pub struct Text {
     pub selections: Selections,
     /// First visible row.
     pub scroll: usize,
+    /// First visible display column of the text area — the horizontal mirror
+    /// of `scroll`. In display columns rather than chars, because tabs and
+    /// wide chars make the two disagree and the screen is ruled in columns.
+    pub left: usize,
 }
 
 /// One view onto one buffer, or onto one directory.
@@ -191,7 +195,7 @@ impl Window {
 
 impl Text {
     pub fn new(buffer: BufferId) -> Self {
-        Self { buffer, selections: Selections::default(), scroll: 0 }
+        Self { buffer, selections: Selections::default(), scroll: 0, left: 0 }
     }
 }
 

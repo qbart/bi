@@ -20,7 +20,7 @@ sign in the gutter for every line the index does not have, and a `+3 ~1 -2`
 numstat in the status row. `:diags` lists every stored diagnostic in a pane
 to jump from, and `:zen` strips the chrome — gutter, numbers, status rows —
 until you ask for it back.
-`Ctrl-P`, the file tree and `:find` all respect what `.gitignore` says is not
+`gf`, the file tree and `:find` all respect what `.gitignore` says is not
 the project's (`gh` in the tree shows everything anyway), and an image file
 opens as the picture it is where the terminal speaks the kitty graphics
 protocol — centered, scrolled with `hjkl`/`gg`/`G` when it does not fit, its
@@ -162,10 +162,14 @@ pulling the next line up.
 | `p` `P` | paste after / before the cursor, or below / above the line if the entry was taken linewise — over a selection they replace it |
 | `"p` `"P` | open the picker to choose from everything captured, then paste |
 | `"_` | black hole prefix — `"_dd` deletes without capturing |
+| `"n` | the named space: `"nyy` captures and then asks `:name {register}`; `"np` picks among the names |
 | `"+y` `"+p` | the system clipboard; `"*` is a spelling of the same register |
 
 Every `y`, `d`, `c` and `x` captures automatically into a 4096-deep ring, so
 there is nothing to decide at yank time. A count goes before the quote: `3"p`.
+Named registers keep that order — capture first, name after — and live outside
+the ring and its budget; backing out of the `:name ` prompt sends the capture
+to the ring instead of losing it.
 
 The system clipboard is explicit rather than mirrored: a delete is not a copy,
 and exporting every `dd` to the desktop is a surprise in the direction that
@@ -425,10 +429,10 @@ leaving whitespace nothing can see. See
 
 ### Picker
 
-One overlay over five lists: the register ring (`"p` / `"P`), the open buffers
-(`:ls`), every file under the session's root (`Ctrl-P`), a tree pane's paths
-(`gf` and `/` in one), and the `:` lines you have run (`Ctrl-R` on the command
-line). Typing filters by substring — every whitespace-separated term must
+One overlay over six lists: the register ring (`"p` / `"P`), the named
+registers (`"np` / `"nP`), the open buffers (`:ls`), every file under the
+session's root (`gf`), a tree pane's paths (`gf` in a tree, `/` for the rows
+on screen), and the `:` lines you have run (`Ctrl-R` on the command line). Typing filters by substring — every whitespace-separated term must
 appear somewhere, in any order, case-insensitively. Matches keep the order they
 were given, so the most recent is first — which is an answer to "which one did
 you mean" that only the tree list has no version of, and so the only one that
@@ -451,11 +455,12 @@ The buffer list is ordered by when each buffer was last *shown* and opens on
 the second row — the one you were in before this one — so `Ctrl-Tab` `Enter`
 switches back and doing it twice returns you. Where a terminal cannot tell
 `Ctrl-Tab` from `Tab` you simply get buffer-next, which is what that key always
-did — and `gf` opens the switcher on every terminal, beside `ga` for the
-alternate file. See [docs/specs/buffers.md](docs/specs/buffers.md).
+did — and `gb` opens the switcher on every terminal, beside `ga` for the
+alternate file and `gf` for the file picker. See [docs/specs/buffers.md](docs/specs/buffers.md).
 
-Only the register ring gets a preview pane. A file name, a command line and a
-buffer are each already the row you are reading, so the pane would repeat it
+Only the register pickers get a preview pane — the ring's, and the named
+space's, where the row is the name and the entry rides underneath. A file
+name, a command line and a buffer are each already the row you are reading, so the pane would repeat it
 and take a third of the overlay to do it; the rows get the space instead.
 
 | Key | Does |
@@ -602,7 +607,7 @@ See [docs/specs/windows.md](docs/specs/windows.md).
 | `Ctrl-W =` | equalise every pane |
 | `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
 | `Ctrl-I` `Ctrl-O` | cycle the buffer list forwards / backwards. `Ctrl-I` is `Tab`, byte for byte |
-| `Ctrl-Tab` `gf` | the buffer switcher: newest first, opening on the one you were in before |
+| `Ctrl-Tab` `gb` | the buffer switcher: newest first, opening on the one you were in before |
 
 Two windows may show one buffer, with their own cursor and their own scroll.
 An edit in one moves the other's cursor *with the text* rather than clamping it
@@ -1149,7 +1154,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
 | `config/` | `Config`, the TOML parser and diagnostics, `ConfigSource` |
 | `history.rs` | the undo tree: revisions, branching, invertible `Change`s |
 | `cmd_history.rs` | the `:` lines you have run, newest first |
-| `registers.rs` | the yank ring: entries, capture, eviction |
+| `registers.rs` | the yank ring and the named space: entries, capture, eviction |
 | `editor.rs` | modes, the `Action` dispatch table, ex commands, scrolling |
 | `motion.rs` | `Motion` / `Operator` / `Kind` — the vocabulary they all share |
 | `picker.rs` | the overlay's state: query, matches, selection |
@@ -1223,15 +1228,11 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](docs/specs/lib-spli
   new group when you arrow away mid-insert.
 - No `g-` / `g+` / `:earlier`, so abandoned branches are stored but unreachable.
 - Undo history is per-session; vim persists it with `'undofile'`.
-- Display width counts chars, so CJK and combining chars misalign the cursor.
-  Needs `unicode-width` and a grapheme walk.
-- No horizontal scrolling — long lines clip.
+- Width is per-`char`: CJK and combining characters align now, but an emoji
+  built from several scalars (ZWJ sequences, flags) counts as their sum —
+  fixing that needs a grapheme walk. See `docs/specs/width.md`.
 - No moving a window around the tree (`Ctrl-W x` / `r` / `H J K L`), and no tab
   pages. The split tree is the shape that would carry both.
-- No named registers (`"n`). The system clipboard is in — `"+y` and `"+p`, with
-  `"*` as a spelling of the same — over OSC 52, so it works over SSH. See
-  [docs/specs/clipboard.md](docs/specs/clipboard.md) and
-  `docs/specs/registers.md`.
 - Twenty grammars: Rust, C, C++, C3, Go, Python, Lua, Bash, CSS, GLSL, HLSL,
   Slang, HCL/Terraform, Dockerfile, CMake, TOML, YAML, JSON, INI and Markdown.
   Adding one is a line in `syntax.rs`, but each is a C library that costs build

@@ -34,7 +34,7 @@ why the register ring still wants whole terms — see `docs/specs/files.md`.
 
 ## No preview
 
-A list and nothing else, the way `Ctrl-P` is. The preview pane exists to show a
+A list and nothing else, the way the file picker is. The preview pane exists to show a
 register entry that is longer than its row; a buffer is a file you know — you
 are switching *back* to it — so its first line tells you nothing you were
 missing and takes a third of the overlay to say it. Rows are what this picker
@@ -56,18 +56,18 @@ key had to be given up — which is the reason the *window* picker went to
 
 `:ls` opens the same list, always, in every terminal.
 
-**`gf` is the default that always arrives.** `Ctrl-Tab` is the key this was
+**`gb` is the default that always arrives.** `Ctrl-Tab` is the key this was
 asked for and the one to use where it works, but "where it works" is a
 property of the terminal, and a switcher you cannot reach on half of them is
-not a default. `gf` sits under the `g` prefix beside `ga`
-(`docs/specs/alternate.md`), on a sequence vim spends on "open the file named
-under the cursor" — a command bi does not have, so nothing is given up, and
-`f` is the letter people reach for when they mean *file*.
+not a default. `gb` sits under the `g` prefix beside `ga`
+(`docs/specs/alternate.md`) and `gf` (`docs/specs/files.md`): `b` for the
+buffer list, `f` for the file picker. It was `gf` before the file picker
+claimed the letter — *file* is what `f` means, and the switcher is buffers.
 
 ## Tests
 
 - Three buffers opened in order list newest-first.
 - Opening and accepting is a switch to the previous buffer; twice is a toggle.
 - Typing leaves the default row and matches a subsequence.
-- The overlay is a list: no preview pane, the same as `Ctrl-P`.
-- `gf` opens it, and `ga` still reaches the alternate file.
+- The overlay is a list: no preview pane, the same as the file picker.
+- `gb` opens it, and `ga` still reaches the alternate file.

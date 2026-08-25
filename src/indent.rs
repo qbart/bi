@@ -68,12 +68,22 @@ impl Indent {
     }
 }
 
+/// How many cells one character occupies.
+///
+/// Unicode's answer, not `1`: a CJK character takes two cells, a combining
+/// mark takes none — it lands on its base's cells — and a control character
+/// paints nothing. Tabs are elastic and are the caller's business.
+pub fn char_width(ch: char) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    ch.width().unwrap_or(0)
+}
+
 /// Screen column of char offset `char_col` within `line`.
 pub fn display_col(line: &str, char_col: usize, tab_width: usize) -> usize {
     let tab_width = tab_width.max(1);
     let mut col = 0;
     for ch in line.chars().take(char_col) {
-        col += if ch == '\t' { tab_width - (col % tab_width) } else { 1 };
+        col += if ch == '\t' { tab_width - (col % tab_width) } else { char_width(ch) };
     }
     col
 }
@@ -84,10 +94,6 @@ pub fn width_of(text: &str, tab_width: usize) -> usize {
 }
 
 /// Expands tabs for display.
-///
-/// Width is counted in chars, so wide (CJK) and combining chars will be off.
-/// Fixing that means a `unicode-width` dependency and a real grapheme walk —
-/// worth doing before this is usable on non-Latin text.
 pub fn expand_tabs(line: &str, tab_width: usize) -> String {
     if !line.contains('\t') {
         return line.to_string();
@@ -102,7 +108,7 @@ pub fn expand_tabs(line: &str, tab_width: usize) -> String {
             col += n;
         } else {
             out.push(ch);
-            col += 1;
+            col += char_width(ch);
         }
     }
     out
@@ -291,6 +297,18 @@ mod tests {
         assert_eq!(display_col("ab\tx", 3, 4), 4, "a tab after two chars still reaches 4");
         assert_eq!(display_col("abcd\tx", 5, 4), 8);
         assert_eq!(width_of("\t\t", 8), 16);
+    }
+
+    /// The gap the README carried for a while: width is cells, not chars. A
+    /// CJK char is two cells, a combining mark is none.
+    #[test]
+    fn display_col_counts_cells_not_chars() {
+        assert_eq!(display_col("漢字x", 2, 4), 4, "two CJK chars are four cells");
+        assert_eq!(display_col("漢字x", 3, 4), 5);
+        // `é` as `e` + U+0301: the mark lands on the base's cell.
+        assert_eq!(display_col("e\u{301}x", 2, 4), 1);
+        assert_eq!(width_of("漢\tx", 4), 5, "a tab after a wide char reaches the next stop");
+        assert_eq!(expand_tabs("漢\tx", 4), "漢  x");
     }
 
     #[test]

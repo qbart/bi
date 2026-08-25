@@ -626,6 +626,10 @@ pub struct Session {
     pub clipboard: Clipboard,
     /// A paste waiting on a name for the file it stopped at.
     pub pasting: Option<Pasting>,
+    /// A capture waiting on its register name — the text `"n{operator}` took,
+    /// held while the `:name ` prompt is up. Never survives leaving the
+    /// prompt: `:name` consumes it, anything else sends it to the ring.
+    pending_named: Option<Entry>,
     /// The world's clipboard, when a frontend has supplied one. `None` is an
     /// embedder that has not, and every test: `"+y` then says so and changes
     /// nothing, which is a diagnostic rather than a panic.
@@ -804,6 +808,11 @@ impl Session {
             Sink::Ring => self.registers.push(entry),
             // Nothing ever reaches the black hole, which is the point of it.
             Sink::BlackHole => {}
+            // Held, not stored: the name is asked for once the command is
+            // done — `Editor::apply` opens the `:name ` prompt when it sees
+            // the capture waiting, because opening it here would be undone by
+            // the mode changes the rest of the command still makes.
+            Sink::Named => self.pending_named = Some(entry),
             Sink::System => {
                 let wrote = match &self.system {
                     Some(clipboard) => clipboard.set(&entry.text).map_err(|e| format!("{e:#}")),
@@ -1492,6 +1501,9 @@ enum ExLine {
     /// seen it, and typing the value both times is typing the wrong one.
     Whitespace(Option<bool>),
     Set(String),
+    /// `:name <register>` — stores the capture waiting on a name. Typed by
+    /// the prompt `"n` prefills far more often than by hand.
+    Name(String),
     Create(String),
     Rename {
         from: String,
@@ -1847,6 +1859,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
+        "name" => match arg {
+            "" => ExLine::Error("name it what? `:name {register}`".into()),
+            name => ExLine::Name(name.into()),
+        },
         // `on`/`off` as well as `true`/`false`: this one is spelled as a
         // command rather than as a setting, and a command reads better with the
         // words a switch uses.
@@ -2269,6 +2285,7 @@ pub struct View<'a> {
     pub filetype: &'a mut Option<&'static str>,
     pub selections: &'a mut Selections,
     pub scroll: &'a mut usize,
+    pub left: &'a mut usize,
     /// Which window this is, for the commands that name one.
     ///
     /// The window itself cannot come too — borrowing it whole and borrowing the
@@ -3286,6 +3303,7 @@ impl Editor {
             filetype: &mut entry.filetype,
             selections: &mut text.selections,
             scroll: &mut text.scroll,
+            left: &mut text.left,
             window: window_id,
             height,
             width,
@@ -4787,6 +4805,12 @@ impl Editor {
                 self.session.mode = Mode::Normal;
                 // The one `:` line that means something when abandoned.
                 self.abandon_paste();
+                // Backing out of the `:name ` prompt must not lose the text —
+                // it goes where an unnamed capture always goes.
+                if let Some(entry) = self.session.pending_named.take() {
+                    self.session.registers.push(entry);
+                    self.session.status = "not named — kept on the ring".into();
+                }
                 // Backing out of the line is not a reason to lose what you
                 // had selected before pressing `:`.
                 let shape = self.session.interrupted_visual.take();
@@ -4808,6 +4832,12 @@ impl Editor {
                 self.session.cmd_history.push(&line);
                 self.run_ex_over(&line, shape);
                 self.revive_visual(shape);
+                // `:name` consumed it; any other line typed over the prompt
+                // leaves it, and it goes to the ring rather than lingering
+                // into the next capture.
+                if let Some(entry) = self.session.pending_named.take() {
+                    self.session.registers.push(entry);
+                }
             }
             Action::BoundaryJump { forward } => self.boundary_jump(*forward),
             Action::Ex { line, run } => {
@@ -4928,6 +4958,9 @@ impl Editor {
             }
             PickerKind::Register { before } => {
                 self.in_view(|view| view.paste_pick(chosen, before));
+            }
+            PickerKind::Named { before } => {
+                self.in_view(|view| view.paste_named(chosen, before));
             }
             // Put back on the `:` line, unrun. Editing it is the point: the
             // line you reach for a history for is the one with a word wrong.
@@ -5512,6 +5545,7 @@ impl Editor {
             ExLine::Highlight(on) => self.session.options.hlsearch = on,
             ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
+            ExLine::Name(name) => self.name_pending(&name),
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Rename { from, to } => self.rename_path(&from, &to),
             ExLine::Delete { path, force } => self.delete_path(&path, force),
@@ -5841,6 +5875,21 @@ impl Editor {
     /// *where the cursor is*, not the session's: that is the one you can see,
     /// and flipping the one behind it would turn the mark off in a window that
     /// never had it on.
+    /// `:name {register}` — stores the capture the `"n` prompt is holding.
+    ///
+    /// Renaming is re-yanking: an existing name is simply replaced, because a
+    /// prompt that stops to ask "are you sure" about a register is slower
+    /// than yanking again.
+    fn name_pending(&mut self, name: &str) {
+        match self.session.pending_named.take() {
+            Some(entry) => {
+                self.session.registers.set_named(name, entry);
+                self.session.status = format!("named \"{name}\"");
+            }
+            None => self.session.status = "nothing to name — `\"n` captures first".into(),
+        }
+    }
+
     fn set_whitespace(&mut self, on: Option<bool>) {
         let on = on.unwrap_or(!self.options().whitespace);
         self.set_option(&format!("whitespace {on}"));
@@ -6008,6 +6057,14 @@ impl Editor {
         // behind — the char is in, the cursor has moved.
         self.sync_completion(&action);
         self.sync_signature(&action);
+
+        // A capture waiting on its name gets the prompt now, after the whole
+        // command has settled its modes — a visual operator ends visual mode
+        // *after* capturing, and a prompt opened inside would not survive it.
+        if self.session.pending_named.is_some() && !matches!(self.session.mode, Mode::Command(_)) {
+            self.session.status.clear();
+            self.session.mode = Mode::Command("name ".into());
+        }
     }
 
     /// Settles everything an edit leaves behind. Called once per key, after the
@@ -7771,6 +7828,9 @@ impl View<'_> {
                 }
                 entry
             }
+            // `"np` opens the picker over the names instead of pasting — the
+            // paste actions turn into `open_picker` before they get here.
+            Sink::Named => None,
         }
     }
 
@@ -8156,6 +8216,12 @@ impl View<'_> {
                 }
             }
             Action::Paste { before, count, sink } => {
+                // `"np` is a choice, not a slot: the picker over the names is
+                // what pasting from the named space means.
+                if *sink == Sink::Named {
+                    self.open_picker(PickerKind::Named { before: *before });
+                    return;
+                }
                 let Some(entry) = self.paste_source(*sink) else { return };
                 let (before, count) = (*before, *count);
                 self.for_each_selection(|ed, sel| {
@@ -8163,6 +8229,12 @@ impl View<'_> {
                 });
             }
             Action::PasteSelection { capture, count, sink } => {
+                if *sink == Sink::Named {
+                    // `capture` is the `p`/`P` distinction here, exactly as
+                    // `paste_pick` will read it back out of `before`.
+                    self.open_picker(PickerKind::Named { before: !*capture });
+                    return;
+                }
                 let Some(entry) = self.paste_source(*sink) else { return };
                 self.paste_over_selection(&entry, *capture, *count);
             }
@@ -8917,25 +8989,49 @@ impl View<'_> {
     }
 
     fn open_picker(&mut self, kind: PickerKind) {
-        if self.session.registers.is_empty() {
-            // An empty overlay is a worse answer than saying so.
-            self.session.status = "nothing to paste".into();
-            return;
-        }
-        let items = self
-            .session
-            .registers
-            .iter()
-            .map(|e| Item {
-                text: e.text.clone(),
-                badge: match e.kind {
-                    Shape::Lines => Some('¶'),
-                    Shape::Block => Some('▚'),
-                    Shape::Chars => None,
-                },
-            })
-            .collect();
-        self.session.picker = Some(Picker::new(kind, items, REGISTER_MIN_LEN));
+        let badge = |kind: Shape| match kind {
+            Shape::Lines => Some('¶'),
+            Shape::Block => Some('▚'),
+            Shape::Chars => None,
+        };
+        // Short entries hide behind `Ctrl-A` on the ring, where `x` deletes
+        // bury the list; a name is short *because* someone chose it.
+        let (items, min_len): (Vec<Item>, usize) = match kind {
+            PickerKind::Named { .. } => {
+                if self.session.registers.named().is_empty() {
+                    // An empty overlay is a worse answer than saying so.
+                    self.session.status = "no named registers".into();
+                    return;
+                }
+                let items = self
+                    .session
+                    .registers
+                    .named()
+                    .iter()
+                    // The name first, so it is the row; the entry follows and
+                    // rides in the preview under it.
+                    .map(|(name, e)| Item {
+                        text: format!("{name}\n{}", e.text),
+                        badge: badge(e.kind),
+                    })
+                    .collect();
+                (items, 0)
+            }
+            _ => {
+                if self.session.registers.is_empty() {
+                    self.session.status = "nothing to paste".into();
+                    return;
+                }
+                let items = self
+                    .session
+                    .registers
+                    .iter()
+                    .map(|e| Item { text: e.text.clone(), badge: badge(e.kind) })
+                    .collect();
+                (items, REGISTER_MIN_LEN)
+            }
+        };
+        self.session.picker = Some(Picker::new(kind, items, min_len));
         // Remembered rather than dropped: the selection is what the chosen
         // entry will replace, and `Mode::Pick` is about to hide that it exists.
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
@@ -8948,6 +9044,17 @@ impl View<'_> {
     /// of the two pastes it turns into.
     fn paste_pick(&mut self, chosen: usize, before: bool) {
         let Some(entry) = self.session.registers.get(chosen).cloned() else { return };
+        self.paste_chosen(entry, before);
+    }
+
+    /// The same, out of the named space — the entry the picker's row stands
+    /// for, by position in the same most-recent-first order.
+    fn paste_named(&mut self, chosen: usize, before: bool) {
+        let Some(entry) = self.session.registers.named_at(chosen).cloned() else { return };
+        self.paste_chosen(entry, before);
+    }
+
+    fn paste_chosen(&mut self, entry: Entry, before: bool) {
         // Push before pasting: move-to-front makes this the ring's head, so
         // `.` and a later bare `p` repeat the entry you chose rather than
         // whatever happened to be most recent.
@@ -9609,6 +9716,40 @@ impl View<'_> {
 
         let max_scroll = self.buffer.line_count().saturating_sub(height);
         (*self.scroll) = (*self.scroll).min(max_scroll);
+
+        self.scroll_to_cursor_col(row);
+    }
+
+    /// The horizontal half: keeps the cursor's display column inside the
+    /// width the frontend last reported, minus the gutter it draws first.
+    ///
+    /// Nothing scrolls by chars here — the offset is display columns, so a
+    /// tab or a CJK char scrolls by what it occupies rather than by one.
+    fn scroll_to_cursor_col(&mut self, row: usize) {
+        let gutter = match self.session.zen {
+            true => 0,
+            false => self.options.gutter_width(self.buffer.line_count()),
+        };
+        let width = self.width.saturating_sub(gutter);
+        if width == 0 {
+            // A width the frontend never reported (a test, a headless
+            // embedder) means no viewport to stay inside — and clamping to a
+            // zero-wide one would pin `left` to the cursor.
+            return;
+        }
+        let line = self.buffer.line(row);
+        let col = crate::indent::display_col(
+            &line,
+            self.buffer.col_at(self.selections.cursor()),
+            self.options.tab_width,
+        );
+        let margin = Self::margin(width);
+
+        if col < (*self.left) + margin {
+            (*self.left) = col.saturating_sub(margin);
+        } else if col + margin >= (*self.left) + width {
+            (*self.left) = col + margin + 1 - width;
+        }
     }
 }
 
@@ -14610,6 +14751,86 @@ mod tests {
         assert_eq!(ed.session.mode, Mode::Visual(Shape::Chars));
     }
 
+    // ---- named registers ---------------------------------------------------
+
+    /// `"nyy` captures first and asks after: the prompt opens prefilled once
+    /// the command is done, and `:name a` files the capture under the name —
+    /// in the named space, not on the ring.
+    #[test]
+    fn a_named_capture_prompts_and_the_name_stores_it() {
+        let mut ed = editor("alpha\n");
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Named,
+        }));
+        assert!(
+            matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "name "),
+            "the prompt opened prefilled"
+        );
+
+        ed.apply(cmd(Action::CommandChar('a')));
+        ed.apply(cmd(Action::CommandExecute));
+
+        assert_eq!(ed.session.registers.named_at(0).unwrap().text, "alpha\n");
+        assert!(ed.session.registers.is_empty(), "the named space is not the ring");
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    /// Backing out of the prompt keeps the text — on the ring, where an
+    /// unnamed capture would have gone. `"ndd` then Esc must not be a way to
+    /// lose a line.
+    #[test]
+    fn abandoning_the_name_prompt_keeps_the_capture_on_the_ring() {
+        let mut ed = editor("alpha\n");
+        ed.set_cursor(Cursor::at(0));
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: Target::Motion(Motion::CurrentLine),
+            count: 1,
+            sink: Sink::Named,
+        }));
+        ed.apply(cmd(Action::CommandCancel));
+
+        assert_eq!(ed.session.registers.front().unwrap().text, "alpha\n", "not lost");
+        assert!(ed.session.registers.named().is_empty());
+    }
+
+    /// `"np` is a choice, not a slot: the picker over the names opens, and
+    /// the chosen entry pastes and leads the ring so `.` and `p` repeat it.
+    #[test]
+    fn quote_n_p_pastes_a_named_register_through_the_picker() {
+        let mut ed = editor("start ");
+        ed.session.registers.set_named("word", charwise("kept"));
+        ed.session.registers.push(charwise("noise"));
+        ed.set_cursor(Cursor::at(5));
+
+        ed.apply(cmd(Action::Paste { before: false, count: 1, sink: Sink::Named }));
+        assert!(ed.session.picker.is_some(), "the picker over the names opened");
+        ed.apply(cmd(Action::PickAccept));
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "start kept");
+        assert_eq!(ed.session.registers.front().unwrap().text, "kept", "leads the ring");
+    }
+
+    #[test]
+    fn quote_n_p_with_no_names_says_so() {
+        let mut ed = editor("x");
+        ed.apply(cmd(Action::Paste { before: false, count: 1, sink: Sink::Named }));
+        assert!(ed.session.picker.is_none());
+        assert_eq!(ed.session.status, "no named registers");
+    }
+
+    #[test]
+    fn naming_with_nothing_pending_reports() {
+        let mut ed = editor("x");
+        ed.run_ex("name a");
+        assert!(ed.session.registers.named().is_empty());
+        assert_eq!(ed.session.status, "nothing to name — `\"n` captures first");
+    }
+
     // ---- replace mode ------------------------------------------------------
 
     fn replaced(text: &str, keys: &str) -> Editor {
@@ -15276,6 +15497,51 @@ mod tests {
         ed.set_cursor(Cursor::at(0));
         ed.scroll_to_cursor(9);
         ed
+    }
+
+    /// The horizontal mirror of the scrolloff clamp: the cursor walks off the
+    /// right edge and the window slides after it, margin included; walking
+    /// back to the start brings the window home. `:zen` first, so the text
+    /// width is the window width and the numbers are the test's own.
+    #[test]
+    fn the_window_follows_the_cursor_sideways() {
+        let mut ed = editor(&format!("{}\n", "x".repeat(100)));
+        ed.run_ex("zen");
+        let focus = ed.focus();
+        ed.set_cursor(Cursor::at(0));
+        ed.size_window(focus, 20, 5);
+        assert_eq!(text_of(&ed, focus).left, 0);
+
+        ed.set_cursor(Cursor::at(99));
+        ed.size_window(focus, 20, 5);
+        assert_eq!(text_of(&ed, focus).left, 99 + 3 + 1 - 20, "the margin past the right edge");
+
+        ed.set_cursor(Cursor::at(0));
+        ed.size_window(focus, 20, 5);
+        assert_eq!(text_of(&ed, focus).left, 0, "and back");
+    }
+
+    /// The offset is display columns: fifty CJK chars are a hundred cells,
+    /// and the window scrolls by what the screen shows rather than by chars.
+    #[test]
+    fn sideways_scrolling_counts_cells_not_chars() {
+        let mut ed = editor(&format!("{}\n", "漢".repeat(50)));
+        ed.run_ex("zen");
+        let focus = ed.focus();
+        ed.set_cursor(Cursor::at(49));
+        ed.size_window(focus, 20, 5);
+        assert_eq!(text_of(&ed, focus).left, 98 + 3 + 1 - 20, "char 49 sits at cell 98");
+    }
+
+    /// A width nobody reported — a headless embedder, a test that never drew —
+    /// must not pin the window to the cursor.
+    #[test]
+    fn no_reported_width_means_no_sideways_scrolling() {
+        let mut ed = editor(&format!("{}\n", "x".repeat(100)));
+        let focus = ed.focus();
+        ed.set_cursor(Cursor::at(99));
+        ed.scroll_to_cursor(5);
+        assert_eq!(text_of(&ed, focus).left, 0);
     }
 
     #[test]
