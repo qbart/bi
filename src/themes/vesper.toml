@@ -1,5 +1,6 @@
-# vesper — a near-black, warm-accented theme, after
-# https://github.com/nexxeln/vesper.nvim.
+# vesper — a near-black, warm-accented theme.
+#
+# Based on https://github.com/nexxeln/vesper.nvim
 #
 # Compiled into the binary; a file at <config dir>/themes/vesper.toml is a
 # PATCH over this one, so changing a single colour does not mean copying the

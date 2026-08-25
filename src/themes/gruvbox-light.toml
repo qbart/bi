@@ -1,10 +1,12 @@
 # gruvbox light, medium contrast.
 #
-# Palette from github.com/morhetz/gruvbox. The same roles as gruvbox, in
-# the light palette's *faded* column — on a light background the bright accents
-# that carry a dark theme have nothing to be bright against, so red is #9d0006
-# here where it is #fb4934 there. Compiled into the binary; a file at
-# <config dir>/themes/gruvbox-light.toml is a PATCH over this one.
+# Based on https://github.com/morhetz/gruvbox
+#
+# The same roles as gruvbox, in the light palette's *faded* column — on a
+# light background the bright accents that carry a dark theme have nothing to
+# be bright against, so red is #9d0006 here where it is #fb4934 there.
+# Compiled into the binary; a file at <config dir>/themes/gruvbox-light.toml
+# is a PATCH over this one.
 #
 # Not the default, and it cannot be: bi has no way to ask the terminal whether
 # it is light. `:set theme gruvbox-light`, or `theme = "gruvbox-light"` in
