@@ -424,6 +424,13 @@ impl Action {
         // A motion repeats, unless its count picks a destination instead.
         // `Operate` never repeats: it folded its counts in already.
         if let Action::Move(m) = self {
+            // A find consumes its own count, exactly as it does under an
+            // operator: `3fp` with two `p`s on the line goes nowhere rather
+            // than stopping at the second, and `2ta` done as two `ta`s would
+            // equal `ta` — see `Buffer::moved_counted`.
+            if matches!(m, Motion::FindChar { .. } | Motion::RepeatFind { .. }) {
+                return false;
+            }
             return !m.is_absolute();
         }
         // A move repeats one row at a time, so `3 Shift-Down` clamps at the
@@ -7899,9 +7906,14 @@ impl View<'_> {
             self.session.undo_from = self.selections.as_pairs();
         }
         self.record(&cmd);
-        let n = if cmd.action.repeatable() { cmd.count.max(1) } else { 1 };
-        for _ in 0..n {
-            self.apply_once(&cmd.action);
+        // A repeatable action runs count times; the rest run once and take
+        // the count with them — most ignore it, a find consumes it whole.
+        if cmd.action.repeatable() {
+            for _ in 0..cmd.count.max(1) {
+                self.apply_once(&cmd.action, 1);
+            }
+        } else {
+            self.apply_once(&cmd.action, cmd.count.max(1));
         }
         // Decided per command rather than inside the search actions, because
         // what ends it is *anything else* — one place to say so, and no way
@@ -8388,7 +8400,7 @@ impl View<'_> {
         }
     }
 
-    fn apply_once(&mut self, action: &Action) {
+    fn apply_once(&mut self, action: &Action, count: usize) {
         let eol = self.session.mode.allows_eol();
 
         match action {
@@ -8404,7 +8416,7 @@ impl View<'_> {
                 }
                 let visual = self.session.mode.visual().is_some();
                 self.for_each_selection(|ed, sel| {
-                    let head = ed.buffer.moved(sel.head, m, eol);
+                    let head = ed.buffer.moved_counted(sel.head, m, eol, count);
                     // In visual mode only the head moves; the anchor is what
                     // makes it a range rather than a cursor.
                     if visual {

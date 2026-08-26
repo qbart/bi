@@ -20,6 +20,9 @@ sign in the gutter for every line the index does not have, and a `+3 ~1 -2`
 numstat in the status row. `:diags` lists every stored diagnostic in a pane
 to jump from, and `:zen` strips the chrome — gutter, numbers, status rows —
 until you ask for it back.
+A latin1 or CRLF file opens without being asked and saves back byte-identical
+— encoding, BOM and line endings are detected at open, shown in the status
+row, and switched with `:set fileencoding` / `:set fileformat` / `:e ++enc=`.
 `gf`, the file tree and `:find` all respect what `.gitignore` says is not
 the project's (`gh` in the tree shows everything anyway), and an image file
 opens as the picture it is where the terminal speaks the kitty graphics
@@ -504,6 +507,9 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:wq` `:x` | write and quit |
 | `:e` `:e!` | revert this buffer from disk, refusing if modified unless forced |
 | `:e <path>` | open another file, reusing its buffer if it is already open |
+| `:e ++enc=cp1250 [path]` | open or revert with the encoding forced; `++ff=dos\|unix` for line endings |
+| `:set fileencoding {enc}` | this buffer's on-disk encoding — the next `:w` converts; bare, reports it |
+| `:set fileformat dos\|unix` | what ends a line on disk; `:set bom true\|false` the byte-order mark |
 | `:reload` | re-read the config, through the same path startup uses — different job from `:e`, which reverts the buffer |
 | `:sp [path]` `:vs [path]` | split below / right; bare, the new window duplicates this one |
 | `:new` `:vnew` | split onto a new unnamed buffer, rather than a second view of this one |
@@ -713,6 +719,9 @@ and a sidebar cannot spare a line to say so twice.
 Names are file names. Which `main.rs` it is belongs to the picker, and a pane
 thirty columns wide has no room to say it twice. The modified marker rides with
 the name in both, because it matters most on a pane you are not looking at.
+So do the storage badges — `[windows-1250]`, `[bom]`, `[crlf]` — shown only
+when a buffer is not plain UTF-8 with `\n`, so a clean file's row does not
+change by one cell.
 
 The footer underneath is the session's: messages, half-typed keys, the cursor
 count, and the `:` and `/` lines.
@@ -1020,12 +1029,42 @@ the cursor follows the text rather than the line number. See
 
 Read, with no switch to turn it on and none to turn it off: a repository that
 has one means it. `root`, `indent_style`, `indent_size`, `tab_width`,
-`trim_trailing_whitespace` and `insert_final_newline` become options; `charset` and `end_of_line` are ignored because bi is always UTF-8 and
-always writes `\n`; the rest are for editors with features bi does not have
-yet. The nearest file to yours wins, `root = true` stops the walk, and the glob
-dialect is the format's own — `**`, `{a,b}`, `{1..9}` and all. Nothing is
-cached, so `:reload` picks up an edit to it. See
+`trim_trailing_whitespace` and `insert_final_newline` become options;
+`charset` and `end_of_line` are honoured too, at the open rather than as
+options — see the next section; the rest are for editors with features bi
+does not have yet. The nearest file to yours wins, `root = true` stops the
+walk, and the glob dialect is the format's own — `**`, `{a,b}`, `{1..9}` and
+all. Nothing is cached, so `:reload` picks up an edit to it. See
 [docs/specs/editorconfig.md](docs/specs/editorconfig.md).
+
+#### Encodings and line endings
+
+The inside of bi is UTF-8 with `\n`, always — encoding, BOM and line endings
+are facts about how a file is *stored*, decoded at open and encoded at save.
+A latin1 header or a CRLF `.csv` opens without being asked and saves back
+byte-identical; the status row grows a `[windows-1250]` / `[bom]` / `[crlf]`
+badge only when there is something to say.
+
+Detection is a list, not a guess: `fileencodings = ["utf-8", "latin1"]` in
+config.toml, walked in order, first clean decode wins — latin1 accepts every
+byte, so an open cannot fail. Anyone living in another codepage writes
+`["utf-8", "cp1250"]` once and is done; the labels are the WHATWG table,
+which speaks vim (`latin1`, `cp1250`, `shift_jis`). An `.editorconfig`
+`charset` is tried first for that file, and `end_of_line` converts the file
+on its next save, which is what the property means.
+
+```
+:set fileencoding cp1250    this buffer; the next :w converts the file
+:set fileformat dos|unix    what ends a line on disk
+:set bom true|false         the byte-order mark; UTF-16 always writes one
+:e ++enc=latin1 [path]      reopen as what you said it is — vim's spelling
+:e ++ff=dos [path]          the same, for the line endings
+```
+
+Each of the three `:set`s is buffer-local, as in vim, and marks the buffer
+modified — the text no longer matches the disk as stored. A char the target
+encoding cannot spell fails the write with the disk untouched, naming the
+char and its `line:col`. See [docs/specs/encoding.md](docs/specs/encoding.md).
 
 #### `:retab`
 

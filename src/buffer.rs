@@ -1805,6 +1805,28 @@ impl Buffer {
         (removed, landed)
     }
 
+    /// [`Buffer::moved`], `count` times — except a find, which consumes the
+    /// count in one pass. `3fp` on a line with two `p`s is one question with
+    /// the answer "not there", not three steps clamping at the second; and
+    /// `2ta` done as two `ta`s would equal `ta`, since a fresh `t` refuses to
+    /// advance past the match it is already next to.
+    pub fn moved_counted(
+        &self,
+        at: Cursor,
+        motion: Motion,
+        allow_eol: bool,
+        count: usize,
+    ) -> Cursor {
+        if let Motion::FindChar { ch, forward, till, repeat } = motion {
+            return self.find_char(at, ch, forward, till, repeat, count.max(1)).unwrap_or(at);
+        }
+        let mut cur = at;
+        for _ in 0..count.max(1) {
+            cur = self.moved(cur, motion, allow_eol);
+        }
+        cur
+    }
+
     /// Where `motion` lands from `at`. Pure, like every other motion here —
     /// the buffer has no cursor of its own to move.
     pub fn moved(&self, at: Cursor, motion: Motion, allow_eol: bool) -> Cursor {
