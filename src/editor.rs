@@ -217,6 +217,10 @@ pub enum Action {
     PickNext,
     PickPrev,
     PickAccept,
+    /// `Ctrl-Enter` — accept into a vertical split, for the pickers that
+    /// choose something a window can show; the rest treat it as `Enter`.
+    /// See `docs/specs/open-in-split.md`.
+    PickAcceptSplit,
     PickCancel,
     PickToggleShort,
 
@@ -2196,7 +2200,11 @@ pub enum ResultsCmd {
     First,
     Last,
     /// Enter — open the file at the line, replacing the results pane.
-    Open,
+    /// `Ctrl-Enter` sets `split`: the file opens in a vertical split beside
+    /// the results instead. See `docs/specs/open-in-split.md`.
+    Open {
+        split: bool,
+    },
     /// `Ctrl-^` back to what the pane was showing before the search.
     Close,
     /// `a` — apply the selected rewrite (or a heading's whole file), on an
@@ -2231,6 +2239,10 @@ pub enum TreeCmd {
     Collapse,
     /// `Enter` — a directory toggles, a file opens.
     Enter,
+    /// `s` — a file opens in a new vertical split of the window the tree
+    /// would have opened it in; a directory toggles, as `Enter` would. See
+    /// `docs/specs/open-in-split.md`.
+    Split,
     /// `-` — re-root at the parent directory.
     Up,
     /// `+` — re-root at the selected directory, the inverse of `-`.
@@ -4499,13 +4511,27 @@ impl Editor {
                 return;
             }
             ResultsCmd::Apply | ResultsCmd::ApplyAll => unreachable!("handled above"),
-            ResultsCmd::Open => {
+            ResultsCmd::Open { split } => {
                 let root = results.root.clone();
                 let Some(path) = results.selected_path().cloned() else { return };
                 // A heading has no line of its own, so it opens the top of the
                 // file — which is what you meant by pressing Enter on a file.
                 let line = results.selected_match().map(|m| (m.line, m.col));
                 let full = root.join(path).to_string_lossy().into_owned();
+                // `Ctrl-Enter`: beside the results rather than over them. The
+                // buffer is opened before the split so a path that fails to
+                // open leaves no second results pane behind; the reopen after
+                // is the cheap one, through the buffer already in the list.
+                if split {
+                    if let Err(e) = self.open_path(&full) {
+                        self.session.status = format!("{e:#}");
+                        return;
+                    }
+                    // A failed split has already said why.
+                    if self.split_focus(Dir::Vertical).is_none() {
+                        return;
+                    }
+                }
                 self.edit_path(&full);
                 if let Some((line, col)) = line {
                     // On the match, not the top of the line: the column is the
@@ -4578,28 +4604,42 @@ impl Editor {
                 return;
             }
             TreeCmd::Paste => return self.paste_into_selected(),
-            TreeCmd::Expand | TreeCmd::Enter => {}
+            TreeCmd::Expand | TreeCmd::Enter | TreeCmd::Split => {}
         }
 
         let Some(row) = tree.selected_row() else { return };
         if row.kind == Kind::Dir {
-            // The difference between the two keys is only here: `l` opens a
-            // closed directory and leaves an open one alone, `Enter` flips it.
+            // The difference between the keys is only here: `l` opens a
+            // closed directory and leaves an open one alone, `Enter` flips
+            // it — and so does `s`, because a directory is not a thing a
+            // window can show beside another.
             match cmd {
-                TreeCmd::Enter => tree.toggle(),
+                TreeCmd::Enter | TreeCmd::Split => tree.toggle(),
                 _ => tree.expand(),
             }
             return;
         }
 
         let path = row.path.clone();
-        let target = self.open_target();
+        // `s` splits beside what the tree would have opened over — never the
+        // sidebar itself. The split is made only once the content is in hand,
+        // so a path that fails to open leaves no extra window behind.
+        let split = matches!(cmd, TreeCmd::Split);
+        let target = |ed: &mut Self| match split {
+            true => {
+                ed.set_focus(ed.open_target());
+                ed.split_focus(Dir::Vertical)
+            }
+            false => Some(ed.open_target()),
+        };
         if let Ok(Some(img)) = self.decode_image(&path) {
+            let Some(target) = target(self) else { return };
             self.show_image(target, img);
             return self.set_focus(target);
         }
         match self.open_path(&path.to_string_lossy()) {
             Ok(id) => {
+                let Some(target) = target(self) else { return };
                 self.show(target, id);
                 self.set_focus(target);
                 self.session.status = self.name_of(id);
@@ -5060,7 +5100,8 @@ impl Editor {
                 }
             }
             Action::PickCancel => self.close_picker(),
-            Action::PickAccept => self.accept_pick(),
+            Action::PickAccept => self.accept_pick(false),
+            Action::PickAcceptSplit => self.accept_pick(true),
 
             _ => return false,
         }
@@ -5082,7 +5123,12 @@ impl Editor {
     /// the editor's; a register pick pastes, which needs a view — and a tree
     /// pane has nothing to paste into; and a history pick runs nothing at all,
     /// because the line is going back to the command line to be edited.
-    fn accept_pick(&mut self) {
+    /// `split` is `Ctrl-Enter`: the two pickers that choose something a
+    /// window can show — a file, a buffer — accept into a new vertical
+    /// split. The rest ignore it and accept as `Enter` would, because their
+    /// choices have no window of their own and a chord that suddenly did
+    /// nothing would read as a broken key.
+    fn accept_pick(&mut self, split: bool) {
         let picker = self.session.picker.take();
         // The selection the picker was opened over is still there, and the
         // paste is about to consume it — so the mode goes back to what it was
@@ -5096,15 +5142,26 @@ impl Editor {
             // A position rather than an id, because the rows were built from
             // the list in order and it cannot change while the picker holds
             // every key.
-            PickerKind::Buffer => self.run_buffer_cmd(BufferCmd::Chosen(chosen)),
+            PickerKind::Buffer => {
+                if split && self.split_focus(Dir::Vertical).is_none() {
+                    return;
+                }
+                self.run_buffer_cmd(BufferCmd::Chosen(chosen));
+            }
             // Through `:e`, like everything else that opens a file, so one
             // already open comes back as the buffer it is rather than as a
-            // second copy of it.
+            // second copy of it — and the split form through `:vs <path>`,
+            // which already opens content before splitting and knows what to
+            // do with a directory or an image.
             PickerKind::File => {
                 let path = picker.items()[chosen].text.clone();
                 let root = self.tree_root(None);
                 let full = root.join(path).to_string_lossy().to_string();
-                self.edit_path(&full);
+                match split {
+                    true => self
+                        .run_window_cmd(WindowCmd::Split { dir: Dir::Vertical, path: Some(full) }),
+                    false => self.edit_path(&full),
+                }
             }
             // A row rather than a file: this one moves the tree's cursor and
             // opens nothing, which is why it is not `PickerKind::File`.
@@ -9074,6 +9131,7 @@ impl View<'_> {
             | Action::PickToggleShort
             | Action::PickCancel
             | Action::PickAccept
+            | Action::PickAcceptSplit
             | Action::LabelChar(_)
             | Action::LabelCancel
             | Action::ShowScopes
@@ -13393,6 +13451,45 @@ mod tests {
         assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
     }
 
+    /// `s` — beside the pane the tree would have opened over, never beside
+    /// the sidebar. See `docs/specs/open-in-split.md`.
+    #[test]
+    fn s_in_the_tree_opens_the_file_in_a_split_beside_the_handoff_window() {
+        let d = ScratchDir::new("tree-split").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(format!("{}/b.rs", d.path())).unwrap();
+        let file = ed.focus();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        let tree = ed.focus();
+
+        tree_key(&mut ed, TreeCmd::First);
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Split);
+
+        assert_eq!(ed.window_ids().len(), 3, "tree, the pane you came from, the split");
+        assert!(ed.window_of(tree).unwrap().tree().is_some(), "the sidebar stayed a sidebar");
+        assert_ne!(ed.focus(), file, "focus is in the new pane");
+        assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"), "showing the pick");
+        let kept = ed.buffer_of(file).unwrap().path.clone().unwrap();
+        assert!(kept.ends_with("b.rs"), "and the pane you came from kept what it had");
+    }
+
+    /// A directory is not a thing a window can show beside another, so `s`
+    /// does what `Enter` does: toggles it.
+    #[test]
+    fn s_on_a_directory_toggles_it_and_splits_nothing() {
+        let d = ScratchDir::new("tree-split-dir").dir("sub").file("sub/x.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        sized(&mut ed);
+        let windows = ed.window_ids().len();
+
+        select_first_entry(&mut ed);
+        tree_key(&mut ed, TreeCmd::Split);
+
+        assert_eq!(ed.window_ids().len(), windows, "no split");
+        assert!(ed.window().tree().is_some(), "still the tree");
+    }
+
     /// Three panes: two files and a tree. Enter has to pick one of the two,
     /// and the one you came from is the one you meant.
     #[test]
@@ -16676,12 +16773,34 @@ mod tests {
         ex(&mut ed, "find other");
 
         ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
-        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: false })));
 
         assert_eq!(ed.buffer().unwrap().line(1), "let other = 2;");
         let at = ed.cursor().unwrap();
         assert_eq!(ed.buffer().unwrap().row_at(at), 1);
         assert_eq!(ed.buffer().unwrap().col_at(at), 4, "on the match, not the start of the line");
+    }
+
+    /// `Ctrl-Enter` — the match opens beside the results instead of over
+    /// them, cursor on the match. See `docs/specs/open-in-split.md`.
+    #[test]
+    fn ctrl_enter_on_a_row_opens_the_match_in_a_split_beside_the_results() {
+        let files = project("find-open-split");
+        let mut ed = in_project(&files, "c.rs");
+        sized(&mut ed);
+        ex(&mut ed, "find other");
+        let results = ed.focus();
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: true })));
+
+        assert_eq!(ed.window_ids().len(), 2);
+        assert!(ed.window_of(results).unwrap().results().is_some(), "the results survived");
+        assert_ne!(ed.focus(), results);
+        assert_eq!(ed.buffer().unwrap().line(1), "let other = 2;");
+        let at = ed.cursor().unwrap();
+        assert_eq!(ed.buffer().unwrap().row_at(at), 1);
+        assert_eq!(ed.buffer().unwrap().col_at(at), 4, "on the match, in the new pane");
     }
 
     #[test]
@@ -16691,7 +16810,7 @@ mod tests {
         ex(&mut ed, "find other");
 
         // Row 0 is the heading, which is where the selection starts.
-        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: false })));
 
         assert_eq!(ed.buffer().unwrap().row_at(ed.cursor().unwrap()), 0);
     }
@@ -17014,7 +17133,7 @@ mod tests {
         let mut ed = in_project(&files, "c.rs");
         ex(&mut ed, "find needle");
         ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
-        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: false })));
         assert!(ed.window().results().is_none(), "the file displaced the pane");
 
         ex(&mut ed, "b#");
@@ -17033,7 +17152,7 @@ mod tests {
         ed.apply(cmd(Action::Results(ResultsCmd::Apply)));
 
         // Leave through Enter, then wander off — the alternate slot moves on.
-        ed.apply(cmd(Action::Results(ResultsCmd::Open)));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: false })));
         let other = files.0.join("c.rs").to_string_lossy().into_owned();
         ex(&mut ed, &format!("e {other}"));
 
@@ -19377,6 +19496,65 @@ int main(void) {
         ed.apply(cmd(Action::PickAccept));
 
         assert_eq!(ed.buffer_ids().len(), before, "one file, one buffer");
+    }
+
+    /// `Ctrl-Enter` — the choice lands in a new vertical split, and the pane
+    /// the picker was opened over keeps what it was showing. See
+    /// `docs/specs/open-in-split.md`.
+    #[test]
+    fn ctrl_enter_in_the_file_picker_accepts_into_a_split() {
+        let files = Files::new("picker-split");
+        files.file("alpha.rs", "one\n");
+        let path = files.file("beta.rs", "two\n");
+        let mut ed = Editor::open(&path).unwrap();
+        sized(&mut ed);
+        ed.session.tree_root = Some(files.0.clone());
+        let first = ed.focus();
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+        ed.apply(cmd(Action::PickChar('l')));
+        ed.apply(cmd(Action::PickAcceptSplit));
+
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.window_ids().len(), 2);
+        assert_ne!(ed.focus(), first);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\n", "the pick, in the new pane");
+        let kept = ed.buffer_of(first).unwrap().path.clone().unwrap();
+        assert!(kept.ends_with("beta.rs"), "the old pane kept its file");
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_buffer_switcher_accepts_into_a_split() {
+        let files = Files::new("switcher-split");
+        let left = files.file("left.rs", "l\n");
+        let mut ed = Editor::open(&left).unwrap();
+        sized(&mut ed);
+        ex(&mut ed, &format!("e {}", files.file("right.rs", "r\n")));
+        let first = ed.focus();
+
+        ed.apply(cmd(Action::Buffer(BufferCmd::List)));
+        ed.apply(cmd(Action::PickChar('l')));
+        ed.apply(cmd(Action::PickChar('e')));
+        ed.apply(cmd(Action::PickAcceptSplit));
+
+        assert_eq!(ed.window_ids().len(), 2);
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "l\n", "the pick, in the new pane");
+        let kept = ed.buffer_of(first).unwrap().path.clone().unwrap();
+        assert!(kept.ends_with("right.rs"), "the old pane kept its file");
+    }
+
+    /// A register has no window of its own: the chord is plain `Enter` there,
+    /// not a broken key.
+    #[test]
+    fn ctrl_enter_in_the_register_picker_is_plain_accept() {
+        let mut ed = ed_with_ring();
+        let c = ed.buffer().unwrap().at_row(0, false);
+        ed.set_cursor(c);
+        ed.apply(open_register_picker(true));
+        pick_keys(&mut ed, &[Action::PickAcceptSplit]);
+
+        assert_eq!(ed.window_ids().len(), 1, "no split appeared");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "gamma\nalpha\nbeta\ngamma");
     }
 
     /// The picker reached from a tree opens the file the way Enter on a tree

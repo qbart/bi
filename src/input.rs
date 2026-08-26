@@ -621,8 +621,8 @@ impl Input {
             // Movement, marks, the two prompts, the two command lines, and `g`
             // and `d`, which are prefixes rather than keys.
             KeyCode::Char(
-                'h' | 'j' | 'k' | 'l' | 'g' | 'd' | 'G' | 'R' | 'y' | 'c' | 'x' | 'p' | 'a' | 'r'
-                | '-' | '+' | ':' | '/',
+                'h' | 'j' | 'k' | 'l' | 'g' | 'd' | 'G' | 'R' | 's' | 'y' | 'c' | 'x' | 'p' | 'a'
+                | 'r' | '-' | '+' | ':' | '/',
             ) => true,
             KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => true,
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => true,
@@ -666,7 +666,8 @@ impl Input {
             KeyCode::Char('k') | KeyCode::Up => ResultsCmd::Move(-1),
             KeyCode::Char('d') if ctrl => ResultsCmd::Move(10),
             KeyCode::Char('u') if ctrl => ResultsCmd::Move(-10),
-            KeyCode::Enter | KeyCode::Char('o') => ResultsCmd::Open,
+            KeyCode::Enter if ctrl => ResultsCmd::Open { split: true },
+            KeyCode::Enter | KeyCode::Char('o') => ResultsCmd::Open { split: false },
             // The armed pane's pair, and the prune. See
             // `docs/specs/find-in-files.md`.
             KeyCode::Char('a') => ResultsCmd::Apply,
@@ -755,6 +756,10 @@ impl Input {
             KeyCode::Char('l') | KeyCode::Right => TreeCmd::Expand,
             KeyCode::Char('h') | KeyCode::Left => TreeCmd::Collapse,
             KeyCode::Enter => TreeCmd::Enter,
+            // A letter rather than `Ctrl-Enter`, because the tree cannot
+            // count on the terminal speaking the kitty keyboard protocol —
+            // see `docs/specs/open-in-split.md`.
+            KeyCode::Char('s') => TreeCmd::Split,
             KeyCode::Char('-') => TreeCmd::Up,
             KeyCode::Char('+') => TreeCmd::Down,
             KeyCode::Char('R') => TreeCmd::Refresh,
@@ -1476,6 +1481,9 @@ impl Input {
             KeyCode::Char('p') if ctrl => Action::PickPrev,
             KeyCode::Char('a') if ctrl => Action::PickToggleShort,
             KeyCode::Char(c) => Action::PickChar(c),
+            // Reaches the keymap only where the terminal disambiguates it —
+            // see `docs/specs/open-in-split.md`.
+            KeyCode::Enter if ctrl => Action::PickAcceptSplit,
             KeyCode::Enter => Action::PickAccept,
             KeyCode::Backspace => Action::PickBackspace,
             KeyCode::Down => Action::PickNext,
@@ -2048,9 +2056,11 @@ leader = \" \"
 
     /// The keymap is an allowlist, and this is what that buys: no key that
     /// edits or enters insert mode can reach a pane sitting on a filesystem.
+    /// `s` left this list when the tree gave it to the split open — it edits
+    /// nothing there either.
     #[test]
     fn nothing_in_a_tree_enters_insert_or_edits() {
-        for c in ['i', 'A', 'I', 'o', 'O', 'v', 'V', 'u', 's'] {
+        for c in ['i', 'A', 'I', 'o', 'O', 'v', 'V', 'u'] {
             assert!(in_tree(&c.to_string()).is_none(), "{c:?} did something in a tree");
         }
     }
@@ -2207,6 +2217,28 @@ leader = \" \"
     /// Two keys, one list: `gf` over every path under the root, `/` over the
     /// rows on screen. `/` is search everywhere else in bi, and a tree's
     /// search is a list you pick from rather than a cursor that moves.
+    #[test]
+    fn s_in_a_tree_is_the_split_open_and_ctrl_enter_splits_a_results_pane() {
+        assert_eq!(tree_action("s"), Action::Tree(TreeCmd::Split));
+
+        let mut input = Input::default();
+        let ctrl_enter = Key {
+            code: KeyCode::Enter,
+            mods: crate::key::Mods { ctrl: true, ..Default::default() },
+        };
+        assert_eq!(
+            input.on_key(ctrl_enter, &Mode::Normal, ContentKind::Results).unwrap().action,
+            Action::Results(ResultsCmd::Open { split: true })
+        );
+        assert_eq!(
+            input
+                .on_key(Key::code(KeyCode::Enter), &Mode::Normal, ContentKind::Results)
+                .unwrap()
+                .action,
+            Action::Results(ResultsCmd::Open { split: false })
+        );
+    }
+
     #[test]
     fn a_tree_searches_the_whole_thing_with_gf_and_the_pane_with_slash() {
         assert_eq!(tree_action("gf"), Action::Tree(TreeCmd::Find { whole: true }));
@@ -2840,6 +2872,11 @@ leader = \" \"
         assert_eq!(act(ctrl('p')), Action::PickPrev);
         assert_eq!(act(ctrl('a')), Action::PickToggleShort);
         assert_eq!(act(Key::code(KeyCode::Enter)), Action::PickAccept);
+        let ctrl_enter = Key {
+            code: KeyCode::Enter,
+            mods: crate::key::Mods { ctrl: true, ..Default::default() },
+        };
+        assert_eq!(act(ctrl_enter), Action::PickAcceptSplit);
         assert_eq!(act(Key::code(KeyCode::Esc)), Action::PickCancel);
         assert_eq!(act(Key::code(KeyCode::Backspace)), Action::PickBackspace);
         assert_eq!(act(Key::code(KeyCode::Down)), Action::PickNext);

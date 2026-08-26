@@ -15,6 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -290,6 +291,10 @@ impl ConfigSource for XdgConfig {
     }
 }
 
+/// Whether the kitty keyboard protocol was pushed, so `restore` — reachable
+/// from the panic hook, which captures nothing — knows to pop it.
+static KITTY_KEYBOARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -297,6 +302,20 @@ fn setup() -> Result<Term> {
     // one keystroke per character. Without it the terminal has no way to say
     // "this is a paste", and a 2 KB paste costs 2000 redraws.
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+
+    // A legacy terminal sends `Enter` and `Ctrl-Enter` as the same byte, so
+    // the chord only exists where the kitty keyboard protocol does. Asked,
+    // never assumed, and only the mildest level — disambiguate changes how
+    // ambiguous keys are encoded and nothing else. A `false` costs the
+    // chord, not the key: `Enter` keeps arriving as `Enter` either way.
+    // See docs/specs/open-in-split.md.
+    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        KITTY_KEYBOARD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Without this, a panic anywhere leaves the user in a wrecked terminal with
     // no echo and no prompt.
@@ -311,6 +330,11 @@ fn setup() -> Result<Term> {
 
 fn restore() -> Result<()> {
     if terminal::is_raw_mode_enabled()? {
+        // Popped before raw mode goes, and only if it was pushed: a pop the
+        // terminal never saw the push for would pop someone else's flags.
+        if KITTY_KEYBOARD.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
+        }
         disable_raw_mode()?;
         // Bracketed paste comes off here too, panic hook included: a terminal
         // left in it pastes escape noise into the next shell prompt.
