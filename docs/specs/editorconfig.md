@@ -34,11 +34,13 @@ is exactly bi's `shiftwidth = 0`, so it resolves to that and needs no arithmetic
 property rather than applying it — which leaves the layer below showing
 through, which is what the word means.
 
-Everything else in the file is ignored, and ignored *silently*: `charset`,
-`end_of_line`, `max_line_length` and whatever else a project has written there
-are not errors, they are properties for editors with features bi does not have
-yet. bi is always UTF-8 and always writes `\n`, which is `charset = utf-8` and
-`end_of_line = lf` whether or not anyone says so.
+**`charset` and `end_of_line`** are honoured, but not here: they are facts
+about how a file is stored rather than options, so they apply at the open
+boundary rather than through the option layers — see `encoding.md`.
+
+Everything else in the file is ignored, and ignored *silently*:
+`max_line_length` and whatever else a project has written there are not
+errors, they are properties for editors with features bi does not have yet.
 
 ## How a file is found
 
