@@ -1588,6 +1588,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             PickerKind::TreeRow => " tree ",
             PickerKind::Symbol => " symbols ",
             PickerKind::History => " history ",
+            PickerKind::Theme => " themes ",
         });
     let inner = outer.inner(rect);
     frame.render_widget(outer, rect);

@@ -808,6 +808,42 @@ next adjustment a fight. What they get instead is one table asserting the
 frame each claims, which is what a stray `#` anywhere else in the file would
 most likely take down with it.
 
+## `:themes`
+
+Sixteen built-ins is too many to hold in your head and type correctly into
+`:set theme <name>` — `nordark` versus `nord`, `gruvbox` versus
+`gruvbox-light`, which one was `lighthaus` again. `:themes` opens the same
+fuzzy picker every other list in bi uses, over the names `Theme::builtins()`
+returns, and accepting a row is `:set theme <name>` — nothing more, so
+everything that already follows from `:set theme` follows from this too: the
+new palette lands immediately, an SSH session still moves whichever of
+`theme` / `ssh_theme` is live, and the status line echoes the name back.
+
+**Aliases are not listed, on purpose.** The same reasoning `Theme::builtin`'s
+own doc comment gives: an editor that answers "what themes are there" with two
+spellings of one screen is answering a question nobody asked. Typing `nord`
+still works — `:set theme nord` reaches the alias directly — `:themes` is
+where you *browse*, and a browse list with the same picture twice is worse
+than one with a gap in it.
+
+**It opens on the theme already in force.** Not row zero, and not the row
+before it the way the buffer switcher does — a buffer switcher is a toggle
+you reach for repeatedly, a theme switcher is a browse you do once and want
+oriented in. The current theme carries a `✓` badge for the same reason: you
+can see where you are before you start moving.
+
+Filtering is a subsequence match, the same rule the file picker and the buffer
+switcher use — theme names are identifiers, not prose, and `nord` should find
+`nordark` the way `sfr` finds `src/find/render.rs`. Matches are ranked by
+quality rather than kept in registration order, because registration order is
+alphabetical-ish and answers nothing about what you typed; unlike the buffer
+list, there is no "most recent" for a theme to fall back to instead.
+
+No preview pane. A theme name is a name you either recognise or are about to
+try — there is nothing a first line of it would tell you that the row does
+not already say, the same argument `docs/specs/buffers.md` makes for the
+buffer switcher.
+
 ## Testing
 
 - every key in `Ui::REQUIRED` is set by every built-in — a theme that forgets
@@ -873,6 +909,11 @@ most likely take down with it.
   adding a spelling cannot quietly shadow a theme
 - each of the eight ports claims the frame its source does, in one table.
   They get no fence of their own: see "No fences" above
+- `:themes` lists exactly `Theme::builtins()` — no alias appears in it, the
+  other half of the check that an alias reaches its theme — opens on the
+  theme already in force with a `✓` on its row, and accepting a row leaves the
+  editor indistinguishable from having run `:set theme <name>` directly: same
+  resolved theme, same status line, same half of `theme` / `ssh_theme` moved
 
 ## Deferred
 

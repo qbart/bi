@@ -68,6 +68,13 @@ pub enum PickerKind {
     /// typo in is a history that only helps when you were already right. See
     /// `docs/specs/cmdline-history.md`.
     History,
+    /// `:themes` — every built-in theme, to `:set theme` to.
+    ///
+    /// Aliases are not rows here — `Theme::builtins()` names each theme once,
+    /// which is the same argument against listing `gameboy` beside `gb` that
+    /// keeps `:set theme ?` to one spelling per screen. See
+    /// `docs/specs/theme.md`.
+    Theme,
 }
 
 impl PickerKind {
@@ -89,7 +96,10 @@ impl PickerKind {
     /// prose — which is what a register holds — "these letters appear in
     /// order" matches nearly everything, which is why it is not the default.
     fn subsequence(&self) -> bool {
-        matches!(self, PickerKind::File | PickerKind::Buffer | PickerKind::TreeRow)
+        matches!(
+            self,
+            PickerKind::File | PickerKind::Buffer | PickerKind::TreeRow | PickerKind::Theme
+        )
     }
 
     /// Whether matches are sorted by how well they match, rather than kept in
@@ -107,7 +117,7 @@ impl PickerKind {
     /// rows it would rather offer first, and they win every tie without
     /// winning an argument. See `docs/specs/tree.md`.
     fn ranked(&self) -> bool {
-        matches!(self, PickerKind::TreeRow | PickerKind::File)
+        matches!(self, PickerKind::TreeRow | PickerKind::File | PickerKind::Theme)
     }
 }
 

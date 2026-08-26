@@ -1593,6 +1593,9 @@ enum ExLine {
     Alternate,
     /// `:symbols` — the declarations in this file, to jump to one.
     Symbols,
+    /// `:themes` — every built-in theme, to `:set theme` to. See
+    /// `docs/specs/theme.md`.
+    Themes,
     /// `:lsp` — where this buffer stands with its language server; `:lsp
     /// restart` and `:lsp stop` manage the instance. See `docs/specs/lsp.md`.
     Lsp(LspCmd),
@@ -1865,6 +1868,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
+        "themes" => ExLine::Themes,
         "yname" => match arg {
             "" => ExLine::Error("name it what? `:yname {register}`".into()),
             name => ExLine::Name { scope, name: name.into() },
@@ -4130,6 +4134,25 @@ impl Editor {
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
     }
 
+    /// `:themes` — every name `Theme::builtins()` gives, no alias among them.
+    /// See `docs/specs/theme.md`.
+    fn open_theme_picker(&mut self) {
+        let names: Vec<&str> = crate::theme::Theme::builtins().collect();
+        let current = self.session.options.active_theme(self.remote).to_string();
+        let items = names
+            .iter()
+            .map(|&name| Item { text: name.to_string(), badge: (name == current).then_some('✓') })
+            .collect();
+        // On the theme already in force, not the front of the list — this is
+        // a browse you orient in, not a toggle you reach for repeatedly like
+        // the buffer switcher.
+        let default_row = names.iter().position(|&name| name == current).unwrap_or(0);
+        let mut picker = Picker::new(PickerKind::Theme, items, 0);
+        picker.open_on(default_row);
+        self.session.picker = Some(picker);
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
     fn open_file_picker(&mut self) {
         let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
         let files = crate::files::walk(&root, crate::files::LIMIT, self.options().gitignore);
@@ -5000,6 +5023,13 @@ impl Editor {
                 let line = picker.items()[chosen].text.clone();
                 self.session.mode = Mode::Command(line.into());
             }
+            // `:set theme <name>`, exactly — so a re-resolve, the status
+            // line, and which of `theme` / `ssh_theme` moved are all the
+            // same thing `:set` already gets right.
+            PickerKind::Theme => {
+                let name = picker.items()[chosen].text.clone();
+                self.set_option(&format!("theme {name}"));
+            }
         }
     }
 
@@ -5621,6 +5651,7 @@ impl Editor {
             }
             ExLine::Alternate => self.open_alternate(),
             ExLine::Symbols => self.open_symbol_picker(),
+            ExLine::Themes => self.open_theme_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
             ExLine::Definition => self.lsp_goto(lsp::Goto::Definition),
             ExLine::Declaration => self.lsp_goto(lsp::Goto::Declaration),
@@ -10727,6 +10758,85 @@ mod tests {
         let problems = ed.load_config(ConfigText(Some("[options]\ntheme = \"ansi\"\n")));
         assert_eq!(problems, []);
         assert_eq!(ed.theme().ui.background, None, "ansi leaves the terminal's alone");
+    }
+
+    /// `:themes` lists exactly `Theme::builtins()` — no alias among the rows,
+    /// which is the check `an_alias_reaches_its_theme_and_is_not_itself_listed`
+    /// makes from the theme side, read from the command side.
+    #[test]
+    fn themes_lists_every_builtin_and_no_alias() {
+        let mut ed = Editor::empty();
+        ex(&mut ed, "themes");
+        let picker = ed.session.picker.as_ref().expect("themes opens a picker");
+        assert_eq!(picker.kind, PickerKind::Theme);
+
+        let names: Vec<&str> = picker.items().iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(names, crate::theme::Theme::builtins().collect::<Vec<_>>());
+        for alias in ["gameboy", "forest", "molokai", "nord", "gruvbox-dark"] {
+            assert!(!names.contains(&alias), "`{alias}` is an alias and should not be a row");
+        }
+    }
+
+    /// It opens oriented on where you already are, not at the front of the
+    /// list — a browse rather than a toggle, unlike the buffer switcher.
+    #[test]
+    fn themes_opens_on_the_current_theme_and_marks_its_row() {
+        let mut ed = Editor::empty();
+        ex(&mut ed, "set theme vesper");
+        ex(&mut ed, "themes");
+
+        let picker = ed.session.picker.as_ref().unwrap();
+        let at = picker.selected().expect("a default row is selected");
+        assert_eq!(picker.items()[at].text, "vesper");
+        assert_eq!(picker.items()[at].badge, Some('✓'), "the current theme is marked");
+        assert_eq!(
+            picker.items().iter().filter(|i| i.badge.is_some()).count(),
+            1,
+            "only one row is current"
+        );
+    }
+
+    /// Accepting a row is `:set theme <name>`, not a shadow of it — same
+    /// resolved theme, same status line, same option moved.
+    #[test]
+    fn accepting_a_theme_is_indistinguishable_from_set_theme() {
+        let mut direct = Editor::empty();
+        ex(&mut direct, "set theme monokai");
+
+        let mut picked = Editor::empty();
+        ex(&mut picked, "themes");
+        let at = picked
+            .session
+            .picker
+            .as_ref()
+            .unwrap()
+            .items()
+            .iter()
+            .position(|i| i.text == "monokai")
+            .expect("monokai is a row");
+        for _ in 0..at {
+            pick_keys(&mut picked, &[Action::PickNext]);
+        }
+        pick_keys(&mut picked, &[Action::PickAccept]);
+
+        assert!(picked.session.picker.is_none());
+        assert_eq!(picked.session.mode, Mode::Normal);
+        assert_eq!(picked.theme(), direct.theme());
+        assert_eq!(picked.session.status, direct.session.status);
+        assert_eq!(picked.session.options.theme, "monokai");
+    }
+
+    /// Typing narrows it the way every other subsequence picker does.
+    #[test]
+    fn typing_filters_the_theme_list_by_subsequence() {
+        let mut ed = Editor::empty();
+        ex(&mut ed, "themes");
+        pick_keys(&mut ed, &[Action::PickChar('n'), Action::PickChar('r'), Action::PickChar('d')]);
+        let picker = ed.session.picker.as_ref().unwrap();
+        let names: Vec<&str> =
+            picker.matches().iter().map(|&i| picker.items()[i].text.as_str()).collect();
+        assert!(names.contains(&"nordark"), "{names:?}");
+        assert!(!names.contains(&"vesper"), "{names:?}");
     }
 
     #[test]
