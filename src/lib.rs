@@ -29,6 +29,7 @@ pub mod context;
 pub mod decoration;
 pub mod editor;
 pub mod editorconfig;
+pub mod encoding;
 pub mod files;
 pub mod find_in_files;
 pub mod git;

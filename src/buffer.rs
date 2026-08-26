@@ -8,12 +8,13 @@
 //!    [`Edit`]. The rope is private specifically so nothing can bypass that.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ropey::Rope;
 
+use crate::encoding::{self, FileFormat, OpenHow, Storage};
 use crate::history::{Change, Cursors, History};
 use crate::indent::{self, Indent};
 use crate::motion::{Kind, Motion, Operator, Target, TextObject};
@@ -127,6 +128,12 @@ pub struct Buffer {
     /// — the search count is the first — compares it to know it is stale.
     /// Not a version anyone may reason about beyond "different means changed".
     edits: u64,
+    /// How the file is stored on disk — encoding, BOM, line endings. The rope
+    /// above it is always UTF-8 with `\n`. See `docs/specs/encoding.md`.
+    storage: Storage,
+    /// Whether `storage` has moved since the last write. History cannot see a
+    /// change that touches no text, and `:set fileencoding` is exactly that.
+    storage_dirty: bool,
 }
 
 impl Buffer {
@@ -137,20 +144,74 @@ impl Buffer {
             pending_edits: Vec::new(),
             history: History::default(),
             edits: 0,
+            storage: Storage::default(),
+            storage_dirty: false,
         }
     }
 
-    /// Opens `path`. A missing file is not an error — it's a new buffer.
+    /// Opens `path` the default way: UTF-8, then latin1, nothing forced.
+    ///
+    /// A missing file is not an error — it's a new buffer.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_how(path, &OpenHow::default())
+    }
+
+    /// Opens `path` with the storage question answered `how` — the detection
+    /// list, anything a `++enc=`/`++ff=` forced, what a new file starts as.
+    pub fn open_how(path: impl AsRef<Path>, how: &OpenHow) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut buf = Self::empty();
+        buf.storage = how.new_file;
         if path.exists() {
-            let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-            buf.rope = Rope::from_reader(BufReader::new(file))
-                .with_context(|| format!("reading {}", path.display()))?;
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let (text, storage) = encoding::decode(&bytes, &how.detect, how.force_encoding);
+            buf.rope = Rope::from_str(&text);
+            buf.storage = storage;
+            if let Some(fileformat) = how.force_fileformat {
+                buf.storage.fileformat = fileformat;
+            }
         }
         buf.path = Some(path);
         Ok(buf)
+    }
+
+    /// How this buffer's file is stored on disk.
+    pub fn storage(&self) -> Storage {
+        self.storage
+    }
+
+    /// `:set fileencoding` — the next write converts the file.
+    ///
+    /// Each of the three marks the buffer modified only when it actually
+    /// moved: the text no longer matches the disk *as stored*, but `:set
+    /// fileformat unix` on a unix buffer changed nothing.
+    pub fn set_encoding(&mut self, encoding: &'static encoding_rs::Encoding) {
+        if self.storage.encoding == encoding {
+            return;
+        }
+        self.storage.encoding = encoding;
+        // A UTF-16 file without a BOM is unreadable by convention.
+        if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
+            self.storage.bom = true;
+        }
+        self.storage_dirty = true;
+    }
+
+    /// `:set fileformat` — what ends a line on the next write.
+    pub fn set_fileformat(&mut self, fileformat: FileFormat) {
+        if self.storage.fileformat != fileformat {
+            self.storage.fileformat = fileformat;
+            self.storage_dirty = true;
+        }
+    }
+
+    /// `:set bom` — whether the next write leads with one.
+    pub fn set_bom(&mut self, bom: bool) {
+        if self.storage.bom != bom {
+            self.storage.bom = bom;
+            self.storage_dirty = true;
+        }
     }
 
     /// Takes the selections because a write closes the open undo group, and a
@@ -160,11 +221,36 @@ impl Buffer {
         // What lands on disk has to be a revision, or nothing can be marked as
         // saved and the buffer stays "modified" straight after a good write.
         self.commit_undo(before, after);
+        // The bytes are worked out *before* the file is truncated: a `€` that
+        // latin1 cannot spell must fail the save with the disk untouched.
+        let bytes = match self.storage.is_default() {
+            true => None,
+            false => Some(encoding::encode(self.rope.chunks(), &self.storage).map_err(
+                |encoding::Unencodable { ch, at }| {
+                    let row = self.rope.char_to_line(at);
+                    let col = at - self.rope.line_to_char(row);
+                    anyhow::anyhow!(
+                        "{} has no {ch:?} ({}:{}) — `:set fileencoding utf-8`, or remove it",
+                        self.storage.encoding_name(),
+                        row + 1,
+                        col + 1,
+                    )
+                },
+            )?),
+        };
         let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        self.rope
-            .write_to(BufWriter::new(file))
-            .with_context(|| format!("writing {}", path.display()))?;
+        match bytes {
+            // Plain UTF-8/unix streams straight from the rope, as it always has.
+            None => self
+                .rope
+                .write_to(BufWriter::new(file))
+                .with_context(|| format!("writing {}", path.display()))?,
+            Some(bytes) => BufWriter::new(file)
+                .write_all(&bytes)
+                .with_context(|| format!("writing {}", path.display()))?,
+        }
         self.history.mark_saved();
+        self.storage_dirty = false;
         Ok(())
     }
 
@@ -182,9 +268,11 @@ impl Buffer {
         &self.rope
     }
 
-    /// Whether the text differs from the last write.
+    /// Whether the text differs from the last write — or the storage does,
+    /// which history cannot see: `:set fileencoding` changes what a write
+    /// means without touching a char.
     pub fn is_modified(&self) -> bool {
-        self.history.is_modified()
+        self.history.is_modified() || self.storage_dirty
     }
 
     /// Line count as a human sees it: a file ending in `\n` does not get a
@@ -444,13 +532,13 @@ impl Buffer {
     /// longer exists, and replaying them through `edit_raw` would desynchronise
     /// the parse tree. Vim keeps history here behind `'undoreload'`; bi does
     /// not. The caller must rebuild syntax — the tree belongs to the old text.
-    pub fn reload(&mut self, at: Cursor) -> Result<Cursor> {
+    pub fn reload(&mut self, at: Cursor, how: &OpenHow) -> Result<Cursor> {
         let path = self.path.clone().context("no file name")?;
         // Keep the cursor where the new text still has room for it. Clamping
         // the raw char index is not enough: it can land on the phantom row
         // after a trailing newline, which `line_count` does not count.
         let (row, col) = (self.row_at(at), self.col_at(at));
-        *self = Self::open(&path)?;
+        *self = Self::open_how(&path, how)?;
         let row = row.min(self.line_count().saturating_sub(1));
         let col = col.min(self.max_col(row, false));
         Ok(Cursor::at(self.rope.line_to_char(row) + col))
@@ -3047,6 +3135,96 @@ mod tests {
 
         assert!(!b.is_modified(), "the buffer is what's on disk");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello!");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- storage: encoding, BOM, line endings ------------------------------
+
+    /// A real file with these bytes, in a name unique to the test.
+    fn stored(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("bi-storage-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_latin1_file_opens_readable_and_saves_back_byte_identical() {
+        let path = stored("latin1", b"caf\xE9\n");
+        let mut b = Buffer::open(&path).unwrap();
+
+        assert_eq!(b.rope().to_string(), "café\n", "the rope is UTF-8, always");
+        assert!(!b.is_modified());
+        b.save(vec![], vec![]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n", "an untouched save moves no byte");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dos_file_strips_the_cr_from_the_rope_and_restores_it_on_save() {
+        let path = stored("dos", b"one\r\ntwo\r\n");
+        let mut b = Buffer::open(&path).unwrap();
+
+        assert_eq!(b.rope().to_string(), "one\ntwo\n", "nothing above the rope sees a \\r");
+        assert_eq!(b.storage().fileformat, FileFormat::Dos);
+        b.insert_str(Cursor::at(0), "zero\n");
+        b.save(vec![], vec![]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"zero\r\none\r\ntwo\r\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unencodable_char_fails_the_save_and_leaves_the_disk_alone() {
+        let path = stored("unencodable", b"caf\xE9\n");
+        let mut b = Buffer::open(&path).unwrap();
+        b.insert_str(Cursor::at(0), "ż");
+
+        let err = b.save(vec![], vec![]).unwrap_err().to_string();
+
+        assert!(err.contains("'ż'") && err.contains("1:1"), "names the char and where: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n", "nothing was written");
+        assert!(b.is_modified(), "and the buffer still knows it differs");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_encoding_marks_modified_and_the_next_save_converts() {
+        let path = stored("convert", "żółć\n".as_bytes());
+        let mut b = Buffer::open(&path).unwrap();
+        assert!(!b.is_modified());
+
+        b.set_encoding(crate::encoding::lookup("cp1250").unwrap());
+
+        assert!(b.is_modified(), "the disk no longer matches the buffer *as stored*");
+        b.save(vec![], vec![]).unwrap();
+        assert!(!b.is_modified());
+        let expected = encoding_rs::WINDOWS_1250.encode("żółć\n").0.into_owned();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn setting_what_already_holds_changes_nothing() {
+        let path = stored("noop-set", b"plain\n");
+        let mut b = Buffer::open(&path).unwrap();
+
+        b.set_fileformat(FileFormat::Unix);
+        b.set_bom(false);
+
+        assert!(!b.is_modified(), "a no-op `:set` must not claim unsaved changes");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_utf8_bom_is_storage_not_text_and_survives_the_round_trip() {
+        let path = stored("bom", b"\xEF\xBB\xBFhi\n");
+        let mut b = Buffer::open(&path).unwrap();
+
+        assert_eq!(b.rope().to_string(), "hi\n");
+        b.save(vec![], vec![]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBFhi\n");
         let _ = std::fs::remove_file(&path);
     }
 

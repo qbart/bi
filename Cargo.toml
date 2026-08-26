@@ -79,6 +79,10 @@ imara-diff = "0.2.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 # The kitty graphics protocol carries pixels as base64. Terminal frontend only.
 base64 = "0.22"
+# Decode on open, encode on save — the one boundary where a file is not
+# UTF-8. The WHATWG set, whose label table already speaks vim ("latin1",
+# "cp1250"). See docs/specs/encoding.md.
+encoding_rs = "0.8.35"
 
 [profile.release]
 lto = true

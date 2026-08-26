@@ -69,6 +69,7 @@ dependencies = [
  "anyhow",
  "arborium-dockerfile",
  "base64",
+ "encoding_rs",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",

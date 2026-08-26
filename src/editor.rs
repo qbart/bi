@@ -13,6 +13,7 @@ use crate::clipboard::SystemClipboard;
 use crate::cmd_history::History;
 use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
+use crate::encoding::{FileFormat, OpenHow};
 use crate::history::Cursors;
 use crate::img::Img;
 use crate::lsp;
@@ -683,6 +684,11 @@ pub struct Session {
     pub overrides: OptionPatch,
     /// `[filetype.<name>]` from the config, kept beside the options it patches.
     pub filetypes: std::collections::BTreeMap<String, OptionPatch>,
+    /// The config's `fileencodings`, resolved to encodings — what an open
+    /// tries a file's bytes as, in order. Empty — the derived `Default` — is
+    /// an embedder that said nothing and means the built-in list. See
+    /// `docs/specs/encoding.md`.
+    pub fileencodings: Vec<&'static encoding_rs::Encoding>,
     pub mode: Mode,
     /// The kind of selection the `:` line interrupted.
     ///
@@ -1027,6 +1033,53 @@ fn hover_lines(markdown: &str) -> Vec<HoverLine> {
 /// list is borrowed mutably, and because it is the whole of the resolution
 /// order in one place — bi's defaults and your config are already inside
 /// `session.options`, and what follows is the file's own.
+/// The open, composed: the config's detection list, the project's say about
+/// this path, and whatever `:e ++enc=`/`++ff=` forced. The temporal half of
+/// what `resolve_options` does for options — storage is read once at open,
+/// not re-resolved. See `docs/specs/encoding.md`.
+fn open_how(
+    session: &Session,
+    path: Option<&std::path::Path>,
+    force_encoding: Option<&'static encoding_rs::Encoding>,
+    force_fileformat: Option<FileFormat>,
+) -> OpenHow {
+    let mut how = OpenHow::default();
+    if !session.fileencodings.is_empty() {
+        how.detect = session.fileencodings.clone();
+    }
+    how.force_encoding = force_encoding;
+    how.force_fileformat = force_fileformat;
+    if let Some(path) = path {
+        let hints = crate::editorconfig::storage_for(path);
+        if let Some((encoding, bom)) = hints.charset {
+            // The project's charset is a preference, not a force: it moves to
+            // the front of the list, and a file whose bytes refuse it still
+            // opens through the rest — refusing the open over an
+            // `.editorconfig` line would be worse than the guess being wrong.
+            how.detect.retain(|e| *e != encoding);
+            how.detect.insert(0, encoding);
+            how.new_file.encoding = encoding;
+            how.new_file.bom = bom;
+        }
+        // `end_of_line` is what files *should* be — one not yet conforming
+        // converts on its next save. A `++ff=` you typed beats the project.
+        if let Some(end_of_line) = hints.end_of_line
+            && how.force_fileformat.is_none()
+        {
+            how.force_fileformat = Some(end_of_line);
+        }
+    }
+    // What was forced is also what a file not on disk yet starts as.
+    if let Some(encoding) = force_encoding {
+        how.new_file.encoding = encoding;
+        how.new_file.bom = encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE;
+    }
+    if let Some(fileformat) = how.force_fileformat {
+        how.new_file.fileformat = fileformat;
+    }
+    how
+}
+
 fn resolve_options(
     session: &Session,
     filetype: Option<&'static str>,
@@ -1480,8 +1533,15 @@ enum ExLine {
     Buffer(BufferCmd),
     /// `:e <path>`. Bare `:e` is [`ExLine::Revert`], which is a different job
     /// — and is not `:reload`, which is the config.
+    ///
+    /// `enc`/`ff` are `++enc=`/`++ff=` — detection overridden by hand, for
+    /// the file the list guessed wrong. `force` is the `!`, which matters
+    /// only when the overrides make this a re-read of a buffer already open.
     Edit {
         path: String,
+        enc: Option<&'static encoding_rs::Encoding>,
+        ff: Option<FileFormat>,
+        force: bool,
     },
     Quit {
         force: bool,
@@ -1660,9 +1720,12 @@ enum ExLine {
 
     Write(String),
     WriteQuit(String),
-    /// Bare `:e` — re-read this file from disk.
+    /// Bare `:e` — re-read this file from disk, re-running detection; with
+    /// `++enc=`/`++ff=`, re-read it as what you said it is.
     Revert {
         force: bool,
+        enc: Option<&'static encoding_rs::Encoding>,
+        ff: Option<FileFormat>,
     },
     /// `:42`, `:$`, `:%` — a range and no command, which goes to its last
     /// line. A special case in the parser once; now the general rule falling
@@ -1685,6 +1748,31 @@ fn parse_move(arg: &str) -> Option<Address> {
     // to land after, and `:m 'v` names no line at all.
     let Some(Scope::Lines(range)) = scope else { return None };
     (rest.is_empty() && range.first == range.last).then_some(range.first)
+}
+
+/// `:e`'s `++enc=`/`++ff=` words, off the front of its argument.
+///
+/// Vim's spelling, kept verbatim — muscle memory is the point of supporting
+/// them at all. A `++` word that is neither, or a name neither table knows,
+/// is a message rather than a file called `++emc=latin1`.
+fn parse_open_overrides(
+    arg: &str,
+) -> Result<(Option<&'static encoding_rs::Encoding>, Option<FileFormat>, String), String> {
+    let mut enc = None;
+    let mut ff = None;
+    let mut rest = arg.trim();
+    while rest.starts_with("++") {
+        let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if let Some(label) = word.strip_prefix("++enc=") {
+            enc = Some(crate::encoding::lookup(label).ok_or(format!("unknown encoding: {label}"))?);
+        } else if let Some(name) = word.strip_prefix("++ff=") {
+            ff = Some(FileFormat::parse(name).ok_or("++ff takes unix or dos".to_string())?);
+        } else {
+            return Err(format!("not an option: {word}"));
+        }
+        rest = tail.trim_start();
+    }
+    Ok((enc, ff, rest.to_string()))
 }
 
 /// `s/a/b/g` as `("s", "/a/b/g")` — the delimiter vim lets touch the name.
@@ -1849,8 +1937,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "on" | "only" => ExLine::Window(WindowCmd::Only),
         // Bare `:e` reloads this buffer; with a path it changes what the
         // window shows, which is two different jobs under one name.
-        "e" | "edit" if arg.is_empty() => ExLine::Revert { force },
-        "e" | "edit" => ExLine::Edit { path: arg.into() },
+        "e" | "edit" => match parse_open_overrides(arg) {
+            Err(message) => ExLine::Error(message),
+            Ok((enc, ff, rest)) if rest.is_empty() => ExLine::Revert { force, enc, ff },
+            Ok((enc, ff, rest)) => ExLine::Edit { path: rest, enc, ff, force },
+        },
         "bn" | "bnext" => ExLine::Buffer(BufferCmd::Next),
         "bp" | "bprev" | "bprevious" => ExLine::Buffer(BufferCmd::Prev),
         "bd" | "bdelete" => ExLine::Buffer(BufferCmd::Delete { force }),
@@ -2367,7 +2458,10 @@ impl Editor {
             editor.window_mut().content = Content::Image(img);
             return Ok(editor);
         }
-        Ok(Self::with_buffer(Buffer::open(path)?))
+        // No session exists yet, so the detection list is the built-in one —
+        // but the project's `.editorconfig` has its say from the first file.
+        let how = open_how(&Session::default(), Some(path), None, None);
+        Ok(Self::with_buffer(Buffer::open_how(path, &how)?))
     }
 
     /// Applies a config source, and remembers it for `:reload`.
@@ -2480,6 +2574,13 @@ impl Editor {
     ) -> Vec<Diagnostic> {
         self.session.options = config.options.clone();
         self.session.filetypes = config.filetypes.clone();
+        // Labels were validated at parse, so a miss here cannot happen twice;
+        // dropping one silently beats refusing the config over it.
+        self.session.fileencodings = config
+            .fileencodings
+            .iter()
+            .filter_map(|label| crate::encoding::lookup(label))
+            .collect();
         // Whatever `:set` said this session is re-applied over the new file,
         // here and in every buffer below: a reload is a new config, not a new
         // session, and it must not undo what you typed.
@@ -3381,7 +3482,10 @@ impl Editor {
         {
             return Ok(entry.id);
         }
-        let buffer = Buffer::open(path)?;
+        // Every open walks the config's detection list and hears the
+        // project's `charset`/`end_of_line` — not just the `++enc=` path.
+        let how = open_how(&self.session, Some(wanted), None, None);
+        let buffer = Buffer::open_how(path, &how)?;
         let id = self.fresh_buffer_id();
         self.buffers.push(BufferEntry::new(id, buffer));
         self.refresh_git(id);
@@ -5114,6 +5218,30 @@ impl Editor {
     /// No longer refuses on unsaved changes: the old buffer goes hidden with
     /// its history and its modified flag intact, so nothing is discarded. Bare
     /// `:e` — reload from disk — still refuses, and needs a view.
+    /// `:e ++enc=… <path>` — the plain open, then the same re-read a bare
+    /// `:e ++enc=…` does, through the one code path that knows how to put the
+    /// cursor and selections back after the text changes under them. The file
+    /// is read twice on this rare path, which costs less than a second
+    /// implementation of that care.
+    fn edit_path_how(
+        &mut self,
+        path: &str,
+        enc: Option<&'static encoding_rs::Encoding>,
+        ff: Option<FileFormat>,
+        force: bool,
+    ) {
+        self.edit_path(path);
+        if enc.is_none() && ff.is_none() {
+            return;
+        }
+        // Only if the open worked and it was a text file: a failed open, a
+        // directory or an image must not re-read whatever was showing before.
+        let showing = self.window().buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        if showing.as_deref() == Some(Path::new(path)) {
+            self.in_view(|view| view.edit(force, enc, ff));
+        }
+    }
+
     fn edit_path(&mut self, path: &str) {
         // A path is a path: `:e` asks the disk what it is rather than making
         // you remember which command a directory wants. A directory re-roots
@@ -5600,7 +5728,7 @@ impl Editor {
         match parsed {
             ExLine::Window(cmd) => self.run_window_cmd(cmd),
             ExLine::Buffer(cmd) => self.run_buffer_cmd(cmd),
-            ExLine::Edit { path } => self.edit_path(&path),
+            ExLine::Edit { path, enc, ff, force } => self.edit_path_how(&path, enc, ff, force),
             ExLine::Quit { force } => self.quit(force),
             ExLine::QuitAll { force } => self.quit_all(force),
             ExLine::WriteAll => self.write_all(),
@@ -5678,8 +5806,8 @@ impl Editor {
             ExLine::Write(path) => {
                 self.in_view(|view| view.write(&path));
             }
-            ExLine::Revert { force } => {
-                self.in_view(|view| view.edit(force));
+            ExLine::Revert { force, enc, ff } => {
+                self.in_view(|view| view.edit(force, enc, ff));
                 // The file on disk moved under the buffer; its standing with
                 // the index may have moved the same way.
                 if let Some(id) = self.window().buffer() {
@@ -5968,6 +6096,53 @@ impl Editor {
         self.session.status = format!("whitespace={on}");
     }
 
+    /// `:set fileencoding cp1250` and its two siblings — the buffer in view,
+    /// marked modified when the value actually moved, because the next `:w`
+    /// now converts the file. Bare, each reports what the buffer is.
+    fn set_storage(&mut self, name: &str, value: &str) {
+        let Some(id) = self.window().buffer() else {
+            self.session.status = "no file here".into();
+            return;
+        };
+        if value.is_empty() {
+            let storage = self.entry(id).buffer.storage();
+            self.session.status = match name {
+                "fileencoding" => format!("fileencoding={}", storage.encoding_name()),
+                "fileformat" => format!("fileformat={}", storage.fileformat.as_str()),
+                _ => format!("bom={}", storage.bom),
+            };
+            return;
+        }
+        let buffer = &mut self.entry_mut(id).buffer;
+        self.session.status = match name {
+            "fileencoding" => match crate::encoding::lookup(value) {
+                Some(encoding) => {
+                    buffer.set_encoding(encoding);
+                    format!("fileencoding={}", buffer.storage().encoding_name())
+                }
+                None => format!("unknown encoding: {value}"),
+            },
+            "fileformat" => match FileFormat::parse(value) {
+                Some(fileformat) => {
+                    buffer.set_fileformat(fileformat);
+                    format!("fileformat={}", fileformat.as_str())
+                }
+                None => "fileformat takes unix or dos".into(),
+            },
+            _ => match value {
+                "true" => {
+                    buffer.set_bom(true);
+                    "bom=true".into()
+                }
+                "false" => {
+                    buffer.set_bom(false);
+                    "bom=false".into()
+                }
+                _ => "bom takes true or false".into(),
+            },
+        };
+    }
+
     fn set_option(&mut self, arg: &str) {
         let (name, value) = match arg.split_once(['=', ' ']) {
             Some((name, value)) => (name.trim(), value.trim()),
@@ -5977,6 +6152,14 @@ impl Editor {
         if name.is_empty() {
             self.session.status = "set what?".into();
             return;
+        }
+
+        // Storage is buffer state, not an option: a layer 5 `:set` lands on
+        // every buffer, and "this file is cp1250" is a fact about one file.
+        // Vim agrees — its fileencoding and fileformat are buffer-local.
+        // See `docs/specs/encoding.md`.
+        if matches!(name, "fileencoding" | "fileformat" | "bom") {
+            return self.set_storage(name, value);
         }
 
         if value.is_empty() {
@@ -9780,14 +9963,20 @@ impl View<'_> {
     ///
     /// The parse tree has to be rebuilt rather than patched — it belongs to
     /// text that no longer exists.
-    fn edit(&mut self, force: bool) {
+    fn edit(
+        &mut self,
+        force: bool,
+        enc: Option<&'static encoding_rs::Encoding>,
+        ff: Option<FileFormat>,
+    ) {
         if self.buffer.is_modified() && !force {
             self.session.status = "unsaved changes (use `:e!` to discard)".into();
             return;
         }
 
         let at = self.selections.cursor();
-        match self.buffer.reload(at) {
+        let how = open_how(self.session, self.buffer.path.as_deref(), enc, ff);
+        match self.buffer.reload(at, &how) {
             Ok(cursor) => {
                 *self.selections = Selections::single(cursor);
                 self.reload_syntax();
@@ -16153,6 +16342,121 @@ mod tests {
         ed.load_config(ConfigText(None));
 
         assert_eq!(ed.options().shiftwidth, 2, "nothing is cached, so nothing goes stale");
+    }
+
+    // ---- storage: encoding, BOM, line endings -------------------------------
+
+    /// "ż" is the useful byte sequence here: valid UTF-8, so detection reads
+    /// one char — and two perfectly good latin1 chars when something says so.
+    #[test]
+    fn e_plus_plus_enc_rereads_the_same_bytes_as_told() {
+        let files = Files::new("ppenc");
+        let path = files.0.join("a.txt");
+        std::fs::write(&path, "ż".as_bytes()).unwrap();
+        let mut ed = Editor::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "ż", "detected as UTF-8");
+
+        ex(&mut ed, "e ++enc=latin1");
+
+        let buffer = ed.buffer().unwrap();
+        assert_eq!(buffer.rope().to_string().chars().count(), 2, "the same bytes, re-read");
+        assert_eq!(buffer.storage().encoding_name(), "windows-1252");
+    }
+
+    #[test]
+    fn a_bad_plus_plus_word_is_a_message_not_a_file_name() {
+        let mut ed = editor("hi");
+        ex(&mut ed, "e ++emc=latin1 a.txt");
+        assert_eq!(ed.session.status, "not an option: ++emc=latin1");
+
+        ex(&mut ed, "e ++enc=nope a.txt");
+        assert_eq!(ed.session.status, "unknown encoding: nope");
+    }
+
+    #[test]
+    fn set_fileencoding_reports_bare_and_converts_on_the_next_write() {
+        let files = Files::new("setfenc");
+        let mut ed = Editor::open(files.file("a.txt", "żółć\n")).unwrap();
+
+        ex(&mut ed, "set fileencoding");
+        assert_eq!(ed.session.status, "fileencoding=utf-8");
+
+        ex(&mut ed, "set fileencoding cp1250");
+        assert_eq!(ed.session.status, "fileencoding=windows-1250");
+        assert!(ed.buffer().unwrap().is_modified(), "the next `:w` converts the file");
+
+        ex(&mut ed, "w");
+        let expected = encoding_rs::WINDOWS_1250.encode("żółć\n").0.into_owned();
+        assert_eq!(std::fs::read(files.0.join("a.txt")).unwrap(), expected);
+        assert!(!ed.buffer().unwrap().is_modified());
+    }
+
+    #[test]
+    fn set_fileformat_dos_writes_crlf() {
+        let files = Files::new("setff");
+        let mut ed = Editor::open(files.file("a.txt", "a\nb\n")).unwrap();
+
+        ex(&mut ed, "set fileformat dos");
+        ex(&mut ed, "w");
+
+        assert_eq!(std::fs::read(files.0.join("a.txt")).unwrap(), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn the_projects_charset_is_tried_first() {
+        let files = Files::new("charset");
+        files.file(".editorconfig", "root = true\n[*.txt]\ncharset = latin1\n");
+        let path = files.0.join("a.txt");
+        std::fs::write(&path, "ż".as_bytes()).unwrap();
+
+        let ed = Editor::open(path.to_str().unwrap()).unwrap();
+
+        let buffer = ed.buffer().unwrap();
+        assert_eq!(buffer.storage().encoding_name(), "windows-1252", "the project said so");
+        assert_eq!(buffer.rope().to_string().chars().count(), 2);
+    }
+
+    #[test]
+    fn a_file_refusing_the_projects_charset_still_opens() {
+        let files = Files::new("charset-refused");
+        files.file(".editorconfig", "root = true\n[*.txt]\ncharset = utf-8\n");
+        let path = files.0.join("a.txt");
+        std::fs::write(&path, b"caf\xE9\n").unwrap();
+
+        let ed = Editor::open(path.to_str().unwrap()).unwrap();
+
+        let buffer = ed.buffer().unwrap();
+        assert_eq!(buffer.rope().to_string(), "café\n", "through the rest of the list");
+        assert_eq!(buffer.storage().encoding_name(), "windows-1252");
+    }
+
+    #[test]
+    fn the_projects_end_of_line_converts_on_the_next_write() {
+        let files = Files::new("eol");
+        files.file(".editorconfig", "root = true\n[*.txt]\nend_of_line = crlf\n");
+        let mut ed = Editor::open(files.file("a.txt", "a\n")).unwrap();
+
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\n", "the rope never holds \\r");
+        ex(&mut ed, "w");
+
+        assert_eq!(std::fs::read(files.0.join("a.txt")).unwrap(), b"a\r\n");
+    }
+
+    #[test]
+    fn a_configured_fileencodings_list_reaches_the_open() {
+        let files = Files::new("fenclist");
+        let path = files.0.join("a.txt");
+        // cp1250 "żółć" — none of it valid UTF-8, all of it valid latin1 too,
+        // so only the configured list can pick the right chars.
+        std::fs::write(&path, encoding_rs::WINDOWS_1250.encode("żółć\n").0.as_ref()).unwrap();
+        let mut ed = editor("");
+        ed.load_config(ConfigText(Some("fileencodings = [\"utf-8\", \"cp1250\"]\n")));
+
+        ex(&mut ed, &format!("e {}", path.display()));
+
+        let buffer = ed.buffer().unwrap();
+        assert_eq!(buffer.rope().to_string(), "żółć\n");
+        assert_eq!(buffer.storage().encoding_name(), "windows-1250");
     }
 
     // ---- trimming on write --------------------------------------------------

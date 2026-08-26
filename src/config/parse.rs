@@ -46,6 +46,13 @@ fn parse_with(
         // reaches it the same way a section's own reader does.
         let line = line_for(&doc, key, src);
 
+        // The one top-level key that is a value rather than a section: a
+        // detection list is one ordered fact, not a table of settings.
+        if key == "fileencodings" {
+            read_fileencodings(item, line, &mut config, &mut problems);
+            continue;
+        }
+
         let Some(table) = item.as_table() else {
             problems.push(Diagnostic { line, message: format!("`{key}` is not in a section") });
             continue;
@@ -66,6 +73,47 @@ fn parse_with(
     }
 
     Ok((config, problems))
+}
+
+/// `fileencodings = ["utf-8", "cp1250"]` — the list an open tries in order.
+///
+/// Labels are checked here, against the same table `:set fileencoding` uses,
+/// so a typo is a diagnostic with a line number rather than a list that
+/// silently never matches. A bad entry drops that one entry, the file's
+/// general rule; a list with nothing good left keeps the default rather than
+/// leaving opens with no way to succeed.
+fn read_fileencodings(
+    item: &toml_edit::Item,
+    line: usize,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+) {
+    let Some(array) = item.as_array() else {
+        problems.push(Diagnostic {
+            line,
+            message: "fileencodings takes a list of encoding names".into(),
+        });
+        return;
+    };
+    let mut labels = Vec::new();
+    for value in array.iter() {
+        let Some(label) = value.as_str() else {
+            problems.push(Diagnostic {
+                line,
+                message: "fileencodings entries are encoding names, in quotes".into(),
+            });
+            continue;
+        };
+        match crate::encoding::lookup(label) {
+            Some(_) => labels.push(label.to_string()),
+            None => {
+                problems.push(Diagnostic { line, message: format!("unknown encoding: {label}") })
+            }
+        }
+    }
+    if !labels.is_empty() {
+        config.fileencodings = labels;
+    }
 }
 
 fn read_options(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<Diagnostic>) {
@@ -511,6 +559,31 @@ mod tests {
     fn ok(src: &str) -> (Config, Vec<String>) {
         let (config, problems) = parse(src, Config::default()).expect("document parses");
         (config, problems.into_iter().map(|d| format!("{}: {}", d.line, d.message)).collect())
+    }
+
+    #[test]
+    fn fileencodings_is_a_top_level_list_and_ships_a_default() {
+        let (config, problems) = ok("");
+        assert!(problems.is_empty());
+        assert_eq!(config.fileencodings, ["utf-8", "latin1"], "the shipped default");
+
+        let (config, problems) = ok("fileencodings = [\"utf-8\", \"cp1250\"]\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.fileencodings, ["utf-8", "cp1250"]);
+    }
+
+    #[test]
+    fn a_bad_fileencodings_entry_is_a_line_numbered_message_not_a_dead_list() {
+        let (config, problems) = ok("fileencodings = [\"utf-8\", \"nope\"]\n");
+        assert_eq!(problems, ["1: unknown encoding: nope"]);
+        assert_eq!(config.fileencodings, ["utf-8"], "the good entry still applies");
+
+        let (config, problems) = ok("fileencodings = [\"nope\"]\n");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(config.fileencodings, ["utf-8", "latin1"], "nothing good keeps the default");
+
+        let (_, problems) = ok("fileencodings = \"utf-8\"\n");
+        assert_eq!(problems, ["1: fileencodings takes a list of encoding names"]);
     }
 
     #[test]

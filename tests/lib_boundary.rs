@@ -172,6 +172,7 @@ const LIB_MODULES: &[&str] = &[
     "decoration.rs",
     "editor.rs",
     "editorconfig.rs",
+    "encoding.rs",
     "files.rs",
     "find_in_files.rs",
     "git.rs",

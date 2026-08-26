@@ -1511,10 +1511,21 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".into());
             let cursor = text.selections.cursor();
-            (
-                format!("{name}{}", if buffer.is_modified() { " [+]" } else { "" }),
-                format!("{}:{}", buffer.row_at(cursor) + 1, buffer.col_at(cursor) + 1),
-            )
+            // Storage badges only when there is something to say: a plain
+            // UTF-8/unix file's status row does not change by one cell. A
+            // non-UTF-8 encoding implies its BOM, so [bom] alone is the
+            // UTF-8-with-BOM case. See docs/specs/encoding.md.
+            let mut name = format!("{name}{}", if buffer.is_modified() { " [+]" } else { "" });
+            let storage = buffer.storage();
+            if storage.encoding != encoding_rs::UTF_8 {
+                name.push_str(&format!(" [{}]", storage.encoding_name()));
+            } else if storage.bom {
+                name.push_str(" [bom]");
+            }
+            if storage.fileformat == bi::encoding::FileFormat::Dos {
+                name.push_str(" [crlf]");
+            }
+            (name, format!("{}:{}", buffer.row_at(cursor) + 1, buffer.col_at(cursor) + 1))
         }
     };
 

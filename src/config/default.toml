@@ -4,6 +4,14 @@
 # anything they leave out keeps doing what this says, including settings added
 # in later versions. See docs/specs/config.md.
 
+# What an open tries a file's bytes as, in order — the first encoding that
+# decodes cleanly wins. latin1 accepts every byte, so the walk cannot fail;
+# anyone living in another codepage puts it between the two, e.g.
+# ["utf-8", "cp1250"]. Vim's fileencodings by another spelling — the labels
+# are the WHATWG table, which speaks vim ("latin1", "cp1250", "shift_jis").
+# See docs/specs/encoding.md.
+fileencodings = ["utf-8", "latin1"]
+
 [options]
 number = 1
 hlsearch = false

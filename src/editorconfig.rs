@@ -323,6 +323,57 @@ fn find_close(p: &[char], from: usize, open: char, close: char) -> Option<usize>
 /// keystroke — and a cache would have to be invalidated when a file bi does
 /// not have open changes.
 pub fn patch_for(path: &Path) -> OptionPatch {
+    let (files, absolute) = files_for(path);
+    patch_from(&files, &absolute)
+}
+
+/// The project's say about how `path` is *stored* — `charset` and
+/// `end_of_line`. Not options, so not in the patch: they apply at the open
+/// boundary, where `docs/specs/encoding.md` says they do.
+pub fn storage_for(path: &Path) -> StorageHints {
+    let (files, absolute) = files_for(path);
+    storage_from(&files, &absolute)
+}
+
+/// What `charset` and `end_of_line` said, translated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageHints {
+    /// The encoding, and whether the value asks for a BOM (`utf-8-bom`,
+    /// either UTF-16).
+    pub charset: Option<(&'static encoding_rs::Encoding, bool)>,
+    pub end_of_line: Option<crate::encoding::FileFormat>,
+}
+
+pub fn storage_from(files: &[(PathBuf, String)], path: &Path) -> StorageHints {
+    let properties = merged_properties(files, path);
+    let get = |name: &str| -> Option<&str> {
+        properties
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| *value != "unset")
+    };
+    let charset = get("charset").and_then(|value| match value {
+        "utf-8-bom" => Some((encoding_rs::UTF_8, true)),
+        "utf-16le" => Some((encoding_rs::UTF_16LE, true)),
+        "utf-16be" => Some((encoding_rs::UTF_16BE, true)),
+        // `latin1` and `utf-8` through the same table `:set` uses. A value
+        // the table has no encoding for is a property for other editors, and
+        // ignored the way every unknown property is.
+        other => crate::encoding::lookup(other).map(|encoding| (encoding, false)),
+    });
+    let end_of_line = get("end_of_line").and_then(|value| match value {
+        "lf" => Some(crate::encoding::FileFormat::Unix),
+        "crlf" => Some(crate::encoding::FileFormat::Dos),
+        // `cr` is a Mac OS 9 file; bi does not write those.
+        _ => None,
+    });
+    StorageHints { charset, end_of_line }
+}
+
+/// Every `.editorconfig` above `path`, nearest last, and the absolute path
+/// their sections are matched against.
+fn files_for(path: &Path) -> (Vec<(PathBuf, String)>, PathBuf) {
     let absolute = match path.is_absolute() {
         true => path.to_path_buf(),
         // What a relative path already means to the `open` that read the
@@ -346,12 +397,16 @@ pub fn patch_for(path: &Path) -> OptionPatch {
 
     // Nearest last: the file closest to yours has the last word.
     files.reverse();
-    patch_from(&files, &absolute)
+    (files, absolute)
 }
 
 /// The same, from files someone else read. `files` are `(directory, text)`,
 /// farthest first — the nearest `.editorconfig` has the last word.
 pub fn patch_from(files: &[(PathBuf, String)], path: &Path) -> OptionPatch {
+    to_patch(&merged_properties(files, path))
+}
+
+fn merged_properties(files: &[(PathBuf, String)], path: &Path) -> Vec<(String, String)> {
     let mut properties: Vec<(String, String)> = Vec::new();
     for (dir, text) in files {
         let Some(relative) = relative_to(dir, path) else { continue };
@@ -362,7 +417,7 @@ pub fn patch_from(files: &[(PathBuf, String)], path: &Path) -> OptionPatch {
             }
         }
     }
-    to_patch(&properties)
+    properties
 }
 
 /// `path` below `dir`, with `/` separators whatever the platform uses.

@@ -522,6 +522,12 @@ pub struct Config {
     /// `[lsp]` — the master switch and the server table. See
     /// `docs/specs/lsp.md`.
     pub lsp: Lsp,
+    /// `fileencodings` — the detection list an open walks, first clean decode
+    /// wins. Top-level rather than an option: it is input to detection at
+    /// open, not a fact any one buffer holds. Labels, validated at parse; the
+    /// default ends in latin1, which accepts every byte, so an open cannot
+    /// fail. See `docs/specs/encoding.md`.
+    pub fileencodings: Vec<String>,
 }
 
 /// The `[lsp]` section: whether servers start at all, and which ones exist.
@@ -556,6 +562,7 @@ impl Default for Config {
                     filetypes: Default::default(),
                     alternates: Vec::new(),
                     lsp: Lsp::default(),
+                    fileencodings: vec!["utf-8".into(), "latin1".into()],
                 };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0
             })
