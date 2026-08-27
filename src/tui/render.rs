@@ -1598,6 +1598,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             PickerKind::File => " files ",
             PickerKind::TreeRow => " tree ",
             PickerKind::Symbol => " symbols ",
+            PickerKind::CodeAction => " actions ",
             PickerKind::History => " history ",
             PickerKind::Theme => " themes ",
         });

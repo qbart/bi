@@ -68,6 +68,10 @@ pub enum PickerKind {
     /// typo in is a history that only helps when you were already right. See
     /// `docs/specs/cmdline-history.md`.
     History,
+    /// `:actions` — what the server offers at the cursor or selection, to
+    /// run one. Rows are the servers' titles in the server's order, which is
+    /// its ranking. See `docs/specs/code-actions.md`.
+    CodeAction,
     /// `:themes` — every built-in theme, to `:set theme` to.
     ///
     /// Aliases are not rows here — `Theme::builtins()` names each theme once,

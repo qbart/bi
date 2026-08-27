@@ -133,6 +133,26 @@ impl Keymap {
         map.bound.insert(from, to);
     }
 
+    /// [`Keymap::insert`], unless the user has spoken: a binding of their own
+    /// on `from` wins outright, and an explicit `= false` wins *harder* — it
+    /// asks for the key back, so the dead entry goes, and with it any prefix
+    /// no other binding still needs, or unbinding `<leader><leader>` would
+    /// leave the bare leader waiting on a sequence that does nothing. How bi
+    /// ships a default binding without owning the key; see
+    /// `docs/specs/code-actions.md`.
+    pub fn insert_default(&mut self, mode: KeyMode, from: Vec<Key>, to: Bind) {
+        let map = self.maps.entry(mode).or_default();
+        match map.bound.get(&from) {
+            Some(Some(_)) => {}
+            Some(None) => {
+                map.bound.remove(&from);
+                let Bindings { bound, prefixes } = map;
+                prefixes.retain(|p| bound.keys().any(|k| k.len() > p.len() && k.starts_with(p)));
+            }
+            None => self.insert(mode, from, Some(to)),
+        }
+    }
+
     /// What `keys` — everything typed since the last complete command — means.
     ///
     /// A complete binding wins over being a prefix of a longer one, which is

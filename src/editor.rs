@@ -725,6 +725,10 @@ pub struct Session {
     /// which is all every other kind needs, and giving one an optional char
     /// offset would put a field on four lists that have no use for it.
     symbol_targets: Vec<usize>,
+    /// What each row of a [`PickerKind::CodeAction`] list runs, and the
+    /// context to run it in — beside the picker for the same reason
+    /// `symbol_targets` is. See `docs/specs/code-actions.md`.
+    pending_actions: Option<PendingActions>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -972,6 +976,12 @@ struct BufferEntry {
     /// something to say — no repository, an untracked file, an embedder that
     /// never calls [`Editor::set_git_baseline`]. See `docs/specs/git-signs.md`.
     git: Option<GitState>,
+    /// The last published diagnostics, in the wire shape the server sent them
+    /// — beside the converted ones the `Doc` holds, because a code action
+    /// request echoes them back and clangd only offers the fix for a
+    /// diagnostic it recognises as its own. Same publish, same order, so
+    /// index `i` here is index `i` there. See `docs/specs/code-actions.md`.
+    wire_diagnostics: Vec<lsp::types::Diagnostic>,
 }
 
 /// The baseline and the diff against it, cached beside the buffer the same
@@ -997,6 +1007,7 @@ impl BufferEntry {
             last: Vec::new(),
             lsp: lsp::Attach::Unresolved,
             git: None,
+            wire_diagnostics: Vec::new(),
         }
     }
 }
@@ -1698,6 +1709,10 @@ enum ExLine {
     References,
     /// `:format` — the whole file, by the server, as one undo step.
     Format,
+    /// `:actions` — what the server offers at the cursor or selection, as a
+    /// picker. `<leader><leader>` out of the box. See
+    /// `docs/specs/code-actions.md`.
+    Actions,
     /// `:dnext` / `:dprev` — `]d` / `[d`, wrapping. See
     /// `docs/specs/diagnostics.md`.
     DiagnosticJump {
@@ -2052,6 +2067,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "fmt" | "format" => {
             ExLine::Error("format takes no argument — it follows tab_width and expandtab".into())
         }
+        "actions" if arg.is_empty() => ExLine::Actions,
+        "actions" => ExLine::Error("actions takes no argument — it asks at the cursor".into()),
         "dn" | "dnext" => ExLine::DiagnosticJump { forward: true },
         "dp" | "dprev" => ExLine::DiagnosticJump { forward: false },
         "hover" => ExLine::Hover,
@@ -2269,6 +2286,19 @@ pub enum TreeCmd {
     },
     /// `a` `r` `d` — fills the command line in and hands over.
     Prompt(FileOp),
+}
+
+/// A code actions answer, parked while its picker is up — what each row
+/// runs, and the context to run it in. See `docs/specs/code-actions.md`.
+struct PendingActions {
+    buffer: BufferId,
+    /// The document version `:actions` was asked at, for the same gate
+    /// `:format` keeps.
+    version: i32,
+    /// Who to send a chosen action's command half back to.
+    server: lsp::ServerId,
+    encoding: lsp::pos::Encoding,
+    actions: Vec<lsp::types::CodeAction>,
 }
 
 /// The three things a tree key can start.
@@ -5169,6 +5199,13 @@ impl Editor {
                 let path = picker.items()[chosen].text.clone();
                 self.select_tree_row(path);
             }
+            // What the row *runs*: the parked action's edit, its command, or
+            // both. See `docs/specs/code-actions.md`.
+            PickerKind::CodeAction => {
+                if let Some(pending) = self.session.pending_actions.take() {
+                    self.run_code_action(pending, chosen);
+                }
+            }
             // Also a row rather than a file, and for the same reason: the list
             // came out of the buffer already in front of you.
             PickerKind::Symbol => {
@@ -5856,6 +5893,7 @@ impl Editor {
             ExLine::Diags => self.show_diagnostics(),
             ExLine::References => self.lsp_references(),
             ExLine::Format => self.lsp_format(),
+            ExLine::Actions => self.lsp_code_actions(),
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
             ExLine::Hover => self.lsp_hover(),
             ExLine::Resize(how) => self.run_resize(how),
@@ -6620,6 +6658,15 @@ impl Editor {
                 Some(lsp::Effect::Formatting { buffer, version, edits, encoding }) => {
                     self.apply_formatting(buffer, version, edits, encoding)
                 }
+                Some(lsp::Effect::CodeActions { buffer, version, server, actions, encoding }) => {
+                    self.offer_code_actions(buffer, version, server, actions, encoding)
+                }
+                Some(lsp::Effect::ApplyEdit { edit, encoding }) => {
+                    self.session.status = match self.apply_workspace_edit(edit, encoding, None) {
+                        Ok(summary) => format!("applied — {summary}"),
+                        Err(message) => format!("action: {message}"),
+                    };
+                }
                 Some(lsp::Effect::Hover { window, anchor, markdown }) => {
                     self.apply_hover(window, anchor, markdown)
                 }
@@ -6669,6 +6716,9 @@ impl Editor {
         if version.is_some_and(|v| v != doc.version) {
             return;
         }
+        // The wire shape kept whole, for `:actions` to echo back — same
+        // publish as the converted list below, same order, same indices.
+        entry.wire_diagnostics = diagnostics.clone();
         let rope = entry.buffer.rope();
         doc.diagnostics = diagnostics
             .into_iter()
@@ -6956,6 +7006,179 @@ impl Editor {
     }
 
     /// `:format` — the whole file, by the server, as one undo step.
+    /// `:actions` — asks what the server offers at the cursor, or over the
+    /// selection when one is up. The answer opens a picker through the pump.
+    /// See `docs/specs/code-actions.md`.
+    fn lsp_code_actions(&mut self) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.code_action {
+                return Err("actions: this server does not offer them".into());
+            }
+            let encoding =
+                self.lsp.instance(doc.server).ok_or("lsp: instance gone — :lsp restart")?.encoding;
+            let Some(text) = self.window().text() else { return Err("no text here".into()) };
+            let primary = text.selections.primary();
+            let rope = self.entry(id).buffer.rope();
+            // The selection when one is up — `visual()` sees through the `:`
+            // line that interrupted it — else the cursor, collapsed.
+            let (start, end) = match self.session.visual().is_some() {
+                true => primary.inclusive_range(rope.len_chars()),
+                false => (primary.head.at, primary.head.at),
+            };
+            let range = lsp::types::Range {
+                start: lsp::pos::position_of(rope, start, encoding),
+                end: lsp::pos::position_of(rope, end, encoding),
+            };
+            // The stored diagnostics overlapping the range, echoed in the
+            // wire shape they arrived in — clangd only offers the fix for a
+            // diagnostic it recognises as its own.
+            let entry = self.entry(id);
+            let converted = match &entry.lsp {
+                lsp::Attach::Doc(doc) => doc.diagnostics.as_slice(),
+                _ => &[],
+            };
+            let diagnostics = converted
+                .iter()
+                .zip(&entry.wire_diagnostics)
+                .filter(|(diag, _)| diag.start <= end && start <= diag.end)
+                .map(|(_, wire)| wire.clone())
+                .collect();
+            self.lsp.code_actions(&doc, id, range, diagnostics)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// A code actions answer: a picker over the titles, the actions parked
+    /// beside it for the accept to run.
+    fn offer_code_actions(
+        &mut self,
+        buffer: BufferId,
+        version: i32,
+        server: lsp::ServerId,
+        actions: Vec<lsp::types::CodeAction>,
+        encoding: lsp::pos::Encoding,
+    ) {
+        if actions.is_empty() {
+            self.session.status = "no actions here".into();
+            return;
+        }
+        // An answer that lands while some other overlay is up loses to it —
+        // replacing a picker mid-choice would eat what you were choosing.
+        if self.session.picker.is_some() {
+            return;
+        }
+        let items = actions.iter().map(|a| Item { text: a.title.clone(), badge: None }).collect();
+        self.session.pending_actions =
+            Some(PendingActions { buffer, version, server, encoding, actions });
+        self.session.picker = Some(Picker::new(PickerKind::CodeAction, items, 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
+    /// Applies a chosen action: its edit, then its command, whichever it has.
+    fn run_code_action(&mut self, pending: PendingActions, chosen: usize) {
+        let PendingActions { buffer, version, server, encoding, mut actions } = pending;
+        if chosen >= actions.len() {
+            return;
+        }
+        let action = actions.swap_remove(chosen);
+        let mut outcome = None;
+        if let Some(edit) = action.edit {
+            match self.apply_workspace_edit(edit, encoding, Some((buffer, version))) {
+                Ok(summary) => outcome = Some(summary),
+                Err(message) => {
+                    self.session.status = format!("{}: {message}", action.title);
+                    return;
+                }
+            }
+        }
+        if let Some(command) = &action.command
+            && let Err(message) = self.lsp.execute_command(server, command)
+        {
+            self.session.status = message;
+            return;
+        }
+        self.session.status = match outcome {
+            Some(summary) => format!("{} — {summary}", action.title),
+            // A command-only action: whatever it edits arrives from the
+            // server as `workspace/applyEdit`, with its own status.
+            None => action.title,
+        };
+    }
+
+    /// One `WorkspaceEdit`, applied everywhere it names. `origin` is the
+    /// buffer and version an action was *requested* on — gated exactly as
+    /// `:format` gates, and per-document versions likewise; unversioned edits
+    /// to other files are taken at their word, the protocol offering nothing
+    /// better. Files not open are opened the way `:e` opens them and left
+    /// modified. See `docs/specs/code-actions.md`.
+    fn apply_workspace_edit(
+        &mut self,
+        edit: lsp::types::WorkspaceEdit,
+        encoding: lsp::pos::Encoding,
+        origin: Option<(BufferId, i32)>,
+    ) -> Result<String, String> {
+        // Both wire shapes down to one: (uri, version if any, edits).
+        let mut docs: Vec<(String, Option<i32>, Vec<lsp::types::TextEdit>)> = Vec::new();
+        if let Some(changes) = edit.document_changes {
+            for change in changes {
+                // A create/rename/delete entry refuses the whole edit:
+                // applying half of a rename is worse than applying none.
+                if let Some(kind) = change.get("kind").and_then(serde_json::Value::as_str) {
+                    return Err(format!("wants to {kind} a file — not supported"));
+                }
+                let uri =
+                    change["textDocument"]["uri"].as_str().ok_or("malformed edit")?.to_string();
+                let version = change["textDocument"]["version"].as_i64().map(|v| v as i32);
+                let edits = serde_json::from_value(change["edits"].clone())
+                    .map_err(|_| "malformed edit")?;
+                docs.push((uri, version, edits));
+            }
+        } else if let Some(changes) = edit.changes {
+            docs.extend(changes.into_iter().map(|(uri, edits)| (uri, None, edits)));
+        }
+
+        let (mut edits_applied, mut buffers, mut stale) = (0usize, 0usize, 0usize);
+        for (uri, version, edits) in docs {
+            if edits.is_empty() {
+                continue;
+            }
+            let Some(path) = lsp::pos::path_of(&uri) else { continue };
+            let id = self
+                .open_path(&path.to_string_lossy())
+                .map_err(|e| format!("opening {}: {e:#}", path.display()))?;
+            let current = match &self.entry(id).lsp {
+                lsp::Attach::Doc(doc) => Some(doc.version),
+                _ => None,
+            };
+            let expected = version.or(origin.filter(|&(b, _)| b == id).map(|(_, v)| v));
+            if let (Some(expected), Some(current)) = (expected, current)
+                && expected != current
+            {
+                stale += 1;
+                continue;
+            }
+            edits_applied += self.apply_lsp_edits(id, &edits, encoding);
+            buffers += 1;
+        }
+        if buffers == 0 && stale > 0 {
+            return Err("the text moved under it — nothing applied".into());
+        }
+        let mut summary = format!(
+            "{edits_applied} edit{} in {buffers} buffer{}",
+            if edits_applied == 1 { "" } else { "s" },
+            if buffers == 1 { "" } else { "s" },
+        );
+        if stale > 0 {
+            summary.push_str(&format!(
+                ", {stale} stale buffer{} skipped",
+                if stale == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(summary)
+    }
+
     fn lsp_format(&mut self) {
         let sent = self.lsp_target().and_then(|(id, doc, caps)| {
             if !caps.formatting {
@@ -7176,6 +7399,29 @@ impl Editor {
             self.session.status = "already formatted".into();
             return;
         }
+        // The version gate: a format computed against text that no longer
+        // exists must not touch the text that replaced it.
+        match &self.entry(id).lsp {
+            lsp::Attach::Doc(doc) if doc.version == version => {}
+            _ => {
+                self.session.status = "text changed under :format — run it again".into();
+                return;
+            }
+        }
+        let n = self.apply_lsp_edits(id, &edits, encoding);
+        self.session.status = format!("formatted — {n} edit{}", if n == 1 { "" } else { "s" });
+    }
+
+    /// Applies `edits` to `id` as one undo step: converted against the
+    /// current rope, applied bottom-up so an earlier edit cannot move a
+    /// later one, the focused window's selections carried across. Version
+    /// gates are the callers' business — this trusts the edits fit the text.
+    fn apply_lsp_edits(
+        &mut self,
+        id: BufferId,
+        edits: &[lsp::types::TextEdit],
+        encoding: lsp::pos::Encoding,
+    ) -> usize {
         let focus = self.focus;
         let focused_here = self.window_of(focus).and_then(Window::buffer) == Some(id);
         // Undo lands you where you were when you asked — the live selections
@@ -7185,21 +7431,8 @@ impl Editor {
             .and_then(Window::text)
             .filter(|_| focused_here)
             .map(|t| t.selections.as_pairs());
-        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return };
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return 0 };
 
-        // The version gate: a format computed against text that no longer
-        // exists must not touch the text that replaced it.
-        match &entry.lsp {
-            lsp::Attach::Doc(doc) if doc.version == version => {}
-            _ => {
-                self.session.status = "text changed under :format — run it again".into();
-                return;
-            }
-        }
-
-        // Converted against the current rope — which the version gate just
-        // proved is the text the edits were computed for — then applied
-        // bottom-up so an earlier edit cannot move a later one.
         let rope = entry.buffer.rope();
         let mut spans: Vec<(usize, usize, String)> = edits
             .iter()
@@ -7240,8 +7473,7 @@ impl Editor {
                 .collect();
             text.selections.set(mapped);
         }
-        self.session.status =
-            format!("formatted — {} edit{}", spans.len(), if spans.len() == 1 { "" } else { "s" });
+        spans.len()
     }
 
     /// `:dnext` / `:dprev` — `]d` / `[d`. Wraps, and puts the message on the
@@ -19790,7 +20022,8 @@ int main(void) {
                         "documentFormattingProvider": true,
                         "hoverProvider": true,
                         "completionProvider": { "triggerCharacters": ["."] },
-                        "signatureHelpProvider": { "triggerCharacters": ["(", ","] } }),
+                        "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
+                        "codeActionProvider": true }),
             );
             ed.settle();
             id
@@ -20186,6 +20419,197 @@ int main(void) {
             respond(&mut ed, &fake, id, "textDocument/formatting", answer);
             assert_eq!(ed.buffer().unwrap().rope().to_string(), "xfn main() {\n}\n", "untouched");
             assert!(ed.session.status.contains(":format"), "{}", ed.session.status);
+        }
+
+        // ---- code actions — see docs/specs/code-actions.md ----------------
+
+        #[test]
+        fn actions_echo_the_overlapping_diagnostics_and_choosing_applies_the_edit() {
+            let (_dir, mut ed, fake) = project("actions");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            // Two diagnostics: one under the cursor, one a line away. Only
+            // the first belongs in the context, `code` and all.
+            publish(
+                &mut ed,
+                &fake,
+                id,
+                json!({ "uri": uri, "version": 1, "diagnostics": [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 2 } },
+                      "message": "not pub", "severity": 1, "code": "E0001" },
+                    { "range": { "start": { "line": 1, "character": 0 },
+                                 "end": { "line": 1, "character": 1 } },
+                      "message": "elsewhere", "severity": 2 },
+                ] }),
+            );
+
+            ex(&mut ed, "actions");
+            let sent = fake.last(id, "textDocument/codeAction").unwrap();
+            assert_eq!(sent["params"]["range"]["start"]["line"], 0);
+            let context = sent["params"]["context"]["diagnostics"].as_array().unwrap();
+            assert_eq!(context.len(), 1, "only what overlaps the cursor");
+            assert_eq!(context[0]["code"], "E0001", "echoed in the wire shape it came in");
+
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "make it pub", "edit": { "changes": { uri.clone(): [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 2 } },
+                      "newText": "pub fn" },
+                ] } } }]),
+            );
+            assert_eq!(ed.session.mode, Mode::Pick);
+            let titles: Vec<String> = ed
+                .session
+                .picker
+                .as_ref()
+                .unwrap()
+                .items()
+                .iter()
+                .map(|i| i.text.clone())
+                .collect();
+            assert_eq!(titles, ["make it pub"]);
+
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "pub fn main() {\n}\n");
+            assert_eq!(ed.session.mode, Mode::Normal);
+            assert!(ed.session.status.contains("make it pub"), "{}", ed.session.status);
+
+            ed.apply(cmd(Action::Undo));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn main() {\n}\n", "one step");
+        }
+
+        #[test]
+        fn a_command_action_goes_back_as_execute_command_and_its_apply_edit_lands() {
+            let (_dir, mut ed, fake) = project("actions-cmd");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            ex(&mut ed, "actions");
+            // The pre-3.8 shape: a bare command, no edit.
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "organize imports", "command": "src.organize",
+                         "arguments": [{ "uri": "opaque" }] }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+
+            let sent = fake.last(id, "workspace/executeCommand").unwrap();
+            assert_eq!(sent["params"]["command"], "src.organize");
+            assert_eq!(sent["params"]["arguments"][0]["uri"], "opaque", "verbatim");
+
+            // The edits come back as the server's own request.
+            let inbox = fake.spawned.lock().unwrap()[0].1.clone();
+            inbox.deliver(
+                id,
+                Inbound::Request {
+                    id: json!(99),
+                    method: "workspace/applyEdit".into(),
+                    params: json!({ "edit": { "changes": { uri: [
+                        { "range": { "start": { "line": 1, "character": 0 },
+                                     "end": { "line": 1, "character": 0 } },
+                          "newText": "// done\n" },
+                    ] } } }),
+                },
+            );
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn main() {\n// done\n}\n");
+            assert!(ed.session.status.contains("applied"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn an_action_computed_against_old_text_is_dropped() {
+            let (_dir, mut ed, fake) = project("actions-stale");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            ex(&mut ed, "actions");
+            // The text moves while the server thinks.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "stale fix", "edit": { "changes": { uri: [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 2 } },
+                      "newText": "clobbered" },
+                ] } } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "xfn main() {\n}\n", "untouched");
+            assert!(ed.session.status.contains("moved"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn no_actions_is_a_status_not_an_empty_picker() {
+            let (_dir, mut ed, fake) = project("actions-none");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "actions");
+            respond(&mut ed, &fake, id, "textDocument/codeAction", json!([]));
+
+            assert_eq!(ed.session.mode, Mode::Normal);
+            assert!(ed.session.picker.is_none());
+            assert_eq!(ed.session.status, "no actions here");
+
+            // Disabled entries are dropped before counting: a row that
+            // cannot be chosen is a row that should not be offered.
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "not here", "disabled": { "reason": "no" },
+                         "edit": { "changes": {} } }]),
+            );
+            assert_eq!(ed.session.status, "no actions here");
+        }
+
+        #[test]
+        fn a_file_operation_refuses_the_whole_edit() {
+            let (_dir, mut ed, fake) = project("actions-fileop");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "move to new file", "edit": { "documentChanges": [
+                    { "kind": "create", "uri": "file:///tmp/new.rs" },
+                    { "textDocument": { "uri": uri, "version": 1 }, "edits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 0, "character": 2 } },
+                          "newText": "gone" } ] },
+                ] } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "fn main() {\n}\n",
+                "half a rename is worse than none"
+            );
+            assert!(ed.session.status.contains("create"), "{}", ed.session.status);
         }
 
         #[test]

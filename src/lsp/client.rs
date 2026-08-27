@@ -64,6 +64,18 @@ pub enum Intent {
     Signature {
         request: u64,
     },
+    /// `:actions` — the buffer asked about, and the document version the
+    /// request was computed against, for the same gate `Formatting` keeps:
+    /// an edit meant for text that no longer exists must not touch the text
+    /// that replaced it.
+    CodeActions {
+        buffer: BufferId,
+        version: i32,
+    },
+    /// `workspace/executeCommand` for a chosen action. The answer is
+    /// usually null — whatever edits the command causes arrive as a
+    /// server→client `workspace/applyEdit` — so only an error says anything.
+    Command,
 }
 
 /// The provider switches core features read from `initialize`. More arrive
@@ -78,6 +90,7 @@ pub struct Caps {
     pub hover: bool,
     pub completion: bool,
     pub signature: bool,
+    pub code_action: bool,
 }
 
 impl Caps {
@@ -175,7 +188,26 @@ impl Client {
                     "textDocument": {
                         "synchronization": { "didSave": true },
                         "publishDiagnostics": { "versionSupport": true },
+                        // Literal support makes servers send `CodeAction`
+                        // objects rather than bare commands — and declaring
+                        // no `resolveSupport` beside it is what obliges them
+                        // to fill `edit` in eagerly instead of waiting for a
+                        // `codeAction/resolve` bi does not send.
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": { "valueSet": [
+                                    "", "quickfix",
+                                    "refactor", "refactor.extract",
+                                    "refactor.inline", "refactor.rewrite",
+                                    "source", "source.organizeImports",
+                                    "source.fixAll",
+                                ] },
+                            },
+                        },
                     },
+                    // What makes a command-backed action land: the server
+                    // sends its edits as `workspace/applyEdit`.
+                    "workspace": { "applyEdit": true },
                     "window": { "workDoneProgress": true },
                 },
             }),
@@ -234,6 +266,7 @@ impl Client {
             hover: truthy(parsed.capabilities.hover_provider.as_ref()),
             completion: truthy(parsed.capabilities.completion_provider.as_ref()),
             signature: truthy(parsed.capabilities.signature_help_provider.as_ref()),
+            code_action: truthy(parsed.capabilities.code_action_provider.as_ref()),
         };
         self.trigger_chars = trigger_characters(parsed.capabilities.completion_provider.as_ref());
         self.signature_chars =

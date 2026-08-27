@@ -96,6 +96,21 @@ pub enum Effect {
     /// A signature answer, already resolved to what the float draws — `None`
     /// is the server saying the cursor left the call, which means close.
     Signature { request: u64, help: Option<SignatureData> },
+    /// A code actions answer: what the server offers at the range asked
+    /// about, disabled entries already dropped, bare commands already
+    /// normalised into [`types::CodeAction`]. `server` is who to send a
+    /// chosen action's command back to.
+    CodeActions {
+        buffer: BufferId,
+        version: i32,
+        server: ServerId,
+        actions: Vec<types::CodeAction>,
+        encoding: Encoding,
+    },
+    /// A server→client `workspace/applyEdit` — the edits a command-backed
+    /// action caused. Already answered `applied: true` on the wire; the
+    /// editor applies it inside `settle` like every other effect.
+    ApplyEdit { edit: types::WorkspaceEdit, encoding: Encoding },
 }
 
 /// The parameters float's content: one label, the active parameter's char
@@ -370,6 +385,43 @@ impl Registry {
         )
     }
 
+    /// `textDocument/codeAction` over `range`, echoing back the stored
+    /// diagnostics that overlap it — the context clangd wants its own
+    /// diagnostics returned in before it offers their fixes.
+    pub fn code_actions(
+        &mut self,
+        doc: &Doc,
+        buffer: BufferId,
+        range: types::Range,
+        diagnostics: Vec<types::Diagnostic>,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": doc.uri },
+                "range": range,
+                "context": { "diagnostics": diagnostics },
+            }),
+            Intent::CodeActions { buffer, version: doc.version },
+        )
+    }
+
+    /// `workspace/executeCommand` for a chosen action's command half. The
+    /// arguments go back verbatim — they are the server's own, and opaque.
+    pub fn execute_command(
+        &mut self,
+        server: ServerId,
+        command: &types::CommandLit,
+    ) -> Result<(), String> {
+        self.request(
+            server,
+            "workspace/executeCommand",
+            json!({ "command": command.command, "arguments": command.arguments }),
+            Intent::Command,
+        )
+    }
+
     /// `textDocument/hover` at `position`. The anchor rides the intent.
     pub fn hover(
         &mut self,
@@ -483,6 +535,23 @@ impl Registry {
                     }),
                     Err(e) => Some(Effect::Status(format!("references: {}", e.message))),
                 },
+                Intent::CodeActions { buffer, version } => match result {
+                    Ok(value) => Some(Effect::CodeActions {
+                        buffer,
+                        version,
+                        server: from,
+                        actions: actions_of(value),
+                        encoding: client.encoding,
+                    }),
+                    Err(e) => Some(Effect::Status(format!("actions: {}", e.message))),
+                },
+                // The answer to `executeCommand` is usually null — the edits
+                // arrive separately as `workspace/applyEdit` — so only an
+                // error has anything to say.
+                Intent::Command => match result {
+                    Ok(_) => None,
+                    Err(e) => Some(Effect::Status(format!("action: {}", e.message))),
+                },
                 Intent::Formatting { buffer, version } => match result {
                     Ok(value) => Some(Effect::Formatting {
                         buffer,
@@ -525,6 +594,7 @@ impl Registry {
             },
 
             Inbound::Request { id, method, params } => {
+                let mut effect = None;
                 let response = match method.as_str() {
                     // Nothing to configure yet; a null per asked-for item is
                     // the spec's "no opinion".
@@ -541,11 +611,25 @@ impl Registry {
                     "window/workDoneProgress/create" => rpc::response_ok(&id, Value::Null),
                     // No UI to ask with; null is "the user chose nothing".
                     "window/showMessageRequest" => rpc::response_ok(&id, Value::Null),
-                    "workspace/applyEdit" => rpc::response_ok(&id, json!({ "applied": false })),
+                    // The edits a command-backed code action caused. Answered
+                    // `applied` optimistically — the effect is handed to the
+                    // editor in the same pump, and a reply held back until it
+                    // ran would mean holding the whole inbox.
+                    "workspace/applyEdit" => {
+                        match serde_json::from_value::<types::WorkspaceEdit>(params["edit"].clone())
+                        {
+                            Ok(edit) => {
+                                effect =
+                                    Some(Effect::ApplyEdit { edit, encoding: client.encoding });
+                                rpc::response_ok(&id, json!({ "applied": true }))
+                            }
+                            Err(_) => rpc::response_ok(&id, json!({ "applied": false })),
+                        }
+                    }
                     _ => rpc::response_err(&id, rpc::METHOD_NOT_FOUND, &method),
                 };
                 client.respond(response);
-                None
+                effect
             }
 
             Inbound::Notification { method, params } => match method.as_str() {
@@ -736,6 +820,32 @@ fn signature_data(value: &Value, encoding: Encoding) -> Option<SignatureData> {
 
 /// A completion answer in either wire shape — a bare array, or a
 /// `CompletionList` carrying `isIncomplete` — as `(incomplete, items)`.
+/// A code actions answer as one list of [`types::CodeAction`].
+///
+/// The wire allows `(Command | CodeAction)[] | null`. A bare `Command` — its
+/// `command` field is a string where a `CodeAction`'s is an object — becomes
+/// an action with only the command half; a disabled action is dropped here,
+/// because a row that cannot be chosen is a row that should not be offered.
+fn actions_of(value: Value) -> Vec<types::CodeAction> {
+    let Value::Array(items) = value else { return Vec::new() };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            if item["command"].is_string() {
+                let command: types::CommandLit = serde_json::from_value(item).ok()?;
+                return Some(types::CodeAction {
+                    title: command.title.clone(),
+                    edit: None,
+                    command: Some(command),
+                    disabled: None,
+                });
+            }
+            serde_json::from_value::<types::CodeAction>(item).ok()
+        })
+        .filter(|action| action.disabled.is_none())
+        .collect()
+}
+
 fn completion_items(value: Value) -> (bool, Vec<types::CompletionItem>) {
     match value {
         Value::Array(_) => (false, serde_json::from_value(value).unwrap_or_default()),

@@ -158,6 +158,17 @@ impl Input {
     /// would be answering a question nobody asked.
     pub fn set_keys(&mut self, keys: Keymap) {
         self.keys = keys;
+        // The one default leader binding bi ships — `<leader><leader>` is
+        // `:actions`. Installed against the live leader after the user's own
+        // bindings, so rebinding it or `= false` wins, and a changed leader
+        // carries it along. See `docs/specs/code-actions.md`.
+        if let Some(leader) = self.keys.leader() {
+            self.keys.insert_default(
+                KeyMode::Normal,
+                vec![leader, leader],
+                Bind::Ex { line: "actions".into(), run: true },
+            );
+        }
         self.remap_pending.clear();
     }
 
@@ -1802,10 +1813,33 @@ leader = \" \"
         assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
         assert_eq!(input.pending_display(), "<Space>", "and the status line says so");
 
-        // Without a binding that spells it, the leader is just a key.
+        // The leader always spells at least the shipped `<leader><leader>`
+        // now, so a bare leader waits even with no binding of your own…
         let mut plain = with_leader("[keys]\nleader = \" \"\n");
-        let cmd = plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert!(plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
+
+        // …and taking the shipped binding off gives the key itself back.
+        let mut unbound =
+            with_leader("[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = false\n");
+        let cmd = unbound.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
         assert_eq!(cmd.action, Action::Move(Motion::Right));
+    }
+
+    /// The one default leader binding bi ships, and the two ways you win:
+    /// your own binding on the sequence replaces it, `= false` removes it.
+    #[test]
+    fn leader_leader_runs_actions_out_of_the_box_and_stays_yours() {
+        let mut input = with_leader("[keys]\nleader = \" \"\n");
+        input.on_key(key(' '), &Mode::Normal, ContentKind::Text);
+        let cmd = input.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Ex { line: "actions".into(), run: true });
+
+        let mut rebound = with_leader(
+            "[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = \":alt<CR>\"\n",
+        );
+        rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text);
+        let cmd = rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Ex { line: "alt".into(), run: true }, "yours wins");
     }
 
     /// The rule that keeps a leader from eating arguments: once a command is

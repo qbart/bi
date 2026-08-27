@@ -34,15 +34,23 @@ pub struct PublishDiagnostics {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Serialize as well as Deserialize, alone among the incoming types: a code
+/// action request echoes the diagnostics it is about back to the server, and
+/// clangd only offers the fix for a diagnostic it recognises as its own —
+/// which is what `code` and `data` are carried for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub range: Range,
     /// 1 error, 2 warning, 3 info, 4 hint. Optional on the wire.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// One `Location` from a definition or references answer.
@@ -69,6 +77,47 @@ pub struct TextEdit {
     pub range: Range,
     #[serde(rename = "newText")]
     pub new_text: String,
+}
+
+/// The executable half of a code action — `workspace/executeCommand` is this,
+/// sent back verbatim.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CommandLit {
+    pub title: String,
+    pub command: String,
+    /// The server's own opaque arguments, returned untouched.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// One offer from `textDocument/codeAction`. A bare `Command` in the answer —
+/// the pre-3.8 shape — is normalised into one of these with only `command`
+/// set, so everything downstream reads one type.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CodeAction {
+    pub title: String,
+    #[serde(default)]
+    pub edit: Option<WorkspaceEdit>,
+    #[serde(default)]
+    pub command: Option<CommandLit>,
+    /// Present means "cannot run here, and this is why". bi drops these rows
+    /// rather than greying them: a row that cannot be chosen is a row that
+    /// should not be offered.
+    #[serde(default)]
+    pub disabled: Option<Value>,
+}
+
+/// The edits a code action (or a server's `workspace/applyEdit`) wants made.
+///
+/// `document_changes` stays raw: its entries are either versioned text edits
+/// or file create/rename/delete operations, and telling them apart is the
+/// applier's job — see `docs/specs/code-actions.md`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WorkspaceEdit {
+    #[serde(default)]
+    pub changes: Option<std::collections::BTreeMap<String, Vec<TextEdit>>>,
+    #[serde(default, rename = "documentChanges")]
+    pub document_changes: Option<Vec<Value>>,
 }
 
 /// One offer from `textDocument/completion`. The fields bi reads; servers
@@ -164,6 +213,8 @@ pub struct Capabilities {
     /// Ditto — `(` and `,` open and move the parameters float.
     #[serde(default, rename = "signatureHelpProvider")]
     pub signature_help_provider: Option<Value>,
+    #[serde(default, rename = "codeActionProvider")]
+    pub code_action_provider: Option<Value>,
 }
 
 /// The `triggerCharacters` of a `completionProvider`, empty when absent.

@@ -7,6 +7,7 @@ Status: modal editing, undo, registers, tree-sitter highlighting for twenty
 languages, a buffer list, split windows, a file tree, and LSP — servers start
 and sync per project, diagnostics are drawn on the text and jumped to with
 `]d` / `[d`, `gd` goes to a definition, `gr` lists references in a pane,
+`<leader><leader>` picks a code action — quickfixes, imports, refactors —
 `:format` reformats the file, `K` floats what the server knows about the
 cursor, completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk it,
 `Tab` or `Enter` accepts, auto-imports included — and typing `(` floats the
@@ -54,7 +55,7 @@ words. `{n}` below means an optional count.
 
 | Key | Moves to |
 |---|---|
-| `h` `l` | left, right (`Space` also moves right) |
+| `h` `l` | left, right (`Space` did too, until `<leader><leader>` claimed it — unbind that to get it back) |
 | `j` `k` | down, up, keeping a goal column through short lines |
 | `w` `b` | start of the next / previous word |
 | `e` `ge` | end of the next / previous word |
@@ -537,6 +538,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](docs/specs/cmdline-history.m
 | `:format` `:fmt` | the whole file, by the server, as one undo step |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
+| `:actions` | `<leader><leader>` — the code actions the server offers here, as a picker; a selection asks over its range |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
 | `:s/a/b/g` | substitute over a range — `:%s//new/g` takes the last search |
 | `:&` `:&&` | the last substitute again, flags included; `&` / `g&` are the keys |
@@ -560,8 +562,9 @@ matches your path decides, then the first of its paths that exists is opened.
 `*` matches anything, separators included, and stands for the same text on the
 right. Go, C and C++ pairs are built in; a pattern you set replaces bi's.
 `<leader>a` is a line of config — `"<leader>a" = ":alt<CR>"` — rather than a
-default, because bi's leader has no built-in meaning and the first binding to
-claim one should be yours. See
+default, because the leader is yours: bi ships exactly one leader binding,
+`<leader><leader>` for `:actions`, and even that one yields to a binding of
+your own or a `= false`. See
 [docs/specs/alternate.md](docs/specs/alternate.md).
 
 `:sort` orders whole rows — the file when nothing narrows it, the rows a range

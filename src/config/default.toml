@@ -242,10 +242,12 @@ filetypes = ["bash"]
 roots = []
 
 [keys]
-# The key <leader> stands for in a binding. Nothing uses it until you write a
-# binding that spells it — and the moment one does, this key stops meaning
-# whatever it meant on its own, because there is no timeout to decide between
-# them.
+# The key <leader> stands for in a binding. The moment any binding spells it,
+# this key stops meaning whatever it meant on its own, because there is no
+# timeout to decide between them. bi ships exactly one such binding —
+# "<leader><leader>" is ":actions", the LSP code action menu — so the bare
+# leader waits by default; rebind the sequence to change it, or set it to
+# false to remove it and get the key itself back.
 leader = " "
 
 # The rest of the keymap is still `match` arms in src/input.rs; only your
