@@ -666,6 +666,9 @@ impl Input {
             KeyCode::Char('k') | KeyCode::Up => ResultsCmd::Move(-1),
             KeyCode::Char('d') if ctrl => ResultsCmd::Move(10),
             KeyCode::Char('u') if ctrl => ResultsCmd::Move(-10),
+            // Beside `Ctrl-Enter` for the same job, because only one of the
+            // two exists on every terminal — see `docs/specs/open-in-split.md`.
+            KeyCode::Char('v') if ctrl => ResultsCmd::Open { split: true },
             KeyCode::Enter if ctrl => ResultsCmd::Open { split: true },
             KeyCode::Enter | KeyCode::Char('o') => ResultsCmd::Open { split: false },
             // The armed pane's pair, and the prune. See
@@ -1480,6 +1483,10 @@ impl Input {
             KeyCode::Char('n') if ctrl => Action::PickNext,
             KeyCode::Char('p') if ctrl => Action::PickPrev,
             KeyCode::Char('a') if ctrl => Action::PickToggleShort,
+            // The split accept on every terminal — `Ctrl-Enter` needs the
+            // kitty keyboard protocol, a control char does not. The letter is
+            // telescope's, for the hands arriving from there.
+            KeyCode::Char('v') if ctrl => Action::PickAcceptSplit,
             KeyCode::Char(c) => Action::PickChar(c),
             // Reaches the keymap only where the terminal disambiguates it —
             // see `docs/specs/open-in-split.md`.
@@ -2231,6 +2238,11 @@ leader = \" \"
             Action::Results(ResultsCmd::Open { split: true })
         );
         assert_eq!(
+            input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Results).unwrap().action,
+            Action::Results(ResultsCmd::Open { split: true }),
+            "the everywhere spelling"
+        );
+        assert_eq!(
             input
                 .on_key(Key::code(KeyCode::Enter), &Mode::Normal, ContentKind::Results)
                 .unwrap()
@@ -2877,6 +2889,7 @@ leader = \" \"
             mods: crate::key::Mods { ctrl: true, ..Default::default() },
         };
         assert_eq!(act(ctrl_enter), Action::PickAcceptSplit);
+        assert_eq!(act(ctrl('v')), Action::PickAcceptSplit, "the everywhere spelling");
         assert_eq!(act(Key::code(KeyCode::Esc)), Action::PickCancel);
         assert_eq!(act(Key::code(KeyCode::Backspace)), Action::PickBackspace);
         assert_eq!(act(Key::code(KeyCode::Down)), Action::PickNext);

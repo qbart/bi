@@ -13,14 +13,17 @@ intention.
   window the tree would have opened it in. The sidebar stays a sidebar; a
   directory just toggles, exactly as `Enter` would, because a directory is
   not a thing a window can show beside another.
-- **`Ctrl-Enter` in the pickers** — the file picker (`gf`, `Ctrl-P`) and the
+- **`Ctrl-V` in the pickers** — the file picker (`gf`, `Ctrl-P`) and the
   buffer switcher (`gb`, `:ls`) accept into a new vertical split. In every
-  other picker — registers, symbols, themes, tree rows — `Ctrl-Enter` is
-  plain `Enter`: those pickers choose things that have no window of their
-  own, and a chord that suddenly did nothing would read as a broken key.
-- **`Ctrl-Enter` in a results pane** — the match opens in a vertical split
+  other picker — registers, symbols, themes, tree rows — it is plain
+  `Enter`: those pickers choose things that have no window of their own, and
+  a key that suddenly did nothing would read as a broken one. `Ctrl-Enter`
+  is a synonym, where the terminal can send it at all (below); `Ctrl-V` is a
+  plain control char, exists everywhere, and is telescope's own key for
+  exactly this, so the hands arriving from vim already know it.
+- **`Ctrl-V` in a results pane** — the match opens in a vertical split
   beside the results, cursor on the match, instead of displacing the pane
-  the way `Enter` does.
+  the way `Enter` does. `Ctrl-Enter` again a synonym.
 
 Vertical only, and no horizontal sibling: the intention this serves is
 "beside what I am reading", and a second modifier for the rarer direction
@@ -39,10 +42,11 @@ out, panic hook included.
 
 Where the terminal says no — and `Enter` therefore cannot have a chord on
 it — nothing changes: `Enter` keeps opening things where they always
-opened, and `s` in the tree still works, which is why the tree key is a
-letter rather than the same chord. kitty, ghostty, wezterm, foot and
-alacritty all say yes; bi already leans on this class of terminal for
-images.
+opened, and `Ctrl-V` and the tree's `s` still work, which is why the
+*primary* spellings are a control char and a letter rather than the chord.
+kitty, ghostty, wezterm, foot and alacritty all say yes; a tmux in between
+answers for itself, usually no — which is what promoted `Ctrl-V` from
+alternative to default.
 
 The core never learns any of this: `Key { Enter, ctrl }` was always
 expressible, and the probe lives entirely in the frontend

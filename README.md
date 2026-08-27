@@ -474,7 +474,7 @@ and take a third of the overlay to do it; the rows get the space instead.
 | `Ctrl-P`, `Up` | previous match |
 | `Ctrl-A` | show or hide one-character entries, hidden in the register list only |
 | `Enter` | take the highlighted row |
-| `Ctrl-Enter` | the same, into a new vertical split — files and buffers; the other lists treat it as `Enter` |
+| `Ctrl-V` | the same, into a new vertical split — files and buffers; the other lists treat it as `Enter`. `Ctrl-Enter` is a synonym where the terminal can send it |
 | `Esc`, `Ctrl-C` | cancel, back to wherever it was opened from |
 
 A `¶` beside a row means the entry is linewise and will open a new line.
@@ -843,9 +843,10 @@ Results are a **pane**, not an overlay — a third content kind beside text and
 the file tree. It stays open beside the file you are editing, `j`/`k` and
 `gg`/`G` move, Enter opens the file **at the match's column**, and `q` puts
 back whatever the pane displaced. Enter on a file heading opens the top of that
-file, and `Ctrl-Enter` opens the match in a vertical split *beside* the
-results instead of over them — where the terminal can tell the chord from
-Enter (see [docs/specs/open-in-split.md](docs/specs/open-in-split.md)). `x` drops a row — a hit, or a heading with everything under it — which is
+file, and `Ctrl-V` opens the match in a vertical split *beside* the results
+instead of over them — `Ctrl-Enter` is a synonym where the terminal can
+tell the chord from Enter (see
+[docs/specs/open-in-split.md](docs/specs/open-in-split.md)). `x` drops a row — a hit, or a heading with everything under it — which is
 how you narrow what a replace is about to take. `Ctrl-^` after Enter swaps the
 pane back, exactly as a parked tree; `:results` brings the last list back
 later, as you left it.
