@@ -613,8 +613,8 @@ impl Input {
             // `0` is not a count, it is a key the tree does not have.
             KeyCode::Char(c) if c.is_ascii_digit() => !(c == '0' && self.count.is_none()),
             // The window prefix, the two half-page keys, the three that ask to
-            // see a buffer, and the file picker.
-            KeyCode::Char('w' | 'u' | 'i' | 'o' | 'p' | '^') if ctrl => true,
+            // see a buffer, the file picker, and the split open.
+            KeyCode::Char('w' | 'u' | 'i' | 'o' | 'p' | 'v' | '^') if ctrl => true,
             // The second half of `gf`, and only while the `g` is armed: a bare
             // `f` is not a tree key, so a `[keys.normal]` binding may have it.
             KeyCode::Char('f') if self.g_pending => true,
@@ -761,8 +761,10 @@ impl Input {
             KeyCode::Enter => TreeCmd::Enter,
             // A letter rather than `Ctrl-Enter`, because the tree cannot
             // count on the terminal speaking the kitty keyboard protocol —
-            // see `docs/specs/open-in-split.md`.
+            // and `Ctrl-V` beside it, the same key the pickers and results
+            // use. See `docs/specs/open-in-split.md`.
             KeyCode::Char('s') => TreeCmd::Split,
+            KeyCode::Char('v') if ctrl => TreeCmd::Split,
             KeyCode::Char('-') => TreeCmd::Up,
             KeyCode::Char('+') => TreeCmd::Down,
             KeyCode::Char('R') => TreeCmd::Refresh,
@@ -2227,6 +2229,12 @@ leader = \" \"
     #[test]
     fn s_in_a_tree_is_the_split_open_and_ctrl_enter_splits_a_results_pane() {
         assert_eq!(tree_action("s"), Action::Tree(TreeCmd::Split));
+        let mut tree_input = Input::default();
+        assert_eq!(
+            tree_input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Tree).unwrap().action,
+            Action::Tree(TreeCmd::Split),
+            "one split key across tree, pickers and results"
+        );
 
         let mut input = Input::default();
         let ctrl_enter = Key {

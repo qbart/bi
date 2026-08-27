@@ -646,7 +646,7 @@ Only naming a directory, `+` and `-` do. See
 | `l` / `→` | open a directory, or open the file under the cursor |
 | `h` / `←` | close a directory, or step to the parent row |
 | `Enter` | a directory toggles, a file opens |
-| `s` | the file, in a new vertical split beside the pane it would have opened in; a directory toggles |
+| `s`, `Ctrl-V` | the file, in a new vertical split beside the pane it would have opened in; a directory toggles |
 | `-` `+` | re-root at the parent directory / at the one you are standing in |
 | `gh` | show or hide dotfiles |
 | `R` | re-read from disk |

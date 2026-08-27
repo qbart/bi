@@ -12,7 +12,9 @@ intention.
 - **`s` in the tree** — the selected file in a new vertical split of the
   window the tree would have opened it in. The sidebar stays a sidebar; a
   directory just toggles, exactly as `Enter` would, because a directory is
-  not a thing a window can show beside another.
+  not a thing a window can show beside another. `Ctrl-V` is a synonym, so
+  the split open is one gesture across the tree, the pickers and the
+  results.
 - **`Ctrl-V` in the pickers** — the file picker (`gf`, `Ctrl-P`) and the
   buffer switcher (`gb`, `:ls`) accept into a new vertical split. In every
   other picker — registers, symbols, themes, tree rows — it is plain
