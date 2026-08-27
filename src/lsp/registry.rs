@@ -111,6 +111,15 @@ pub enum Effect {
     /// action caused. Already answered `applied: true` on the wire; the
     /// editor applies it inside `settle` like every other effect.
     ApplyEdit { edit: types::WorkspaceEdit, encoding: Encoding },
+    /// A `codeAction/resolve` answer: the chosen action again, its lazy
+    /// halves filled in. `None` when the answer did not parse as an action.
+    ResolvedAction {
+        buffer: BufferId,
+        version: i32,
+        server: ServerId,
+        action: Option<types::CodeAction>,
+        encoding: Encoding,
+    },
 }
 
 /// The parameters float's content: one label, the active parameter's char
@@ -407,6 +416,25 @@ impl Registry {
         )
     }
 
+    /// `codeAction/resolve` for an action whose edit the server kept lazy.
+    /// The params are the action exactly as it arrived — `data` is the
+    /// server's bookmark, and only the untouched original is guaranteed to
+    /// be honoured.
+    pub fn resolve_action(
+        &mut self,
+        server: ServerId,
+        action: &types::CodeAction,
+        buffer: BufferId,
+        version: i32,
+    ) -> Result<(), String> {
+        self.request(
+            server,
+            "codeAction/resolve",
+            action.raw.clone(),
+            Intent::Resolve { buffer, version },
+        )
+    }
+
     /// `workspace/executeCommand` for a chosen action's command half. The
     /// arguments go back verbatim — they are the server's own, and opaque.
     pub fn execute_command(
@@ -551,6 +579,16 @@ impl Registry {
                 Intent::Command => match result {
                     Ok(_) => None,
                     Err(e) => Some(Effect::Status(format!("action: {}", e.message))),
+                },
+                Intent::Resolve { buffer, version } => match result {
+                    Ok(value) => Some(Effect::ResolvedAction {
+                        buffer,
+                        version,
+                        server: from,
+                        action: action_of(value),
+                        encoding: client.encoding,
+                    }),
+                    Err(e) => Some(Effect::Status(format!("actions: {}", e.message))),
                 },
                 Intent::Formatting { buffer, version } => match result {
                     Ok(value) => Some(Effect::Formatting {
@@ -828,22 +866,25 @@ fn signature_data(value: &Value, encoding: Encoding) -> Option<SignatureData> {
 /// because a row that cannot be chosen is a row that should not be offered.
 fn actions_of(value: Value) -> Vec<types::CodeAction> {
     let Value::Array(items) = value else { return Vec::new() };
-    items
-        .into_iter()
-        .filter_map(|item| {
-            if item["command"].is_string() {
-                let command: types::CommandLit = serde_json::from_value(item).ok()?;
-                return Some(types::CodeAction {
-                    title: command.title.clone(),
-                    edit: None,
-                    command: Some(command),
-                    disabled: None,
-                });
-            }
-            serde_json::from_value::<types::CodeAction>(item).ok()
-        })
-        .filter(|action| action.disabled.is_none())
-        .collect()
+    items.into_iter().filter_map(action_of).filter(|action| action.disabled.is_none()).collect()
+}
+
+/// One `Command | CodeAction`, keeping the wire shape in `raw` — a later
+/// `codeAction/resolve` must send back exactly what arrived.
+fn action_of(item: Value) -> Option<types::CodeAction> {
+    if item["command"].is_string() {
+        let command: types::CommandLit = serde_json::from_value(item.clone()).ok()?;
+        return Some(types::CodeAction {
+            title: command.title.clone(),
+            edit: None,
+            command: Some(command),
+            disabled: None,
+            raw: item,
+        });
+    }
+    let mut action: types::CodeAction = serde_json::from_value(item.clone()).ok()?;
+    action.raw = item;
+    Some(action)
 }
 
 fn completion_items(value: Value) -> (bool, Vec<types::CompletionItem>) {

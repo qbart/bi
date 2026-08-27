@@ -76,6 +76,13 @@ pub enum Intent {
     /// usually null — whatever edits the command causes arrive as a
     /// server→client `workspace/applyEdit` — so only an error says anything.
     Command,
+    /// `codeAction/resolve` for a chosen action that arrived as a claim
+    /// ticket — no edit, no command. The gate context rides along exactly
+    /// as [`Intent::CodeActions`] carries it.
+    Resolve {
+        buffer: BufferId,
+        version: i32,
+    },
 }
 
 /// The provider switches core features read from `initialize`. More arrive
@@ -189,10 +196,11 @@ impl Client {
                         "synchronization": { "didSave": true },
                         "publishDiagnostics": { "versionSupport": true },
                         // Literal support makes servers send `CodeAction`
-                        // objects rather than bare commands — and declaring
-                        // no `resolveSupport` beside it is what obliges them
-                        // to fill `edit` in eagerly instead of waiting for a
-                        // `codeAction/resolve` bi does not send.
+                        // objects rather than bare commands. `resolveSupport`
+                        // invites them to keep the expensive halves lazy —
+                        // bi cashes the ticket with `codeAction/resolve` on
+                        // accept — and `dataSupport` is what lets their
+                        // bookmark ride along.
                         "codeAction": {
                             "codeActionLiteralSupport": {
                                 "codeActionKind": { "valueSet": [
@@ -203,11 +211,23 @@ impl Client {
                                     "source.fixAll",
                                 ] },
                             },
+                            "resolveSupport": { "properties": ["edit", "command"] },
+                            "dataSupport": true,
                         },
                     },
                     // What makes a command-backed action land: the server
-                    // sends its edits as `workspace/applyEdit`.
-                    "workspace": { "applyEdit": true },
+                    // sends its edits as `workspace/applyEdit`. The
+                    // `workspaceEdit` half is what earns bi the file-shaped
+                    // refactors — a server offers create/rename/delete only
+                    // to a client that admits to understanding them.
+                    "workspace": {
+                        "applyEdit": true,
+                        "workspaceEdit": {
+                            "documentChanges": true,
+                            "resourceOperations": ["create", "rename", "delete"],
+                            "failureHandling": "abort",
+                        },
+                    },
                     "window": { "workDoneProgress": true },
                 },
             }),

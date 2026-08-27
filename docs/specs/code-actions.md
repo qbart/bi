@@ -43,6 +43,15 @@ Choosing a row does what the action says:
   honours (it used to answer `applied: false`) and applies through the
   same path.
 - Both, in that order, when the action carries both.
+- **Neither** means the action is a claim ticket: the server offered a
+  title and kept the expensive part — computing the edit — for later.
+  The chosen action goes back verbatim as `codeAction/resolve` (the
+  `data` field is the server's bookmark, carried untouched, which is why
+  actions keep their raw wire shape beside the parsed one), and the
+  filled-in answer runs through the same edit-then-command path. Only
+  the chosen action is resolved, only when it needs it: the menu stays
+  as cheap as the server can make it. A resolved action that still has
+  neither half is a status, not a silence.
 
 ## Applying a workspace edit
 
@@ -62,25 +71,42 @@ was *requested* on is gated against the version at request time. Unversioned
 nothing better.
 
 Resource operations — create/rename/delete file entries inside
-`documentChanges` — are not applied: the whole edit is refused with a
-status naming what it wanted, because applying half of a rename is worse
-than applying none of it.
+`documentChanges` — are applied in the order the server listed them,
+interleaved with the text edits, because the order is the meaning: a
+"move module to file" creates the file, then fills it, then empties the
+old one. They are filesystem operations and land on the filesystem, the
+way `:create`, `:mv` and `:delete` land — text edits stay in unsaved
+buffers you can inspect, but a created file exists, a renamed file has
+moved (any open buffer follows it, its syntax re-picked and its LSP
+document re-attached under the new name), and a deleted file is gone
+(its buffer, if open, stays — text and history intact, as `:delete`
+already behaves). `overwrite` and `ignoreIfExists` options are honoured;
+`recursive` likewise for delete.
+
+The failure rule is *abort*: the first operation that fails stops the
+whole edit there, with a status naming what failed and what had already
+been done — applying half of a rename silently is the one outcome worse
+than either whole. This is also what bi declares as `failureHandling`.
 
 ## Capabilities
 
 `initialize` now declares `codeActionLiteralSupport` (with the standard
 kind set) so servers send `CodeAction` literals rather than bare commands
-— and does **not** declare `resolveSupport`, which is what obliges a
-server to fill `edit` in eagerly instead of waiting for a
-`codeAction/resolve` bi does not send. `workspace.applyEdit` is declared
-true, which is what makes command-backed actions land. The server-side
-gate is `codeActionProvider`, parsed truthy like every other provider.
+— and `resolveSupport` for `edit` and `command`, which invites servers to
+keep the expensive halves lazy and lets the menu open fast; bi cashes the
+ticket with `codeAction/resolve` on accept. `workspace.applyEdit` is
+declared true, which is what makes command-backed actions land, and
+`workspace.workspaceEdit` declares `documentChanges` plus the three
+`resourceOperations` with `failureHandling: "abort"` — a server only
+sends what the client admits to understanding, and before this
+declaration a rename-file refactor was never even offered. The
+server-side gate is `codeActionProvider`, parsed truthy like every other
+provider.
 
 ## What this is not
 
-No `codeAction/resolve` round-trip, no auto-applied `source.fixAll` on
-save, no lightbulb in the gutter, no kind filtering. The menu, chosen by
-hand, is the feature.
+No auto-applied `source.fixAll` on save, no lightbulb in the gutter, no
+kind filtering. The menu, chosen by hand, is the feature.
 
 ## Testing
 
@@ -90,5 +116,11 @@ picker and choosing applies a multi-edit `WorkspaceEdit` as one undo step;
 a versioned document edit against moved text is dropped; a command-only
 action sends `executeCommand`, and the server's `workspace/applyEdit` is
 applied and answered `applied: true`; a response with no actions is a
-status. The keymap: `<leader><leader>` runs `:actions` out of the box,
+status. An action with neither edit nor command sends `codeAction/resolve`
+with `data` intact and applies the answer. A `documentChanges` list that
+creates a file, edits it, renames another and deletes a third does all
+four in order — the created file exists and holds its edits, the renamed
+buffer follows its file, the deleted file is gone — and one that renames
+a file that is not there stops at the failure with nothing after it
+applied. The keymap: `<leader><leader>` runs `:actions` out of the box,
 a user binding of the same sequence wins, and `= false` removes it.

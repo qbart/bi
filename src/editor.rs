@@ -1592,7 +1592,7 @@ enum ExLine {
         name: String,
     },
     Create(String),
-    Rename {
+    Mv {
         from: String,
         to: String,
     },
@@ -2004,11 +2004,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // and testable without one.
         "create" if !arg.is_empty() => ExLine::Create(arg.into()),
         "create" => ExLine::Error("create what?".into()),
-        "rename" => match arg.split_once(char::is_whitespace) {
+        "mv" => match arg.split_once(char::is_whitespace) {
             Some((from, to)) if !to.trim().is_empty() => {
-                ExLine::Rename { from: from.into(), to: to.trim().into() }
+                ExLine::Mv { from: from.into(), to: to.trim().into() }
             }
-            _ => ExLine::Error("rename takes the old path and the new one".into()),
+            _ => ExLine::Error("mv takes the old path and the new one".into()),
         },
         "delete" if !arg.is_empty() => ExLine::Delete { path: arg.into(), force },
         "delete" => ExLine::Error("delete what?".into()),
@@ -5576,9 +5576,9 @@ impl Editor {
         self.report(result, format!("\"{path}\" created"));
     }
 
-    /// `:rename <old> <new>` — which is also how you move a file, since it is
-    /// the same call and pretending otherwise would need two commands.
-    fn rename_path(&mut self, from: &str, to: &str) {
+    /// `:mv <old> <new>` — rename, which is also how you move a file, since
+    /// it is the same call and pretending otherwise would need two commands.
+    fn move_path(&mut self, from: &str, to: &str) {
         let (source, target) = (std::path::Path::new(from), std::path::Path::new(to));
         if !source.exists() {
             self.session.status = format!("\"{from}\" does not exist");
@@ -5602,13 +5602,7 @@ impl Editor {
 
         // A buffer left pointing at a path that no longer exists would recreate
         // the file under its old name on the next `:w`.
-        for entry in &mut self.buffers {
-            if entry.buffer.path.as_deref() == Some(source) {
-                entry.buffer.path = Some(target.to_path_buf());
-                // The extension may have changed, and with it the grammar.
-                entry.syntax = syntax_for(&entry.buffer, &entry.options);
-            }
-        }
+        self.repoint_buffers(source, target);
         self.report(Ok(()), format!("\"{from}\" → \"{to}\""));
     }
 
@@ -5799,7 +5793,7 @@ impl Editor {
                 };
                 format!("create {}/", dir.display())
             }
-            FileOp::Rename => format!("rename {path} {path}"),
+            FileOp::Rename => format!("mv {path} {path}"),
         };
         self.session.status.clear();
         self.session.mode = Mode::Command(line.into());
@@ -5847,7 +5841,7 @@ impl Editor {
                 }
             }
             ExLine::Create(path) => self.create_path(&path),
-            ExLine::Rename { from, to } => self.rename_path(&from, &to),
+            ExLine::Mv { from, to } => self.move_path(&from, &to),
             ExLine::Delete { path, force } => self.delete_path(&path, force),
             ExLine::Paste(dir) => match dir {
                 Some(dir) => self.paste_into(std::path::Path::new(&dir)),
@@ -6667,6 +6661,14 @@ impl Editor {
                         Err(message) => format!("action: {message}"),
                     };
                 }
+                Some(lsp::Effect::ResolvedAction { buffer, version, server, action, encoding }) => {
+                    match action {
+                        Some(action) => {
+                            self.perform_action(action, buffer, version, server, encoding, true)
+                        }
+                        None => self.session.status = "actions: unreadable resolve answer".into(),
+                    }
+                }
                 Some(lsp::Effect::Hover { window, anchor, markdown }) => {
                     self.apply_hover(window, anchor, markdown)
                 }
@@ -7083,6 +7085,31 @@ impl Editor {
             return;
         }
         let action = actions.swap_remove(chosen);
+        self.perform_action(action, buffer, version, server, encoding, false);
+    }
+
+    /// Runs an action's edit, then its command, whichever it has. One with
+    /// neither is a claim ticket the server kept the edit for: it goes back
+    /// as `codeAction/resolve` and returns through this same path with
+    /// `resolved` set — which is what keeps a still-empty answer from
+    /// resolving forever.
+    fn perform_action(
+        &mut self,
+        action: lsp::types::CodeAction,
+        buffer: BufferId,
+        version: i32,
+        server: lsp::ServerId,
+        encoding: lsp::pos::Encoding,
+        resolved: bool,
+    ) {
+        if action.edit.is_none() && action.command.is_none() {
+            if resolved {
+                self.session.status = format!("{}: nothing to apply", action.title);
+            } else if let Err(status) = self.lsp.resolve_action(server, &action, buffer, version) {
+                self.session.status = status;
+            }
+            return;
+        }
         let mut outcome = None;
         if let Some(edit) = action.edit {
             match self.apply_workspace_edit(edit, encoding, Some((buffer, version))) {
@@ -7112,57 +7139,199 @@ impl Editor {
     /// `:format` gates, and per-document versions likewise; unversioned edits
     /// to other files are taken at their word, the protocol offering nothing
     /// better. Files not open are opened the way `:e` opens them and left
-    /// modified. See `docs/specs/code-actions.md`.
+    /// modified. Resource operations — create/rename/delete — land on the
+    /// filesystem in the order the server listed them, and the first one
+    /// that fails stops the whole edit there. See
+    /// `docs/specs/code-actions.md`.
     fn apply_workspace_edit(
         &mut self,
         edit: lsp::types::WorkspaceEdit,
         encoding: lsp::pos::Encoding,
         origin: Option<(BufferId, i32)>,
     ) -> Result<String, String> {
-        // Both wire shapes down to one: (uri, version if any, edits).
-        let mut docs: Vec<(String, Option<i32>, Vec<lsp::types::TextEdit>)> = Vec::new();
+        enum Op {
+            Edit { uri: String, version: Option<i32>, edits: Vec<lsp::types::TextEdit> },
+            Create { uri: String, options: serde_json::Value },
+            Rename { from: String, to: String, options: serde_json::Value },
+            Delete { uri: String, options: serde_json::Value },
+        }
+        let field = |v: &serde_json::Value, key: &str| -> Result<String, String> {
+            v[key].as_str().map(str::to_string).ok_or_else(|| "malformed edit".into())
+        };
+
+        // Both wire shapes down to one ordered list — the order is the
+        // meaning: a "move to new file" creates, then fills, then empties.
+        let mut ops: Vec<Op> = Vec::new();
         if let Some(changes) = edit.document_changes {
             for change in changes {
-                // A create/rename/delete entry refuses the whole edit:
-                // applying half of a rename is worse than applying none.
-                if let Some(kind) = change.get("kind").and_then(serde_json::Value::as_str) {
-                    return Err(format!("wants to {kind} a file — not supported"));
+                match change.get("kind").and_then(serde_json::Value::as_str) {
+                    Some("create") => ops.push(Op::Create {
+                        uri: field(&change, "uri")?,
+                        options: change["options"].clone(),
+                    }),
+                    Some("rename") => ops.push(Op::Rename {
+                        from: field(&change, "oldUri")?,
+                        to: field(&change, "newUri")?,
+                        options: change["options"].clone(),
+                    }),
+                    Some("delete") => ops.push(Op::Delete {
+                        uri: field(&change, "uri")?,
+                        options: change["options"].clone(),
+                    }),
+                    Some(kind) => return Err(format!("wants to {kind} a file — not supported")),
+                    None => ops.push(Op::Edit {
+                        uri: change["textDocument"]["uri"]
+                            .as_str()
+                            .ok_or("malformed edit")?
+                            .to_string(),
+                        version: change["textDocument"]["version"].as_i64().map(|v| v as i32),
+                        edits: serde_json::from_value(change["edits"].clone())
+                            .map_err(|_| "malformed edit")?,
+                    }),
                 }
-                let uri =
-                    change["textDocument"]["uri"].as_str().ok_or("malformed edit")?.to_string();
-                let version = change["textDocument"]["version"].as_i64().map(|v| v as i32);
-                let edits = serde_json::from_value(change["edits"].clone())
-                    .map_err(|_| "malformed edit")?;
-                docs.push((uri, version, edits));
             }
         } else if let Some(changes) = edit.changes {
-            docs.extend(changes.into_iter().map(|(uri, edits)| (uri, None, edits)));
+            ops.extend(changes.into_iter().map(|(uri, edits)| Op::Edit {
+                uri,
+                version: None,
+                edits,
+            }));
         }
 
-        let (mut edits_applied, mut buffers, mut stale) = (0usize, 0usize, 0usize);
-        for (uri, version, edits) in docs {
-            if edits.is_empty() {
-                continue;
+        let flag = |options: &serde_json::Value, name: &str| {
+            options.get(name).and_then(serde_json::Value::as_bool).unwrap_or(false)
+        };
+        // What an abort message says was already done — half a rename must
+        // never *look* like a whole one.
+        fn done(edits: usize, files: usize) -> String {
+            match (edits, files) {
+                (0, 0) => "nothing applied before it".into(),
+                (e, f) => format!("{e} edit(s) and {f} file op(s) applied before it"),
             }
-            let Some(path) = lsp::pos::path_of(&uri) else { continue };
-            let id = self
-                .open_path(&path.to_string_lossy())
-                .map_err(|e| format!("opening {}: {e:#}", path.display()))?;
-            let current = match &self.entry(id).lsp {
-                lsp::Attach::Doc(doc) => Some(doc.version),
-                _ => None,
-            };
-            let expected = version.or(origin.filter(|&(b, _)| b == id).map(|(_, v)| v));
-            if let (Some(expected), Some(current)) = (expected, current)
-                && expected != current
-            {
-                stale += 1;
-                continue;
-            }
-            edits_applied += self.apply_lsp_edits(id, &edits, encoding);
-            buffers += 1;
         }
-        if buffers == 0 && stale > 0 {
+
+        let (mut edits_applied, mut buffers, mut stale, mut files) = (0usize, 0usize, 0, 0usize);
+        for op in ops {
+            match op {
+                Op::Edit { uri, version, edits } => {
+                    if edits.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = lsp::pos::path_of(&uri) else { continue };
+                    let id = self
+                        .open_path(&path.to_string_lossy())
+                        .map_err(|e| format!("opening {}: {e:#}", path.display()))?;
+                    let current = match &self.entry(id).lsp {
+                        lsp::Attach::Doc(doc) => Some(doc.version),
+                        _ => None,
+                    };
+                    let expected = version.or(origin.filter(|&(b, _)| b == id).map(|(_, v)| v));
+                    if let (Some(expected), Some(current)) = (expected, current)
+                        && expected != current
+                    {
+                        stale += 1;
+                        continue;
+                    }
+                    edits_applied += self.apply_lsp_edits(id, &edits, encoding);
+                    buffers += 1;
+                }
+                Op::Create { uri, options } => {
+                    let Some(path) = lsp::pos::path_of(&uri) else { continue };
+                    if path.exists() {
+                        // `overwrite` wins over `ignoreIfExists` — the
+                        // protocol's own precedence.
+                        if flag(&options, "overwrite") {
+                            std::fs::write(&path, "").map_err(|e| {
+                                format!(
+                                    "create {}: {e} — {}",
+                                    path.display(),
+                                    done(edits_applied, files)
+                                )
+                            })?;
+                        } else if !flag(&options, "ignoreIfExists") {
+                            return Err(format!(
+                                "create {}: already exists — {}",
+                                path.display(),
+                                done(edits_applied, files)
+                            ));
+                        }
+                    } else {
+                        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::write(&path, "").map_err(|e| {
+                            format!(
+                                "create {}: {e} — {}",
+                                path.display(),
+                                done(edits_applied, files)
+                            )
+                        })?;
+                    }
+                    files += 1;
+                }
+                Op::Rename { from, to, options } => {
+                    let (Some(source), Some(target)) =
+                        (lsp::pos::path_of(&from), lsp::pos::path_of(&to))
+                    else {
+                        continue;
+                    };
+                    if !source.exists() {
+                        return Err(format!(
+                            "rename {}: does not exist — {}",
+                            source.display(),
+                            done(edits_applied, files)
+                        ));
+                    }
+                    if target.exists() && !flag(&options, "overwrite") {
+                        if flag(&options, "ignoreIfExists") {
+                            continue;
+                        }
+                        return Err(format!(
+                            "rename to {}: already exists — {}",
+                            target.display(),
+                            done(edits_applied, files)
+                        ));
+                    }
+                    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::rename(&source, &target).map_err(|e| {
+                        format!("rename {}: {e} — {}", source.display(), done(edits_applied, files))
+                    })?;
+                    self.repoint_buffers(&source, &target);
+                    files += 1;
+                }
+                Op::Delete { uri, options } => {
+                    let Some(path) = lsp::pos::path_of(&uri) else { continue };
+                    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                        if flag(&options, "ignoreIfNotExists") {
+                            continue;
+                        }
+                        return Err(format!(
+                            "delete {}: does not exist — {}",
+                            path.display(),
+                            done(edits_applied, files)
+                        ));
+                    };
+                    let result = if meta.is_dir() {
+                        match flag(&options, "recursive") {
+                            true => std::fs::remove_dir_all(&path),
+                            false => std::fs::remove_dir(&path),
+                        }
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    result.map_err(|e| {
+                        format!("delete {}: {e} — {}", path.display(), done(edits_applied, files))
+                    })?;
+                    files += 1;
+                }
+            }
+        }
+        if files > 0 {
+            self.refresh_trees();
+        }
+        if buffers == 0 && files == 0 && stale > 0 {
             return Err("the text moved under it — nothing applied".into());
         }
         let mut summary = format!(
@@ -7170,6 +7339,9 @@ impl Editor {
             if edits_applied == 1 { "" } else { "s" },
             if buffers == 1 { "" } else { "s" },
         );
+        if files > 0 {
+            summary.push_str(&format!(", {files} file op{}", if files == 1 { "" } else { "s" }));
+        }
         if stale > 0 {
             summary.push_str(&format!(
                 ", {stale} stale buffer{} skipped",
@@ -7177,6 +7349,22 @@ impl Editor {
             ));
         }
         Ok(summary)
+    }
+
+    /// A file moved on disk: any buffer at `source` follows to `target` —
+    /// its path, its grammar, and its LSP document, which is closed and left
+    /// to re-attach under the new name on the next settle.
+    fn repoint_buffers(&mut self, source: &std::path::Path, target: &std::path::Path) {
+        for entry in &mut self.buffers {
+            if entry.buffer.path.as_deref() == Some(source) {
+                entry.buffer.path = Some(target.to_path_buf());
+                entry.syntax = syntax_for(&entry.buffer, &entry.options);
+                if let lsp::Attach::Doc(doc) = &entry.lsp {
+                    self.lsp.close(doc);
+                    entry.lsp = lsp::Attach::Unresolved;
+                }
+            }
+        }
     }
 
     fn lsp_format(&mut self) {
@@ -12962,13 +13150,13 @@ mod tests {
     /// Leaving the buffer pointing at a path that no longer exists means the
     /// next `:w` recreates the file under its old name.
     #[test]
-    fn rename_moves_an_open_buffer_with_the_file_and_repicks_its_syntax() {
+    fn mv_moves_an_open_buffer_with_the_file_and_repicks_its_syntax() {
         let d = ScratchDir::new("rename").file("a.txt");
         let (from, to) = (format!("{}/a.txt", d.path()), format!("{}/b.rs", d.path()));
         let mut ed = Editor::open(&from).unwrap();
         assert!(ed.syntax().is_none(), "no grammar for .txt");
 
-        ex(&mut ed, &format!("rename {from} {to}"));
+        ex(&mut ed, &format!("mv {from} {to}"));
 
         assert!(std::path::Path::new(&to).is_file(), "moved on disk");
         assert!(!std::path::Path::new(&from).exists());
@@ -13039,7 +13227,7 @@ mod tests {
 
         let Mode::Command(line) = &ed.session.mode else { panic!("not on the command line") };
         let path = format!("{}/a.rs", d.path());
-        assert_eq!(line, &format!("rename {path} {path}"), "edit the second one");
+        assert_eq!(line, &format!("mv {path} {path}"), "edit the second one");
     }
 
     // ---- moving lines -------------------------------------------------------
@@ -20583,8 +20771,196 @@ int main(void) {
         }
 
         #[test]
-        fn a_file_operation_refuses_the_whole_edit() {
-            let (_dir, mut ed, fake) = project("actions-fileop");
+        fn an_action_with_neither_half_is_resolved_on_accept() {
+            let (_dir, mut ed, fake) = project("actions-resolve");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            // The lazy flow only exists because the client admits to it.
+            let init = fake.last(id, "initialize").unwrap();
+            let action_caps = &init["params"]["capabilities"]["textDocument"]["codeAction"];
+            assert_eq!(action_caps["resolveSupport"]["properties"][0], "edit");
+            assert_eq!(action_caps["dataSupport"], true);
+
+            ex(&mut ed, "actions");
+            // A claim ticket: a title and the server's bookmark, no edit yet.
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "extract function", "kind": "refactor.extract",
+                         "data": { "id": 4 } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+
+            let sent = fake.last(id, "codeAction/resolve").unwrap();
+            assert_eq!(sent["params"]["title"], "extract function");
+            assert_eq!(sent["params"]["data"]["id"], 4, "the bookmark goes back untouched");
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "fn main() {\n}\n",
+                "nothing applied before the resolve answers"
+            );
+
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "codeAction/resolve",
+                json!({ "title": "extract function", "edit": { "changes": { uri: [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 0 } },
+                      "newText": "// extracted\n" },
+                ] } } }),
+            );
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "// extracted\nfn main() {\n}\n");
+            assert!(ed.session.status.contains("extract function"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_resolved_action_that_is_still_empty_is_a_status() {
+            let (_dir, mut ed, fake) = project("actions-resolve-empty");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "do nothing", "data": 1 }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            respond(&mut ed, &fake, id, "codeAction/resolve", json!({ "title": "do nothing" }));
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn main() {\n}\n");
+            assert!(ed.session.status.contains("nothing to apply"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn file_operations_apply_in_the_order_the_server_listed_them() {
+            let (dir, mut ed, fake) = project("actions-fileop");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            // The client must have admitted to resource operations, or the
+            // server would never have sent them.
+            let init = fake.last(id, "initialize").unwrap();
+            let ws_edit = &init["params"]["capabilities"]["workspace"]["workspaceEdit"];
+            assert_eq!(ws_edit["documentChanges"], true);
+            assert_eq!(ws_edit["resourceOperations"][0], "create");
+
+            let new_path = format!("{}/src/lib.rs", dir.path());
+            let new_uri = crate::lsp::pos::uri_of(std::path::Path::new(&new_path));
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "move to new file", "edit": { "documentChanges": [
+                    { "kind": "create", "uri": new_uri },
+                    { "textDocument": { "uri": new_uri, "version": null }, "edits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 0, "character": 0 } },
+                          "newText": "fn moved() {}\n" } ] },
+                    { "textDocument": { "uri": uri, "version": 1 }, "edits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 0, "character": 2 } },
+                          "newText": "pub fn" } ] },
+                ] } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+
+            assert!(std::path::Path::new(&new_path).is_file(), "created on disk");
+            let new_id = ed
+                .buffer_ids()
+                .into_iter()
+                .find(|&b| ed.name_of(b) == new_path)
+                .expect("the created file is an open buffer");
+            assert_eq!(
+                ed.entry(new_id).buffer.rope().to_string(),
+                "fn moved() {}\n",
+                "its edits landed in the buffer, unsaved"
+            );
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "pub fn main() {\n}\n",
+                "and the old file got its edit too"
+            );
+            assert!(ed.session.status.contains("move to new file"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_rename_entry_moves_the_file_and_the_buffer_follows() {
+            let (dir, mut ed, fake) = project("actions-mv");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+
+            let old_path = format!("{}/src/main.rs", dir.path());
+            let new_path = format!("{}/src/renamed.rs", dir.path());
+            let new_uri = crate::lsp::pos::uri_of(std::path::Path::new(&new_path));
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "rename file", "edit": { "documentChanges": [
+                    { "kind": "rename", "oldUri": uri, "newUri": new_uri },
+                    { "textDocument": { "uri": new_uri, "version": null }, "edits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 0, "character": 0 } },
+                          "newText": "// moved\n" } ] },
+                ] } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+
+            assert!(!std::path::Path::new(&old_path).exists(), "the old name is gone");
+            assert!(std::path::Path::new(&new_path).is_file());
+            let buffer = ed.window().buffer().unwrap();
+            assert_eq!(ed.name_of(buffer), new_path, "the buffer followed the file");
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "// moved\nfn main() {\n}\n",
+                "the edit found it under the new name"
+            );
+        }
+
+        #[test]
+        fn a_delete_entry_removes_the_file() {
+            let (dir, mut ed, fake) = project("actions-del");
+            let id = handshake(&mut ed, &fake);
+            let doomed = format!("{}/Cargo.toml", dir.path());
+            let doomed_uri = crate::lsp::pos::uri_of(std::path::Path::new(&doomed));
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "drop it", "edit": { "documentChanges": [
+                    { "kind": "delete", "uri": doomed_uri },
+                ] } }]),
+            );
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+
+            assert!(!std::path::Path::new(&doomed).exists());
+            assert!(ed.session.status.contains("drop it"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_failing_file_operation_stops_the_edit_there() {
+            let (_dir, mut ed, fake) = project("actions-abort");
             let id = handshake(&mut ed, &fake);
             let uri = open_uri(&fake, id);
 
@@ -20594,8 +20970,9 @@ int main(void) {
                 &fake,
                 id,
                 "textDocument/codeAction",
-                json!([{ "title": "move to new file", "edit": { "documentChanges": [
-                    { "kind": "create", "uri": "file:///tmp/new.rs" },
+                json!([{ "title": "bad move", "edit": { "documentChanges": [
+                    { "kind": "rename", "oldUri": "file:///nope/missing.rs",
+                      "newUri": "file:///nope/other.rs" },
                     { "textDocument": { "uri": uri, "version": 1 }, "edits": [
                         { "range": { "start": { "line": 0, "character": 0 },
                                      "end": { "line": 0, "character": 2 } },
@@ -20604,12 +20981,13 @@ int main(void) {
             );
             ed.apply(cmd(Action::PickAccept));
             ed.settle();
+
             assert_eq!(
                 ed.buffer().unwrap().rope().to_string(),
                 "fn main() {\n}\n",
-                "half a rename is worse than none"
+                "nothing after the failure is applied"
             );
-            assert!(ed.session.status.contains("create"), "{}", ed.session.status);
+            assert!(ed.session.status.contains("bad move"), "{}", ed.session.status);
         }
 
         #[test]

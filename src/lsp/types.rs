@@ -105,6 +105,11 @@ pub struct CodeAction {
     /// should not be offered.
     #[serde(default)]
     pub disabled: Option<Value>,
+    /// The action exactly as it arrived, for `codeAction/resolve` — the
+    /// server's `data` bookmark and the fields bi does not model must go
+    /// back untouched. Filled in by the registry, not by serde.
+    #[serde(skip)]
+    pub raw: Value,
 }
 
 /// The edits a code action (or a server's `workspace/applyEdit`) wants made.

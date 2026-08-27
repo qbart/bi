@@ -183,7 +183,7 @@ its variants rather than a special case bolted beside it.
 line is *prefilled* on the command line and left for you to finish, which is
 the other half of what a binding is for: `":e "` puts you on an `:e ` line with
 the path still to type. That is not a new mechanism — it is exactly how the
-tree's `a` and `r` keys already work, filling in a `:create` or `:rename` line
+tree's `a` and `r` keys already work, filling in a `:create` or `:mv` line
 for you to agree to.
 
 An earlier draft stripped the `<CR>` as vim-habit noise, on the grounds that

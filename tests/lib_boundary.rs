@@ -396,7 +396,7 @@ fn an_embedder_can_create_rename_and_delete_files() {
     assert!(made.is_file(), "with its parent made along the way");
 
     let moved = dir.path().join("pkg/NOTES.md");
-    editor.run_ex(&format!("rename {} {}", made.display(), moved.display()));
+    editor.run_ex(&format!("mv {} {}", made.display(), moved.display()));
     assert!(moved.is_file() && !made.exists());
 
     editor.run_ex(&format!("delete {}", moved.display()));

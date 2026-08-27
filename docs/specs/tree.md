@@ -508,7 +508,7 @@ Three ex commands, and the tree keys are prefills over them:
 
 ```
 :create <path>          an empty file; a trailing / makes a directory
-:rename <old> <new>     also how you move a file
+:mv <old> <new>         rename, which is also how you move a file
 :delete[!] <path>       ! for a directory with anything in it
 ```
 
@@ -518,8 +518,13 @@ become the thing they should be — a way to fill in the path you are already
 looking at.
 
 `a` opens the command line on `create <selected directory>/`. `r` opens it on
-`rename <path> <path>` with the cursor at the end, so backspacing the basename
+`mv <path> <path>` with the cursor at the end, so backspacing the basename
 and typing a new one is the rename.
+
+The command is `:mv` rather than `:rename` — the unix verb, and the honest
+one, since moving between directories is the same call. It also keeps
+`:rename` free for what an LSP client should eventually mean by the word:
+renaming a *symbol* across the project.
 
 **A prefilled command line is the confirmation.** The editor has no prompt
 machinery and gains none here: you see the path, and Enter is the assent. Where

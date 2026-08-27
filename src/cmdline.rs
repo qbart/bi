@@ -31,7 +31,7 @@ impl PartialEq for CmdLine {
 }
 
 /// Against plain text, the cursor is not part of the question: "is the line
-/// `rename a b`" is asking what it says, not where you are in it.
+/// `mv a b`" is asking what it says, not where you are in it.
 impl PartialEq<str> for CmdLine {
     fn eq(&self, other: &str) -> bool {
         self.text == other
