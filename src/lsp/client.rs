@@ -83,6 +83,12 @@ pub enum Intent {
         buffer: BufferId,
         version: i32,
     },
+    /// `:rename` — the same version gate as `Formatting`, for the same
+    /// reason: the answer rewrites text it was computed against.
+    Rename {
+        buffer: BufferId,
+        version: i32,
+    },
 }
 
 /// The provider switches core features read from `initialize`. More arrive
@@ -98,6 +104,7 @@ pub struct Caps {
     pub completion: bool,
     pub signature: bool,
     pub code_action: bool,
+    pub rename: bool,
 }
 
 impl Caps {
@@ -214,6 +221,10 @@ impl Client {
                             "resolveSupport": { "properties": ["edit", "command"] },
                             "dataSupport": true,
                         },
+                        // Presence, nothing more: no `prepareSupport`,
+                        // because bi never sends `prepareRename` — see
+                        // `docs/specs/rename.md`.
+                        "rename": {},
                     },
                     // What makes a command-backed action land: the server
                     // sends its edits as `workspace/applyEdit`. The
@@ -287,6 +298,7 @@ impl Client {
             completion: truthy(parsed.capabilities.completion_provider.as_ref()),
             signature: truthy(parsed.capabilities.signature_help_provider.as_ref()),
             code_action: truthy(parsed.capabilities.code_action_provider.as_ref()),
+            rename: truthy(parsed.capabilities.rename_provider.as_ref()),
         };
         self.trigger_chars = trigger_characters(parsed.capabilities.completion_provider.as_ref());
         self.signature_chars =

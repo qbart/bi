@@ -220,6 +220,8 @@ pub struct Capabilities {
     pub signature_help_provider: Option<Value>,
     #[serde(default, rename = "codeActionProvider")]
     pub code_action_provider: Option<Value>,
+    #[serde(default, rename = "renameProvider")]
+    pub rename_provider: Option<Value>,
 }
 
 /// The `triggerCharacters` of a `completionProvider`, empty when absent.

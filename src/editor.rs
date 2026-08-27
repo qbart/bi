@@ -1596,6 +1596,8 @@ enum ExLine {
         from: String,
         to: String,
     },
+    /// `:rename <newname>` — the symbol under the cursor, by the server.
+    Rename(String),
     Delete {
         path: String,
         force: bool,
@@ -2004,6 +2006,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // and testable without one.
         "create" if !arg.is_empty() => ExLine::Create(arg.into()),
         "create" => ExLine::Error("create what?".into()),
+        "rename" if !arg.is_empty() => ExLine::Rename(arg.into()),
+        "rename" => ExLine::Error("rename takes the new name".into()),
         "mv" => match arg.split_once(char::is_whitespace) {
             Some((from, to)) if !to.trim().is_empty() => {
                 ExLine::Mv { from: from.into(), to: to.trim().into() }
@@ -5842,6 +5846,7 @@ impl Editor {
             }
             ExLine::Create(path) => self.create_path(&path),
             ExLine::Mv { from, to } => self.move_path(&from, &to),
+            ExLine::Rename(name) => self.lsp_rename(&name),
             ExLine::Delete { path, force } => self.delete_path(&path, force),
             ExLine::Paste(dir) => match dir {
                 Some(dir) => self.paste_into(std::path::Path::new(&dir)),
@@ -6669,6 +6674,13 @@ impl Editor {
                         None => self.session.status = "actions: unreadable resolve answer".into(),
                     }
                 }
+                Some(lsp::Effect::RenameEdit { buffer, version, edit, encoding }) => {
+                    self.session.status =
+                        match self.apply_workspace_edit(edit, encoding, Some((buffer, version))) {
+                            Ok(summary) => format!("renamed — {summary}"),
+                            Err(message) => format!("rename: {message}"),
+                        };
+                }
                 Some(lsp::Effect::Hover { window, anchor, markdown }) => {
                     self.apply_hover(window, anchor, markdown)
                 }
@@ -7046,6 +7058,26 @@ impl Editor {
                 .map(|(_, wire)| wire.clone())
                 .collect();
             self.lsp.code_actions(&doc, id, range, diagnostics)
+        });
+        if let Err(status) = sent {
+            self.session.status = status;
+        }
+    }
+
+    /// `:rename <newname>` — the symbol under the cursor, renamed across
+    /// the project by the server. The answer is a `WorkspaceEdit` through
+    /// the same applier code actions use. See `docs/specs/rename.md`.
+    fn lsp_rename(&mut self, new_name: &str) {
+        let sent = self.lsp_target().and_then(|(id, doc, caps)| {
+            if !caps.rename {
+                return Err("rename: this server does not offer it".into());
+            }
+            let encoding =
+                self.lsp.instance(doc.server).ok_or("lsp: instance gone — :lsp restart")?.encoding;
+            let Some(text) = self.window().text() else { return Err("no text here".into()) };
+            let at = text.selections.primary().head.at;
+            let position = lsp::pos::position_of(self.entry(id).buffer.rope(), at, encoding);
+            self.lsp.rename(&doc, id, position, new_name)
         });
         if let Err(status) = sent {
             self.session.status = status;
@@ -20211,7 +20243,8 @@ int main(void) {
                         "hoverProvider": true,
                         "completionProvider": { "triggerCharacters": ["."] },
                         "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
-                        "codeActionProvider": true }),
+                        "codeActionProvider": true,
+                        "renameProvider": true }),
             );
             ed.settle();
             id
@@ -20956,6 +20989,75 @@ int main(void) {
 
             assert!(!std::path::Path::new(&doomed).exists());
             assert!(ed.session.status.contains("drop it"), "{}", ed.session.status);
+        }
+
+        // ---- rename — see docs/specs/rename.md ----------------------------
+
+        #[test]
+        fn rename_sends_the_new_name_and_applies_the_answer_across_files() {
+            let (dir, mut ed, fake) = project("rename-symbol");
+            let id = handshake(&mut ed, &fake);
+            let uri = open_uri(&fake, id);
+            let other = format!("{}/Cargo.toml", dir.path());
+            let other_uri = crate::lsp::pos::uri_of(std::path::Path::new(&other));
+
+            ex(&mut ed, "rename counter");
+            let sent = fake.last(id, "textDocument/rename").unwrap();
+            assert_eq!(sent["params"]["newName"], "counter");
+            assert_eq!(sent["params"]["position"]["line"], 0);
+
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/rename",
+                json!({ "changes": {
+                    uri: [ { "range": { "start": { "line": 0, "character": 3 },
+                                        "end": { "line": 0, "character": 7 } },
+                            "newText": "counter" } ],
+                    other_uri: [ { "range": { "start": { "line": 0, "character": 0 },
+                                              "end": { "line": 0, "character": 0 } },
+                                   "newText": "# counter\n" } ],
+                } }),
+            );
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn counter() {\n}\n");
+            let other_id = ed
+                .buffer_ids()
+                .into_iter()
+                .find(|&b| ed.name_of(b) == other)
+                .expect("the other file opened as a buffer");
+            assert_eq!(ed.entry(other_id).buffer.rope().to_string(), "# counter\n[package]\n");
+            assert!(ed.entry(other_id).buffer.is_modified(), "left to inspect before :w");
+            assert!(ed.session.status.contains("renamed"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_rename_with_nothing_at_the_cursor_is_a_status() {
+            let (_dir, mut ed, fake) = project("rename-null");
+            let id = handshake(&mut ed, &fake);
+
+            ex(&mut ed, "rename counter");
+            respond(&mut ed, &fake, id, "textDocument/rename", json!(null));
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn main() {\n}\n");
+            assert!(ed.session.status.contains("nothing"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_bare_rename_and_a_server_without_the_provider_are_refused() {
+            let (_dir, mut ed, fake) = project("rename-refused");
+            // A handshake that offers nothing beyond sync.
+            ed.settle();
+            let id = fake.spawned.lock().unwrap()[0].0;
+            fake.grant(id, json!({ "textDocumentSync": 2 }));
+            ed.settle();
+
+            ex(&mut ed, "rename");
+            assert!(ed.session.status.contains("new name"), "{}", ed.session.status);
+
+            ex(&mut ed, "rename counter");
+            assert!(ed.session.status.contains("does not offer"), "{}", ed.session.status);
+            assert_eq!(fake.last(id, "textDocument/rename"), None, "nothing was sent");
         }
 
         #[test]

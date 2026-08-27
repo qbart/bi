@@ -120,6 +120,9 @@ pub enum Effect {
         action: Option<types::CodeAction>,
         encoding: Encoding,
     },
+    /// A `textDocument/rename` answer: the workspace edit that performs it,
+    /// gated on the version the rename was asked at.
+    RenameEdit { buffer: BufferId, version: i32, edit: types::WorkspaceEdit, encoding: Encoding },
 }
 
 /// The parameters float's content: one label, the active parameter's char
@@ -416,6 +419,25 @@ impl Registry {
         )
     }
 
+    /// `textDocument/rename` — the symbol at `position`, renamed to
+    /// `new_name` everywhere. The answer is a `WorkspaceEdit`, applied
+    /// exactly as a code action's is.
+    pub fn rename(
+        &mut self,
+        doc: &Doc,
+        buffer: BufferId,
+        position: types::Position,
+        new_name: &str,
+    ) -> Result<(), String> {
+        self.request(
+            doc.server,
+            "textDocument/rename",
+            json!({ "textDocument": { "uri": doc.uri }, "position": position,
+                    "newName": new_name }),
+            Intent::Rename { buffer, version: doc.version },
+        )
+    }
+
     /// `codeAction/resolve` for an action whose edit the server kept lazy.
     /// The params are the action exactly as it arrived — `data` is the
     /// server's bookmark, and only the untouched original is guaranteed to
@@ -589,6 +611,20 @@ impl Registry {
                         encoding: client.encoding,
                     }),
                     Err(e) => Some(Effect::Status(format!("actions: {}", e.message))),
+                },
+                Intent::Rename { buffer, version } => match result {
+                    // Null is the spec's "nothing renameable here".
+                    Ok(Value::Null) => Some(Effect::Status("rename: nothing at the cursor".into())),
+                    Ok(value) => match serde_json::from_value::<types::WorkspaceEdit>(value) {
+                        Ok(edit) => Some(Effect::RenameEdit {
+                            buffer,
+                            version,
+                            edit,
+                            encoding: client.encoding,
+                        }),
+                        Err(_) => Some(Effect::Status("rename: unreadable answer".into())),
+                    },
+                    Err(e) => Some(Effect::Status(format!("rename: {}", e.message))),
                 },
                 Intent::Formatting { buffer, version } => match result {
                     Ok(value) => Some(Effect::Formatting {
