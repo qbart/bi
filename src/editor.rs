@@ -3798,7 +3798,7 @@ impl Editor {
         showing.sort_by_key(|&w| w == self.focus);
         let orphan = showing
             .into_iter()
-            .fold(None, |orphan, w| if self.close_window(w) { orphan } else { Some(w) });
+            .fold(None, |orphan, w| if self.close_window(w).is_some() { orphan } else { Some(w) });
 
         // Only now, because closing a window sweeps blanks nobody is looking
         // at, and a fresh heir is exactly that until it is shown.
@@ -4487,30 +4487,24 @@ impl Editor {
     /// close, so it shows a buffer instead. Which is what Enter on a file does
     /// from a `bi .` session, and leaves a session that still has a window.
     fn close_tree(&mut self, id: WindowId) {
+        self.park_results(id);
         // The expansion is state you built; closing the pane is not a reason
         // to lose it. Parked the way the results list is, revived by the next
         // open on the same root.
-        let first = self.buffer_ids()[0];
-        if let Some(window) = self.window_mut_of(id)
-            && matches!(window.content, Content::Tree(_))
-            && let Content::Tree(tree) =
-                std::mem::replace(&mut window.content, Content::Text(Text::new(first)))
-        {
-            self.session.parked_tree = Some(Box::new(tree));
-        }
-        self.park_results(id);
         if self.windows.len() > 1 {
-            self.close_window(id);
+            if let Some(Window { content: Content::Tree(tree), .. }) = self.close_window(id) {
+                self.session.parked_tree = Some(Box::new(tree));
+            }
             return;
         }
-        match self.window_mut_of(id).and_then(|w| w.alt.take()) {
-            Some(alt) => self.window_mut_of(id).expect("checked above").content = alt,
-            None => {
-                let first = self.buffer_ids()[0];
-                if let Some(window) = self.window_mut_of(id) {
-                    window.content = Content::Text(Text::new(first));
-                }
-            }
+        let replacement = match self.window_mut_of(id).and_then(|w| w.alt.take()) {
+            Some(alt) => alt,
+            None => Content::Text(Text::new(self.buffer_ids()[0])),
+        };
+        if let Some(window) = self.window_mut_of(id)
+            && let Content::Tree(tree) = std::mem::replace(&mut window.content, replacement)
+        {
+            self.session.parked_tree = Some(Box::new(tree));
         }
     }
 
@@ -4955,10 +4949,13 @@ impl Editor {
     ///
     /// Never checks for unsaved changes: it discards nothing, because the
     /// buffer stays in the list. That is what "hidden buffer" means.
-    fn close_window(&mut self, id: WindowId) -> bool {
+    /// Hands the closed window back, so a caller can salvage what it showed —
+    /// `close_tree` parks the tree — rather than planting a placeholder for
+    /// the bookkeeping here to trip over.
+    fn close_window(&mut self, id: WindowId) -> Option<Window> {
         let Some(heir) = self.layout.close(id) else {
             self.session.status = "cannot close the last window".into();
-            return false;
+            return None;
         };
         // A results pane goes down with its window; keep it for `:results`.
         self.park_results(id);
@@ -4968,14 +4965,15 @@ impl Editor {
             let (buffer, pairs) = (text.buffer, text.selections.as_pairs());
             self.entry_mut(buffer).last = pairs;
         }
-        self.windows.retain(|w| w.id != id);
+        let at = self.windows.iter().position(|w| w.id == id);
+        let window = at.map(|at| self.windows.remove(at));
         if self.focus == id {
             self.set_focus(heir);
         }
         // Closing the only window that showed a blank is the other way one
         // becomes unreachable.
         self.sweep_scratch();
-        true
+        window
     }
 
     /// Where the cursor sits on the axis a directional switch travels across,
@@ -14383,6 +14381,27 @@ mod tests {
             tree.selected_row().expect("a selection").path.ends_with("b.rs"),
             "the file you came from is the selection",
         );
+    }
+
+    /// Closing the tree pane must not touch any buffer's saved place. It
+    /// briefly did: parking the tree swapped a text placeholder into the
+    /// dying window, and `close_window`'s bookkeeping wrote that placeholder's
+    /// cursor — row zero of the first buffer — into the buffer's `last`.
+    #[test]
+    fn closing_the_tree_pane_keeps_every_buffers_saved_place() {
+        let d = ScratchDir::new("keep-place")
+            .written("a.rs", "one\ntwo\nthree\n")
+            .written("b.rs", "x\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.set_cursor(ed.buffer().unwrap().at_row(2, false));
+        ex(&mut ed, &format!("e {}/b.rs", d.path())); // leaving saves a.rs's place
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // the pane
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // and away again
+
+        ex(&mut ed, &format!("e {}/a.rs", d.path()));
+        assert_eq!(ed.cursor_row().unwrap(), 2, "back on the row you left, not the top");
     }
 
     /// Closing the tree pane parks its state: the reopen shows what you had
