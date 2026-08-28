@@ -718,6 +718,11 @@ pub struct Session {
     /// as it was: selection, prunes and applied marks intact. Nothing here
     /// re-runs the search. See `docs/specs/find-in-files.md`.
     parked_results: Option<Box<crate::results::Results>>,
+    /// The tree the last closed pane held, expansion and selection intact.
+    /// The next open on the same root revives it rather than re-reading the
+    /// directory — folding everything you had opened is what closing a pane
+    /// must not cost. See `docs/specs/tree.md`.
+    parked_tree: Option<Box<Tree>>,
     /// Where each row of a [`PickerKind::Symbol`] list goes, by the same index
     /// the picker holds its items at.
     ///
@@ -4482,6 +4487,17 @@ impl Editor {
     /// close, so it shows a buffer instead. Which is what Enter on a file does
     /// from a `bi .` session, and leaves a session that still has a window.
     fn close_tree(&mut self, id: WindowId) {
+        // The expansion is state you built; closing the pane is not a reason
+        // to lose it. Parked the way the results list is, revived by the next
+        // open on the same root.
+        let first = self.buffer_ids()[0];
+        if let Some(window) = self.window_mut_of(id)
+            && matches!(window.content, Content::Tree(_))
+            && let Content::Tree(tree) =
+                std::mem::replace(&mut window.content, Content::Text(Text::new(first)))
+        {
+            self.session.parked_tree = Some(Box::new(tree));
+        }
         self.park_results(id);
         if self.windows.len() > 1 {
             self.close_window(id);
@@ -4626,7 +4642,14 @@ impl Editor {
             // already open somewhere, simply over to it. One tree.
             if cmd == TreeCmd::Up {
                 match self.tree_window() {
-                    Some(open) => self.set_focus(open),
+                    // Going over to the open tree is still "out of this file",
+                    // so the file is revealed there exactly as a fresh open
+                    // would have revealed it.
+                    Some(open) => {
+                        let path = self.buffer().and_then(|b| b.path.clone());
+                        self.set_focus(open);
+                        self.reveal_in_tree(path.as_deref());
+                    }
                     None => self.show_tree_here(),
                 }
             }
@@ -4881,12 +4904,15 @@ impl Editor {
                 // being made.
                 let path = self.buffer().and_then(|b| b.path.clone());
                 let root = self.tree_root(path.as_deref());
-                let tree = match Tree::new(&root, self.options().gitignore) {
-                    Ok(tree) => tree,
-                    Err(e) => {
-                        self.session.status = format!("{e:#}");
-                        return;
-                    }
+                let tree = match self.revive_tree(&root) {
+                    Some(tree) => tree,
+                    None => match Tree::new(&root, self.options().gitignore) {
+                        Ok(tree) => tree,
+                        Err(e) => {
+                            self.session.status = format!("{e:#}");
+                            return;
+                        }
+                    },
                 };
                 self.session.tree_root = Some(tree.root().to_path_buf());
 
@@ -5499,14 +5525,39 @@ impl Editor {
         self.windows.iter().find_map(|w| w.img().filter(|img| img.id == id))
     }
 
+    /// The tree that was here before, if one was: parked behind this window
+    /// when a file was opened out of it, or parked by a pane closing. Same
+    /// root only — its expansion is the point of reviving it — refreshed so
+    /// the listing is current, with the gitignore setting as it now stands.
+    fn revive_tree(&mut self, root: &Path) -> Option<Tree> {
+        let from_alt =
+            matches!(&self.window().alt, Some(Content::Tree(tree)) if tree.root() == root);
+        let mut tree = if from_alt {
+            match self.window_mut().alt.take() {
+                Some(Content::Tree(tree)) => tree,
+                _ => unreachable!("checked above"),
+            }
+        } else if self.session.parked_tree.as_ref().is_some_and(|tree| tree.root() == root) {
+            *self.session.parked_tree.take().expect("checked above")
+        } else {
+            return None;
+        };
+        tree.set_gitignore(self.options().gitignore);
+        tree.refresh();
+        Some(tree)
+    }
+
     /// Points the focused window at a tree on `root`, parking what it held.
     fn show_tree(&mut self, root: &str) {
-        let tree = match Tree::new(root, self.options().gitignore) {
-            Ok(tree) => tree,
-            Err(e) => {
-                self.session.status = format!("{e:#}");
-                return;
-            }
+        let tree = match self.revive_tree(Path::new(root)) {
+            Some(tree) => tree,
+            None => match Tree::new(root, self.options().gitignore) {
+                Ok(tree) => tree,
+                Err(e) => {
+                    self.session.status = format!("{e:#}");
+                    return;
+                }
+            },
         };
         // Leaving a buffer still records where this window was in it, whether
         // what replaces it is another buffer or a tree.
@@ -14284,6 +14335,73 @@ mod tests {
         assert!(
             matches!(ed.window().alt, Some(Content::Tree(_))),
             "and the tree is the alternate, expansion and all",
+        );
+    }
+
+    /// `-` from a file opened out of the tree brings the *same* tree back —
+    /// what you had expanded stays expanded, and the file you were in is
+    /// revealed. A re-read here would fold everything you had opened.
+    #[test]
+    fn dash_brings_the_parked_tree_back_expansion_intact() {
+        let d = ScratchDir::new("park-tree").file("pkg/a.rs").file("top.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        select_first_entry(&mut ed); // `pkg`, directories first
+        tree_key(&mut ed, TreeCmd::Expand);
+        tree_key(&mut ed, TreeCmd::Select { down: true, count: 2 }); // past a.rs to top.rs
+        tree_key(&mut ed, TreeCmd::Enter);
+        assert!(ed.window().tree().is_none(), "a file is open now");
+
+        ed.apply(cmd(Action::Tree(TreeCmd::Up))); // `-` — back out to the tree
+        let tree = ed.window().tree().expect("the tree again");
+        assert!(
+            tree.rows().iter().any(|row| row.path.ends_with("a.rs")),
+            "`pkg` is still expanded",
+        );
+        assert!(
+            tree.selected_row().expect("a selection").path.ends_with("top.rs"),
+            "and the file you were in is the selection",
+        );
+    }
+
+    /// `-` with a tree already open in another window goes over to it — and
+    /// puts the selection on the file you came from, exactly as a fresh open
+    /// would have.
+    #[test]
+    fn dash_over_to_an_open_tree_reveals_the_file_you_were_in() {
+        let d = ScratchDir::new("reveal-over").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        sized(&mut ed);
+        select_first_entry(&mut ed); // a.rs
+        tree_key(&mut ed, TreeCmd::Enter);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // the tree pane, focused
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false }))); // back to the file
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+
+        ed.apply(cmd(Action::Tree(TreeCmd::Up))); // `-` — over to the open tree
+        let tree = ed.window().tree().expect("focus went to the tree");
+        assert!(
+            tree.selected_row().expect("a selection").path.ends_with("b.rs"),
+            "the file you came from is the selection",
+        );
+    }
+
+    /// Closing the tree pane parks its state: the reopen shows what you had
+    /// expanded, not a fresh read of the root.
+    #[test]
+    fn a_closed_tree_pane_comes_back_with_its_expansion() {
+        let d = ScratchDir::new("close-tree").file("pkg/a.rs").file("top.rs");
+        let mut ed = Editor::open(d.path()).unwrap();
+        sized(&mut ed);
+        select_first_entry(&mut ed); // `pkg`
+        tree_key(&mut ed, TreeCmd::Expand);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // toggles it away
+        assert!(ed.window().tree().is_none(), "closed");
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // and back
+        let tree = ed.window().tree().expect("the tree again");
+        assert!(
+            tree.rows().iter().any(|row| row.path.ends_with("a.rs")),
+            "`pkg` is still expanded",
         );
     }
 

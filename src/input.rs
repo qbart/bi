@@ -852,8 +852,9 @@ impl Input {
             // beside it rather than only underneath it.
             KeyCode::Char('^') if ctrl => self.plain(Action::Buffer(BufferCmd::Alternate)),
             // The tree on this file's directory. In a tree the same key goes
-            // up a level, which is the same move one step further out.
-            KeyCode::Char('-') => self.plain(Action::Tree(TreeCmd::Up)),
+            // up a level, which is the same move one step further out. Never
+            // while a key is spoken for: `r-` writes a dash, `f-` finds one.
+            KeyCode::Char('-') if !self.awaiting_char() => self.plain(Action::Tree(TreeCmd::Up)),
             // The first thing in the keymap to read `shift`, which `Key` has
             // carried since it was written. Terminals that do not send a
             // modifier with an arrow simply get the plain arrow, which still
@@ -897,6 +898,16 @@ impl Input {
                 None
             }
         }
+    }
+
+    /// Whether the next character is already spoken for — `r`'s replacement,
+    /// `f`'s target, an object under `i`/`a`, a register name. While one is,
+    /// no binding may take the key: `normal_char` reads it literally.
+    fn awaiting_char(&self) -> bool {
+        self.replace_pending
+            || self.find_pending.is_some()
+            || self.object_pending.is_some()
+            || self.quote_pending
     }
 
     fn normal_char(&mut self, c: char) -> Option<Command> {
@@ -3214,6 +3225,15 @@ leader = \" \"
             panic!("expected an operator");
         };
         assert_eq!(count, 6, "counts multiply, as they do for any motion");
+    }
+
+    /// `-` opens the tree — but not while a key is being awaited literally.
+    /// `r-` writes a dash and `f-` finds one; a tree opening mid-`r` is the
+    /// bug this pins down.
+    #[test]
+    fn a_pending_key_takes_the_dash_rather_than_opening_the_tree() {
+        assert_eq!(typed("r-").action, Action::ReplaceChar { ch: '-', count: 1 });
+        assert_eq!(typed("f-").action, Action::Move(find('-', true, false)));
     }
 
     #[test]

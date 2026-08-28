@@ -483,11 +483,28 @@ from the tree or from anywhere else — it puts that one away rather than openin
 a second. Two trees are two of the same thing, and the second is never the one
 you wanted; a tree is a place you look things up, not a document you might want
 two views of. `-` follows the same rule from the other side: with a tree open it
-moves focus to it, and only opens one when there is none.
+moves focus to it — with the current file revealed there, exactly as a fresh
+open would have — and only opens one when there is none.
 
 Closing means closing the window, except when it is the last one — that can
 never close, so it shows a buffer instead. Which is what Enter on a file already
 does from a `bi .` session, and leaves a session that still has a window in it.
+
+**Closing parks the tree, and the next open revives it.** The expansion is
+state you built, and neither closing the pane nor opening a file out of the
+tree is a reason to lose it: the pane's tree goes to `Session::parked_tree`
+the way the results list parks, and a tree displaced by a file it opened is
+already the window's `alt`. The next open on the same root — `-` or
+`Ctrl-W e` — takes the parked one back, refreshed so the listing is current,
+rather than re-reading the directory into a folded-up column. A different
+root is a different question and reads fresh. `-` from a buffer that had never
+been on the tree still reveals it: the way down to the file is opened on top
+of whatever was already expanded.
+
+**A pending key beats the tree gesture.** `-` opens or crosses to the tree
+only as a bare keystroke: while `r`, `f`/`t`, an object, or a register name is
+holding out for its character, `-` is that character — `r-` writes a dash and
+`f-` finds one, and neither opens anything.
 
 The escape hatch is still there: `:e <dir>`, `:sp <dir>` and `:vs <dir>` name a
 path outright, and someone who types two of them has asked for two trees.
