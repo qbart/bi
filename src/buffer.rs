@@ -118,6 +118,35 @@ fn class_of(c: char) -> CharClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufferId(pub u32);
 
+/// What the file looked like on disk at the last read or write. The whole of
+/// the checktime machinery: a fresh `stat` compared against this says whether
+/// someone else has been at the file. See `docs/specs/checktime.md`.
+///
+/// Mtime is an `Option` because a platform may not report one; size beside it
+/// catches the same-second rewrite an mtime of one-second granularity misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskState {
+    mtime: Option<std::time::SystemTime>,
+    size: u64,
+}
+
+/// The file's current state on disk, or `None` when it is not there.
+fn disk_state(path: &Path) -> Option<DiskState> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DiskState { mtime: meta.modified().ok(), size: meta.len() })
+}
+
+/// What a check against the snapshot found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskCheck {
+    Unchanged,
+    /// The file's mtime or size moved — including a file recreated after a
+    /// deletion, and one created under a buffer that had never been on disk.
+    Changed,
+    /// The file is gone. The buffer is now the only copy.
+    Deleted,
+}
+
 pub struct Buffer {
     rope: Rope,
     pub path: Option<PathBuf>,
@@ -134,6 +163,14 @@ pub struct Buffer {
     /// Whether `storage` has moved since the last write. History cannot see a
     /// change that touches no text, and `:set fileencoding` is exactly that.
     storage_dirty: bool,
+    /// The file on disk as of the last read or write — what a check compares
+    /// against. `None` when the buffer has no path or the file has never
+    /// existed. See `docs/specs/checktime.md`.
+    disk: Option<DiskState>,
+    /// The on-disk state already reported to the user, so one external change
+    /// warns once rather than nagging at every check. The inner `None` is a
+    /// reported deletion. Cleared whenever the snapshot is refreshed.
+    noticed: Option<Option<DiskState>>,
 }
 
 impl Buffer {
@@ -146,6 +183,8 @@ impl Buffer {
             edits: 0,
             storage: Storage::default(),
             storage_dirty: false,
+            disk: None,
+            noticed: None,
         }
     }
 
@@ -171,9 +210,36 @@ impl Buffer {
             if let Some(fileformat) = how.force_fileformat {
                 buf.storage.fileformat = fileformat;
             }
+            buf.disk = disk_state(&path);
         }
         buf.path = Some(path);
         Ok(buf)
+    }
+
+    /// Compares the disk against the snapshot taken at the last read or write.
+    /// Pure — one `stat`, no memory of having asked. A buffer with no path,
+    /// or a new file still absent on both sides, is `Unchanged`.
+    pub fn check_disk(&self) -> DiskCheck {
+        let Some(path) = &self.path else { return DiskCheck::Unchanged };
+        match (self.disk, disk_state(path)) {
+            (None, None) => DiskCheck::Unchanged,
+            (None, Some(_)) => DiskCheck::Changed,
+            (Some(_), None) => DiskCheck::Deleted,
+            (Some(snap), Some(now)) if snap == now => DiskCheck::Unchanged,
+            _ => DiskCheck::Changed,
+        }
+    }
+
+    /// Remembers the disk state just observed. True when it had not been
+    /// reported yet — the caller's cue to warn once and then stay quiet until
+    /// the disk moves again.
+    pub fn notice_disk(&mut self) -> bool {
+        let now = self.path.as_deref().and_then(disk_state);
+        if self.noticed == Some(now) {
+            return false;
+        }
+        self.noticed = Some(now);
+        true
     }
 
     /// How this buffer's file is stored on disk.
@@ -216,8 +282,23 @@ impl Buffer {
 
     /// Takes the selections because a write closes the open undo group, and a
     /// group needs somewhere to put you when you undo back through it.
-    pub fn save(&mut self, before: Cursors, after: Cursors) -> Result<()> {
+    ///
+    /// `force` is the `!`: without it, a file that moved on disk since the
+    /// last read refuses the write with the disk untouched — the floor under
+    /// everything checktime does. A file that is merely *gone* writes without
+    /// complaint; recreating it is the fix, not a conflict.
+    pub fn save(&mut self, before: Cursors, after: Cursors, force: bool) -> Result<()> {
         let path = self.path.clone().context("no file name (use `:w <path>`)")?;
+        if !force
+            && let Some(snap) = self.disk
+            && let Some(now) = disk_state(&path)
+            && snap != now
+        {
+            anyhow::bail!(
+                "\"{}\" changed on disk since last read (`:e` loads it, `:w!` overwrites)",
+                path.display()
+            );
+        }
         // What lands on disk has to be a revision, or nothing can be marked as
         // saved and the buffer stays "modified" straight after a good write.
         self.commit_undo(before, after);
@@ -251,6 +332,10 @@ impl Buffer {
         }
         self.history.mark_saved();
         self.storage_dirty = false;
+        // What was just written *is* the disk now; the next check has nothing
+        // to say until someone else moves it.
+        self.disk = disk_state(&path);
+        self.noticed = None;
         Ok(())
     }
 
@@ -261,7 +346,10 @@ impl Buffer {
         path: impl AsRef<Path>,
     ) -> Result<()> {
         self.path = Some(path.as_ref().to_path_buf());
-        self.save(before, after)
+        // The snapshot belonged to the old path; guarding the new one against
+        // it would refuse writes for no reason.
+        self.disk = None;
+        self.save(before, after, true)
     }
 
     pub fn rope(&self) -> &Rope {
@@ -526,22 +614,67 @@ impl Buffer {
         self.clamped(cursor, false)
     }
 
-    /// `:e` — re-reads the file from disk, discarding everything local.
+    /// `:e` and autoread — re-reads the file from disk, as one revision.
     ///
-    /// Undo history goes with it: the old revisions describe text that no
-    /// longer exists, and replaying them through `edit_raw` would desynchronise
-    /// the parse tree. Vim keeps history here behind `'undoreload'`; bi does
-    /// not. The caller must rebuild syntax — the tree belongs to the old text.
+    /// Not a rebuild: the new content is diffed against the rope and the hunks
+    /// go through the ordinary edit funnel. That makes a reload undoable —
+    /// `:e!` discards nothing irrecoverably — carries it to tree-sitter and
+    /// LSP as the incremental edits it is, and rides the cursor through
+    /// [`Edit::map`] instead of clamping it. Marked saved at the end: a
+    /// freshly reloaded buffer matches the disk, and undoing past the reload
+    /// makes it modified again, which is what it then is.
     pub fn reload(&mut self, at: Cursor, how: &OpenHow) -> Result<Cursor> {
         let path = self.path.clone().context("no file name")?;
-        // Keep the cursor where the new text still has room for it. Clamping
-        // the raw char index is not enough: it can land on the phantom row
-        // after a trailing newline, which `line_count` does not count.
-        let (row, col) = (self.row_at(at), self.col_at(at));
-        *self = Self::open_how(&path, how)?;
-        let row = row.min(self.line_count().saturating_sub(1));
-        let col = col.min(self.max_col(row, false));
-        Ok(Cursor::at(self.rope.line_to_char(row) + col))
+        let fresh = Self::open_how(&path, how)?;
+        let old = self.rope.to_string();
+        let new = fresh.rope.to_string();
+        let base = self.pending_edits.len();
+
+        if old != new {
+            let before: Cursors = vec![(at.at, at.at)];
+            // Seal whatever was pending first, so what `:e!` discards is a
+            // revision of its own — one `u` past the reload brings it back.
+            self.commit_undo(before.clone(), before.clone());
+
+            // Line starts in the new text, as byte offsets, one entry past the
+            // last line — the same boundaries the rope puts its lines on.
+            let mut starts: Vec<usize> = vec![0];
+            for (i, b) in new.bytes().enumerate() {
+                if b == b'\n' {
+                    starts.push(i + 1);
+                }
+            }
+            if *starts.last().expect("starts is never empty") != new.len() {
+                starts.push(new.len());
+            }
+
+            let input = imara_diff::InternedInput::new(old.as_str(), new.as_str());
+            let diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
+            let hunks: Vec<_> = diff.hunks().collect();
+            // Bottom-up, so an edit on one hunk cannot move the hunks still to
+            // come.
+            for hunk in hunks.iter().rev() {
+                let (a, b) = (hunk.before.start as usize, hunk.before.end as usize);
+                let start = self.rope.line_to_char(a.min(self.rope.len_lines()));
+                let end = match b >= self.rope.len_lines() {
+                    true => self.rope.len_chars(),
+                    false => self.rope.line_to_char(b),
+                };
+                let text = &new[starts[hunk.after.start as usize]..starts[hunk.after.end as usize]];
+                self.apply_edit(start, end, text);
+            }
+
+            let moved = self.pending_edits[base..].iter().fold(at.at, |at, edit| edit.map(at));
+            self.commit_undo(before, vec![(moved, moved)]);
+        }
+
+        self.history.mark_saved();
+        self.storage = fresh.storage;
+        self.storage_dirty = false;
+        self.disk = fresh.disk;
+        self.noticed = None;
+        let moved = self.pending_edits[base..].iter().fold(at.at, |at, edit| edit.map(at));
+        Ok(self.clamped(Cursor::at(moved), false))
     }
 
     /// Replaces a char range with `text`. What `:case` needs and what nothing
@@ -3176,7 +3309,7 @@ mod tests {
 
         assert_eq!(b.rope().to_string(), "café\n", "the rope is UTF-8, always");
         assert!(!b.is_modified());
-        b.save(vec![], vec![]).unwrap();
+        b.save(vec![], vec![], false).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n", "an untouched save moves no byte");
         let _ = std::fs::remove_file(&path);
@@ -3190,7 +3323,7 @@ mod tests {
         assert_eq!(b.rope().to_string(), "one\ntwo\n", "nothing above the rope sees a \\r");
         assert_eq!(b.storage().fileformat, FileFormat::Dos);
         b.insert_str(Cursor::at(0), "zero\n");
-        b.save(vec![], vec![]).unwrap();
+        b.save(vec![], vec![], false).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"zero\r\none\r\ntwo\r\n");
         let _ = std::fs::remove_file(&path);
@@ -3202,7 +3335,7 @@ mod tests {
         let mut b = Buffer::open(&path).unwrap();
         b.insert_str(Cursor::at(0), "ż");
 
-        let err = b.save(vec![], vec![]).unwrap_err().to_string();
+        let err = b.save(vec![], vec![], false).unwrap_err().to_string();
 
         assert!(err.contains("'ż'") && err.contains("1:1"), "names the char and where: {err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n", "nothing was written");
@@ -3219,7 +3352,7 @@ mod tests {
         b.set_encoding(crate::encoding::lookup("cp1250").unwrap());
 
         assert!(b.is_modified(), "the disk no longer matches the buffer *as stored*");
-        b.save(vec![], vec![]).unwrap();
+        b.save(vec![], vec![], false).unwrap();
         assert!(!b.is_modified());
         let expected = encoding_rs::WINDOWS_1250.encode("żółć\n").0.into_owned();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
@@ -3244,7 +3377,7 @@ mod tests {
         let mut b = Buffer::open(&path).unwrap();
 
         assert_eq!(b.rope().to_string(), "hi\n");
-        b.save(vec![], vec![]).unwrap();
+        b.save(vec![], vec![], false).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBFhi\n");
         let _ = std::fs::remove_file(&path);

@@ -200,6 +200,15 @@ pub struct Options {
     /// Whether the file picker skips what the project says are not its files.
     /// Nothing else consults it: `:e` on an ignored path has always worked.
     pub gitignore: bool,
+    /// Whether a clean buffer follows the disk silently when the file changes
+    /// under it. Never applies to a modified buffer — two sets of changes are
+    /// a conflict, and the editor does not pick winners. See
+    /// `docs/specs/checktime.md`.
+    pub autoread: bool,
+    /// How often the visible buffers are checked against the disk, in
+    /// milliseconds. 0 is no polling, which leaves the buffer-switch, focus,
+    /// `:checktime` and write-guard moments.
+    pub checktime: usize,
 
     /// What a write tidies up on its way out — see `docs/specs/trim.md`.
     ///
@@ -243,6 +252,8 @@ impl Default for Options {
             context_min_lines: 1,
             yank_flash: 150,
             gitignore: true,
+            autoread: true,
+            checktime: 2000,
             trim: crate::trim::Trim::default(),
         }
     }
@@ -329,6 +340,12 @@ impl Options {
             ("yank_flash", _) => {
                 return Err("yank_flash takes milliseconds, or 0 to turn it off".into());
             }
+            ("autoread", OptionValue::Bool(on)) => self.autoread = on,
+            ("autoread", _) => return Err("autoread takes true or false".into()),
+            ("checktime", OptionValue::Int(n)) if n >= 0 => self.checktime = n as usize,
+            ("checktime", _) => {
+                return Err("checktime takes milliseconds, or 0 to turn polling off".into());
+            }
             ("trim_on_write", OptionValue::Bool(on)) => self.trim.on_write = on,
             ("trim_trailing", OptionValue::Bool(on)) => self.trim.trailing = on,
             ("trim_first_line", OptionValue::Bool(on)) => self.trim.first_line = on,
@@ -378,6 +395,8 @@ impl Options {
             "context_min_lines" => OptionValue::Int(self.context_min_lines as i64),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),
+            "autoread" => OptionValue::Bool(self.autoread),
+            "checktime" => OptionValue::Int(self.checktime as i64),
             "trim_on_write" => OptionValue::Bool(self.trim.on_write),
             "trim_trailing" => OptionValue::Bool(self.trim.trailing),
             "trim_first_line" => OptionValue::Bool(self.trim.first_line),

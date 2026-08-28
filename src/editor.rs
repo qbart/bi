@@ -1572,8 +1572,15 @@ enum ExLine {
     QuitAll {
         force: bool,
     },
-    /// `:wa` — writes every modified buffer.
-    WriteAll,
+    /// `:wa` — writes every modified buffer. The `!` writes over files that
+    /// changed on disk since they were read.
+    WriteAll {
+        force: bool,
+    },
+    /// `:checktime` — compares every buffer against the disk, as vim's does.
+    /// The moments do this on their own; this is the on-demand form. See
+    /// `docs/specs/checktime.md`.
+    Checktime,
     Highlight(bool),
     /// `:whitespace`, `:whitespace on|off` — show the blanks.
     ///
@@ -1746,8 +1753,17 @@ enum ExLine {
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
 
-    Write(String),
-    WriteQuit(String),
+    /// `:w`, `:w <path>`. The `!` writes over a file that changed on disk
+    /// since it was read — without it that write refuses. See
+    /// `docs/specs/checktime.md`.
+    Write {
+        path: String,
+        force: bool,
+    },
+    WriteQuit {
+        path: String,
+        force: bool,
+    },
     /// Bare `:e` — re-read this file from disk, re-running detection; with
     /// `++enc=`/`++ff=`, re-read it as what you said it is.
     Revert {
@@ -1949,9 +1965,10 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     }
 
     Some(match name {
-        "w" | "write" => ExLine::Write(arg.into()),
+        "w" | "write" => ExLine::Write { path: arg.into(), force },
         // The `a` forms mean "every buffer", which they genuinely do.
-        "wa" | "wall" => ExLine::WriteAll,
+        "wa" | "wall" => ExLine::WriteAll { force },
+        "checktime" => ExLine::Checktime,
         "qa" | "qall" => ExLine::QuitAll { force },
         "q" | "quit" => ExLine::Quit { force },
         "sp" | "split" => split(Dir::Horizontal),
@@ -2112,7 +2129,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "ret" | "retab" => {
             ExLine::Error("retab takes no argument — it follows tab_width and expandtab".into())
         }
-        "wq" | "x" => ExLine::WriteQuit(arg.into()),
+        "wq" | "x" => ExLine::WriteQuit { path: arg.into(), force },
         "reload" => ExLine::ReloadConfig,
         // A bare line number never reaches here: it is a range with no
         // command, and was handled before the table.
@@ -2392,6 +2409,9 @@ pub struct Editor {
     /// inside the loader is `None` too: there is nothing to say about a file
     /// git holds no copy of. See `docs/specs/git-signs.md`.
     git_baseline: Option<Box<dyn Fn(&Path) -> Option<String>>>,
+    /// When the next checktime poll is due. `None` until the clock first runs
+    /// — or while `checktime` is 0. See `docs/specs/checktime.md`.
+    next_disk_check: Option<std::time::Instant>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2798,6 +2818,7 @@ impl Editor {
             signature_seq: 0,
             replaying_normal: false,
             git_baseline: None,
+            next_disk_check: None,
         };
         editor.resolve_options();
         editor.apply_italics();
@@ -3402,13 +3423,22 @@ impl Editor {
     /// already expired, which is what stops "expired zero seconds ago" from
     /// being a timeout to spin on.
     pub fn redraw_in(&mut self) -> Option<std::time::Duration> {
-        let flash = self.session.flash.as_ref()?;
-        let left = flash.until.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            self.session.flash = None;
-            return None;
-        }
-        Some(left)
+        // The checktime poll shares the clock: whichever of the two is due
+        // sooner is how long the frontend may block.
+        let poll = self.poll_disk();
+        let flash = match self.session.flash.as_ref() {
+            None => None,
+            Some(flash) => {
+                let left = flash.until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    self.session.flash = None;
+                    None
+                } else {
+                    Some(left)
+                }
+            }
+        };
+        [poll, flash].into_iter().flatten().min()
     }
 
     /// The buffer a given window shows, if it shows one.
@@ -3584,6 +3614,9 @@ impl Editor {
         let window = self.window_mut_of(window).expect("checked above");
         window.show(Content::Text(text));
         self.sweep_scratch();
+        // The buffer-switch checktime moment: the file may have moved on disk
+        // while nothing was looking at it.
+        self.check_disk_of(to);
     }
 
     /// Drops a `[No Name]` nobody is looking at.
@@ -5281,7 +5314,7 @@ impl Editor {
         }
     }
 
-    fn write_all(&mut self) {
+    fn write_all(&mut self, force: bool) {
         let ids: Vec<BufferId> = self
             .buffers
             .iter()
@@ -5304,7 +5337,7 @@ impl Editor {
             // No selections to record for a buffer nobody is looking at, and
             // the ones for a buffer in view have not moved.
             let pairs = entry.last.clone();
-            match entry.buffer.save(pairs.clone(), pairs) {
+            match entry.buffer.save(pairs.clone(), pairs, force) {
                 Ok(()) => {
                     written += 1;
                     self.session.pending_saves.push(*id);
@@ -5830,7 +5863,13 @@ impl Editor {
             ExLine::Edit { path, enc, ff, force } => self.edit_path_how(&path, enc, ff, force),
             ExLine::Quit { force } => self.quit(force),
             ExLine::QuitAll { force } => self.quit_all(force),
-            ExLine::WriteAll => self.write_all(),
+            ExLine::WriteAll { force } => self.write_all(force),
+            ExLine::Checktime => {
+                let ids: Vec<BufferId> = self.buffers.iter().map(|b| b.id).collect();
+                for id in ids {
+                    self.check_disk_of(id);
+                }
+            }
             ExLine::Highlight(on) => self.session.options.hlsearch = on,
             ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
@@ -5904,8 +5943,8 @@ impl Editor {
             ExLine::ReloadConfig => self.reload_config(),
 
             // The rest need the rope, and so need a view.
-            ExLine::Write(path) => {
-                self.in_view(|view| view.write(&path));
+            ExLine::Write { path, force } => {
+                self.in_view(|view| view.write(&path, force));
             }
             ExLine::Revert { force, enc, ff } => {
                 self.in_view(|view| view.edit(force, enc, ff));
@@ -5918,8 +5957,8 @@ impl Editor {
             ExLine::Goto(address) => {
                 self.in_view(|view| view.goto(address));
             }
-            ExLine::WriteQuit(path) => {
-                if self.in_view(|view| view.write(&path)) == Some(true) {
+            ExLine::WriteQuit { path, force } => {
+                if self.in_view(|view| view.write(&path, force)) == Some(true) {
                     self.quit(true);
                 }
             }
@@ -8244,6 +8283,106 @@ impl Editor {
         });
     }
 
+    /// One buffer against the disk — the policy half of checktime; the facts
+    /// come from [`Buffer::check_disk`]. A clean buffer follows the disk when
+    /// `autoread` says so; everything else is a status line naming the state
+    /// and the commands that resolve it, once per change. True when something
+    /// user-visible happened — a reload or a fresh warning. See
+    /// `docs/specs/checktime.md`.
+    fn check_disk_of(&mut self, id: BufferId) -> bool {
+        use crate::buffer::DiskCheck;
+        let Some(entry) = self.buffers.iter().find(|b| b.id == id) else { return false };
+        let Some(path) = entry.buffer.path.clone() else { return false };
+        let name = path.display().to_string();
+        let clean = !entry.buffer.is_modified();
+        let verdict = entry.buffer.check_disk();
+        match verdict {
+            DiskCheck::Unchanged => false,
+            DiskCheck::Changed if clean && entry.options.autoread => {
+                let reloaded = if self.window().buffer() == Some(id) {
+                    // Through the view, so the cursor rides the reload's edits.
+                    self.in_view(|view| view.edit(false, None, None)) == Some(true)
+                } else {
+                    let how = open_how(&self.session, Some(&path), None, None);
+                    let entry = self.buffers.iter_mut().find(|b| b.id == id).expect("found above");
+                    let at =
+                        entry.last.first().map(|&(_, head)| Cursor::at(head)).unwrap_or_default();
+                    match entry.buffer.reload(at, &how) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            self.session.status = format!("{e:#}");
+                            return true;
+                        }
+                    }
+                };
+                if reloaded {
+                    self.refresh_git(id);
+                    self.session.status = format!("\"{name}\" reloaded (`u` undoes it)");
+                }
+                reloaded
+            }
+            state => {
+                let entry = self.buffers.iter_mut().find(|b| b.id == id).expect("found above");
+                if !entry.buffer.notice_disk() {
+                    return false;
+                }
+                self.session.status = match state {
+                    DiskCheck::Deleted => {
+                        format!("\"{name}\" no longer on disk (`:w` recreates it)")
+                    }
+                    _ if clean => format!("\"{name}\" changed on disk (`:e` reloads)"),
+                    _ => format!(
+                        "\"{name}\" changed on disk and in the buffer (`:e!` loads disk, `:w!` keeps yours)"
+                    ),
+                };
+                true
+            }
+        }
+    }
+
+    /// The terminal regained focus — a checktime moment: the change happened
+    /// while you were away, and this is the instant you are back to see it.
+    /// The TUI calls this on `FocusGained`; an embedder that never does
+    /// simply loses the moment.
+    pub fn focus_gained(&mut self) {
+        let ids: Vec<BufferId> = self.buffers.iter().map(|b| b.id).collect();
+        for id in ids {
+            self.check_disk_of(id);
+        }
+    }
+
+    /// The polling half of checktime: when the interval has elapsed, checks
+    /// the visible buffers and schedules the next round. Returns how long
+    /// until that round — or zero when a check just found something, so the
+    /// frontend draws it now rather than an interval late.
+    fn poll_disk(&mut self) -> Option<std::time::Duration> {
+        let ms = self.session.options.checktime;
+        if ms == 0 {
+            self.next_disk_check = None;
+            return None;
+        }
+        let every = std::time::Duration::from_millis(ms as u64);
+        let now = std::time::Instant::now();
+        if let Some(at) = self.next_disk_check
+            && now < at
+        {
+            return Some(at - now);
+        }
+        self.next_disk_check = Some(now + every);
+        let visible: Vec<BufferId> = self.windows.iter().filter_map(Window::buffer).collect();
+        let mut moved = false;
+        for id in visible {
+            moved |= self.check_disk_of(id);
+        }
+        if moved {
+            // A reload's edits must reach the parse tree before the draw that
+            // shows them — the loop draws on a timeout without settling.
+            self.settle();
+            return Some(std::time::Duration::ZERO);
+        }
+        Some(every)
+    }
+
     /// The theme's style for a severity.
     fn diag_style(&self, severity: lsp::Severity) -> crate::theme::Style {
         match severity {
@@ -10204,12 +10343,13 @@ impl View<'_> {
         *self.selections = Selections::single(cursor);
     }
 
-    /// Returns whether the write succeeded.
-    fn write(&mut self, path: &str) -> bool {
+    /// Returns whether the write succeeded. `force` is the `!` — it writes
+    /// over a file that changed on disk since it was read.
+    fn write(&mut self, path: &str, force: bool) -> bool {
         self.trim_for_write();
         let (before, after) = self.undo_bounds();
         let result = if path.is_empty() {
-            self.buffer.save(before, after)
+            self.buffer.save(before, after, force)
         } else {
             self.buffer.save_as(before, after, path)
         };
@@ -10490,10 +10630,10 @@ impl View<'_> {
         force: bool,
         enc: Option<&'static encoding_rs::Encoding>,
         ff: Option<FileFormat>,
-    ) {
+    ) -> bool {
         if self.buffer.is_modified() && !force {
             self.session.status = "unsaved changes (use `:e!` to discard)".into();
-            return;
+            return false;
         }
 
         let at = self.selections.cursor();
@@ -10505,8 +10645,12 @@ impl View<'_> {
                 let name =
                     self.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 self.session.status = format!("\"{name}\" loaded");
+                true
             }
-            Err(e) => self.session.status = format!("{e:#}"),
+            Err(e) => {
+                self.session.status = format!("{e:#}");
+                false
+            }
         }
     }
 
@@ -14236,20 +14380,38 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_drops_undo_history_rather_than_replaying_gone_text() {
-        let f = Scratch::new("history.txt", "one\n");
+    fn e_bang_then_u_restores_the_discarded_changes() {
+        let f = Scratch::new("history.txt", "disk\n");
         let mut ed = opened(&f);
-        type_str(&mut ed, "typed");
-        let pairs = ed.selections().unwrap().as_pairs();
-        ed.buffer_mut().unwrap().commit_undo(pairs.clone(), pairs);
+        type_str(&mut ed, "precious ");
 
-        f.write("two\n");
+        f.write("rewritten on disk\n");
         ex(&mut ed, "e!");
-        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two\n");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "rewritten on disk\n");
 
-        // Undoing here must not resurrect text from the previous file.
+        // The reload is one revision, so what `:e!` discarded is one `u` away.
         ed.apply(cmd(Action::Undo));
-        assert_eq!(ed.buffer().unwrap().rope().to_string(), "two\n");
+        assert!(
+            ed.buffer().unwrap().rope().to_string().contains("precious"),
+            "`:e!` discards, `u` takes it back — got: {}",
+            ed.buffer().unwrap().rope(),
+        );
+    }
+
+    #[test]
+    fn a_reload_maps_the_cursor_through_the_edit_instead_of_clamping_it() {
+        let f = Scratch::new("mapped.txt", "one\ntwo\nthree\nfour\n");
+        let mut ed = opened(&f);
+        let c = ed.buffer().unwrap().at_row(3, false);
+        ed.set_cursor(c);
+
+        f.write("zero\none\ntwo\nthree\nfour\n");
+        ex(&mut ed, "e");
+        assert_eq!(
+            ed.cursor_row().unwrap(),
+            4,
+            "a line inserted above must push the cursor down, not leave it on `three`",
+        );
     }
 
     #[test]
@@ -14307,6 +14469,133 @@ mod tests {
         ex(&mut ed, "e");
         assert!(!ed.session.status.is_empty(), "should say something");
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "scratch");
+    }
+
+    // ---- checktime ---------------------------------------------------------
+
+    #[test]
+    fn checktime_reloads_a_clean_buffer_and_u_undoes_it() {
+        let f = Scratch::new("autoread.txt", "old text\n");
+        let mut ed = opened(&f);
+
+        f.write("new text entirely\n");
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "new text entirely\n");
+        assert!(!ed.buffer().unwrap().is_modified(), "a buffer that followed the disk is clean");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "old text\n");
+    }
+
+    #[test]
+    fn checktime_with_autoread_off_warns_and_leaves_the_text() {
+        let f = Scratch::new("noauto.txt", "old\n");
+        let mut ed = opened(&f);
+        ex(&mut ed, "set autoread false");
+
+        f.write("new stuff\n");
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "old\n");
+        assert!(ed.session.status.contains("changed on disk"), "got: {}", ed.session.status);
+    }
+
+    #[test]
+    fn a_modified_buffer_is_never_autoread_and_warns_once() {
+        let f = Scratch::new("conflict.txt", "disk\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "mine ");
+
+        f.write("theirs, changed underneath\n");
+        ex(&mut ed, "checktime");
+        assert!(ed.buffer().unwrap().rope().to_string().contains("mine"), "never pick a winner");
+        assert!(ed.session.status.contains("changed on disk"), "got: {}", ed.session.status);
+
+        ed.session.status.clear();
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.session.status, "", "one change, one warning — never a nag");
+    }
+
+    #[test]
+    fn w_refuses_when_the_file_changed_on_disk_and_w_bang_overwrites() {
+        let f = Scratch::new("clobber.txt", "original\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "mine ");
+
+        f.write("someone else's work\n");
+        ex(&mut ed, "w");
+        assert_eq!(f.read(), "someone else's work\n", "a refused write must not touch the disk");
+        assert!(ed.session.status.contains("changed on disk"), "got: {}", ed.session.status);
+
+        ex(&mut ed, "w!");
+        assert!(f.read().contains("mine"), "`:w!` is the override");
+    }
+
+    #[test]
+    fn a_write_refreshes_the_snapshot() {
+        let f = Scratch::new("snapshot.txt", "one\n");
+        let mut ed = opened(&f);
+        type_str(&mut ed, "two ");
+        ex(&mut ed, "w");
+
+        ed.session.status.clear();
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.session.status, "", "a file we just wrote has nothing to report");
+    }
+
+    #[test]
+    fn a_deleted_file_warns_once_keeps_the_text_and_w_recreates_it() {
+        let f = Scratch::new("deleted.txt", "the only copy\n");
+        let mut ed = opened(&f);
+        std::fs::remove_file(f.path()).unwrap();
+
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "the only copy\n");
+        assert!(ed.session.status.contains("no longer"), "got: {}", ed.session.status);
+
+        ed.session.status.clear();
+        ex(&mut ed, "checktime");
+        assert_eq!(ed.session.status, "", "one deletion, one warning");
+
+        ex(&mut ed, "w");
+        assert_eq!(f.read(), "the only copy\n", "`:w` recreates without complaint");
+    }
+
+    #[test]
+    fn regaining_focus_is_a_checktime_moment() {
+        let f = Scratch::new("focus.txt", "old\n");
+        let mut ed = opened(&f);
+
+        f.write("new after alt-tab\n");
+        ed.focus_gained();
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "new after alt-tab\n");
+    }
+
+    #[test]
+    fn switching_back_to_a_buffer_is_a_checktime_moment() {
+        let a = Scratch::new("switch-a.txt", "a old\n");
+        let b = Scratch::new("switch-b.txt", "b\n");
+        let mut ed = opened(&a);
+        ex(&mut ed, &format!("e {}", b.path()));
+
+        a.write("a new\n");
+        ex(&mut ed, &format!("e {}", a.path()));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "a new\n");
+    }
+
+    #[test]
+    fn the_poll_clock_wakes_the_loop_and_finds_the_change() {
+        let f = Scratch::new("poll.txt", "old\n");
+        let mut ed = opened(&f);
+        ex(&mut ed, "set checktime 1");
+
+        let wait = ed.redraw_in();
+        assert!(wait.is_some(), "with polling on there is always something to wake for");
+
+        f.write("new, from another pane\n");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let wait = ed.redraw_in();
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "new, from another pane\n");
+        assert_eq!(wait, Some(std::time::Duration::ZERO), "a find is drawn now, not next poll");
     }
 
     #[test]
@@ -19160,6 +19449,8 @@ int main(void) {
     fn a_flash_of_no_time_at_all_is_the_spelling_of_off() {
         let mut ed = editor("alpha\n");
         ex(&mut ed, "set yank_flash 0");
+        // The checktime poll has its own wakeups; this test is about the flash.
+        ex(&mut ed, "set checktime 0");
 
         ed.apply(cmd(Action::Operate {
             op: Operator::Yank,
@@ -19176,6 +19467,8 @@ int main(void) {
     fn an_expired_flash_draws_nothing_and_asks_for_no_more_frames() {
         let mut ed = editor("alpha\n");
         ex(&mut ed, "set yank_flash 1");
+        // The checktime poll has its own wakeups; this test is about the flash.
+        ex(&mut ed, "set checktime 0");
         ed.apply(cmd(Action::Operate {
             op: Operator::Yank,
             target: Target::Motion(Motion::CurrentLine),

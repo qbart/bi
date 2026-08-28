@@ -14,8 +14,9 @@ use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -301,7 +302,10 @@ fn setup() -> Result<Term> {
     // Bracketed paste is what makes a paste arrive as one event instead of as
     // one keystroke per character. Without it the terminal has no way to say
     // "this is a paste", and a 2 KB paste costs 2000 redraws.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Focus events feed checktime: coming back to the terminal is the moment
+    // to notice a file that changed while you were away. A terminal that does
+    // not send them costs the moment, nothing else — the poll still runs.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
 
     // A legacy terminal sends `Enter` and `Ctrl-Enter` as the same byte, so
     // the chord only exists where the kitty keyboard protocol does. Asked,
@@ -338,7 +342,7 @@ fn restore() -> Result<()> {
         disable_raw_mode()?;
         // Bracketed paste comes off here too, panic hook included: a terminal
         // left in it pastes escape noise into the next shell prompt.
-        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste, LeaveAlternateScreen)?;
     }
     Ok(())
 }
@@ -439,6 +443,9 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
                 // The terminal sends it whole, so nothing here has to guess
                 // where it ends.
                 Wake::Term(Event::Paste(text)) => ed.paste_text(text),
+                // Coming back to the terminal is a checktime moment: files
+                // change while you are away in another pane.
+                Wake::Term(Event::FocusGained) => ed.focus_gained(),
                 Wake::Term(_) => {}
                 // Nothing to do here by name: the settle below pumps the LSP
                 // inbox along with everything else.

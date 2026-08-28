@@ -106,6 +106,17 @@ yank_flash = 150
 # See docs/specs/gitignore.md.
 gitignore = true
 
+# Whether a clean buffer follows the disk silently when the file changes under
+# it — `u` undoes the reload. A modified buffer is never autoread: two sets of
+# changes are a conflict, and the editor does not pick winners.
+# See docs/specs/checktime.md.
+autoread = true
+
+# How often the visible buffers are checked against the disk, in milliseconds
+# — 0 turns the polling off, which leaves the buffer-switch, focus,
+# `:checktime` and write-guard moments. See docs/specs/checktime.md.
+checktime = 2000
+
 # The palette. A name in themes/ beside this file wins, then a built-in of the
 # same name, then this one. Sixteen are built in; several answer to a second
 # name, given in brackets. Each theme file names its source at the top.
