@@ -10119,11 +10119,12 @@ impl View<'_> {
         };
         let Some((first, last)) = self.whole_rows(region) else { return };
         let lines = self.buffer.line_count() as isize;
-        // `.` is still the cursor's line even with a range in front of the
-        // command — a range does not move the cursor, which is why `:m +1`
-        // over a selection depends on which end the cursor is at. Vim's
-        // behaviour, and the reason `Shift-Down` exists for the job.
-        let address = to.resolve(at);
+        // A relative address measures from the block's own edge — `-2` from
+        // its first line, `+1` from its last — so `:m-2` over a selection
+        // steps it up exactly as it steps a single line, whichever end the
+        // cursor is at. Vim resolves these against the cursor and errors when
+        // that lands inside the block; see `Address::resolve_for_block`.
+        let address = to.resolve_for_block(at, first + 1, last + 1);
 
         // Off either end is refused rather than clamped, because that is what
         // vim does — and unlike the arrow keys, a typed address is a claim
@@ -13629,6 +13630,40 @@ mod tests {
         assert_eq!(at("m 5"), "a\nd\ne\nb\nc\n", "from above line 5");
         assert_eq!(at("m 0"), "b\nc\na\nd\ne\n", "to the top");
         assert_eq!(at("m 1"), "a\nb\nc\nd\ne\n", "already after line 1");
+    }
+
+    /// `:m-2` over a selection must step the block up one, exactly as it steps
+    /// a single line — measured from the block's own edge, not the cursor,
+    /// which vim would use and which sits inside a 3-line block, jamming the
+    /// move. This is what `vnoremap <C-k> :m-2<CR>` expects to do.
+    #[test]
+    fn a_relative_address_measures_from_the_blocks_edge_not_the_cursor() {
+        // Selected downward: the cursor ends on the block's last line.
+        let down = |arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(1, false));
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
+        assert_eq!(down("m-2"), "b\nc\nd\na\ne\n", "up one, cursor at the bottom");
+        assert_eq!(down("m+1"), "a\ne\nb\nc\nd\n", "down one, cursor at the bottom");
+
+        // Selected upward: the cursor ends on the block's first line, and the
+        // answer must not change.
+        let up = |arg: &str| {
+            let mut ed = editor("a\nb\nc\nd\ne\n");
+            ed.set_cursor(ed.buffer().unwrap().at_row(3, false));
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+            ed.apply(cmd(Action::Move(Motion::Up)));
+            ed.apply(cmd(Action::Move(Motion::Up)));
+            ex(&mut ed, arg);
+            whole(&ed)
+        };
+        assert_eq!(up("m-2"), "b\nc\nd\na\ne\n", "up one, cursor at the top");
+        assert_eq!(up("m+1"), "a\ne\nb\nc\nd\n", "down one, cursor at the top");
     }
 
     /// A typed address is a claim about a line that either exists or does not,

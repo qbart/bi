@@ -66,6 +66,17 @@ the line above and therefore moves nothing at all, and `-2` is how you go up
 one. That reads like an off-by-one and is not one: it falls out of "after",
 and it is why every vimrc in the world binds `:m .+1` and `:m .-2`.
 
+**Corrected: over a block, a relative address measures from the block's own
+edge** — `-2` from its first line, `+1` from its last — never from the cursor.
+Vim resolves these against the cursor, which may sit at either end of a
+selection and, inside a tall one, names a line the block itself occupies;
+vim errors there (E134), and that is why vimrcs spell the visual pair `'<-2`
+and `'>+1`. bi makes the plain spelling mean what those do: `:m-2` steps a
+selection up one and `:m+1` steps it down one, whichever end the cursor is at
+— the same keystrokes that already work on a single line. Absolute forms
+(`0`, `$`, a number, `'<`) are untouched, and on a single line the cursor is
+both edges, so nothing changes there.
+
 Three consequences worth stating, because each is a thing someone will file as
 a bug:
 

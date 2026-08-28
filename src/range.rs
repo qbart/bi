@@ -98,6 +98,24 @@ impl Address {
         };
         base + self.offset
     }
+
+    /// The reading `:m` gives an address over a block of lines: a relative
+    /// offset measures from the block's own edge in its direction of travel —
+    /// `-2` from the first line, `+1` from the last — never from the cursor,
+    /// which may sit at either end of a selection and, inside a tall one,
+    /// resolves to a line the block itself occupies. Vim keeps the cursor
+    /// reading and errors there (E134), which is why every vimrc spells these
+    /// `'<-2` and `'>+1`; bi makes the plain spelling mean what those do.
+    /// Every absolute form resolves as [`Address::resolve`].
+    pub fn resolve_for_block(&self, at: Where, first: usize, last: usize) -> isize {
+        match self.base {
+            Base::Current if self.offset != 0 => {
+                let edge = if self.offset < 0 { first } else { last };
+                edge as isize + self.offset
+            }
+            _ => self.resolve(at),
+        }
+    }
 }
 
 impl LineRange {
