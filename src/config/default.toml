@@ -266,6 +266,13 @@ roots = ["project.json"]
 command = ["c3fmt", "--stdin", "--stdout"]
 filetypes = ["c3"]
 
+# On stdin clang-format looks for .clang-format from its cwd — the file's
+# own directory, the way bi runs tools — and the fallback keeps a project
+# without one formatting the same way clangd would have.
+[fmt.tools.clang-format]
+command = ["clang-format", "--style=file", "--fallback-style=LLVM"]
+filetypes = ["c", "cpp"]
+
 [keys]
 # The key <leader> stands for in a binding. The moment any binding spells it,
 # this key stops meaning whatever it meant on its own, because there is no

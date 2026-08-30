@@ -959,6 +959,11 @@ mod tests {
         assert_eq!(c3lsp.command, ["c3-lsp"]);
         assert_eq!(c3lsp.filetypes, ["c3"]);
         assert_eq!(c3lsp.roots, ["project.json"]);
+
+        let clang = &config.fmt.tools["clang-format"];
+        assert_eq!(clang.command, ["clang-format", "--style=file", "--fallback-style=LLVM"]);
+        assert_eq!(clang.filetypes, ["c", "cpp"]);
+        assert!(clang.enabled);
     }
 
     /// The promise `[fmt.tools.<name>]` shares with the server table:

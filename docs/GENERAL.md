@@ -536,7 +536,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:implementation` `:impl` | `gi` — the implementations: trait impls, overrides, the source for a header |
 | `:peek` | the definition in a vertical split, focus on it |
 | `:references` `:refs` | `gr` — every reference, in a results pane; `:replace //new/` over it is a rename |
-| `:format` `:fmt` | the whole file, as one undo step — an external formatter where `[fmt.tools]` names one (C3's `c3fmt` is built in), the server otherwise |
+| `:format` `:fmt` | the whole file, as one undo step — an external formatter where `[fmt.tools]` names one (`c3fmt` and `clang-format` are built in), the server otherwise |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
 | `:actions` | `<leader><leader>` — the code actions the server offers here, as a picker; a selection asks over its range. A formatter language leads the menu with a preselected `format` row |

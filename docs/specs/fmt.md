@@ -17,7 +17,17 @@ has is the answer; bi just has to run it.
 [fmt.tools.c3fmt]
 command   = ["c3fmt", "--stdin", "--stdout"]
 filetypes = ["c3"]
+
+[fmt.tools.clang-format]
+command   = ["clang-format", "--style=file", "--fallback-style=LLVM"]
+filetypes = ["c", "cpp"]
 ```
+
+Both ship as built-ins. clang-format on stdin looks for `.clang-format`
+from its cwd — the file's own directory, the way bi runs tools — and the
+fallback keeps a project without one formatting the way clangd would have,
+so moving C and C++ from the server to the tool changes who runs the
+formatter, not what comes out.
 
 The shape is `[lsp.servers.<name>]`'s on purpose: `command` is the argv,
 `filetypes` the buffers it claims, `enabled = false` inside a section turns
