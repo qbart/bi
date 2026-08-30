@@ -20,13 +20,14 @@
 
 [syntax]
 # Pink for the words that are the language rather than the program.
-keyword     = "#ee5396"
+keyword     = { fg = "#12BEBB", bold = false }
+#keyword     = { fg = "#5B9AB0", bold = false }
 function    = { fg = "#dde1e6", bold = true }        # blue
 constructor = { fg = "#dde1e6", bold = true }
 #constructor = { fg = "#78a9ff", bold = true }
 
-type        = "#00D3D0"                              # teal
-module      = "#00D3D0"
+type        = "#00ABD1"                              # teal
+module      = "#00ABD1"
 
 
 
@@ -34,12 +35,11 @@ module      = "#00D3D0"
 # vocabulary calls them element types. Without this every `<div>` in an HTML
 # file is captured and then painted plain foreground, which on screen is
 # indistinguishable from a grammar that never matched.
-tag         = "#00D3D0"
+tag         = "#00ABD1"
 
-
-string      = "#B6A0FF"                              # green
-escape      = "#B6A0FF"
-character   = "#B6A0FF"
+string      = "#E5B38A"
+escape      = "#E5B38A"
+character   = "#E5B38A"
 
 # gray60 rather than gray70: a comment is meant to recede, not to need
 # squinting at, and #525252 on #161616 is under three to one.
@@ -57,8 +57,8 @@ label       = "#82cfff"
 # programs, and painting the `&` the colour of the text around it is the
 # failure docs/specs/tree-sitter.md names as "a capture styled the colour of
 # nothing".
-operator    = "#ff7eb6"
-#operator    = "#FFC799"
+#operator    = "#959E9A"
+operator    = "#be95ff"
 
 # Brackets and separators stay quiet on purpose — structure, not meaning, and
 # on every line.
@@ -68,7 +68,7 @@ delimiter   = "#8d8d8d"
 # The key side of a config format. Without this the whole left-hand column of
 # a TOML or JSON file reads as ordinary string values.
 #property             = "#33b1ff"                     # cyan
-property             = "#5FDFDF"                     # cyan
+property             = "#AAD9EA"                     # cyan
 "string.special.key" = "#33b1ff"
 
 # A Ruby symbol is a key, not a string, and Ruby is dense with them. Left to
@@ -92,7 +92,8 @@ background = "#161616"                               # gray100
 foreground = "#dde1e6"                               # gray20
 
 cursorline = { bg = "#262626" }                      # gray90
-selection  = { bg = "#393939" }                      # gray80
+#selection  = { bg = "#393939" }                      # gray80
+selection  = { bg = "#1D697F", fg = "#FFFF00" }                      # gray80
 # Both halves: a match has to be legible against whatever it lands on, and
 # while `s` is aiming that is dimmed text. A background alone would leave
 # `dim`'s foreground sitting on it.
@@ -151,7 +152,7 @@ git_delete   = "#fa4d56"
 # inside it reuse the picker keys, so choosing looks the same everywhere.
 popup = { fg = "#dde1e6", bg = "#262626" }                  # gray90, the elevated surface
 
-mode_normal = { fg = "#161616", bg = "#00D3D0", bold = true }
+mode_normal = { fg = "#161616", bg = "#12BEBB", bold = true }
 mode_insert = { fg = "#161616", bg = "#ff7eb6", bold = true }
 mode_pick   = { fg = "#161616", bg = "#ee5396", bold = true }
 
@@ -160,7 +161,7 @@ status_muted    = "#6f6f6f"
 status_inactive = "#525252"
 statusline      = { fg = "#dde1e6", bg = "#262626" }  # gray90
 
-tree_dir  = "#78a9ff"
+tree_dir  = "#12BEBB"
 tree_link = "#B6A0FF"
 mark_copy = "#ff7eb6"
 mark_cut  = "#ee5396"
