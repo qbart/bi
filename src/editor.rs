@@ -1685,8 +1685,11 @@ enum ExLine {
     /// one-line retab is not.
     Retab(Option<Scope>),
     /// `:alt` — the other file: the test beside the implementation, the
-    /// header beside the source.
-    Alternate,
+    /// header beside the source. `:valt` — `gA` — the same file in a new
+    /// vertical split, the open-in-split idiom by ex command.
+    Alternate {
+        split: bool,
+    },
     /// `:symbols` — the declarations in this file, to jump to one.
     Symbols,
     /// `:themes` — every built-in theme, to `:set theme` to. See
@@ -2068,7 +2071,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             true => ExLine::Error("normal what? `:normal {keys}`".into()),
             false => ExLine::Normal { scope, keys: arg.to_string() },
         },
-        "alt" | "alternate" => ExLine::Alternate,
+        "alt" | "alternate" => ExLine::Alternate { split: false },
+        // The `v` prefix the split family already wears: `:vs`, `:vnew`.
+        "valt" | "valternate" => ExLine::Alternate { split: true },
         // Plural, because the command shows a list. `:sym` is the short form;
         // `:s` is taken by substitute and always will be.
         "sym" | "symbols" => ExLine::Symbols,
@@ -2318,6 +2323,15 @@ pub enum TreeCmd {
 /// runs, and the context to run it in. See `docs/specs/code-actions.md`.
 struct PendingActions {
     buffer: BufferId,
+    /// A leading `format` row when an external tool claims the buffer — the
+    /// tool's name, and row 0 then runs `:fmt` rather than a server action.
+    /// See `docs/specs/fmt.md`.
+    format: Option<String>,
+    /// The server's half — `None` when the menu is only the format row.
+    lsp: Option<PendingLspActions>,
+}
+
+struct PendingLspActions {
     /// The document version `:actions` was asked at, for the same gate
     /// `:format` keeps.
     version: i32,
@@ -2417,6 +2431,11 @@ pub struct Editor {
     /// When the next checktime poll is due. `None` until the clock first runs
     /// — or while `checktime` is 0. See `docs/specs/checktime.md`.
     next_disk_check: Option<std::time::Instant>,
+    /// How external formatters run — the frontend's process runner, a test's
+    /// fake. `None` is an embedder that supplies none: a matching tool then
+    /// names itself unrunnable rather than silently deferring to the server.
+    /// See `docs/specs/fmt.md`.
+    fmt_runner: Option<Box<dyn crate::fmt::Run>>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2824,6 +2843,7 @@ impl Editor {
             replaying_normal: false,
             git_baseline: None,
             next_disk_check: None,
+            fmt_runner: None,
         };
         editor.resolve_options();
         editor.apply_italics();
@@ -3833,7 +3853,7 @@ impl Editor {
     /// paths that exists is opened. A path that does not exist is not offered
     /// and not created: `:alt` finds the other file, and making one is `:e`'s
     /// job — with the name it just told you. See `docs/specs/alternate.md`.
-    fn open_alternate(&mut self) {
+    fn open_alternate(&mut self, split: bool) {
         let Some(path) = self.buffer().and_then(|b| b.path.clone()) else {
             self.session.status = "no file name".into();
             return;
@@ -3847,7 +3867,11 @@ impl Editor {
         match candidates.iter().find(|candidate| std::path::Path::new(candidate).exists()) {
             Some(found) => {
                 let found = found.clone();
-                self.edit_path(&found)
+                match split {
+                    true => self
+                        .run_window_cmd(WindowCmd::Split { dir: Dir::Vertical, path: Some(found) }),
+                    false => self.edit_path(&found),
+                }
             }
             None => self.session.status = format!("none of {} is there", candidates.join(", ")),
         }
@@ -5965,7 +5989,7 @@ impl Editor {
             ExLine::DeleteLines { scope } => {
                 self.in_view(|view| view.delete_rows(scope, shape));
             }
-            ExLine::Alternate => self.open_alternate(),
+            ExLine::Alternate { split } => self.open_alternate(split),
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Themes => self.open_theme_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
@@ -5979,8 +6003,8 @@ impl Editor {
             ExLine::Zen => self.toggle_zen(),
             ExLine::Diags => self.show_diagnostics(),
             ExLine::References => self.lsp_references(),
-            ExLine::Format => self.lsp_format(),
-            ExLine::Actions => self.lsp_code_actions(),
+            ExLine::Format => self.format(),
+            ExLine::Actions => self.code_actions(),
             ExLine::DiagnosticJump { forward } => self.diagnostic_jump(forward),
             ExLine::Hover => self.lsp_hover(),
             ExLine::Resize(how) => self.run_resize(how),
@@ -7111,7 +7135,9 @@ impl Editor {
     /// `:actions` — asks what the server offers at the cursor, or over the
     /// selection when one is up. The answer opens a picker through the pump.
     /// See `docs/specs/code-actions.md`.
-    fn lsp_code_actions(&mut self) {
+    /// Sends the `textDocument/codeAction` ask; whether it went at all —
+    /// the status already written when it did not.
+    fn lsp_code_actions(&mut self) -> bool {
         let sent = self.lsp_target().and_then(|(id, doc, caps)| {
             if !caps.code_action {
                 return Err("actions: this server does not offer them".into());
@@ -7147,8 +7173,28 @@ impl Editor {
                 .collect();
             self.lsp.code_actions(&doc, id, range, diagnostics)
         });
-        if let Err(status) = sent {
-            self.session.status = status;
+        match sent {
+            Ok(_) => true,
+            Err(status) => {
+                self.session.status = status;
+                false
+            }
+        }
+    }
+
+    /// `:actions` — the server's offers, led by the format row. A formatter
+    /// language always has a menu to open, server or no server: the ask this
+    /// cannot answer is one `:fmt` still can. See `docs/specs/fmt.md`.
+    fn code_actions(&mut self) {
+        if self.lsp_code_actions() {
+            return;
+        }
+        // No server half — a formatter language still has its one row, and
+        // the status the server path wrote stands otherwise.
+        if let Some(id) = self.window().buffer()
+            && let Some((name, _)) = self.format_tool_for(id)
+        {
+            self.offer_actions(id, Some(name), None);
         }
     }
 
@@ -7173,7 +7219,9 @@ impl Editor {
     }
 
     /// A code actions answer: a picker over the titles, the actions parked
-    /// beside it for the accept to run.
+    /// beside it for the accept to run — led by the `format` row when an
+    /// external tool claims the buffer, which is why an empty answer can
+    /// still be a menu. See `docs/specs/fmt.md`.
     fn offer_code_actions(
         &mut self,
         buffer: BufferId,
@@ -7182,25 +7230,58 @@ impl Editor {
         actions: Vec<lsp::types::CodeAction>,
         encoding: lsp::pos::Encoding,
     ) {
-        if actions.is_empty() {
+        let format = self.format_tool_for(buffer).map(|(name, _)| name);
+        if actions.is_empty() && format.is_none() {
             self.session.status = "no actions here".into();
             return;
         }
-        // An answer that lands while some other overlay is up loses to it —
+        let lsp = (!actions.is_empty()).then_some(PendingLspActions {
+            version,
+            server,
+            encoding,
+            actions,
+        });
+        self.offer_actions(buffer, format, lsp);
+    }
+
+    /// Opens the actions picker over whatever halves exist. Row 0 is the
+    /// format row when there is one, preselected — the "reformat this file"
+    /// ask is the common one, and it should be an accept away.
+    fn offer_actions(
+        &mut self,
+        buffer: BufferId,
+        format: Option<String>,
+        lsp: Option<PendingLspActions>,
+    ) {
+        // An offer that lands while some other overlay is up loses to it —
         // replacing a picker mid-choice would eat what you were choosing.
         if self.session.picker.is_some() {
             return;
         }
-        let items = actions.iter().map(|a| Item { text: a.title.clone(), badge: None }).collect();
-        self.session.pending_actions =
-            Some(PendingActions { buffer, version, server, encoding, actions });
+        let mut items: Vec<Item> = Vec::new();
+        if let Some(name) = &format {
+            items.push(Item { text: format!("format — {name}"), badge: None });
+        }
+        if let Some(half) = &lsp {
+            items.extend(half.actions.iter().map(|a| Item { text: a.title.clone(), badge: None }));
+        }
+        self.session.pending_actions = Some(PendingActions { buffer, format, lsp });
         self.session.picker = Some(Picker::new(PickerKind::CodeAction, items, 0));
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
     }
 
-    /// Applies a chosen action: its edit, then its command, whichever it has.
+    /// Applies a chosen action: `:fmt` for the format row, else the server
+    /// action's edit, then its command, whichever it has.
     fn run_code_action(&mut self, pending: PendingActions, chosen: usize) {
-        let PendingActions { buffer, version, server, encoding, mut actions } = pending;
+        let PendingActions { buffer, format, lsp } = pending;
+        let chosen = match format {
+            Some(_) if chosen == 0 => return self.format(),
+            Some(_) => chosen - 1,
+            None => chosen,
+        };
+        let Some(PendingLspActions { version, server, encoding, mut actions }) = lsp else {
+            return;
+        };
         if chosen >= actions.len() {
             return;
         }
@@ -7487,6 +7568,78 @@ impl Editor {
         }
     }
 
+    /// The external tool `:fmt` would run for `id` — its `[fmt.tools.<name>]`
+    /// entry, when an enabled one with a command claims the filetype.
+    fn format_tool_for(&self, id: BufferId) -> Option<(String, Vec<String>)> {
+        let filetype = self.entry(id).filetype?;
+        self.config
+            .fmt
+            .tools
+            .iter()
+            .find(|(_, t)| {
+                t.enabled && !t.command.is_empty() && t.filetypes.iter().any(|f| f == filetype)
+            })
+            .map(|(name, t)| (name.clone(), t.command.clone()))
+    }
+
+    /// `:fmt` — the first external tool claiming the buffer's filetype, or
+    /// the server when none does. See `docs/specs/fmt.md`.
+    fn format(&mut self) {
+        let Some(id) = self.window().buffer() else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        let Some((name, command)) = self.format_tool_for(id) else {
+            return self.lsp_format();
+        };
+        let entry = self.entry(id);
+        // The file's own directory, so a filter that walks up looking for
+        // its config finds it. A pathless buffer formats from bi's cwd.
+        let cwd = entry
+            .buffer
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let input = entry.buffer.rope().to_string();
+        let Some(runner) = &self.fmt_runner else {
+            self.session.status = format!("fmt: this frontend supplies no runner for {name}");
+            return;
+        };
+        let output = match runner.run(&command, &cwd, &input) {
+            Ok(output) => output,
+            Err(message) => {
+                self.session.status = format!("fmt: {message}");
+                return;
+            }
+        };
+        if output == input {
+            self.session.status = "already formatted".into();
+            return;
+        }
+        // One edit, trimmed to the changed middle: the common prefix and
+        // suffix stay put, which is what lets selections outside the change
+        // map through unmoved.
+        let old: Vec<char> = input.chars().collect();
+        let new: Vec<char> = output.chars().collect();
+        let mut prefix = 0;
+        while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old.len() - prefix
+            && suffix < new.len() - prefix
+            && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let middle: String = new[prefix..new.len() - suffix].iter().collect();
+        self.apply_spans(id, vec![(prefix, old.len() - suffix, middle)]);
+        self.session.status = format!("formatted with {name}");
+    }
+
     fn lsp_format(&mut self) {
         let sent = self.lsp_target().and_then(|(id, doc, caps)| {
             if !caps.formatting {
@@ -7730,6 +7883,25 @@ impl Editor {
         edits: &[lsp::types::TextEdit],
         encoding: lsp::pos::Encoding,
     ) -> usize {
+        let rope = self.entry(id).buffer.rope();
+        let spans: Vec<(usize, usize, String)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    lsp::pos::char_of(rope, e.range.start, encoding),
+                    lsp::pos::char_of(rope, e.range.end, encoding),
+                    e.new_text.clone(),
+                )
+            })
+            .collect();
+        self.apply_spans(id, spans)
+    }
+
+    /// Applies char-range replacements to `id` as one undo step — applied
+    /// bottom-up so an earlier span cannot move a later one, the focused
+    /// window's selections carried across. The shared floor under the LSP
+    /// edits and the external formatter's one span.
+    fn apply_spans(&mut self, id: BufferId, mut spans: Vec<(usize, usize, String)>) -> usize {
         let focus = self.focus;
         let focused_here = self.window_of(focus).and_then(Window::buffer) == Some(id);
         // Undo lands you where you were when you asked — the live selections
@@ -7740,18 +7912,6 @@ impl Editor {
             .filter(|_| focused_here)
             .map(|t| t.selections.as_pairs());
         let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return 0 };
-
-        let rope = entry.buffer.rope();
-        let mut spans: Vec<(usize, usize, String)> = edits
-            .iter()
-            .map(|e| {
-                (
-                    lsp::pos::char_of(rope, e.range.start, encoding),
-                    lsp::pos::char_of(rope, e.range.end, encoding),
-                    e.new_text.clone(),
-                )
-            })
-            .collect();
         spans.sort_by(|a, b| b.0.cmp(&a.0));
 
         let before = current.unwrap_or_else(|| entry.last.clone());
@@ -8294,6 +8454,12 @@ impl Editor {
     /// embedding host that has no processes to spawn.
     pub fn set_lsp_spawner(&mut self, spawner: impl lsp::transport::Spawn + 'static) {
         self.lsp.set_spawner(spawner);
+    }
+
+    /// Replaces how external formatters run — the same arrangement as the
+    /// spawner above. See `docs/specs/fmt.md`.
+    pub fn set_fmt_runner(&mut self, runner: impl crate::fmt::Run + 'static) {
+        self.fmt_runner = Some(Box::new(runner));
     }
 
     /// Session end: every server asked to leave, briefly waited for, then
@@ -20527,6 +20693,39 @@ int main(void) {
         );
     }
 
+    /// `:valt` — `gA` — the alternate in a new vertical split, the
+    /// open-in-split idiom reaching the other file. See
+    /// `docs/specs/alternate.md`.
+    #[test]
+    fn valt_opens_the_alternate_beside_you() {
+        let files = Files::new("valt");
+        let source = files.file("thing.go", "package main\n");
+        files.file("thing_test.go", "package main\n");
+        let mut ed = Editor::open(&source).unwrap();
+        sized(&mut ed);
+
+        ex(&mut ed, "valt");
+
+        assert_eq!(ed.window_ids().len(), 2, "it split");
+        assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("thing_test.go"));
+        let other = ed.window_ids().into_iter().find(|&w| w != ed.focus()).unwrap();
+        let shown = ed.window_of(other).and_then(Window::buffer).unwrap();
+        assert!(ed.entry(shown).buffer.path.as_ref().unwrap().ends_with("thing.go"));
+    }
+
+    #[test]
+    fn valt_with_no_alternate_splits_nothing() {
+        let files = Files::new("valt-none");
+        let source = files.file("orphan.txt", "alone\n");
+        let mut ed = Editor::open(&source).unwrap();
+        sized(&mut ed);
+
+        ex(&mut ed, "valt");
+
+        assert_eq!(ed.window_ids().len(), 1, "no split to show a failure in");
+        assert!(ed.session.status.contains("no alternate"), "{}", ed.session.status);
+    }
+
     #[test]
     fn alt_takes_the_first_of_its_paths_that_is_there() {
         let files = Files::new("alt-order");
@@ -20666,6 +20865,113 @@ int main(void) {
             ed.name_of(ed.window().buffer().unwrap()).ends_with("a.txt"),
             "`at` is a subsequence of a.txt and of nothing else here"
         );
+    }
+
+    /// `:fmt` through an external tool — the filter run, its application as
+    /// one edit, and the failures that leave the buffer alone. The tool
+    /// itself is a fake runner. See `docs/specs/fmt.md`.
+    mod external_fmt {
+        use super::*;
+        use crate::fmt::fake::FakeRun;
+
+        /// A C3 file on disk and an editor opened on it — the shipped
+        /// defaults route its filetype to the c3fmt tool.
+        fn c3(name: &str, answer: Result<&str, &str>) -> (ScratchDir, Editor, FakeRun) {
+            let dir = ScratchDir::new(&format!("extfmt-{name}"))
+                .written("main.c3", "fn int main() { return 0; }\n");
+            let mut ed = Editor::open(format!("{}/main.c3", dir.path())).unwrap();
+            let fake = FakeRun::answering(answer.map(str::to_string).map_err(str::to_string));
+            ed.set_fmt_runner(fake.clone());
+            ed.settle();
+            (dir, ed, fake)
+        }
+
+        #[test]
+        fn fmt_runs_the_tool_and_applies_its_stdout_as_one_undo_step() {
+            let formatted = "fn int main()\n{\n    return 0;\n}\n";
+            let (dir, mut ed, fake) = c3("applies", Ok(formatted));
+
+            ex(&mut ed, "fmt");
+            let calls = fake.calls.lock().unwrap();
+            let (argv, cwd, stdin) = &calls[0];
+            assert_eq!(argv, &["c3fmt", "--stdin", "--stdout"]);
+            assert_eq!(cwd.to_str().unwrap(), dir.path(), "the file's own directory");
+            assert_eq!(stdin, "fn int main() { return 0; }\n");
+            drop(calls);
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), formatted);
+            assert!(ed.session.status.contains("c3fmt"), "{}", ed.session.status);
+
+            ed.apply(cmd(Action::Undo));
+            ed.settle();
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "fn int main() { return 0; }\n",
+                "one step"
+            );
+        }
+
+        #[test]
+        fn identical_output_is_already_formatted_and_no_undo_entry() {
+            let (_dir, mut ed, _fake) = c3("identical", Ok("xfn int main() { return 0; }\n"));
+
+            // An edit first, so the undo below can prove `:fmt` wrote no
+            // entry of its own: one `u` must reach past it.
+            ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "x");
+            ed.settle();
+
+            ex(&mut ed, "fmt");
+            assert!(ed.session.status.contains("already formatted"), "{}", ed.session.status);
+
+            ed.apply(cmd(Action::Undo));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn int main() { return 0; }\n");
+        }
+
+        #[test]
+        fn a_failing_tool_leaves_the_buffer_alone_and_surfaces_its_stderr() {
+            let (_dir, mut ed, _fake) = c3("fails", Err("c3fmt: unexpected token at 1:4"));
+
+            ex(&mut ed, "fmt");
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn int main() { return 0; }\n");
+            assert!(
+                ed.session.status.contains("c3fmt: unexpected token at 1:4"),
+                "{}",
+                ed.session.status
+            );
+        }
+
+        /// `:actions` on a formatter language, server or no server — see
+        /// the fmt spec's promise that the menu always has the format row.
+        #[test]
+        fn actions_offer_the_format_row_even_without_a_server() {
+            let formatted = "fn int main()\n{\n    return 0;\n}\n";
+            let (_dir, mut ed, fake) = c3("actions", Ok(formatted));
+
+            ex(&mut ed, "actions");
+            let picker = ed.session.picker.as_ref().expect("a menu with the format row");
+            assert_eq!(picker.items().len(), 1);
+            let row = &picker.items()[0].text;
+            assert!(row.contains("format") && row.contains("c3fmt"), "{row}");
+
+            // Preselected: a bare accept formats.
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), formatted);
+            assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn no_runner_names_the_tool_it_could_not_run() {
+            let dir = ScratchDir::new("extfmt-norunner")
+                .written("main.c3", "fn int main() { return 0; }\n");
+            let mut ed = Editor::open(format!("{}/main.c3", dir.path())).unwrap();
+            ed.settle();
+
+            ex(&mut ed, "fmt");
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "fn int main() { return 0; }\n");
+            assert!(ed.session.status.contains("c3fmt"), "{}", ed.session.status);
+        }
     }
 
     /// The editor's half of LSP: attachment in `settle`, the drain feeding
@@ -21266,6 +21572,87 @@ int main(void) {
                          "edit": { "changes": {} } }]),
             );
             assert_eq!(ed.session.status, "no actions here");
+        }
+
+        /// A C3 project, its fake server granted the handshake, and a fake
+        /// formatter behind `:fmt` — the buffer that has both halves.
+        fn c3_project(
+            name: &str,
+        ) -> (ScratchDir, Editor, FakeSpawn, crate::fmt::fake::FakeRun, crate::lsp::ServerId)
+        {
+            let dir = ScratchDir::new(&format!("lsp-{name}"))
+                .written("project.json", "{}\n")
+                .written("main.c3", "fn int main() { return 0; }\n");
+            let mut ed = Editor::open(format!("{}/main.c3", dir.path())).unwrap();
+            let fake = FakeSpawn::default();
+            ed.set_lsp_spawner(fake.clone());
+            let run = crate::fmt::fake::FakeRun::answering(Ok("formatted\n".to_string()));
+            ed.set_fmt_runner(run.clone());
+            let id = handshake(&mut ed, &fake);
+            (dir, ed, fake, run, id)
+        }
+
+        #[test]
+        fn a_formatter_language_gets_the_format_row_atop_its_server_actions() {
+            let (_dir, mut ed, fake, _run, id) = c3_project("c3-actions");
+
+            ex(&mut ed, "actions");
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "organize imports", "edit": { "changes": {} } }]),
+            );
+
+            let picker = ed.session.picker.as_ref().expect("a menu");
+            let rows: Vec<&str> = picker.items().iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows[0].contains("format") && rows[0].contains("c3fmt"), "{rows:?}");
+            assert_eq!(rows[1], "organize imports");
+
+            // The preselected first row is `:fmt` by another door.
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "formatted\n");
+        }
+
+        #[test]
+        fn the_shifted_rows_still_run_the_server_action_they_name() {
+            let (_dir, mut ed, fake, run, id) = c3_project("c3-actions-shift");
+
+            ex(&mut ed, "actions");
+            let uri = open_uri(&fake, id);
+            respond(
+                &mut ed,
+                &fake,
+                id,
+                "textDocument/codeAction",
+                json!([{ "title": "prepend comment", "edit": { "changes": { uri: [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 0 } },
+                      "newText": "// c\n" }] } } }]),
+            );
+
+            ed.apply(cmd(Action::PickNext));
+            ed.apply(cmd(Action::PickAccept));
+            ed.settle();
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "// c\nfn int main() { return 0; }\n"
+            );
+            assert!(run.calls.lock().unwrap().is_empty(), "the formatter was not the choice");
+        }
+
+        #[test]
+        fn an_empty_answer_still_opens_the_menu_when_a_formatter_exists() {
+            let (_dir, mut ed, fake, _run, id) = c3_project("c3-actions-empty");
+
+            ex(&mut ed, "actions");
+            respond(&mut ed, &fake, id, "textDocument/codeAction", json!([]));
+
+            let picker = ed.session.picker.as_ref().expect("the format row alone");
+            assert_eq!(picker.items().len(), 1);
         }
 
         #[test]

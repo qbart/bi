@@ -541,6 +541,8 @@ pub struct Config {
     /// `[lsp]` — the master switch and the server table. See
     /// `docs/specs/lsp.md`.
     pub lsp: Lsp,
+    /// `[fmt]` — the external formatter table. See `docs/specs/fmt.md`.
+    pub fmt: Fmt,
     /// `fileencodings` — the detection list an open walks, first clean decode
     /// wins. Top-level rather than an option: it is input to detection at
     /// open, not a fact any one buffer holds. Labels, validated at parse; the
@@ -565,6 +567,17 @@ impl Default for Lsp {
     }
 }
 
+/// The `[fmt]` section: which external formatters exist. No master switch —
+/// a table you can empty out per-tool does not need a second way to be
+/// empty, and `:fmt` without any tool still means the server.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Fmt {
+    /// `[fmt.tools.<name>]`, the user's entries merged field-wise over the
+    /// built-in defaults of the same name — overriding `command` alone
+    /// keeps the filetypes.
+    pub tools: std::collections::BTreeMap<String, crate::fmt::ToolConfig>,
+}
+
 impl Default for Config {
     /// The compiled-in defaults, parsed once.
     ///
@@ -581,6 +594,7 @@ impl Default for Config {
                     filetypes: Default::default(),
                     alternates: Vec::new(),
                     lsp: Lsp::default(),
+                    fmt: Fmt::default(),
                     fileencodings: vec!["utf-8".into(), "latin1".into()],
                 };
                 parse(DEFAULT_TOML, bare).expect("bi's own default.toml must parse").0

@@ -32,6 +32,7 @@ pub mod editorconfig;
 pub mod encoding;
 pub mod files;
 pub mod find_in_files;
+pub mod fmt;
 pub mod git;
 pub mod gitignore;
 pub mod history;

@@ -69,6 +69,13 @@ nothing. `<leader>a` — which is what was asked for — is a line of config awa
 It is not the default because bi's leader has no built-in meaning at all, and
 the first binding to claim one should be the user's rather than one of ours.
 
+`gA` — `:valt` — is the same jump into a new vertical split: the test
+*beside* the implementation, literally. The shifted letter is the splitting
+flavour of the plain one, the `v` prefix is the one `:vs` and `:vnew`
+already wear, and the failure modes are `ga`'s own — no alternate, nothing
+splits, and the status line says why. See `docs/specs/open-in-split.md` for
+the idiom it extends.
+
 ## Tests
 
 - Implementation to test and back, which is the ordering rule.
@@ -76,5 +83,8 @@ the first binding to claim one should be the user's rather than one of ours.
 - A missing alternate says which names it looked for; a file no rule matches
   says that instead.
 - A `[alternate]` rule in the config replaces the built-in one for its pattern.
+- `:valt` opens the alternate in a new vertical split, the original still
+  showing in the old window.
+- `:valt` with no alternate splits nothing and says why.
 - `*` captures across directories, and greedily from the end, so `*.go` on
   `a.b.go` is `a.b`.

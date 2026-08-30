@@ -35,6 +35,13 @@ server's ranking), disabled actions dropped rather than greyed — bi has
 no grey, and a row that cannot be chosen is a row that should not be
 offered. No actions is a status line, not an empty picker.
 
+One row does not come from the server: a buffer whose filetype has an
+external formatter (`docs/specs/fmt.md`) leads the menu with a preselected
+`format — <tool>` row, so reformatting is an accept away and the menu
+exists even where the server offered nothing — or where there is no server
+at all. Only formatter languages get it; everyone else's menu is exactly
+the server's answer, and "no actions here" still means what it says.
+
 Choosing a row does what the action says:
 
 - **An edit** (`WorkspaceEdit`) is applied — see below.

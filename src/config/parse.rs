@@ -68,6 +68,7 @@ fn parse_with(
             "filetype" => read_filetypes(src, table, &mut config, &mut problems),
             "alternate" => read_alternates(src, table, &mut config, &mut problems),
             "lsp" => read_lsp(src, table, &mut config, &mut problems, local),
+            "fmt" => read_fmt(src, table, &mut config, &mut problems, local),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
     }
@@ -299,6 +300,80 @@ fn read_servers(
                 },
                 other => problems
                     .push(Diagnostic { line, message: format!("unknown server setting: {other}") }),
+            }
+        }
+    }
+}
+
+/// `[fmt]`: the `[fmt.tools.<name>]` sections. See `docs/specs/fmt.md`.
+fn read_fmt(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
+    for (key, item) in table.iter() {
+        let line = line_for(table, key, src);
+        match key {
+            "tools" => match item.as_table() {
+                Some(tools) => read_tools(src, tools, config, problems, local),
+                None => problems.push(Diagnostic {
+                    line,
+                    message: "tools holds [fmt.tools.<name>] sections".into(),
+                }),
+            },
+            other => {
+                problems.push(Diagnostic { line, message: format!("unknown fmt setting: {other}") })
+            }
+        }
+    }
+}
+
+/// One `[fmt.tools.<name>]` merges **field-wise** over the built-in tool of
+/// the same name, with the server table's refusal: a project config does not
+/// get to name the binary bi runs.
+fn read_tools(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
+    for (name, item) in table.iter() {
+        let line = line_for(table, name, src);
+        let Some(tool) = item.as_table() else {
+            problems.push(Diagnostic {
+                line,
+                message: format!("{name} is a section: [fmt.tools.{name}]"),
+            });
+            continue;
+        };
+        let entry = config.fmt.tools.entry(name.to_string()).or_default();
+        for (field, item) in tool.iter() {
+            let line = line_for(tool, field, src);
+            match field {
+                "enabled" => match item.as_value().and_then(Value::as_bool) {
+                    Some(b) => entry.enabled = b,
+                    None => problems
+                        .push(Diagnostic { line, message: "enabled is true or false".into() }),
+                },
+                "command" if local => problems.push(Diagnostic {
+                    line,
+                    message: "command is not read from a project config".into(),
+                }),
+                "command" | "filetypes" => match string_list(item) {
+                    Some(list) => match field {
+                        "command" => entry.command = list,
+                        _ => entry.filetypes = list,
+                    },
+                    None => problems.push(Diagnostic {
+                        line,
+                        message: format!("{field} takes a list of strings"),
+                    }),
+                },
+                other => problems
+                    .push(Diagnostic { line, message: format!("unknown tool setting: {other}") }),
             }
         }
     }
@@ -868,6 +943,74 @@ mod tests {
         let (config, problems) = ok("[lsp.servers.gopls]\ncommand = [\"gopls\", \"-remote\"]\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(config.lsp.servers["gopls"].command, ["gopls", "-remote"]);
+    }
+
+    // ---- [fmt.tools.<name>] — see docs/specs/fmt.md --------------------
+
+    #[test]
+    fn the_shipped_defaults_carry_a_formatter_table_and_a_c3_server() {
+        let config = Config::default();
+        let c3fmt = &config.fmt.tools["c3fmt"];
+        assert_eq!(c3fmt.command, ["c3fmt", "--stdin", "--stdout"]);
+        assert_eq!(c3fmt.filetypes, ["c3"]);
+        assert!(c3fmt.enabled);
+
+        let c3lsp = &config.lsp.servers["c3-lsp"];
+        assert_eq!(c3lsp.command, ["c3-lsp"]);
+        assert_eq!(c3lsp.filetypes, ["c3"]);
+        assert_eq!(c3lsp.roots, ["project.json"]);
+    }
+
+    /// The promise `[fmt.tools.<name>]` shares with the server table:
+    /// overriding one field keeps the rest of the built-in it patches.
+    #[test]
+    fn a_formatter_override_merges_field_wise_over_the_default() {
+        let (config, problems) = ok("[fmt.tools.c3fmt]\ncommand = [\"c3fmt\", \"--default\"]\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let c3fmt = &config.fmt.tools["c3fmt"];
+        assert_eq!(c3fmt.command, ["c3fmt", "--default"]);
+        assert_eq!(c3fmt.filetypes, ["c3"], "kept from the default");
+
+        let (config, _) = ok("[fmt.tools.c3fmt]\nenabled = false\n");
+        assert!(!config.fmt.tools["c3fmt"].enabled);
+        assert_eq!(config.fmt.tools["c3fmt"].command[0], "c3fmt", "definition kept, just off");
+    }
+
+    #[test]
+    fn a_new_formatter_is_defined_whole() {
+        let src = "[fmt.tools.gofmt]\ncommand = [\"gofmt\"]\nfiletypes = [\"go\"]\n";
+        let (config, problems) = ok(src);
+        assert!(problems.is_empty(), "{problems:?}");
+        let gofmt = &config.fmt.tools["gofmt"];
+        assert_eq!(gofmt.command, ["gofmt"]);
+        assert_eq!(gofmt.filetypes, ["go"]);
+        assert!(gofmt.enabled, "enabled unless said otherwise");
+    }
+
+    #[test]
+    fn a_local_config_may_not_name_a_formatter_binary() {
+        let src = "[fmt.tools.c3fmt]\nfiletypes = [\"c3\", \"c3i\"]\ncommand = [\"evil\"]\n";
+        let (config, problems) = ok_local(src);
+        assert_eq!(problems, ["3: command is not read from a project config"]);
+        assert_eq!(config.fmt.tools["c3fmt"].command, ["c3fmt", "--stdin", "--stdout"]);
+        assert_eq!(
+            config.fmt.tools["c3fmt"].filetypes,
+            ["c3", "c3i"],
+            "the harmless field is read"
+        );
+    }
+
+    #[test]
+    fn fmt_mistakes_are_named_with_their_line() {
+        let (config, problems) = ok("[fmt.tools.c3fmt]\ncommand = \"c3fmt\"\n");
+        assert_eq!(problems, ["2: command takes a list of strings"]);
+        assert_eq!(config.fmt.tools["c3fmt"].command[0], "c3fmt", "the default survives");
+
+        let (_, problems) = ok("[fmt]\nnope = 1\n");
+        assert_eq!(problems, ["2: unknown fmt setting: nope"]);
+
+        let (_, problems) = ok("[fmt.tools.c3fmt]\ncmd = [\"c3fmt\"]\n");
+        assert_eq!(problems, ["2: unknown tool setting: cmd"]);
     }
 
     #[test]

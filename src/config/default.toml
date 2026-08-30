@@ -252,6 +252,20 @@ command = ["bash-language-server", "start"]
 filetypes = ["bash"]
 roots = []
 
+[lsp.servers.c3-lsp]
+command = ["c3-lsp"]
+filetypes = ["c3"]
+roots = ["project.json"]
+
+# External formatters. `:fmt` runs the first [fmt.tools.<name>] claiming the
+# buffer's filetype — the whole buffer on its stdin, the formatted file back
+# on its stdout, exit 0 — and only asks the language server when no tool
+# does. Sections patch same-named built-ins field by field, like the server
+# table above. See docs/specs/fmt.md.
+[fmt.tools.c3fmt]
+command = ["c3fmt", "--stdin", "--stdout"]
+filetypes = ["c3"]
+
 [keys]
 # The key <leader> stands for in a binding. The moment any binding spells it,
 # this key stops meaning whatever it meant on its own, because there is no

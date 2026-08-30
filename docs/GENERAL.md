@@ -302,10 +302,11 @@ every one of them is typeable without its key and rebindable by name
 |---|---|
 | `gd` | go to the definition, opening the file it lives in |
 | `gr` | every reference, in a results pane — `:replace //new/` over it is a rename |
+| `gi` | the implementations: trait impls, overrides, the source for a header |
 | `]d` `[d` | next / previous diagnostic, wrapping, message on the status line |
 | `K` | what the server knows about the cursor, floated beside it |
 | `:peek` | the definition in a vertical split, focus on it — the call site stays put |
-| `:decl` `:impl` | the declaration / the implementations — `gd`'s two siblings, for when `gd` lands in the header and you wanted the source, or the other way round |
+| `:decl` | the declaration — for when `gd` lands in the source and you wanted the header |
 
 Diagnostics wear their severity's colour on the text, a `•` in the gutter,
 and the message at the end of the cursor's line; `:set diagnostics false`
@@ -527,17 +528,18 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:m +3` `:m -2` | the same, relative to the cursor's line — vim's addresses throughout |
 | `:m .+1` `:m+1` | the `.` written out, or the space left off. Both are the address above |
 | `:2,5m 0` `:%m $` | a range says *which* lines; with none, the selection does |
-| `:alt` | the other file — the test beside the implementation, the header beside the source |
+| `:alt` | `ga` — the other file: the test beside the implementation, the header beside the source |
+| `:valt` | `gA` — the same, in a new vertical split |
 | `:lsp` | where this buffer stands with its language server; `restart` and `stop` manage it |
 | `:definition` `:def` | `gd` — jump to the definition the server names |
 | `:declaration` `:decl` | the declaration — the header's side, where the languages split the two |
-| `:implementation` `:impl` | the implementations: trait impls, overrides, the source for a header |
+| `:implementation` `:impl` | `gi` — the implementations: trait impls, overrides, the source for a header |
 | `:peek` | the definition in a vertical split, focus on it |
 | `:references` `:refs` | `gr` — every reference, in a results pane; `:replace //new/` over it is a rename |
-| `:format` `:fmt` | the whole file, by the server, as one undo step |
+| `:format` `:fmt` | the whole file, as one undo step — an external formatter where `[fmt.tools]` names one (C3's `c3fmt` is built in), the server otherwise |
 | `:dnext` `:dprev` | `]d` / `[d` — the next / previous diagnostic, wrapping |
 | `:hover` | `K` — what the server knows about the cursor, floated beside it |
-| `:actions` | `<leader><leader>` — the code actions the server offers here, as a picker; a selection asks over its range |
+| `:actions` | `<leader><leader>` — the code actions the server offers here, as a picker; a selection asks over its range. A formatter language leads the menu with a preselected `format` row |
 | `:case <style>` | respell what the scope names, or the word under the cursor |
 | `:s/a/b/g` | substitute over a range — `:%s//new/g` takes the last search |
 | `:&` `:&&` | the last substitute again, flags included; `&` / `g&` are the keys |

@@ -66,9 +66,10 @@ header when you wanted the source often enough to want the explicit ask.
 `:decl` is the header's side of the question, `:impl` the bodies — which for
 Rust and friends also means trait implementations and overrides.
 
-Commands only, no default keys: `gd` earned its two letters by frequency,
-and these are the occasional precise question. `:declaration` and
-`:implementation` are the long spellings.
+`:impl` wears `gi`, completing the family the way `gd` and `gr` began it —
+the jump's own initial, on a key vim spends re-entering insert mode, which
+bi does not do. `:decl` stays a command only: it is the occasional precise
+question, and `:declaration` and `:implementation` are the long spellings.
 
 ## `:peek` — the definition beside you
 
@@ -106,6 +107,10 @@ exactly the occurrences the server named, which is rename spelled with two
 commands bi already has.
 
 ## `:format` — whole-file formatting
+
+This is `:format`'s server half — a buffer whose filetype has an external
+formatter never gets here, because the tool claims the command first. See
+`docs/specs/fmt.md` for that layer and the order's why.
 
 `:format` (`:fmt`) sends `textDocument/formatting` with the options in force
 (`tab_width`, `expandtab`) — the options, not the `.editorconfig`, for the

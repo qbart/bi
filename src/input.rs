@@ -1006,6 +1006,11 @@ impl Input {
                 // and a leader binding can spell it `<leader>a` instead.
                 // See `docs/specs/alternate.md`.
                 'a' => self.plain(Action::Ex { line: "alt".into(), run: true }),
+                // The same file, beside you — the open-in-split idiom
+                // (`docs/specs/open-in-split.md`) reaching the alternate:
+                // the shifted letter is the splitting flavour of the plain
+                // one, as `:vs` is of `:e`.
+                'A' => self.plain(Action::Ex { line: "valt".into(), run: true }),
                 // The picker over every file under the session's root. Vim's
                 // `gf` opens the file named under the cursor; bi has no such
                 // command, and the letter is the one people reach for when
@@ -1020,6 +1025,11 @@ impl Input {
                 // the same shape as `ga`. See `docs/specs/lsp-requests.md`.
                 'd' => self.plain(Action::Ex { line: "definition".into(), run: true }),
                 'r' => self.plain(Action::Ex { line: "references".into(), run: true }),
+                // `gi` completes the family: definition, references,
+                // implementation. Vim's `gi` re-enters insert at the last
+                // insertion point, which bi does not do, and the letter is
+                // the jump's own initial.
+                'i' => self.plain(Action::Ex { line: "impl".into(), run: true }),
                 // The last substitute over the whole file — `:%&&` and
                 // nothing more. See `docs/specs/substitute.md`.
                 '&' => self.plain(Action::Ex { line: "%&&".into(), run: true }),
@@ -2216,6 +2226,7 @@ leader = \" \"
     #[test]
     fn the_g_prefix_reaches_the_other_file_and_the_two_lists() {
         assert_eq!(typed("ga").action, Action::Ex { line: "alt".into(), run: true });
+        assert_eq!(typed("gA").action, Action::Ex { line: "valt".into(), run: true });
         assert_eq!(typed("gf").action, Action::OpenPicker(PickerKind::File));
         assert_eq!(typed("gb").action, Action::Buffer(BufferCmd::List));
     }
@@ -2227,6 +2238,7 @@ leader = \" \"
     fn the_lsp_jumps_are_ex_commands_wearing_keys() {
         assert_eq!(typed("gd").action, Action::Ex { line: "definition".into(), run: true });
         assert_eq!(typed("gr").action, Action::Ex { line: "references".into(), run: true });
+        assert_eq!(typed("gi").action, Action::Ex { line: "impl".into(), run: true });
         assert_eq!(typed("]d").action, Action::Ex { line: "dnext".into(), run: true });
         assert_eq!(typed("[d").action, Action::Ex { line: "dprev".into(), run: true });
         assert_eq!(typed("K").action, Action::Ex { line: "hover".into(), run: true });

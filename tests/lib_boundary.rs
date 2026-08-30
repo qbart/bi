@@ -175,6 +175,7 @@ const LIB_MODULES: &[&str] = &[
     "encoding.rs",
     "files.rs",
     "find_in_files.rs",
+    "fmt.rs",
     "git.rs",
     "gitignore.rs",
     "history.rs",
