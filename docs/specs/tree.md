@@ -383,17 +383,20 @@ time a tree was opened. A tree is destroyed whenever a file displaces it, so the
 scope you chose did not survive one trip through a file: `bi .`, `Enter` on
 `pkg/a.rs`, `-`, and you were rooted at `pkg` having asked for nothing of the
 kind — and again at `pkg/sub` the next time, walking the root somewhere you
-never named. The root is now `Session::tree_root`, which outlives the tree, and
-a fallback covers the session that has never had one.
+never named. The root is now `Session::tree_root`, which outlives the tree.
 
-**Corrected again.** The fallback was the file's directory outright, and it
-scoped too narrowly: `bi src/vk/material.cpp` from the project's top rooted
-the tree — and `gf`, and `:find` — at `src/vk`, when the directory bi was
-called from is the project and the place you meant. The fallback is now the
-**working directory when the file sits under it**, and the file's directory
-only when it does not (`bi ~/elsewhere/notes.md` — a root at your own cwd
-would show a tree the file is not even in). A `[No Name]` buffer has no
-directory, so that case still ends at the working directory.
+**Corrected again.** The root is no longer derived on demand at all — it is
+**resolved once, when the session opens, and stored**, and everything that
+needs a root (the tree, `gf`, `:find`, the picker's accept) reads the stored
+fact. Deriving lazily meant different readers could derive at different
+moments, against different focused buffers, and disagree — the file picker
+once walked one root and joined the chosen row to another. What the open
+resolves it to: the directory bi was pointed at when it was a directory; the
+**working directory when the file sits under it** — `bi src/vk/material.cpp`
+from the project's top means the project, not `src/vk`; the file's own
+directory when it does not (`bi ~/elsewhere/notes.md` — a root at your own
+cwd would show a tree the file is not even in); the working directory for a
+`[No Name]` buffer. After that, only the three movers above touch it.
 
 Because the root can now sit any number of levels above the file, landing on the
 file means opening the way down to it: `Tree::reveal` expands each directory

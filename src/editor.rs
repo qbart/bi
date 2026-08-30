@@ -734,11 +734,6 @@ pub struct Session {
     /// context to run it in — beside the picker for the same reason
     /// `symbol_targets` is. See `docs/specs/code-actions.md`.
     pending_actions: Option<PendingActions>,
-    /// The root a [`PickerKind::File`] list was walked from — beside the
-    /// picker like `pending_actions`, so the chosen row joins the base its
-    /// relative path means, never a root recomputed at accept. The two
-    /// computations disagreeing was `docs/specs/files.md`'s founding bug.
-    file_picker_root: Option<PathBuf>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -2589,6 +2584,10 @@ impl Editor {
             && let Ok(img) = crate::img::Img::open(path, 1)
         {
             let mut editor = Self::empty();
+            // The rule files follow, for the file this is: `Self::empty()`
+            // pinned the working directory knowing no path.
+            editor.session.tree_root =
+                Some(fallback_root(Some(path), &std::env::current_dir().unwrap_or_default()));
             editor.next_image = 2;
             editor.window_mut().content = Content::Image(img);
             return Ok(editor);
@@ -2883,6 +2882,13 @@ impl Editor {
             next_disk_check: None,
             fmt_runner: None,
         };
+        // The session's root, resolved once and stored — the single fact the
+        // tree, the pickers and `:find` all read. Only `bi <dir>` / `:e
+        // <dir>`, `+` and `-` move it after this. See `docs/specs/tree.md`.
+        editor.session.tree_root = Some(fallback_root(
+            editor.buffers[0].buffer.path.as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
+        ));
         editor.resolve_options();
         editor.apply_italics();
         editor
@@ -4044,7 +4050,7 @@ impl Editor {
     }
 
     fn run_find(&mut self, arg: &str, regex: bool) {
-        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let root = self.session_root();
         let (scope, pattern) = Self::split_scope(&root, arg);
         let query = crate::find_in_files::Query {
             pattern: pattern.to_string(),
@@ -4098,7 +4104,7 @@ impl Editor {
     /// the pane's keys (`a`, `A`, `x`) decide. See
     /// `docs/specs/find-in-files.md`.
     fn run_replace(&mut self, arg: &str, regex: bool) {
-        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let root = self.session_root();
         let (scope, rest) = Self::split_scope(&root, arg);
         let (pattern, with) = match crate::substitute::parse_replace(rest) {
             Ok(parsed) => parsed,
@@ -4411,7 +4417,7 @@ impl Editor {
     }
 
     fn open_file_picker(&mut self) {
-        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let root = self.session_root();
         let files = crate::files::walk(&root, crate::files::LIMIT, self.options().gitignore);
         if files.is_empty() {
             // An empty overlay is a worse answer than saying so.
@@ -4421,7 +4427,6 @@ impl Editor {
         let capped = files.len() >= crate::files::LIMIT;
         let items = files.into_iter().map(|text| Item { text, badge: None }).collect();
         // No length floor: a file named `a` is a file.
-        self.session.file_picker_root = Some(root);
         self.session.picker = Some(Picker::new(PickerKind::File, items, 0));
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
         if capped {
@@ -4487,7 +4492,7 @@ impl Editor {
         // Relative to the session's root where a path is under it — what you
         // would have typed, and a column of identical prefixes says nothing.
         // The file picker's rule; a path outside the root stays whole.
-        let root = self.tree_root(None);
+        let root = self.session_root();
         let items = ids
             .iter()
             .map(|&id| {
@@ -4960,7 +4965,7 @@ impl Editor {
                 // fact about the window you are leaving rather than the one
                 // being made.
                 let path = self.buffer().and_then(|b| b.path.clone());
-                let root = self.tree_root(path.as_deref());
+                let root = self.session_root();
                 let tree = match self.revive_tree(&root) {
                     Some(tree) => tree,
                     None => match Tree::new(&root, self.options().gitignore) {
@@ -5309,11 +5314,9 @@ impl Editor {
             // do with a directory or an image.
             PickerKind::File => {
                 let path = picker.items()[chosen].text.clone();
-                // The root the rows are relative to — never recomputed here,
-                // where the focused buffer and the session may have moved on
-                // since the walk.
-                let root =
-                    self.session.file_picker_root.take().unwrap_or_else(|| self.tree_root(None));
+                // The same stored root the list was walked from — the pin at
+                // construction is what makes reading it twice safe.
+                let root = self.session_root();
                 let full = root.join(path).to_string_lossy().to_string();
                 match split {
                     true => self
@@ -5648,7 +5651,7 @@ impl Editor {
     /// root somewhere you never asked for.
     fn show_tree_here(&mut self) {
         let path = self.buffer().and_then(|b| b.path.clone());
-        let root = self.tree_root(path.as_deref());
+        let root = self.session_root();
 
         self.show_tree(&root.to_string_lossy());
         self.reveal_in_tree(path.as_deref());
@@ -5658,11 +5661,16 @@ impl Editor {
     /// root ever set — the directory holding `path`, and failing that the
     /// working directory. A `[No Name]` buffer has no directory, which is the
     /// case that reaches the end.
-    fn tree_root(&self, path: Option<&Path>) -> PathBuf {
-        if let Some(root) = &self.session.tree_root {
-            return root.clone();
-        }
-        fallback_root(path, &std::env::current_dir().unwrap_or_default())
+    /// The session's root — pinned at construction, moved only by a
+    /// directory named outright, `+` and `-`. One stored fact, so the tree,
+    /// the pickers and `:find` can never disagree about where things are
+    /// relative to. The unwrap is for a hand-rolled `Session` only; every
+    /// constructor sets it.
+    fn session_root(&self) -> PathBuf {
+        self.session
+            .tree_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     }
 
     /// Opens the focused tree down to `path` and puts the selection on it.
@@ -7810,7 +7818,7 @@ impl Editor {
     /// only, because that is what the store holds. See
     /// `docs/specs/diagnostics.md`.
     fn show_diagnostics(&mut self) {
-        let root = self.tree_root(self.buffer().and_then(|b| b.path.as_deref()));
+        let root = self.session_root();
         let mut matches: Vec<crate::find_in_files::Match> = Vec::new();
         let mut files = 0;
         for entry in &self.buffers {
@@ -20699,6 +20707,28 @@ int main(void) {
         assert!(ed.window_of(tree).unwrap().tree().is_some(), "the sidebar stayed");
         assert_eq!(ed.focus(), file, "and the file landed where you came from");
         assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
+    }
+
+    /// One root, resolved when the session opens and pinned: the tree, the
+    /// picker and `:find` read the same stored fact, and a later `:e`
+    /// somewhere else does not drag it around.
+    #[test]
+    fn the_root_is_pinned_at_open_and_does_not_follow_later_files() {
+        let a = Files::new("root-pin-a");
+        a.dir("src");
+        let first = a.file("src/main.rs", "a\n");
+        let b = Files::new("root-pin-b");
+        let second = b.file("other.rs", "b\n");
+        let mut ed = Editor::open(first).unwrap();
+        sized(&mut ed);
+        ex(&mut ed, &format!("e {second}"));
+        assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("other.rs"));
+
+        ed.apply(cmd(Action::Tree(TreeCmd::Up)));
+
+        let tree = ed.window().tree().expect("a tree");
+        let pinned = a.0.join("src").canonicalize().unwrap();
+        assert_eq!(tree.root(), pinned, "the session's root, not the last file's directory");
     }
 
     /// The founding bug of `docs/specs/files.md`'s root rule: the walk read
