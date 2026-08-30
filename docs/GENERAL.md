@@ -29,8 +29,7 @@ the project's (`gh` in the tree shows everything anyway), and an image file
 opens as the picture it is where the terminal speaks the kitty graphics
 protocol — centered, scrolled with `hjkl`/`gg`/`G` when it does not fit, its
 size in the status row where `row:col` would be.
-See [RECOMMENDATION.md](../RECOMMENDATION.md) for why the stack is what it is, and
-[docs/specs](specs) for the designs behind each piece.
+See [docs/specs](specs) for the designs behind each piece.
 
 ```sh
 cargo run -- <file>
@@ -1295,8 +1294,7 @@ sibling rather than a rewrite. See [docs/specs/lib-split.md](specs/lib-split.md)
 - No regular expressions in search or `:s`. See
   [docs/specs/search.md](specs/search.md).
 - No marks (`m{a}`, `` `{a} ``), and no `gn`.
-- No git, though it is half the point — see
-  [RECOMMENDATION.md](../RECOMMENDATION.md).
+- No git, though it is half the point.
 
 ### Architectural, and cheaper to fix now than later
 
