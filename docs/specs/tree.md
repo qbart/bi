@@ -384,9 +384,16 @@ scope you chose did not survive one trip through a file: `bi .`, `Enter` on
 `pkg/a.rs`, `-`, and you were rooted at `pkg` having asked for nothing of the
 kind — and again at `pkg/sub` the next time, walking the root somewhere you
 never named. The root is now `Session::tree_root`, which outlives the tree, and
-the file's directory is only the fallback for a session that has never had one
-(`bi a.rs`, then `Ctrl-W e`). A `[No Name]` buffer has no directory, so that
-case still ends at the working directory.
+a fallback covers the session that has never had one.
+
+**Corrected again.** The fallback was the file's directory outright, and it
+scoped too narrowly: `bi src/vk/material.cpp` from the project's top rooted
+the tree — and `gf`, and `:find` — at `src/vk`, when the directory bi was
+called from is the project and the place you meant. The fallback is now the
+**working directory when the file sits under it**, and the file's directory
+only when it does not (`bi ~/elsewhere/notes.md` — a root at your own cwd
+would show a tree the file is not even in). A `[No Name]` buffer has no
+directory, so that case still ends at the working directory.
 
 Because the root can now sit any number of levels above the file, landing on the
 file means opening the way down to it: `Tree::reveal` expands each directory

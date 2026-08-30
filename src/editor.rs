@@ -734,6 +734,11 @@ pub struct Session {
     /// context to run it in — beside the picker for the same reason
     /// `symbol_targets` is. See `docs/specs/code-actions.md`.
     pending_actions: Option<PendingActions>,
+    /// The root a [`PickerKind::File`] list was walked from — beside the
+    /// picker like `pending_actions`, so the chosen row joins the base its
+    /// relative path means, never a root recomputed at accept. The two
+    /// computations disagreeing was `docs/specs/files.md`'s founding bug.
+    file_picker_root: Option<PathBuf>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -1019,6 +1024,39 @@ impl BufferEntry {
 
 /// An identifier char, for the completion word — the same class `w` calls a
 /// word char.
+/// The session root's fallback, for a session that never chose one: the
+/// working directory when the file sits under it — `bi src/vk/m.cpp` from
+/// the project top means the project — and the file's own directory when it
+/// does not, because a root the file is not even under shows a tree and a
+/// picker with the wrong contents. No file at all is the working directory.
+/// See `docs/specs/tree.md`, "The root is the session's".
+///
+/// The comparison is lexical — `..` popped, `.` dropped — not resolved
+/// against the filesystem: the file may not exist yet, and a symlinked
+/// spelling of the cwd counts as outside it, which errs toward the narrower
+/// root rather than a surprising one.
+fn fallback_root(path: Option<&Path>, cwd: &Path) -> PathBuf {
+    let Some(path) = path else { return cwd.to_path_buf() };
+    let absolute = match path.is_absolute() {
+        true => path.to_path_buf(),
+        false => cwd.join(path),
+    };
+    let mut normal = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    match normal.starts_with(cwd) {
+        true => cwd.to_path_buf(),
+        false => normal.parent().map_or_else(|| cwd.to_path_buf(), Path::to_path_buf),
+    }
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -4383,6 +4421,7 @@ impl Editor {
         let capped = files.len() >= crate::files::LIMIT;
         let items = files.into_iter().map(|text| Item { text, badge: None }).collect();
         // No length floor: a file named `a` is a file.
+        self.session.file_picker_root = Some(root);
         self.session.picker = Some(Picker::new(PickerKind::File, items, 0));
         self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
         if capped {
@@ -5270,7 +5309,11 @@ impl Editor {
             // do with a directory or an image.
             PickerKind::File => {
                 let path = picker.items()[chosen].text.clone();
-                let root = self.tree_root(None);
+                // The root the rows are relative to — never recomputed here,
+                // where the focused buffer and the session may have moved on
+                // since the walk.
+                let root =
+                    self.session.file_picker_root.take().unwrap_or_else(|| self.tree_root(None));
                 let full = root.join(path).to_string_lossy().to_string();
                 match split {
                     true => self
@@ -5619,10 +5662,7 @@ impl Editor {
         if let Some(root) = &self.session.tree_root {
             return root.clone();
         }
-        match path.and_then(Path::parent) {
-            Some(parent) => parent.to_path_buf(),
-            None => std::env::current_dir().unwrap_or_default(),
-        }
+        fallback_root(path, &std::env::current_dir().unwrap_or_default())
     }
 
     /// Opens the focused tree down to `path` and puts the selection on it.
@@ -20659,6 +20699,45 @@ int main(void) {
         assert!(ed.window_of(tree).unwrap().tree().is_some(), "the sidebar stayed");
         assert_eq!(ed.focus(), file, "and the file landed where you came from");
         assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
+    }
+
+    /// The founding bug of `docs/specs/files.md`'s root rule: the walk read
+    /// one root, the accept computed another, and the picker opened a path
+    /// that did not exist.
+    #[test]
+    fn a_picked_file_opens_under_the_root_the_list_was_walked_from() {
+        let files = Files::new("picker-root");
+        files.dir("sub");
+        files.file("sub/one.rs", "one\n");
+        files.file("sub/two.rs", "two\n");
+        // No session root: the fallback is in charge on both ends. The
+        // scratch dir sits outside the test's working directory, so a
+        // recomputed cwd root would join the row to the wrong base.
+        let mut ed = Editor::open(files.file("sub/one.rs", "one\n")).unwrap();
+
+        ed.apply(cmd(Action::OpenPicker(PickerKind::File)));
+        for c in "two".chars() {
+            ed.apply(cmd(Action::PickChar(c)));
+        }
+        ed.apply(cmd(Action::PickAccept));
+
+        let buffer = ed.buffer().unwrap();
+        assert!(buffer.path.as_ref().unwrap().ends_with("sub/two.rs"), "{:?}", buffer.path);
+        assert_eq!(buffer.rope().to_string(), "two\n", "the file on disk, not an empty stray");
+    }
+
+    /// The sessionless fallback: the working directory when the file sits
+    /// under it — `bi src/vk/m.cpp` from the project top means the project —
+    /// and the file's own directory when it does not.
+    #[test]
+    fn the_sessionless_root_scopes_to_the_cwd_when_the_file_is_under_it() {
+        let cwd = std::path::Path::new("/proj");
+        let root = |p: &str| fallback_root(Some(std::path::Path::new(p)), cwd);
+        assert_eq!(root("/proj/src/vk/m.cpp"), std::path::Path::new("/proj"));
+        assert_eq!(root("src/vk/m.cpp"), std::path::Path::new("/proj"), "relative is under");
+        assert_eq!(root("/elsewhere/notes.md"), std::path::Path::new("/elsewhere"));
+        assert_eq!(root("../other/f.rs"), std::path::Path::new("/other"), "`..` escapes");
+        assert_eq!(fallback_root(None, cwd), std::path::Path::new("/proj"), "[No Name]");
     }
 
     #[test]

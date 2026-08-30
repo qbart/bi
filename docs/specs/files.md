@@ -56,8 +56,16 @@ someone chose.
 
 ## What is walked
 
-From the session's root — the tree's root if there is one, else the directory
-of the file bi was opened on.
+From the session's root — the tree's root if there is one, else the working
+directory when the file bi was opened on sits under it, else that file's own
+directory (`docs/specs/tree.md`, "The root is the session's").
+
+**The chosen row joins the root the list was walked from** — held beside the
+picker, the way parked code actions are — never a root recomputed at accept.
+The two computations once disagreed (the walk read the file's directory, the
+accept read the working directory), and a picker that shows `material.cpp`
+and then opens a `material.cpp` that does not exist is this spec's founding
+bug.
 
 **Hidden entries are skipped**, the same rule the tree follows for the same
 reason: `.git` alone would double the list.
@@ -100,3 +108,8 @@ copy of it.
 - Choosing a file shows it in the focused window; choosing one already open
   reuses its buffer.
 - Nothing under the root at all says so rather than opening an empty overlay.
+- A picked row opens under the root the list was walked from, not a root
+  recomputed at accept.
+- The sessionless fallback is the working directory when the file sits under
+  it, the file's own directory when it does not — `..` counted as escaping —
+  and the working directory for a `[No Name]` buffer.
