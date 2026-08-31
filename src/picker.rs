@@ -16,6 +16,8 @@
 /// typed most often — so history and the buffer list pass 0 instead.
 pub const REGISTER_MIN_LEN: usize = 2;
 
+use crate::cmdline::CmdLine;
+
 pub struct Item {
     /// Matched against, previewed, and the row label is its first line. One
     /// field because for registers all three are the same string, and holding a
@@ -128,7 +130,10 @@ impl PickerKind {
 pub struct Picker {
     pub kind: PickerKind,
     items: Vec<Item>,
-    query: String,
+    /// The typed filter, with a cursor — the widget the `:` line already is,
+    /// because a query line has the same needs a command line does. See
+    /// `docs/specs/picker-cursor.md`.
+    query: CmdLine,
     /// Indices into `items`, in the order they were given. Recomputed whole on
     /// every keystroke — at a few thousand short entries that is far cheaper
     /// than the machinery to avoid it.
@@ -251,7 +256,7 @@ impl Picker {
         let mut picker = Self {
             kind,
             items,
-            query: String::new(),
+            query: CmdLine::default(),
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -278,12 +283,18 @@ impl Picker {
     /// What makes `Ctrl-R` on a half-written `:` line narrow the list to what
     /// you had started saying rather than asking you to say it again.
     pub fn set_query(&mut self, query: String) {
-        self.query = query;
+        self.query = query.into();
         self.refilter();
     }
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Which column of the query the cursor is in, in characters — what the
+    /// frontend adds its own prompt width to.
+    pub fn cursor(&self) -> usize {
+        self.query.cursor()
     }
 
     pub fn items(&self) -> &[Item] {
@@ -313,7 +324,7 @@ impl Picker {
     }
 
     fn refilter(&mut self) {
-        let (query, show_short) = (self.query.clone(), self.show_short);
+        let (query, show_short) = (self.query.to_string(), self.show_short);
         let min_len = self.min_len;
         let subsequence = self.kind.subsequence();
         self.matches = self
@@ -339,7 +350,7 @@ impl Picker {
 
     pub fn push_char(&mut self, c: char) {
         let was_whole = self.query.is_empty();
-        self.query.push(c);
+        self.query.insert(c);
         self.refilter();
         // The first character leaves the *default* row behind: it was a fact
         // about the whole list, and this is no longer the whole list. A row
@@ -350,10 +361,13 @@ impl Picker {
         }
     }
 
-    /// Returns false when there was nothing left to delete, which cancels —
-    /// the same way backspacing off the end of a `:` line does.
+    /// Returns false when there was nothing before the cursor to delete. On an
+    /// empty query that cancels, the same way backspacing off an empty `:`
+    /// line leaves; at column 0 of a query with text on it, it is just nothing
+    /// to delete — the caller checks `query()`, exactly as it does for the `:`
+    /// line.
     pub fn backspace(&mut self) -> bool {
-        if self.query.pop().is_none() {
+        if !self.query.backspace() {
             return false;
         }
         self.refilter();
@@ -361,6 +375,24 @@ impl Picker {
             self.selected = self.default_row.min(self.matches.len().saturating_sub(1));
         }
         true
+    }
+
+    /// The four horizontal movements, delegated. Vertical stays [`Picker::next`]
+    /// and [`Picker::prev`]: the list is what up and down mean here.
+    pub fn left(&mut self) {
+        self.query.left();
+    }
+
+    pub fn right(&mut self) {
+        self.query.right();
+    }
+
+    pub fn home(&mut self) {
+        self.query.home();
+    }
+
+    pub fn end(&mut self) {
+        self.query.end();
     }
 
     pub fn next(&mut self) {
@@ -665,6 +697,68 @@ mod tests {
         p.push_char('o');
         assert!(p.backspace(), "deleted a char");
         assert!(!p.backspace(), "nothing left, so cancel");
+    }
+
+    /// The cursor came apart from "the end" — see
+    /// `docs/specs/picker-cursor.md` — and the query edits where it is.
+    #[test]
+    fn typing_lands_at_the_cursor() {
+        let mut p = picker(&["arc", "ac"]);
+        type_query(&mut p, "ac");
+        assert_eq!(shown(&p), ["ac"]);
+
+        p.left();
+        p.push_char('r');
+        assert_eq!(p.query(), "arc");
+        assert_eq!(p.cursor(), 2);
+        assert_eq!(shown(&p), ["arc"], "the edit refilters like any other");
+    }
+
+    #[test]
+    fn backspace_takes_the_character_before_the_cursor() {
+        let mut p = picker(&["arc", "ac"]);
+        type_query(&mut p, "arc");
+        p.left();
+        assert!(p.backspace(), "deleted the r");
+        assert_eq!(p.query(), "ac");
+        assert_eq!(shown(&p), ["ac"]);
+    }
+
+    /// At column 0 there is nothing to delete, but the query is not empty —
+    /// the caller tells "cancel" from "nothing happened" by asking `query()`,
+    /// the same way the `:` line's caller does.
+    #[test]
+    fn backspace_at_column_zero_is_not_a_cancel() {
+        let mut p = picker(&["one"]);
+        p.push_char('o');
+        p.home();
+        assert!(!p.backspace(), "nothing before the cursor");
+        assert_eq!(p.query(), "o", "and the query still has text on it");
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends() {
+        let mut p = picker(&["ab"]);
+        type_query(&mut p, "ab");
+        p.home();
+        p.left();
+        assert_eq!(p.cursor(), 0);
+        p.end();
+        p.right();
+        assert_eq!(p.cursor(), 2);
+        p.left();
+        assert_eq!(p.cursor(), 1);
+        p.right();
+        assert_eq!(p.cursor(), 2);
+    }
+
+    /// `Ctrl-R` seeds the query; the cursor arrives at its end, ready to
+    /// keep typing.
+    #[test]
+    fn a_seeded_query_puts_the_cursor_at_its_end() {
+        let mut p = with_min_len(&["set theme gb"], 0);
+        p.set_query("set".into());
+        assert_eq!(p.cursor(), 3);
     }
 
     #[test]

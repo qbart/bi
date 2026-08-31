@@ -67,6 +67,7 @@ learn:
 | `Ctrl-R` | opens it, from the `:` line |
 | typing | filters, on the same all-terms-must-appear match as everywhere else |
 | `Ctrl-N` / `Ctrl-P`, `Down` / `Up` | move the highlight, wrapping |
+| `Left` / `Right`, `Home` / `End` | move the query's cursor — see [picker-cursor.md](picker-cursor.md) |
 | `Enter` | puts the line on the `:` line, unrun |
 | `Esc` / `Ctrl-C` | back to the `:` line as you left it |
 | `Backspace` | deletes a query character; on an empty query, cancels |

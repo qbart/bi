@@ -1680,9 +1680,11 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
     set_picker_cursor(frame, picker, query_area);
 }
 
-/// After the `> ` prompt, at the end of what has been typed.
+/// After the `> ` prompt, wherever the query's cursor is — a character
+/// column, so it is widened through the text before it, not counted.
 fn set_picker_cursor(frame: &mut Frame, picker: &Picker, query_area: Rect) {
-    frame.set_cursor_position((query_area.x + 2 + span_width(picker.query()) as u16, query_area.y));
+    let before: String = picker.query().chars().take(picker.cursor()).collect();
+    frame.set_cursor_position((query_area.x + 2 + span_width(&before) as u16, query_area.y));
 }
 
 fn status_line(

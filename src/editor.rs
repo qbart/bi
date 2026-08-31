@@ -214,6 +214,9 @@ pub enum Action {
     FindCancel,
     PickChar(char),
     PickBackspace,
+    /// Arrows and `Home`/`End` on the query — the same payload the `:` line's
+    /// [`Action::CommandMove`] carries. See `docs/specs/picker-cursor.md`.
+    PickMove(CmdMove),
     PickNext,
     PickPrev,
     PickAccept,
@@ -5237,10 +5240,26 @@ impl Editor {
                 }
             }
             Action::PickBackspace => {
-                // Backspacing off the front cancels, as it does on a `:` line.
-                let empty = self.session.picker.as_mut().is_some_and(|p| !p.backspace());
+                // Backspacing an empty query cancels, as it does on a `:`
+                // line; at column 0 of a query with text on it there is just
+                // nothing to delete.
+                let empty = self
+                    .session
+                    .picker
+                    .as_mut()
+                    .is_some_and(|p| !p.backspace() && p.query().is_empty());
                 if empty {
                     self.close_picker();
+                }
+            }
+            Action::PickMove(how) => {
+                if let Some(picker) = &mut self.session.picker {
+                    match how {
+                        CmdMove::Left => picker.left(),
+                        CmdMove::Right => picker.right(),
+                        CmdMove::Home => picker.home(),
+                        CmdMove::End => picker.end(),
+                    }
                 }
             }
             Action::PickNext => {
@@ -9980,6 +9999,7 @@ impl View<'_> {
             | Action::CommandExecute
             | Action::PickChar(_)
             | Action::PickBackspace
+            | Action::PickMove(_)
             | Action::PickNext
             | Action::PickPrev
             | Action::PickToggleShort
@@ -11657,6 +11677,35 @@ mod tests {
 
         ed.apply(cmd(Action::PickBackspace));
         assert_eq!(ed.session.mode, Mode::Normal, "nothing left to delete");
+    }
+
+    /// The query has a cursor now — see `docs/specs/picker-cursor.md` — and
+    /// typing lands on it, not on the end.
+    #[test]
+    fn the_picker_query_edits_at_its_cursor() {
+        let mut ed = ed_with_ring();
+        ed.apply(open_register_picker(false));
+        pick_keys(&mut ed, &[Action::PickChar('b'), Action::PickChar('t')]);
+        pick_keys(&mut ed, &[Action::PickMove(CmdMove::Left), Action::PickChar('e')]);
+
+        let p = ed.session.picker.as_ref().unwrap();
+        assert_eq!(p.query(), "bet");
+        assert_eq!(p.items()[p.selected().unwrap()].text, "beta\n", "and the fix refiltered");
+    }
+
+    /// Cancel means an *empty* query's Backspace, as on the `:` line; column 0
+    /// of a query with text on it is just nothing to delete.
+    #[test]
+    fn backspace_at_the_query_start_does_not_close_the_picker() {
+        let mut ed = ed_with_ring();
+        ed.apply(open_register_picker(false));
+        pick_keys(
+            &mut ed,
+            &[Action::PickChar('a'), Action::PickMove(CmdMove::Home), Action::PickBackspace],
+        );
+
+        assert_eq!(ed.session.mode, Mode::Pick);
+        assert_eq!(ed.session.picker.as_ref().unwrap().query(), "a", "untouched");
     }
 
     #[test]

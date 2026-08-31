@@ -1529,6 +1529,13 @@ impl Input {
             KeyCode::Backspace => Action::PickBackspace,
             KeyCode::Down => Action::PickNext,
             KeyCode::Up => Action::PickPrev,
+            // Horizontal for the query, vertical for the list. No `Ctrl-A`/
+            // `Ctrl-E` pair here — `Ctrl-A` is the reveal-short toggle above.
+            // See `docs/specs/picker-cursor.md`.
+            KeyCode::Left => Action::PickMove(CmdMove::Left),
+            KeyCode::Right => Action::PickMove(CmdMove::Right),
+            KeyCode::Home => Action::PickMove(CmdMove::Home),
+            KeyCode::End => Action::PickMove(CmdMove::End),
             _ => return None,
         };
         Some(Command { count: 1, action })
@@ -2959,6 +2966,19 @@ leader = \" \"
         assert_eq!(act(Key::code(KeyCode::Backspace)), Action::PickBackspace);
         assert_eq!(act(Key::code(KeyCode::Down)), Action::PickNext);
         assert_eq!(act(Key::code(KeyCode::Up)), Action::PickPrev);
+    }
+
+    /// Horizontal for the query, vertical for the list — see
+    /// `docs/specs/picker-cursor.md`.
+    #[test]
+    fn picker_arrows_move_the_query_cursor() {
+        let mut input = Input::default();
+        let mut act = |k: Key| input.on_key(k, &Mode::Pick, ContentKind::Text).unwrap().action;
+
+        assert_eq!(act(Key::code(KeyCode::Left)), Action::PickMove(CmdMove::Left));
+        assert_eq!(act(Key::code(KeyCode::Right)), Action::PickMove(CmdMove::Right));
+        assert_eq!(act(Key::code(KeyCode::Home)), Action::PickMove(CmdMove::Home));
+        assert_eq!(act(Key::code(KeyCode::End)), Action::PickMove(CmdMove::End));
     }
 
     /// `p` is a literal in the picker's query, not the paste key.
