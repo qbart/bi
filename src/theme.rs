@@ -767,7 +767,7 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(theme.ui.background, Some(Color::Rgb(0x16, 0x16, 0x16)));
         assert_eq!(theme.ui.foreground, Some(Color::Rgb(0xdd, 0xe1, 0xe6)));
-        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0xee, 0x53, 0x96))));
+        assert_eq!(theme.style("keyword"), Some(Style::fg(Color::Rgb(0x12, 0xbe, 0xbb))));
 
         // Carbon's grey ramp. `context` is deliberately not on it — see below.
         const RAMP: &[(u8, u8, u8)] = &[
@@ -784,7 +784,6 @@ mod tests {
         let ui = &theme.ui;
         for (role, style) in [
             ("cursorline", ui.cursorline),
-            ("selection", ui.selection),
             ("dim", ui.dim),
             ("gutter", ui.gutter),
             ("rule", ui.rule),
@@ -796,6 +795,11 @@ mod tests {
             let Color::Rgb(r, g, b) = colour else { panic!("{role} is not 24-bit") };
             assert!(RAMP.contains(&(r, g, b)), "{role} left the grey ramp: {colour:?}");
         }
+
+        // Selection stepped off the ramp on purpose: a grey wash was easy to
+        // lose, so it wears a teal ground with a yellow ink.
+        assert_eq!(ui.selection.bg, Some(Color::Rgb(0x1d, 0x69, 0x7f)));
+        assert_eq!(ui.selection.fg, Some(Color::Rgb(0xff, 0xff, 0x00)));
 
         // `context` sits mid-ramp, italic: quiet enough to be an annotation,
         // far enough from the frame's near-black to be findable. It was
