@@ -89,7 +89,7 @@ must reflect both.
 edges, editor as single owner of truth:
 
 ```
-src/dap.rs            module root — SessionId, Inbox, editor-facing surface
+src/dap/mod.rs        module root — SessionId, Inbox, editor-facing surface
 src/dap/types.rs      the protocol structs bi uses, serde-derived      (pure)
 src/dap/rpc.rs        seq/request/response/event envelope; framing
                       shared with lsp/rpc.rs (identical Content-Length) (pure)

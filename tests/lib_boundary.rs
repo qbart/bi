@@ -169,7 +169,11 @@ const LIB_MODULES: &[&str] = &[
     "config/mod.rs",
     "config/parse.rs",
     "context.rs",
-    "dap.rs",
+    "dap/client.rs",
+    "dap/mod.rs",
+    "dap/registry.rs",
+    "dap/rpc.rs",
+    "dap/transport.rs",
     "dap/types.rs",
     "decoration.rs",
     "editor.rs",
@@ -260,8 +264,12 @@ fn the_module_list_matches_what_lib_rs_declares() {
         .filter_map(|l| l.trim().strip_prefix("pub mod ")?.strip_suffix(';'))
         .map(|m| {
             // A module can live at `m.rs` or, once it grows submodules, at
-            // `m/mod.rs` — check the filesystem rather than guessing.
-            if root.join(format!("{m}.rs")).is_file() {
+            // `m/mod.rs` — check the filesystem rather than guessing. A flat
+            // `m.rs` *beside* an `m/` directory counts as the directory: that
+            // shape hides every file in `m/` from the per-directory scan
+            // below, which is precisely how `dap/client.rs` and friends went
+            // unchecked while `dap.rs` sat at the root.
+            if root.join(format!("{m}.rs")).is_file() && !root.join(m).is_dir() {
                 format!("{m}.rs")
             } else {
                 format!("{m}/mod.rs")
