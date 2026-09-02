@@ -7064,20 +7064,44 @@ impl Editor {
                 dap::Effect::Status(status) => self.session.status = status,
                 dap::Effect::Terminated { reason, .. } => {
                     self.session.status = format!("debug: session ended — {reason}");
+                    // `Mode::Debug` only makes sense while a session is up —
+                    // same call `debug_stop` makes when the editor ends it
+                    // itself.
+                    if self.session.mode == Mode::Debug {
+                        self.session.mode = Mode::Normal;
+                    }
                 }
-                // Task 10 answers with `setBreakpoints` for this path and
-                // lets the registry's own count reach `configurationDone`.
-                dap::Effect::PushBreakpoints { .. } => {}
-                // Task 10 moves the source window and kicks the
-                // threads → stackTrace → scopes → variables chain.
-                dap::Effect::Stopped { .. } => {}
-                // Task 10 requests `stackTrace` for each thread.
+                // The registry already counted this file into
+                // `pending_pushes` on `initialized`; the editor's only job is
+                // to answer with `setBreakpoints` — the registry's own count
+                // reaches `configurationDone` from there. See the module doc
+                // on `dap::registry`.
+                dap::Effect::PushBreakpoints { path } => self.push_breakpoints(&path),
+                // The client is already `Phase::Stopped{thread}` (the
+                // registry did `on_stopped`) — kick the lazy chain's first
+                // link, `stackTrace`, for that thread.
+                dap::Effect::Stopped { thread, .. } => {
+                    if let Some(client) = self.dap.active_mut() {
+                        client.request(
+                            "stackTrace",
+                            serde_json::json!({
+                                "threadId": thread,
+                                "startFrame": 0,
+                                "levels": 20
+                            }),
+                            dap::client::Intent::StackTrace { thread },
+                        );
+                    }
+                }
+                // Not (yet) driven by anything on the `Stopped` chain — v1
+                // has no Threads pane, so nothing requests `threads`.
                 dap::Effect::Threads(_) => {}
-                // Task 10 jumps to the top frame; Task 11's Stack pane shows
-                // the rest.
-                dap::Effect::Stack { .. } => {}
-                // Task 10 requests `variables` for each scope; Task 12's
-                // Variables pane fills in the tree.
+                // The top frame is where execution actually sits: jump the
+                // source window there and kick `scopes` so Task 12's
+                // Variables pane has data by the time it exists. Task 11's
+                // Stack pane shows the rest of `frames`.
+                dap::Effect::Stack { frames } => self.apply_stopped_frame(frames),
+                // Task 12's Variables pane fills in the tree.
                 dap::Effect::Scopes(_) => {}
                 // Task 12's Variables pane fills in the expanded node.
                 dap::Effect::Variables { .. } => {}
@@ -7231,25 +7255,103 @@ impl Editor {
         };
         let now_set = self.dap.toggle_breakpoint(&path, row);
         if self.dap.active().is_some() {
-            let breakpoints: Vec<serde_json::Value> = self
-                .dap
-                .breakpoints_for(&path)
-                .iter()
-                .map(|bp| serde_json::json!({ "line": bp.line + 1 }))
-                .collect();
-            let source = serde_json::json!({ "path": path.to_string_lossy() });
-            if let Some(client) = self.dap.active_mut() {
-                client.request(
-                    "setBreakpoints",
-                    serde_json::json!({ "source": source, "breakpoints": breakpoints }),
-                    dap::client::Intent::SetBreakpoints { path: path.clone() },
-                );
-            }
+            self.push_breakpoints(&path);
         }
         self.session.status = match now_set {
             true => format!("breakpoint set line {}", row + 1),
             false => format!("breakpoint cleared line {}", row + 1),
         };
+    }
+
+    /// Sends `setBreakpoints` for every breakpoint stored at `path`, in the
+    /// order [`dap::Registry::breakpoints_for`] holds them — the registry
+    /// zips the answer back positionally, so that order is a hard contract.
+    /// The only two callers: [`Effect::PushBreakpoints`] (the `initialized`
+    /// gate) and [`Editor::debug_toggle_breakpoint`]'s live re-push while a
+    /// session is already running.
+    fn push_breakpoints(&mut self, path: &Path) {
+        let breakpoints: Vec<serde_json::Value> = self
+            .dap
+            .breakpoints_for(path)
+            .iter()
+            .map(|bp| serde_json::json!({ "line": bp.line + 1 }))
+            .collect();
+        let source = serde_json::json!({ "path": path.to_string_lossy() });
+        if let Some(client) = self.dap.active_mut() {
+            client.request(
+                "setBreakpoints",
+                serde_json::json!({ "source": source, "breakpoints": breakpoints }),
+                dap::client::Intent::SetBreakpoints { path: path.to_path_buf() },
+            );
+        }
+    }
+
+    /// [`dap::Effect::Stack`] once a `stopped` event's `stackTrace` answers:
+    /// the top frame is where execution actually sits. A frame with a source
+    /// path jumps [`Editor::debug_source_window`] there, records it as
+    /// `dap::Registry::stopped_at` for the gutter, and kicks `scopes` so
+    /// Task 12's Variables pane has data by the time it exists. A frame with
+    /// no source (library code with no debug info) cannot be jumped to —
+    /// `stopped_at` is left alone and the status line says so.
+    fn apply_stopped_frame(&mut self, frames: Vec<dap::types::StackFrame>) {
+        let Some(top) = frames.into_iter().next() else {
+            self.session.status = "debug: stopped with an empty stack".into();
+            return;
+        };
+        match top.source.as_ref().and_then(|s| s.path.as_deref()) {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                // Wire lines are 1-based; the buffer row bi's cursor and
+                // gutter use is 0-based, same conversion as
+                // `dap::Registry::set_verified`.
+                let row = (top.line - 1).max(0) as usize;
+                self.dap.set_stopped_at(path.clone(), row);
+                let window = self.debug_source_window();
+                match self.open_path(&path.to_string_lossy()) {
+                    Ok(id) => {
+                        self.show(window, id);
+                        // Column 0: DAP's `column` is in units the adapter
+                        // never names (bi's LSP side only gets this right by
+                        // carrying an explicit encoding across the wire —
+                        // see `lsp::pos`) and the gutter's own stopped-line
+                        // marker already points at the whole row, so the
+                        // start of the line is the reading a debugger jump
+                        // owes without inventing an encoding DAP does not
+                        // give.
+                        if let Some(mut view) = self.view(window) {
+                            view.goto_row(row + 1);
+                        }
+                        self.session.status = format!("stopped in {}", top.name);
+                    }
+                    Err(e) => self.session.status = format!("debug: {e:#}"),
+                }
+            }
+            None => {
+                self.session.status = format!("stopped in {} (no source)", top.name);
+            }
+        }
+        if let Some(client) = self.dap.active_mut() {
+            client.request(
+                "scopes",
+                serde_json::json!({ "frameId": top.id }),
+                dap::client::Intent::Scopes { frame: top.id },
+            );
+        }
+    }
+
+    /// Which window a debugger jump lands in: the focused window if it is
+    /// showing text, else the first text window in layout order, else the
+    /// focused window regardless (nothing else to offer — the single-window
+    /// tree/results case). Same shape as [`Editor::handoff_window`], but
+    /// without that one's "not the current window" rule — a debugger jump is
+    /// welcome to move the window already in focus.
+    fn debug_source_window(&self) -> WindowId {
+        let is_text = |id: &WindowId| self.window_of(*id).is_some_and(|w| w.text().is_some());
+        if is_text(&self.focus) {
+            self.focus
+        } else {
+            self.window_ids().into_iter().find(|id| is_text(id)).unwrap_or(self.focus)
+        }
     }
 
     /// `K` in `Mode::Debug` — the word under the cursor, evaluated in the
@@ -23546,6 +23648,112 @@ int main(void) {
             // not quite the one that was asked for, and the sign says so.
             assert_eq!(moved.unwrap().2, ed.theme().ui.debug_breakpoint_unverified);
             assert_ne!(moved.unwrap().2, ed.theme().ui.debug_breakpoint);
+        }
+
+        // ---- Task 10: push/verify, jump-to-stopped, teardown -----------------
+
+        #[test]
+        fn breakpoints_are_pushed_at_initialized_then_configuration_done() {
+            let (_dir, mut ed, fake) = project("push-bp");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ed.dap_mut().toggle_breakpoint(&path, 4);
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+
+            let sb = fake.last(SessionId(0), "setBreakpoints").expect("pushed");
+            assert_eq!(sb["arguments"]["breakpoints"][0]["line"], json!(5)); // 0-based row 4 -> wire 5
+            assert!(
+                !fake.methods(SessionId(0)).contains(&"configurationDone".to_string()),
+                "the answer has not come back yet"
+            );
+
+            let seq = sb["seq"].as_i64().expect("a request carries its own seq");
+            fake.respond(
+                SessionId(0),
+                seq,
+                "setBreakpoints",
+                true,
+                json!({"breakpoints": [{"verified": true, "line": 5}]}),
+            );
+            ed.settle();
+
+            assert!(
+                fake.methods(SessionId(0)).contains(&"configurationDone".to_string()),
+                "{:?}",
+                fake.methods(SessionId(0))
+            );
+            assert!(ed.dap().breakpoints_for(&path)[0].verified);
+        }
+
+        #[test]
+        fn a_stopped_event_moves_the_source_window_to_the_frame() {
+            let (_dir, mut ed, fake) = project("stopped-jump");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            assert!(
+                fake.methods(SessionId(0)).contains(&"configurationDone".to_string()),
+                "no breakpoints — the gate opens on its own"
+            );
+
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 1}));
+            ed.settle();
+
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            assert_eq!(st["arguments"]["threadId"], json!(1));
+
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [{
+                        "id": 3,
+                        "name": "main",
+                        "source": {"path": path.to_string_lossy()},
+                        "line": 2,
+                        "column": 1
+                    }],
+                    "totalFrames": 1
+                }),
+            );
+            ed.settle();
+
+            let focus = ed.focus();
+            assert_eq!(ed.buffer_of(focus).and_then(|b| b.path.clone()), Some(path.clone()));
+            assert_eq!(row_in(&ed, focus), 1, "1-based line 2 -> row 1");
+            assert_eq!(ed.dap().stopped_at(), Some((path.as_path(), 1)));
+
+            let scopes = fake.last(SessionId(0), "scopes").expect("scopes sent");
+            assert_eq!(scopes["arguments"]["frameId"], json!(3));
+        }
+
+        #[test]
+        fn terminated_returns_to_normal_mode() {
+            let (_dir, mut ed, fake) = project("terminated");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            assert_eq!(ed.session.mode, Mode::Debug);
+
+            fake.event(SessionId(0), "terminated", json!({}));
+            ed.settle();
+
+            assert_eq!(ed.session.mode, Mode::Normal);
+            assert!(ed.session.status.contains("end"), "{}", ed.session.status);
         }
     }
 
