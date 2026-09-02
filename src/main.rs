@@ -63,6 +63,10 @@ fn main() -> Result<()> {
     // holds the trait, and spawning processes is a fact about the host. An
     // editor whose frontend never calls this attaches nothing.
     editor.set_lsp_spawner(bi::lsp::transport::ProcessSpawn);
+    // Debug adapters arrive the same way — a DAP adapter is a child process
+    // like a language server, and spawning one is the host's business too.
+    // See docs/specs/debug.md.
+    editor.set_dap_spawner(bi::dap::transport::ProcessSpawn);
     // External formatters too — `:fmt` through a tool is a child process,
     // and processes are the host's business. See docs/specs/fmt.md.
     editor.set_fmt_runner(bi::fmt::ProcessRun::default());
@@ -358,6 +362,7 @@ fn restore() -> Result<()> {
 enum Wake {
     Term(Event),
     Lsp,
+    Dap,
 }
 
 fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> Result<()> {
@@ -380,8 +385,12 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
             }
         }
     });
+    let dap_tx = tx.clone();
     ed.set_lsp_waker(move || {
         let _ = tx.send(Wake::Lsp);
+    });
+    ed.set_dap_waker(move || {
+        let _ = dap_tx.send(Wake::Dap);
     });
 
     let mut input = Input::default();
@@ -454,6 +463,8 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
                 // Nothing to do here by name: the settle below pumps the LSP
                 // inbox along with everything else.
                 Wake::Lsp => {}
+                // Same story for DAP — the settle below pumps its inbox too.
+                Wake::Dap => {}
             }
             // Feed the parse tree and the language servers — both hang off
             // this one drain.

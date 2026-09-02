@@ -13,6 +13,7 @@ use crate::clipboard::SystemClipboard;
 use crate::cmd_history::History;
 use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
+use crate::dap;
 use crate::encoding::{FileFormat, OpenHow};
 use crate::history::Cursors;
 use crate::img::Img;
@@ -2471,6 +2472,9 @@ pub struct Editor {
     /// The language servers: running clients, their inbox, and the routing.
     /// See `docs/specs/lsp.md`.
     lsp: lsp::Registry,
+    /// The debug sessions and the editor-owned breakpoint store. See
+    /// `docs/specs/debug.md`.
+    dap: dap::Registry,
     /// A completion ask parked until `settle` — see [`CompleteWant`].
     complete_want: Option<CompleteWant>,
     /// The newest completion request's number; only its answer is accepted.
@@ -2906,6 +2910,7 @@ impl Editor {
             config_source: None,
             config_epoch: 0,
             lsp: lsp::Registry::default(),
+            dap: dap::Registry::default(),
             complete_want: None,
             complete_seq: 0,
             signature_want: None,
@@ -6775,6 +6780,7 @@ impl Editor {
         self.flush_signature();
         self.flush_saves();
         self.pump_lsp();
+        self.pump_dap();
         // The pump can itself edit — a `:format` answer — so the drain runs
         // once more: the parse tree and the servers see those edits before
         // the frame that shows them, not one keystroke later.
@@ -6977,6 +6983,71 @@ impl Editor {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// The DAP counterpart of [`Editor::pump_lsp`]: drains the registry's
+    /// inbox and applies whatever only the editor can do. Most arms are
+    /// still no-ops — the registry already did the client bookkeeping and
+    /// the `initialized`→`configurationDone` gate itself (see
+    /// `dap::registry`'s module doc) — deepened as the panes and the
+    /// state-chain requests that feed them arrive in later tasks.
+    fn pump_dap(&mut self) {
+        for effect in self.dap.pump() {
+            match effect {
+                dap::Effect::Status(status) => self.session.status = status,
+                dap::Effect::Terminated { reason, .. } => {
+                    self.session.status = format!("debug: session ended — {reason}");
+                }
+                // Task 10 answers with `setBreakpoints` for this path and
+                // lets the registry's own count reach `configurationDone`.
+                dap::Effect::PushBreakpoints { .. } => {}
+                // Task 10 moves the source window and kicks the
+                // threads → stackTrace → scopes → variables chain.
+                dap::Effect::Stopped { .. } => {}
+                // Task 10 requests `stackTrace` for each thread.
+                dap::Effect::Threads(_) => {}
+                // Task 10 jumps to the top frame; Task 11's Stack pane shows
+                // the rest.
+                dap::Effect::Stack { .. } => {}
+                // Task 10 requests `variables` for each scope; Task 12's
+                // Variables pane fills in the tree.
+                dap::Effect::Scopes(_) => {}
+                // Task 12's Variables pane fills in the expanded node.
+                dap::Effect::Variables { .. } => {}
+                // Task 11's Console pane consumes this — a status line here
+                // would be spam.
+                dap::Effect::Output { .. } => {}
+                // Task 12's Watches pane and Task 13's evaluate float show
+                // the result.
+                dap::Effect::Evaluated { .. } => {}
+            }
+        }
+    }
+
+    /// Resolves `name` against `[[debug.launch]]` and starts it. A
+    /// temporary, minimal surface — Task 9's `DebugCmd::Start` supersedes
+    /// this with the real `:debug` command.
+    pub fn debug_launch(&mut self, name: &str) {
+        if !self.config.debug.enabled {
+            self.session.status = "debug is off (`enabled = false` in [debug])".into();
+            return;
+        }
+        let Some(launch) = self.config.debug.launch.iter().find(|l| l.name == name) else {
+            self.session.status = format!("debug: no launch config named {name:?}");
+            return;
+        };
+        let Some(adapter) = self.config.debug.adapters.get(&launch.adapter) else {
+            self.session.status = format!("debug: no adapter named {:?}", launch.adapter);
+            return;
+        };
+        let root = self.session_root();
+        let name = launch.name.clone();
+        let command = adapter.command.clone();
+        let request = launch.request.clone();
+        let body = launch.body.clone();
+        if let Err(reason) = self.dap.launch(&name, &command, &root, &request, body) {
+            self.session.status = format!("debug: {reason}");
         }
     }
 
@@ -8714,6 +8785,19 @@ impl Editor {
     /// embedding host that has no processes to spawn.
     pub fn set_lsp_spawner(&mut self, spawner: impl lsp::transport::Spawn + 'static) {
         self.lsp.set_spawner(spawner);
+    }
+
+    /// Registers how DAP adapter reader threads wake the frontend's event
+    /// loop — the DAP counterpart of [`Editor::set_lsp_waker`], same reason.
+    pub fn set_dap_waker(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.dap.inbox().set_waker(wake);
+    }
+
+    /// Replaces how debug adapters come to exist — a test's fake, or an
+    /// embedding host that has no processes to spawn. The DAP counterpart
+    /// of [`Editor::set_lsp_spawner`].
+    pub fn set_dap_spawner(&mut self, spawner: impl dap::transport::Spawn + 'static) {
+        self.dap.set_spawner(spawner);
     }
 
     /// Replaces how external formatters run — the same arrangement as the
@@ -22947,6 +23031,72 @@ int main(void) {
             assert!(ed.session.status.contains("stopped"), "{}", ed.session.status);
         }
     }
+
+    /// The editor's half of DAP: `debug_launch` driving the registry through
+    /// `settle`. The protocol itself is tested in `src/dap/`; here the
+    /// adapter is a fake and the interest is the wiring. See
+    /// `docs/specs/debug.md`.
+    mod dap_integration {
+        use serde_json::json;
+
+        use super::*;
+        use crate::dap::SessionId;
+        use crate::dap::transport::fake::FakeSpawn;
+
+        /// A project on disk with a `[[debug.launch]]` named "run tests", an
+        /// editor opened on its main file, and a fake behind the registry —
+        /// installed before the launch, which is when the adapter is spawned.
+        fn project(name: &str) -> (ScratchDir, Editor, FakeSpawn) {
+            let dir = ScratchDir::new(&format!("dap-{name}"))
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", "fn main() {\n}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            ed.load_config(ConfigText(Some(
+                "[[debug.launch]]\n\
+                 name = \"run tests\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"launch\"\n\
+                 body = { program = \"target/debug/bi\", args = [] }\n",
+            )));
+            let fake = FakeSpawn::default();
+            ed.set_dap_spawner(fake.clone());
+            (dir, ed, fake)
+        }
+
+        #[test]
+        fn a_launch_drives_the_handshake_through_settle() {
+            let (_dir, mut ed, fake) = project("launch");
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
+
+            // Answer initialize; the next settle sends launch.
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            ed.settle();
+            assert!(fake.methods(SessionId(0)).contains(&"launch".to_string()));
+        }
+
+        #[test]
+        fn an_unknown_launch_name_names_it_in_the_status() {
+            let (_dir, mut ed, _fake) = project("unknown-launch");
+
+            ed.debug_launch("no such config");
+
+            assert!(ed.session.status.contains("no such config"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn debug_off_says_so() {
+            let (_dir, mut ed, _fake) = project("off");
+            ed.load_config(ConfigText(Some("[debug]\nenabled = false\n")));
+
+            ed.debug_launch("run tests");
+
+            assert!(ed.session.status.contains("off"), "{}", ed.session.status);
+        }
+    }
+
     /// A real PNG in a scratch directory, for the image-pane tests.
     struct PngDir(std::path::PathBuf);
 
