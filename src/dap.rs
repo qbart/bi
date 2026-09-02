@@ -16,6 +16,46 @@ use std::sync::{Arc, Mutex};
 
 pub use registry::{Breakpoint, Effect, Registry};
 
+/// One `[debug.adapters.<name>]` — the argv that starts a DAP adapter.
+///
+/// Deliberately just the argv: unlike `lsp::ServerConfig` there is no
+/// `filetypes`/`roots` (a debug session is started by naming a launch
+/// configuration, never by opening a file) and no per-adapter `enabled`
+/// (the one switch is `[debug]`'s own — an adapter nobody's launch config
+/// names costs nothing to leave defined). See `docs/specs/debug.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdapterConfig {
+    pub command: Vec<String>,
+}
+
+/// One `[[debug.launch]]` — a named way to start or attach a debug session,
+/// the project's own list rather than something merged over a built-in.
+///
+/// `body` is the DAP `launch`/`attach` request's `arguments`: every adapter
+/// invents its own shape for it (`program`/`args`/`cwd` for codelldb,
+/// `mode`/`program` for dlv), so bi never parses it — only the adapter does.
+/// It travels from TOML to here to the wire opaquely, unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchConfig {
+    pub name: String,
+    /// Which `[debug.adapters.<name>]` starts it.
+    pub adapter: String,
+    /// `"launch"` or `"attach"` — DAP's only fork in how a session begins.
+    pub request: String,
+    pub body: serde_json::Value,
+}
+
+impl Default for LaunchConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            adapter: String::new(),
+            request: String::new(),
+            body: serde_json::Value::Null,
+        }
+    }
+}
+
 /// A running adapter instance's identity within a session.
 ///
 /// Handed out monotonically and never reused, like `lsp::ServerId` and for

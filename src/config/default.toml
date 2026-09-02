@@ -268,6 +268,24 @@ filetypes = ["c3"]
 roots = ["project.json"]
 install_hint = "build c3lsp from github.com/pherrymason/c3-lsp"
 
+# The debugger, over the Debug Adapter Protocol. Setting `enabled` to false
+# turns the lot off. Each [debug.adapters.<name>] section is one adapter's
+# argv; a section of yours patches the same-named one here field by field,
+# like the server table above. A project names which adapter it wants and
+# how to start or attach with its own [[debug.launch]] entries — see
+# docs/specs/debug.md.
+[debug]
+enabled = true
+
+[debug.adapters.codelldb]
+command = ["codelldb"]         # CodeLLDB: Rust/C++, best data visualization
+
+[debug.adapters.dlv]
+command = ["dlv", "dap"]       # Delve speaks DAP natively; goroutines as threads
+
+[debug.adapters.gdb]
+command = ["gdb", "-i", "dap"] # no-install fallback on gdb >= 14
+
 # External formatters. `:fmt` runs the first [fmt.tools.<name>] claiming the
 # buffer's filetype — the whole buffer on its stdin, the formatted file back
 # on its stdout, exit 0 — and only asks the language server when no tool

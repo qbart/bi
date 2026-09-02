@@ -68,6 +68,7 @@ fn parse_with(
             "filetype" => read_filetypes(src, table, &mut config, &mut problems),
             "alternate" => read_alternates(src, table, &mut config, &mut problems),
             "lsp" => read_lsp(src, table, &mut config, &mut problems, local),
+            "debug" => read_debug(src, table, &mut config, &mut problems, local),
             "fmt" => read_fmt(src, table, &mut config, &mut problems, local),
             _ => problems.push(Diagnostic { line, message: format!("unknown section: {key}") }),
         }
@@ -311,6 +312,156 @@ fn read_servers(
             }
         }
     }
+}
+
+/// `[debug]`: `enabled`, `[debug.adapters.<name>]`, and `[[debug.launch]]`.
+/// See `docs/specs/debug.md`.
+fn read_debug(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
+    for (key, item) in table.iter() {
+        let line = line_for(table, key, src);
+        match key {
+            "enabled" => match item.as_value().and_then(Value::as_bool) {
+                Some(b) => config.debug.enabled = b,
+                None => {
+                    problems.push(Diagnostic { line, message: "enabled is true or false".into() })
+                }
+            },
+            "adapters" => match item.as_table() {
+                Some(adapters) => read_adapters(src, adapters, config, problems, local),
+                None => problems.push(Diagnostic {
+                    line,
+                    message: "adapters holds [debug.adapters.<name>] sections".into(),
+                }),
+            },
+            "launch" => match item.as_array_of_tables() {
+                Some(launch) => read_launch(src, launch, config, problems),
+                None => problems.push(Diagnostic {
+                    line,
+                    message: "launch holds [[debug.launch]] sections".into(),
+                }),
+            },
+            other => problems
+                .push(Diagnostic { line, message: format!("unknown debug setting: {other}") }),
+        }
+    }
+}
+
+/// One `[debug.adapters.<name>]` merges **field-wise** over the built-in
+/// adapter of the same name — the same patch promise `[lsp.servers.<name>]`
+/// makes. `command` names the binary bi spawns, so it carries the same
+/// refusal a server's `command` does: a project cannot pick what runs.
+fn read_adapters(
+    src: &str,
+    table: &Table,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+    local: bool,
+) {
+    for (name, item) in table.iter() {
+        let line = line_for(table, name, src);
+        let Some(adapter) = item.as_table() else {
+            problems.push(Diagnostic {
+                line,
+                message: format!("{name} is a section: [debug.adapters.{name}]"),
+            });
+            continue;
+        };
+        let entry = config.debug.adapters.entry(name.to_string()).or_default();
+        for (field, item) in adapter.iter() {
+            let line = line_for(adapter, field, src);
+            match field {
+                "command" if local => problems.push(Diagnostic {
+                    line,
+                    message: "command is not read from a project config".into(),
+                }),
+                "command" => match string_list(item) {
+                    Some(list) => entry.command = list,
+                    None => problems
+                        .push(Diagnostic { line, message: "command takes a list of strings".into() }),
+                },
+                other => problems
+                    .push(Diagnostic { line, message: format!("unknown adapter setting: {other}") }),
+            }
+        }
+    }
+}
+
+/// `[[debug.launch]]` — the project's own list, appended to in file order
+/// rather than merged: a launch configuration names a program to run, which
+/// has no built-in of the same name to patch over. A launch config missing a
+/// required field is dropped whole, the same rule a bad option follows
+/// elsewhere — a broken entry does not cost the others.
+fn read_launch(
+    src: &str,
+    tables: &toml_edit::ArrayOfTables,
+    config: &mut Config,
+    problems: &mut Vec<Diagnostic>,
+) {
+    for table in tables.iter() {
+        // An array-of-tables element has no key of its own to blame a
+        // diagnostic on — the table's own first entry's line is the closest
+        // thing it has, and "line 1" for an empty one is as good as anything.
+        let line = table.iter().next().map_or(1, |(key, _)| line_for(table, key, src));
+
+        let name = table.get("name").and_then(Item::as_str);
+        let adapter = table.get("adapter").and_then(Item::as_str);
+        let request = table.get("request").and_then(Item::as_str);
+        match (name, adapter, request) {
+            (Some(name), Some(adapter), Some(request)) => {
+                let body = table.get("body").map_or(serde_json::Value::Null, to_json);
+                config.debug.launch.push(crate::dap::LaunchConfig {
+                    name: name.to_string(),
+                    adapter: adapter.to_string(),
+                    request: request.to_string(),
+                    body,
+                });
+            }
+            _ => problems.push(Diagnostic {
+                line,
+                message: "[[debug.launch]] needs name, adapter and request".into(),
+            }),
+        }
+    }
+}
+
+/// A `toml_edit` item, converted to the `serde_json::Value` a DAP body is
+/// carried as from here on. Only the shapes a launch body can actually use
+/// appear in TOML: a datetime becomes its RFC 3339 string, since JSON has no
+/// datetime type of its own and the adapter, not bi, is the one that must
+/// still make sense of it.
+fn to_json(item: &Item) -> serde_json::Value {
+    fn value_to_json(value: &Value) -> serde_json::Value {
+        match value {
+            Value::String(s) => serde_json::Value::String(s.value().clone()),
+            Value::Integer(i) => serde_json::Value::from(*i.value()),
+            Value::Float(f) => serde_json::Number::from_f64(*f.value())
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
+            Value::Boolean(b) => serde_json::Value::Bool(*b.value()),
+            Value::Datetime(d) => serde_json::Value::String(d.value().to_string()),
+            Value::Array(a) => serde_json::Value::Array(a.iter().map(value_to_json).collect()),
+            Value::InlineTable(t) => serde_json::Value::Object(
+                t.iter().map(|(k, v)| (k.to_string(), value_to_json(v))).collect(),
+            ),
+        }
+    }
+    match item {
+        Item::None => serde_json::Value::Null,
+        Item::Value(v) => value_to_json(v),
+        Item::Table(t) => serde_json::Value::Object(
+            t.iter().map(|(k, i)| (k.to_string(), to_json(i))).collect(),
+        ),
+        Item::ArrayOfTables(a) => serde_json::Value::Array(a.iter().map(to_json_table).collect()),
+    }
+}
+
+fn to_json_table(table: &Table) -> serde_json::Value {
+    serde_json::Value::Object(table.iter().map(|(k, i)| (k.to_string(), to_json(i))).collect())
 }
 
 /// `[fmt]`: the `[fmt.tools.<name>]` sections. See `docs/specs/fmt.md`.
@@ -1070,5 +1221,33 @@ mod tests {
 
         let (_, problems) = ok("[lsp.servers.gopls]\ncmd = [\"gopls\"]\n");
         assert_eq!(problems, ["2: unknown server setting: cmd"]);
+    }
+
+    // ---- [debug] / [debug.adapters.<name>] / [[debug.launch]] — see
+    // docs/specs/debug.md ------------------------------------------------
+
+    #[test]
+    fn debug_adapters_come_from_defaults_and_launch_configs_parse() {
+        let (config, problems) = ok(r#"
+            [[debug.launch]]
+            name = "run tests"
+            adapter = "codelldb"
+            request = "launch"
+            body = { program = "target/debug/bi", args = [] }
+        "#);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        // The blessed adapters are present from defaults.
+        assert!(config.debug.adapters.contains_key("codelldb"));
+        assert!(config.debug.adapters.contains_key("dlv"));
+        assert!(config.debug.adapters.contains_key("gdb"));
+
+        // The project's own launch config parses, body passed through opaquely.
+        let launch = &config.debug.launch[0];
+        assert_eq!(launch.name, "run tests");
+        assert_eq!(launch.adapter, "codelldb");
+        assert_eq!(launch.request, "launch");
+        assert_eq!(launch.body["program"], "target/debug/bi");
+        assert_eq!(launch.body["args"], serde_json::json!([]));
     }
 }

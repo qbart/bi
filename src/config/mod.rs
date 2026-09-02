@@ -541,6 +541,9 @@ pub struct Config {
     /// `[lsp]` — the master switch and the server table. See
     /// `docs/specs/lsp.md`.
     pub lsp: Lsp,
+    /// `[debug]` — the master switch, the adapter table, and the project's
+    /// launch configurations. See `docs/specs/debug.md`.
+    pub debug: Debug,
     /// `[fmt]` — the external formatter table. See `docs/specs/fmt.md`.
     pub fmt: Fmt,
     /// `fileencodings` — the detection list an open walks, first clean decode
@@ -564,6 +567,34 @@ pub struct Lsp {
 impl Default for Lsp {
     fn default() -> Self {
         Self { enabled: true, servers: Default::default() }
+    }
+}
+
+/// The `[debug]` section: whether the debugger is offered at all, which
+/// adapters it knows how to start, and the project's own launch
+/// configurations.
+///
+/// Shaped like [`Lsp`] for the adapter table — same master switch, same
+/// merge-field-wise-over-the-built-in promise for `[debug.adapters.<name>]`
+/// — but `launch` has no built-in counterpart to merge over: a launch
+/// configuration names a program to run, which is inherently project-local,
+/// so `[[debug.launch]]` is read as-is rather than patched. See
+/// `docs/specs/debug.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Debug {
+    pub enabled: bool,
+    /// `[debug.adapters.<name>]`, the user's entries merged field-wise over
+    /// the built-in defaults of the same name.
+    pub adapters: std::collections::BTreeMap<String, crate::dap::AdapterConfig>,
+    /// `[[debug.launch]]`, in file order — the project's own list, appended
+    /// to rather than merged, since a launch config has no built-in of the
+    /// same name to patch.
+    pub launch: Vec<crate::dap::LaunchConfig>,
+}
+
+impl Default for Debug {
+    fn default() -> Self {
+        Self { enabled: true, adapters: Default::default(), launch: Vec::new() }
     }
 }
 
@@ -594,6 +625,7 @@ impl Default for Config {
                     filetypes: Default::default(),
                     alternates: Vec::new(),
                     lsp: Lsp::default(),
+                    debug: Debug::default(),
                     fmt: Fmt::default(),
                     fileencodings: vec!["utf-8".into(), "latin1".into()],
                 };
