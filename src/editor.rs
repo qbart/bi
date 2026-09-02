@@ -2709,11 +2709,23 @@ fn wanted_syntax(buffer: &Buffer, options: &Options) -> Option<&'static str> {
 /// appearing twice) whose `reference` matches, then keeps walking into
 /// whatever is expanded, since a `variables` answer for a nested node can
 /// arrive after its ancestor's own children are already in place.
+///
+/// A node this call just filled is never walked into for the *same*
+/// reference: some adapters intern `variablesReference` by object identity
+/// rather than by position, so a self-referential structure (a cycle, a
+/// parent pointer, a linked list's `next`) can legally answer with one of
+/// its own children carrying the very reference just fetched. Recursing into
+/// a freshly assigned `children` in that case would fill that child with the
+/// same slice, then walk into *its* copy, forever — unbounded recursion,
+/// not a handful of wasted calls. A node just filled is filled; a deeper
+/// occurrence of the same reference gets its own turn only when the user
+/// expands it and its own `variables` answer arrives.
 fn fill_matching_reference(node: &mut VarNode, reference: i64, children: &[VarNode]) {
     if node.reference == reference {
         node.children = children.to_vec();
         node.loaded = true;
         node.expanded = true;
+        return;
     }
     for child in &mut node.children {
         fill_matching_reference(child, reference, children);
@@ -24847,6 +24859,92 @@ int main(void) {
             ed.apply(cmd(Action::Tree(TreeCmd::Delete)));
 
             assert!(ed.dap().watches().is_empty());
+        }
+
+        /// A `variables` answer where one of the elements shares the parent
+        /// node's own `variables_reference` — legal DAP, and exactly what an
+        /// adapter that interns reference ids by object identity produces for
+        /// a cycle, a parent pointer, or a linked list's `next`. Filling must
+        /// stop at the node that matched rather than walking into its own
+        /// freshly assigned children looking for more matches — completing at
+        /// all (rather than a stack overflow) is the test.
+        #[test]
+        fn a_self_referential_variables_answer_fills_once_and_does_not_recurse() {
+            let (_dir, mut ed, fake) = project("vars-self-ref");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            stopped_with_two_scopes(&mut ed, &fake, &path);
+            let id = window_with(&ed, ContentKind::DapVariables);
+
+            ed.apply(cmd(Action::Tree(TreeCmd::Expand)));
+            let vars_req = fake.last(SessionId(0), "variables").expect("variables sent");
+            assert_eq!(vars_req["arguments"]["variablesReference"], json!(3));
+            let seq = vars_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "variables",
+                true,
+                json!({"variables": [
+                    {"name": "x", "value": "1", "variablesReference": 0},
+                    // Same reference (3) as the node this answer is filling.
+                    {"name": "self", "value": "<cycle>", "variablesReference": 3}
+                ]}),
+            );
+            ed.settle(); // must return rather than overflow the stack
+
+            let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                panic!("not a variables pane")
+            };
+            assert!(vars.roots[0].expanded && vars.roots[0].loaded);
+            assert_eq!(vars.roots[0].children.len(), 2, "filled once");
+            let cyclic_child = &vars.roots[0].children[1];
+            assert_eq!(cyclic_child.reference, 3);
+            assert!(
+                !cyclic_child.expanded && !cyclic_child.loaded,
+                "not recursively filled — it gets its own turn only if the user expands it"
+            );
+        }
+
+        /// The Variables pane opened *after* the session is already stopped
+        /// somewhere: `open_debug_pane` must ask for that frame's `scopes`
+        /// right away, since `Effect::Scopes` only reaches panes that already
+        /// existed when it arrived — every other Variables test opens the
+        /// pane before the stop, so this is the ordering none of them cover.
+        #[test]
+        fn opening_vars_while_stopped_requests_scopes() {
+            let (_dir, mut ed, fake) = project("vars-open-after-stop");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            stopped_at_frame(&mut ed, &fake, &path, 3, 1);
+            let scopes_calls =
+                |fake: &FakeSpawn| fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "scopes").count();
+            let before = scopes_calls(&fake);
+            assert_eq!(before, 1, "apply_stopped_frame's own request");
+
+            ex(&mut ed, "debug vars");
+            ed.settle();
+
+            assert_eq!(scopes_calls(&fake), before + 1, "exactly one new scopes request");
+            let scopes_req = fake.last(SessionId(0), "scopes").expect("scopes sent");
+            assert_eq!(scopes_req["arguments"]["frameId"], json!(3));
+
+            let seq = scopes_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "scopes",
+                true,
+                json!({"scopes": [{"name": "Locals", "variablesReference": 3, "expensive": false}]}),
+            );
+            ed.settle();
+
+            let id = window_with(&ed, ContentKind::DapVariables);
+            let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                panic!("not a variables pane")
+            };
+            assert_eq!(vars.roots.len(), 1, "the late-open request's answer filled the pane");
         }
     }
 
