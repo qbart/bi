@@ -29,13 +29,20 @@ only way the two stay in agreement.
 
 ## What a project may not say
 
-Two sections are refused, with a diagnostic naming the refusal rather than a
-silence:
+A handful of keys are refused, with a diagnostic naming the refusal rather
+than a silence:
 
 - **`[lsp.servers.<name>].command`** — a repository that can name the binary
   bi spawns on open is arbitrary code execution by `git clone`. The rest of
   a server's definition — `enabled`, `filetypes`, `roots`, and `[lsp]`
   itself — is a project's legitimate business and is read.
+- **`[fmt.tools.<name>].command`** — the same trap, one tool later: a
+  formatter is a binary bi runs your buffer through. `filetypes` and
+  `[fmt]` itself are still read.
+- **`[debug.adapters.<name>].command`** — the same trap again: an adapter is
+  a binary bi spawns to run your program under. `[debug]`'s own `enabled`
+  and `[[debug.launch]]` — which is inherently project-local, the whole
+  point of the section — are still read.
 - **`[keys]`** — a binding can carry an ex line, which is the same trap one
   keypress later; and a project has no business with your muscle memory
   besides.
@@ -56,5 +63,5 @@ reason `options.md` gives: you said so, this session, by hand.
 String)>` — so an embedder that wants no project config does nothing, and
 the terminal frontend implements the walk (the working directory is process
 state, which has always been the frontend's to know). The parser grows
-`parse_local`, the same reader with the two refusals switched on, so a
+`parse_local`, the same reader with the refusals above switched on, so a
 refused key gets a real line number in its diagnostic.

@@ -18,11 +18,11 @@ pub fn parse(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagn
 }
 
 /// Parses a **project's** `.bi.toml` as a patch over `base` — the same reader
-/// with two refusals switched on: `[keys]`, and a server's `command`. A
-/// repository that could name the binary bi spawns on open, or the ex line a
-/// key runs, would be arbitrary code execution by `git clone`. Each refusal
-/// is a diagnostic with the offending line, never a silence.
-/// See `docs/specs/local-config.md`.
+/// with several refusals switched on: `[keys]`, and the `command` of an lsp
+/// server, an fmt tool, and a debug adapter. A repository that could name a
+/// binary bi spawns, or the ex line a key runs, would be arbitrary code
+/// execution by `git clone`. Each refusal is a diagnostic with the offending
+/// line, never a silence. See `docs/specs/local-config.md`.
 pub fn parse_local(src: &str, base: Config) -> Result<(Config, Vec<Diagnostic>), Diagnostic> {
     parse_with(src, base, true)
 }
@@ -392,11 +392,16 @@ fn read_adapters(
     }
 }
 
-/// `[[debug.launch]]` — the project's own list, appended to in file order
-/// rather than merged: a launch configuration names a program to run, which
-/// has no built-in of the same name to patch over. A launch config missing a
-/// required field is dropped whole, the same rule a bad option follows
-/// elsewhere — a broken entry does not cost the others.
+/// `[[debug.launch]]` — the project's own list, with no built-in of the same
+/// name to merge field-wise over (a launch configuration names a whole
+/// program to run, not a handful of settings to patch). Named entries still
+/// follow the one merge rule every other list-of-named-things in this file
+/// keeps: a name already in the list is *replaced* in place, keeping its
+/// position, exactly [`read_alternates`]'s rule for a repeated pattern — a
+/// later layer redefining "run tests" means it, not a second launch config
+/// called the same thing a `:debug` picker would show twice. A launch
+/// config missing a required field is dropped whole, the same rule a bad
+/// option follows elsewhere — a broken entry does not cost the others.
 fn read_launch(
     src: &str,
     tables: &toml_edit::ArrayOfTables,
@@ -415,12 +420,16 @@ fn read_launch(
         match (name, adapter, request) {
             (Some(name), Some(adapter), Some(request)) => {
                 let body = table.get("body").map_or(serde_json::Value::Null, to_json);
-                config.debug.launch.push(crate::dap::LaunchConfig {
+                let entry = crate::dap::LaunchConfig {
                     name: name.to_string(),
                     adapter: adapter.to_string(),
                     request: request.to_string(),
                     body,
-                });
+                };
+                match config.debug.launch.iter_mut().find(|l| l.name == name) {
+                    Some(existing) => *existing = entry,
+                    None => config.debug.launch.push(entry),
+                }
             }
             _ => problems.push(Diagnostic {
                 line,
@@ -1249,5 +1258,70 @@ mod tests {
         assert_eq!(launch.request, "launch");
         assert_eq!(launch.body["program"], "target/debug/bi");
         assert_eq!(launch.body["args"], serde_json::json!([]));
+    }
+
+    /// The promise `read_alternates` already makes for a repeated pattern:
+    /// a name a later layer repeats *replaces* the earlier layer's entry in
+    /// place, rather than piling up a duplicate a `:debug` picker would show
+    /// twice.
+    #[test]
+    fn a_later_layers_launch_config_replaces_the_same_named_earlier_one() {
+        let (base, problems) = parse(
+            "[[debug.launch]]\n\
+             name = \"run tests\"\n\
+             adapter = \"codelldb\"\n\
+             request = \"launch\"\n\
+             body = { program = \"a\" }\n",
+            Config::default(),
+        )
+        .unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(base.debug.launch.len(), 1);
+
+        let (config, problems) = crate::config::parse_local(
+            "[[debug.launch]]\n\
+             name = \"run tests\"\n\
+             adapter = \"codelldb\"\n\
+             request = \"launch\"\n\
+             body = { program = \"b\" }\n\
+             \n\
+             [[debug.launch]]\n\
+             name = \"run bench\"\n\
+             adapter = \"codelldb\"\n\
+             request = \"launch\"\n\
+             body = { program = \"c\" }\n",
+            base,
+        )
+        .unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+
+        assert_eq!(config.debug.launch.len(), 2, "same name replaces, does not duplicate");
+        assert_eq!(config.debug.launch[0].name, "run tests", "position kept");
+        assert_eq!(config.debug.launch[0].body["program"], "b", "the later layer wins");
+        assert_eq!(config.debug.launch[1].name, "run bench", "a new name is appended");
+    }
+
+    /// The same refusal `[lsp.servers.*].command` and `[fmt.tools.*].command`
+    /// carry: a project cannot pick the binary bi spawns. `AdapterConfig` has
+    /// no other field to prove "the harmless part still reads" with, unlike
+    /// its lsp/fmt counterparts — `command` is the whole struct — so this
+    /// instead shows the rest of `[debug]` (another adapter, `enabled`) is
+    /// untouched by the one refused line.
+    #[test]
+    fn a_local_config_may_not_name_a_debug_adapter_binary() {
+        let src = "[debug]\nenabled = false\n\n[debug.adapters.codelldb]\ncommand = [\"evil\"]\n";
+        let (config, problems) = ok_local(src);
+        assert_eq!(problems, ["5: command is not read from a project config"]);
+        assert_eq!(
+            config.debug.adapters["codelldb"].command,
+            ["codelldb"],
+            "the built-in survives"
+        );
+        assert_eq!(
+            config.debug.adapters["dlv"].command,
+            ["dlv", "dap"],
+            "a different adapter, never mentioned, is untouched"
+        );
+        assert!(!config.debug.enabled, "the harmless [debug] setting is still read");
     }
 }
