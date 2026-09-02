@@ -170,6 +170,18 @@ impl Client {
         self.pending.remove(&seq)
     }
 
+    /// Answers a reverse request — one the adapter sent (e.g.
+    /// `runInTerminal`) — allocating bi's own `seq` from the very counter
+    /// `request` uses. DAP numbers every outbound message, requests and
+    /// responses alike, from one sequence per side; a second counter here
+    /// would hand out numbers `request` could also hand out, and the
+    /// adapter would see the collision.
+    pub fn respond(&mut self, request_seq: i64, command: &str, success: bool, body: Value) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.transport.send(&rpc::response(request_seq, seq, command, success, body));
+    }
+
     /// The `initialize` response arrived: record what the adapter granted,
     /// then fire the launch/attach that was waiting on it. Moves to
     /// `Configuring` — the program has not started yet; that waits for the

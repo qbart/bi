@@ -6,12 +6,15 @@
 //! The editor stays the single owner of truth, exactly as with LSP.
 
 pub mod client;
+pub mod registry;
 pub mod rpc;
 pub mod transport;
 pub mod types;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+pub use registry::{Breakpoint, Effect, Registry};
 
 /// A running adapter instance's identity within a session.
 ///
