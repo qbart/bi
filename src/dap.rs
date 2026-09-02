@@ -5,6 +5,7 @@
 //! anything; `client` is one running session; `registry` is the set of them.
 //! The editor stays the single owner of truth, exactly as with LSP.
 
+pub mod client;
 pub mod rpc;
 pub mod transport;
 pub mod types;
