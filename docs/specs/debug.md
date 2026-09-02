@@ -67,7 +67,9 @@ The handshake is fixed by the protocol:
 5. From here it is event-driven. A `stopped` event (reason: breakpoint /
    step / pause / exception, plus `threadId`) is the cue to fetch state,
    always lazily down one chain:
-   `threads` → `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`.
+   `stackTrace(thread)` → `scopes(frame)` → `variables(ref)` — the `stopped`
+   event already carries the thread, so bi skips a `threads` round-trip
+   (see Deviations #2; v1 has no Threads pane to populate it for).
    Variables form a lazy tree — expanding a struct means requesting its
    `variablesReference`. **Watches** are just
    `evaluate { expr, frameId, context: "watch" }`, re-run on every stop.
