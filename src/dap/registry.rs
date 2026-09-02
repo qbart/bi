@@ -535,6 +535,37 @@ mod tests {
         }
     }
 
+    /// `stopped_at` is what the gutter's `▶` reads — it must not survive past
+    /// the moment the program is no longer sitting still: `continued`,
+    /// `terminated`, and the pipe closing all clear it. Task 10 will be the
+    /// one to *set* it for real (from the top stack frame); this only
+    /// exercises the clearing side, via the test-only `set_stopped_at`.
+    #[test]
+    fn stopped_at_clears_on_continued_terminated_and_eof() {
+        let fake = FakeSpawn::default();
+        let mut reg = Registry::default();
+        reg.set_spawner(fake.clone());
+        let id = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect("spawner is set");
+
+        reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        assert_eq!(reg.stopped_at(), Some((Path::new("/a.rs"), 10)));
+        fake.event(id, "continued", Value::Null);
+        reg.pump();
+        assert_eq!(reg.stopped_at(), None, "continued clears it");
+
+        reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        fake.event(id, "terminated", Value::Null);
+        reg.pump();
+        assert_eq!(reg.stopped_at(), None, "terminated clears it");
+
+        reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        reg.inbox().deliver(id, Inbound::Eof);
+        reg.pump();
+        assert_eq!(reg.stopped_at(), None, "the pipe closing (Eof) clears it");
+    }
+
     #[test]
     fn configuration_done_waits_for_every_pushed_file_to_answer() {
         let fake = FakeSpawn::default();
