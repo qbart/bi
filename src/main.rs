@@ -66,6 +66,7 @@ fn main() -> Result<()> {
     // External formatters too — `:fmt` through a tool is a child process,
     // and processes are the host's business. See docs/specs/fmt.md.
     editor.set_fmt_runner(bi::fmt::ProcessRun::default());
+    editor.set_lsp_installer(bi::lsp::transport::ProcessInstall);
     // Git arrives the same way: the library computes the diff, and running
     // `git` is a fact about the host. See docs/specs/git-signs.md.
     editor.set_git_baseline(bi::git::baseline);

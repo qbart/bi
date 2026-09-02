@@ -221,36 +221,43 @@ enabled = true
 command = ["rust-analyzer"]
 filetypes = ["rust"]
 roots = ["Cargo.toml"]
+install = ["rustup", "component", "add", "rust-analyzer"]
 
 [lsp.servers.gopls]
 command = ["gopls"]
 filetypes = ["go"]
 roots = ["go.work", "go.mod"]
+install = ["go", "install", "golang.org/x/tools/gopls@latest"]
 
 [lsp.servers.clangd]
 command = ["clangd"]
 filetypes = ["c", "cpp"]
 roots = ["compile_commands.json", ".clangd"]
+install_hint = "clangd ships with LLVM — install it with your package manager"
 
 [lsp.servers.pyright]
 command = ["pyright-langserver", "--stdio"]
 filetypes = ["python"]
 roots = ["pyproject.toml", "setup.py", "requirements.txt"]
+install = ["npm", "install", "--global", "pyright"]
 
 [lsp.servers.typescript-language-server]
 command = ["typescript-language-server", "--stdio"]
 filetypes = ["typescript", "tsx", "javascript"]
 roots = ["tsconfig.json", "package.json"]
+install = ["npm", "install", "--global", "typescript-language-server", "typescript"]
 
 [lsp.servers.lua-language-server]
 command = ["lua-language-server"]
 filetypes = ["lua"]
 roots = [".luarc.json"]
+install_hint = "lua-language-server comes from your package manager"
 
 [lsp.servers.bash-language-server]
 command = ["bash-language-server", "start"]
 filetypes = ["bash"]
 roots = []
+install = ["npm", "install", "--global", "bash-language-server"]
 
 # pherrymason's server resolves stdlib symbols itself. ManuLinares's c3_ls
 # wants the paths spelled out: swap the command for
@@ -259,6 +266,7 @@ roots = []
 command = ["c3-lsp"]
 filetypes = ["c3"]
 roots = ["project.json"]
+install_hint = "build c3lsp from github.com/pherrymason/c3-lsp"
 
 # External formatters. `:fmt` runs the first [fmt.tools.<name>] claiming the
 # buffer's filetype — the whole buffer on its stdin, the formatted file back

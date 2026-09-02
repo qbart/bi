@@ -69,6 +69,13 @@ impl Inbox {
     /// Called from reader threads: queue the message, wake the frontend.
     pub fn deliver(&self, from: ServerId, msg: Inbound) {
         self.queue.lock().expect("inbox queue poisoned").push_back((from, msg));
+        self.wake();
+    }
+
+    /// Rings the waker without a message — how a background completion that
+    /// is not a server (a finished `:lsp install`) gets the next settle to
+    /// run rather than waiting for a keystroke.
+    pub fn wake(&self) {
         let waker = self.waker.lock().expect("inbox waker poisoned").clone();
         if let Some(wake) = waker {
             wake();

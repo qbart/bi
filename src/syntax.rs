@@ -1193,7 +1193,7 @@ mod tests {
     /// whole. C++'s is a `; inherits: c` delta and compiled happily on its own
     /// while matching `auto` and almost nothing else, so every language gets a
     /// snippet whose comment, keyword and literal must all come back captured.
-    #[test]
+    ///
     /// The regression behind `C_BOOLEANS`: `nullptr` and the numbers took a
     /// colour and `true`/`false` rendered plain, in every C-family grammar
     /// at once — none of their upstream queries captures the two nodes.

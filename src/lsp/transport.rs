@@ -49,6 +49,43 @@ pub trait Spawn {
     ) -> Result<Box<dyn Transport>, String>;
 }
 
+/// How `:lsp install` runs an installer — begun and left, because a `go
+/// install` can compile for minutes and the fmt runner's guarded synchronous
+/// call is the wrong shape for that. The editor hears back through `done`,
+/// on whatever thread ran the work, and turns it into state inside `settle`.
+/// See `docs/specs/lsp-install.md`.
+pub trait Installer {
+    fn begin(&self, argv: &[String], done: Box<dyn FnOnce(Result<(), String>) + Send>);
+}
+
+/// The real thing: the child on its own thread, waited to the end. `Ok` on
+/// exit 0; otherwise the last non-empty stderr line — installers narrate,
+/// and the last line is the verdict, where a formatter's first line was.
+pub struct ProcessInstall;
+
+impl Installer for ProcessInstall {
+    fn begin(&self, argv: &[String], done: Box<dyn FnOnce(Result<(), String>) + Send>) {
+        let argv = argv.to_vec();
+        std::thread::spawn(move || {
+            let run = || {
+                let (name, args) = argv.split_first().ok_or("empty install command")?;
+                let output = Command::new(name)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("{name}: {e}"))?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let verdict = stderr.lines().rev().find(|l| !l.trim().is_empty());
+                Err(verdict.unwrap_or("exited nonzero").to_string())
+            };
+            done(run());
+        });
+    }
+}
+
 /// The real thing: `command[0]` run in `root`, stdio piped.
 pub struct ProcessSpawn;
 

@@ -35,11 +35,25 @@ pub struct ServerConfig {
     /// Root markers, tried on every ancestor of the file before the `.git`
     /// fallback.
     pub roots: Vec<String>,
+    /// argv that installs the server — the ecosystem's own one-liner, run by
+    /// `:lsp install`. Empty means there is none. See
+    /// `docs/specs/lsp-install.md`.
+    pub install: Vec<String>,
+    /// What `:lsp install` says when there is no one-liner — "clangd ships
+    /// with LLVM", for the ecosystems where a sentence is the honest answer.
+    pub install_hint: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { enabled: true, command: Vec::new(), filetypes: Vec::new(), roots: Vec::new() }
+        Self {
+            enabled: true,
+            command: Vec::new(),
+            filetypes: Vec::new(),
+            roots: Vec::new(),
+            install: Vec::new(),
+            install_hint: String::new(),
+        }
     }
 }
 
@@ -993,6 +1007,7 @@ mod tests {
                 command: vec!["rust-analyzer".into()],
                 filetypes: vec!["rust".into()],
                 roots: vec!["Cargo.toml".into()],
+                ..ServerConfig::default()
             },
         );
         Rig { registry, fake, servers, dir }

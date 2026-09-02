@@ -127,6 +127,8 @@ batteries included, and a binary that is not installed is a quiet fact `:lsp`
 reports, not an error bi nags about. A user's `[lsp.servers.<name>]` merges
 field-wise over the default of the same name, so overriding `command` alone
 keeps the filetypes and roots; `enabled = false` inside one turns it off.
+`:lsp install` runs the section's `install` one-liner to go and get the
+binary — see [lsp-install.md](lsp-install.md).
 
 **Attachment is lazy and lives in `settle`**: any buffer with a path and a
 filetype and no resolution yet gets one — find the server config claiming the

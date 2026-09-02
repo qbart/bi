@@ -2125,7 +2125,13 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             "" => ExLine::Lsp(LspCmd::Status),
             "restart" => ExLine::Lsp(LspCmd::Restart),
             "stop" => ExLine::Lsp(LspCmd::Stop),
-            _ => ExLine::Error("lsp takes restart, stop, or nothing for status".into()),
+            "install" => ExLine::Lsp(LspCmd::Install { filetype: None }),
+            _ => match arg.strip_prefix("install ") {
+                Some(ft) => ExLine::Lsp(LspCmd::Install { filetype: Some(ft.trim().into()) }),
+                None => {
+                    ExLine::Error("lsp takes restart, stop, install, or nothing for status".into())
+                }
+            },
         },
         "def" | "definition" => ExLine::Definition,
         "decl" | "declaration" => ExLine::Declaration,
@@ -2240,13 +2246,21 @@ enum CompleteWant {
     Manual,
 }
 
-/// What `:lsp` was asked to do. Three values because the core has three
-/// verbs: say where things stand, start over, stand down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a running install's thread puts its verdict for `settle` to find.
+type InstallSlot = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
+
+/// What `:lsp` was asked to do: say where things stand, start over, stand
+/// down — or go and get the server. See `docs/specs/lsp-install.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspCmd {
     Status,
     Restart,
     Stop,
+    /// `:lsp install` — the buffer's filetype; `:lsp install go` — the named
+    /// one, for installing ahead of need.
+    Install {
+        filetype: Option<String>,
+    },
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -2482,6 +2496,12 @@ pub struct Editor {
     /// names itself unrunnable rather than silently deferring to the server.
     /// See `docs/specs/fmt.md`.
     fmt_runner: Option<Box<dyn crate::fmt::Run>>,
+    /// How `:lsp install` runs an installer — frontend-supplied, like the
+    /// spawner and the fmt runner. See `docs/specs/lsp-install.md`.
+    installer: Option<Box<dyn lsp::transport::Installer>>,
+    /// An install begun and not yet reported: the server's name, and the slot
+    /// its thread fills. One at a time — the slot is the whole queue.
+    pending_install: Option<(String, InstallSlot)>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -2894,6 +2914,8 @@ impl Editor {
             git_baseline: None,
             next_disk_check: None,
             fmt_runner: None,
+            installer: None,
+            pending_install: None,
         };
         // The session's root, resolved once and stored — the single fact the
         // tree, the pickers and `:find` all read. Only `bi <dir>` / `:e
@@ -6741,6 +6763,9 @@ impl Editor {
     }
 
     pub fn settle(&mut self) {
+        // Before the attach pass: a finished install re-arms exactly the
+        // resolutions the attach below will then re-ask.
+        self.pump_install();
         self.attach_lsp();
         self.drain_edits();
         // After the drain: a completion or signature ask must trail the
@@ -8491,6 +8516,11 @@ impl Editor {
 
     /// `:lsp`, `:lsp restart`, `:lsp stop` — all about the focused buffer.
     fn run_lsp(&mut self, cmd: LspCmd) {
+        // Install first: with a named filetype it needs no buffer at all —
+        // installing ahead of need, from anywhere.
+        if let LspCmd::Install { filetype } = cmd {
+            return self.lsp_install(filetype);
+        }
         let Some(id) = self.window().buffer() else {
             self.session.status = "no buffer in this window".into();
             return;
@@ -8499,6 +8529,93 @@ impl Editor {
             LspCmd::Status => self.session.status = self.lsp_status(id),
             LspCmd::Restart => self.lsp_restart(id),
             LspCmd::Stop => self.lsp_stop(id),
+            LspCmd::Install { .. } => unreachable!("handled above"),
+        }
+    }
+
+    /// `:lsp install` — runs the server's `install` argv from the config, in
+    /// the background, through the frontend's [`lsp::transport::Installer`].
+    /// See `docs/specs/lsp-install.md`.
+    fn lsp_install(&mut self, filetype: Option<String>) {
+        let filetype = match filetype {
+            Some(ft) => ft,
+            None => {
+                let here = self.window().buffer().and_then(|id| self.entry(id).filetype);
+                match here {
+                    Some(ft) => ft.to_string(),
+                    None => {
+                        self.session.status =
+                            "no filetype here — `:lsp install <filetype>` names one".into();
+                        return;
+                    }
+                }
+            }
+        };
+        // The attach predicate, asked one more time.
+        let found = self
+            .config
+            .lsp
+            .servers
+            .iter()
+            .find(|(_, s)| s.enabled && s.filetypes.iter().any(|f| *f == filetype));
+        let Some((name, server)) = found else {
+            self.session.status = format!("no server claims {filetype}");
+            return;
+        };
+        let (name, install, hint) =
+            (name.clone(), server.install.clone(), server.install_hint.clone());
+
+        if let Some((running, _)) = &self.pending_install {
+            self.session.status = format!("still installing {running}");
+            return;
+        }
+        if install.is_empty() {
+            self.session.status = match hint.is_empty() {
+                false => hint,
+                true => {
+                    format!("no installer known for {name} — set install in [lsp.servers.{name}]")
+                }
+            };
+            return;
+        }
+        let Some(installer) = &self.installer else {
+            self.session.status = "this frontend runs no installers".into();
+            return;
+        };
+
+        let slot: InstallSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let filled = slot.clone();
+        let inbox = self.lsp.inbox().clone();
+        installer.begin(
+            &install,
+            Box::new(move |result| {
+                *filled.lock().expect("install slot poisoned") = Some(result);
+                // The next settle is a frame away, not a keystroke away.
+                inbox.wake();
+            }),
+        );
+        self.session.status = format!("installing {name}: {}", install.join(" "));
+        self.pending_install = Some((name, slot));
+    }
+
+    /// Turns a finished install into state: the report, and — on success —
+    /// every "no server" resolution asked again, because the binary that was
+    /// missing is the thing that just changed. Runs at the top of `settle`,
+    /// so the re-ask happens in the same pass.
+    fn pump_install(&mut self) {
+        let Some((_, slot)) = &self.pending_install else { return };
+        let Some(result) = slot.lock().expect("install slot poisoned").take() else { return };
+        let (name, _) = self.pending_install.take().expect("checked above");
+        match result {
+            Ok(()) => {
+                for entry in &mut self.buffers {
+                    if matches!(&entry.lsp, lsp::Attach::No { .. }) {
+                        entry.lsp = lsp::Attach::Unresolved;
+                    }
+                }
+                self.session.status = format!("{name} installed");
+            }
+            Err(e) => self.session.status = format!("{name} install failed: {e}"),
         }
     }
 
@@ -8603,6 +8720,12 @@ impl Editor {
     /// spawner above. See `docs/specs/fmt.md`.
     pub fn set_fmt_runner(&mut self, runner: impl crate::fmt::Run + 'static) {
         self.fmt_runner = Some(Box::new(runner));
+    }
+
+    /// Replaces how `:lsp install` runs installers — the same arrangement
+    /// again. See `docs/specs/lsp-install.md`.
+    pub fn set_lsp_installer(&mut self, installer: impl lsp::transport::Installer + 'static) {
+        self.installer = Some(Box::new(installer));
     }
 
     /// Session end: every server asked to leave, briefly waited for, then
@@ -21395,6 +21518,121 @@ int main(void) {
                 Inbound::Notification { method: "textDocument/publishDiagnostics".into(), params },
             );
             ed.settle();
+        }
+
+        /// Records what `:lsp install` asked for and holds the callback, so a
+        /// test decides when — and how — the install "finishes".
+        #[derive(Clone, Default)]
+        struct FakeInstall {
+            ran: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+            #[allow(clippy::type_complexity, reason = "a test double's pocket")]
+            done: std::sync::Arc<std::sync::Mutex<Vec<Box<dyn FnOnce(Result<(), String>) + Send>>>>,
+        }
+
+        impl crate::lsp::transport::Installer for FakeInstall {
+            fn begin(&self, argv: &[String], done: Box<dyn FnOnce(Result<(), String>) + Send>) {
+                self.ran.lock().unwrap().push(argv.to_vec());
+                self.done.lock().unwrap().push(done);
+            }
+        }
+
+        impl FakeInstall {
+            fn finish(&self, result: Result<(), String>) {
+                let done = self.done.lock().unwrap().pop().expect("an install to finish");
+                done(result);
+            }
+        }
+
+        /// The whole loop: the buffer's filetype picks the server, the argv
+        /// is the config's, and success re-arms attach — the resolution that
+        /// said "no spawner" is asked again and finds the one installed in
+        /// the meantime. See `docs/specs/lsp-install.md`.
+        #[test]
+        fn install_runs_the_configured_argv_and_success_rearms_attach() {
+            let dir = ScratchDir::new("lsp-install")
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", "fn main() {\n}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            ed.settle(); // resolves to Attach::No — there is no spawner yet
+
+            let install = FakeInstall::default();
+            ed.set_lsp_installer(install.clone());
+            ex(&mut ed, "lsp install");
+
+            assert!(ed.session.status.starts_with("installing rust-analyzer"), "{}", {
+                &ed.session.status
+            });
+            assert_eq!(
+                install.ran.lock().unwrap()[0],
+                ["rustup", "component", "add", "rust-analyzer"],
+                "the config's incantation, verbatim"
+            );
+
+            let fake = FakeSpawn::default();
+            ed.set_lsp_spawner(fake.clone());
+            install.finish(Ok(()));
+            ed.settle();
+
+            assert_eq!(ed.session.status, "rust-analyzer installed");
+            assert_eq!(fake.spawned.lock().unwrap().len(), 1, "attach asked again and spawned");
+        }
+
+        /// The argument covers installing ahead of need, from any buffer.
+        #[test]
+        fn install_with_an_argument_ignores_the_buffer_and_hints_stay_hints() {
+            let (_dir, mut ed, _fake) = project("install-arg");
+            let install = FakeInstall::default();
+            ed.set_lsp_installer(install.clone());
+
+            ex(&mut ed, "lsp install go");
+            assert_eq!(
+                install.ran.lock().unwrap()[0][..2],
+                ["go".to_string(), "install".to_string()],
+                "gopls's installer, from a rust buffer"
+            );
+
+            // One at a time — the slot is the whole queue.
+            ex(&mut ed, "lsp install rust");
+            assert_eq!(ed.session.status, "still installing gopls");
+
+            install.finish(Ok(()));
+            ed.settle();
+            ex(&mut ed, "lsp install c3");
+            assert_eq!(
+                ed.session.status, "build c3lsp from github.com/pherrymason/c3-lsp",
+                "a hint-only server prints the hint and runs nothing"
+            );
+            assert_eq!(install.ran.lock().unwrap().len(), 1);
+
+            ex(&mut ed, "lsp install zig");
+            assert_eq!(ed.session.status, "no server claims zig");
+        }
+
+        #[test]
+        fn a_failed_install_reports_the_verdict_and_clears_the_slot() {
+            let (_dir, mut ed, _fake) = project("install-fail");
+            let install = FakeInstall::default();
+            ed.set_lsp_installer(install.clone());
+
+            ex(&mut ed, "lsp install");
+            install.finish(Err("error: no such component".into()));
+            ed.settle();
+
+            assert_eq!(ed.session.status, "rust-analyzer install failed: error: no such component");
+            // The slot cleared: a new install starts rather than "still installing".
+            ex(&mut ed, "lsp install");
+            assert_eq!(install.ran.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn no_installer_and_no_filetype_each_say_so() {
+            let (_dir, mut ed, _fake) = project("install-none");
+            ex(&mut ed, "lsp install");
+            assert_eq!(ed.session.status, "this frontend runs no installers");
+
+            ex(&mut ed, "enew");
+            ex(&mut ed, "lsp install");
+            assert_eq!(ed.session.status, "no filetype here — `:lsp install <filetype>` names one");
         }
 
         #[test]

@@ -282,21 +282,29 @@ fn read_servers(
                         .push(Diagnostic { line, message: "enabled is true or false".into() }),
                 },
                 // The refusal that makes a project config safe to read at
-                // all: a repository does not get to name the binary bi runs.
-                "command" if local => problems.push(Diagnostic {
+                // all: a repository does not get to name a command bi runs —
+                // nor a hint, which is an instruction you are being asked to
+                // follow by whoever wrote the repo.
+                "command" | "install" | "install_hint" if local => problems.push(Diagnostic {
                     line,
-                    message: "command is not read from a project config".into(),
+                    message: format!("{field} is not read from a project config"),
                 }),
-                "command" | "filetypes" | "roots" => match string_list(item) {
+                "command" | "filetypes" | "roots" | "install" => match string_list(item) {
                     Some(list) => match field {
                         "command" => entry.command = list,
                         "filetypes" => entry.filetypes = list,
+                        "install" => entry.install = list,
                         _ => entry.roots = list,
                     },
                     None => problems.push(Diagnostic {
                         line,
                         message: format!("{field} takes a list of strings"),
                     }),
+                },
+                "install_hint" => match item.as_value().and_then(Value::as_str) {
+                    Some(hint) => entry.install_hint = hint.to_string(),
+                    None => problems
+                        .push(Diagnostic { line, message: "install_hint takes a string".into() }),
                 },
                 other => problems
                     .push(Diagnostic { line, message: format!("unknown server setting: {other}") }),
@@ -943,6 +951,33 @@ mod tests {
         let (config, problems) = ok("[lsp.servers.gopls]\ncommand = [\"gopls\", \"-remote\"]\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(config.lsp.servers["gopls"].command, ["gopls", "-remote"]);
+    }
+
+    /// The `:lsp install` fields, patching like the rest of the section —
+    /// and refused from a project config exactly as `command` is, hint
+    /// included: a hint is an instruction you are being asked to follow.
+    /// See `docs/specs/lsp-install.md`.
+    #[test]
+    fn install_and_its_hint_parse_and_a_local_config_gets_neither() {
+        let (config, problems) =
+            ok("[lsp.servers.gopls]\ninstall = [\"go\", \"install\", \"gopls@v1\"]\n\
+             [lsp.servers.clangd]\ninstall_hint = \"ask your package manager\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.lsp.servers["gopls"].install, ["go", "install", "gopls@v1"]);
+        assert_eq!(config.lsp.servers["gopls"].command, ["gopls"], "patched, not replaced");
+        assert_eq!(config.lsp.servers["clangd"].install_hint, "ask your package manager");
+
+        let src = "[lsp.servers.gopls]\ninstall = [\"evil\"]\ninstall_hint = \"run evil\"\n";
+        let (config, problems) = ok_local(src);
+        assert_eq!(
+            problems,
+            [
+                "2: install is not read from a project config",
+                "3: install_hint is not read from a project config"
+            ]
+        );
+        let default = &Config::default().lsp.servers["gopls"];
+        assert_eq!(config.lsp.servers["gopls"].install, default.install, "the built-in survives");
     }
 
     // ---- [fmt.tools.<name>] — see docs/specs/fmt.md --------------------
