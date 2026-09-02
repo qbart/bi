@@ -26,6 +26,7 @@ pub mod colors;
 pub mod complete;
 pub mod config;
 pub mod context;
+pub mod dap;
 pub mod decoration;
 pub mod editor;
 pub mod editorconfig;
