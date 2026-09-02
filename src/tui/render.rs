@@ -648,12 +648,35 @@ fn render_tree(
 /// a list of rows with one selected, and the selection is drawn in every such
 /// pane rather than only the focused one, because it is where the next Enter
 /// goes rather than where a text cursor is.
+/// A matched line arrives exactly as the file spelled it, tabs and control
+/// characters included — and a `\t` written into a cell is how the diff and
+/// the real terminal come to disagree, which reads as stale glyphs left
+/// behind after the pane closes. Tabs expand to the option's stops, other
+/// control characters are dropped; `col` runs across a row's segments so the
+/// stops land where the buffer view would put them.
+fn terminal_safe(text: &str, col: &mut usize, tab: usize) -> String {
+    let tab = tab.max(1);
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\t' {
+            let n = tab - (*col % tab);
+            out.extend(std::iter::repeat_n(' ', n));
+            *col += n;
+        } else if !ch.is_control() {
+            out.push(ch);
+            *col += char_width(ch);
+        }
+    }
+    out
+}
+
 fn render_results(
     frame: &mut Frame,
     results: &bi::results::Results,
     area: Rect,
     focused: bool,
     ui: &Ui,
+    tab: usize,
 ) -> Option<(u16, u16)> {
     use bi::results::Row;
 
@@ -694,6 +717,7 @@ fn render_results(
                         };
                         let mut out =
                             vec![Span::styled(format!("{:>6} ", m.line), tui(ui.gutter)), mark];
+                        let mut col = 0;
                         match bi::find_in_files::rewrite_line(
                             matcher,
                             &m.text,
@@ -705,16 +729,21 @@ fn render_results(
                                 let mut at = 0;
                                 for (from, to) in rewrite.spans {
                                     let (from, to) = (from.min(text.len()), to.min(text.len()));
-                                    out.push(Span::raw(text[at..from].iter().collect::<String>()));
+                                    let before = text[at..from].iter().collect::<String>();
+                                    out.push(Span::raw(terminal_safe(&before, &mut col, tab)));
+                                    let hit = text[from..to].iter().collect::<String>();
                                     out.push(Span::styled(
-                                        text[from..to].iter().collect::<String>(),
+                                        terminal_safe(&hit, &mut col, tab),
                                         tui(ui.search),
                                     ));
                                     at = to;
                                 }
-                                out.push(Span::raw(text[at..].iter().collect::<String>()));
+                                let after = text[at..].iter().collect::<String>();
+                                out.push(Span::raw(terminal_safe(&after, &mut col, tab)));
                             }
-                            None => out.push(Span::raw(m.text.clone())),
+                            None => {
+                                out.push(Span::raw(terminal_safe(&m.text, &mut col, tab)));
+                            }
                         }
                         out
                     }
@@ -727,12 +756,13 @@ fn render_results(
                             vec![Span::styled(format!("{:>6}  ", m.line), tui(ui.gutter))];
                         let text: Vec<char> = m.text.chars().collect();
                         let (from, to) = (m.col.min(text.len()), (m.col + m.len).min(text.len()));
-                        out.push(Span::raw(text[..from].iter().collect::<String>()));
-                        out.push(Span::styled(
-                            text[from..to].iter().collect::<String>(),
-                            tui(ui.search),
-                        ));
-                        out.push(Span::raw(text[to..].iter().collect::<String>()));
+                        let mut col = 0;
+                        let before = text[..from].iter().collect::<String>();
+                        out.push(Span::raw(terminal_safe(&before, &mut col, tab)));
+                        let hit = text[from..to].iter().collect::<String>();
+                        out.push(Span::styled(terminal_safe(&hit, &mut col, tab), tui(ui.search)));
+                        let after = text[to..].iter().collect::<String>();
+                        out.push(Span::raw(terminal_safe(&after, &mut col, tab)));
                         out
                     }
                 }
@@ -827,7 +857,8 @@ fn render_window(
     let (text, buffer, syntax, options) = match ed.pane(id)? {
         Pane::Text { text, buffer, syntax, options, .. } => (text, buffer, syntax, options),
         Pane::Results { results, .. } => {
-            return render_results(frame, results, text_area, focused, &ed.theme().ui);
+            let tab = ed.session.options.tab_width;
+            return render_results(frame, results, text_area, focused, &ed.theme().ui, tab);
         }
         Pane::Tree { tree, .. } => {
             return render_tree(
@@ -1766,6 +1797,26 @@ fn status_spans(
 mod tests {
     use super::*;
     use bi::editor::LineNumbers;
+
+    /// A `\t` written into a cell desyncs the diff from the real terminal,
+    /// which reads as stale glyphs after the pane closes. Expanded to the
+    /// stops instead, with the column running across segments; other control
+    /// characters are dropped.
+    #[test]
+    fn a_results_row_reaches_the_terminal_with_no_control_characters() {
+        let mut col = 0;
+        assert_eq!(terminal_safe("\tfn main()", &mut col, 4), "    fn main()");
+        assert_eq!(col, 13);
+
+        // The second segment's tab knows where the first one ended.
+        let mut col = 0;
+        let head = terminal_safe("ab", &mut col, 4);
+        let tail = terminal_safe("\tc", &mut col, 4);
+        assert_eq!(format!("{head}{tail}"), "ab  c", "two columns to the next stop");
+
+        let mut col = 0;
+        assert_eq!(terminal_safe("a\u{7}b\u{1b}c", &mut col, 4), "abc", "control bytes dropped");
+    }
 
     /// Any background will do for the padding tests below — they are about
     /// geometry, not colour.

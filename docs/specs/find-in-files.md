@@ -102,6 +102,22 @@ alternate, so `q` puts your file back. A split first is how you get both at
 once; that is one keystroke, and it saves this command a policy about where
 results ought to live.
 
+**Except a tree.** `:find` typed in the sidebar would replace the sidebar,
+and a results pane wearing the tree's column is neither thing done well. From
+a window that shows no text — the tree, an image — the results go to the last
+text window you were in, or the first one there is, and focus follows them;
+only a session with nowhere else to put them displaces the pane you are in.
+The same routing `Enter` on a tree file already does (`handoff_window`), asked
+one more time.
+
+**`q` and `Esc` put back what the pane displaced** — the window's alternate,
+the file you were reading before `:find` took the window. They do not close
+the window: closing it was how a results pane in one half of a split took the
+split down with it, your file included, which punished exactly the person who
+had arranged to keep both. A window with nothing displaced — no alternate to
+restore — closes instead, and the last window shows a buffer rather than
+closing, as ever.
+
 **Nothing found leaves the pane you were in.** An empty results pane that
 displaced your file in order to say "no" is a worse answer than a line of text
 saying the same thing.
@@ -223,6 +239,16 @@ that already exist:
 
 Nothing here re-runs the search: what comes back is the list as you left it,
 prunes and ✓s included. A search you want fresh is a search you type again.
+
+## Rows are terminal-safe
+
+A matched line arrives exactly as the file spelled it, tabs and control
+characters included, and a `\t` handed raw to the terminal is how a results
+pane leaves stale glyphs behind after it closes: the cell diff and the real
+screen disagree about where the cursor went. Rows render through the same
+discipline as buffer text — tabs expanded to the option's stops, other
+control characters dropped — so what the pane draws is exactly what the diff
+thinks it drew.
 
 ## Limits, said out loud
 
