@@ -556,11 +556,11 @@ fn string_list(item: &Item) -> Option<Vec<String>> {
     (strings.len() == array.len()).then_some(strings)
 }
 
-/// `leader`, `[keys.normal]`, `[keys.visual]`, `[keys.tree]`.
+/// `leader`, `[keys.normal]`, `[keys.visual]`, `[keys.tree]`, `[keys.debug]`.
 ///
-/// `[keys]` itself is one implicit table holding the three modes and the
+/// `[keys]` itself is one implicit table holding the four modes and the
 /// leader, which is how TOML reads a dotted header — so this is one section
-/// with sub-tables, not three sections, and a stray `[keys.nope]` is reported
+/// with sub-tables, not four sections, and a stray `[keys.nope]` is reported
 /// against its own line.
 ///
 /// `leader` is read in a pass of its own, before any binding, because a
@@ -587,7 +587,8 @@ fn read_keys(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<D
         }
         let line = line_for(table, name, src);
         let Some(mode) = KeyMode::from_section(name) else {
-            let message = format!("unknown key mode: {name} — try normal, visual, tree or leader");
+            let message =
+                format!("unknown key mode: {name} — try normal, visual, tree, debug or leader");
             problems.push(Diagnostic { line, message });
             continue;
         };
@@ -987,7 +988,7 @@ mod tests {
         assert!(ok("[keys]\nleader = \" \"\n").1.is_empty());
         assert_eq!(
             ok("[keys.nope]\n\"x\" = \"left\"\n").1,
-            ["1: unknown key mode: nope — try normal, visual, tree or leader"]
+            ["1: unknown key mode: nope — try normal, visual, tree, debug or leader"]
         );
     }
 

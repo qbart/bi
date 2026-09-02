@@ -94,6 +94,11 @@ pub struct Client {
     /// `"launch"` or `"attach"`; `body` is the adapter-specific JSON, passed
     /// through opaquely per the protocol's own design.
     stashed: Option<(String, Value)>,
+    /// The thread the last `stopped` event named. Cleared never — `pause`
+    /// has no thread of its own to send and reaches for whichever one bi
+    /// last saw stop, on the theory that most adapters pause every thread
+    /// regardless of which id the request carries.
+    last_thread: Option<i64>,
 }
 
 impl Client {
@@ -127,6 +132,7 @@ impl Client {
             pending: HashMap::new(),
             ready_to_configure: false,
             stashed: Some((request.to_string(), body)),
+            last_thread: None,
         };
         client.request(
             "initialize",
@@ -221,6 +227,13 @@ impl Client {
     /// `threads` → `stackTrace` → `scopes` → `variables`.
     pub fn on_stopped(&mut self, thread: i64) {
         self.phase = Phase::Stopped { thread };
+        self.last_thread = Some(thread);
+    }
+
+    /// The thread the last `stopped` event named — `pause`'s fallback when
+    /// the session is running and no thread is otherwise in hand.
+    pub fn last_thread(&self) -> Option<i64> {
+        self.last_thread
     }
 
     /// A `continued` event, or the local echo of a step/continue request

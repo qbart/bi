@@ -140,6 +140,12 @@ pub enum Mode {
     /// `s` — typing narrows what is matched on screen and a letter jumps to
     /// one. See `docs/specs/find.md`.
     Find,
+    /// A debug session is running and plain keys step it: `c`/`n`/`s`/`o`/`p`
+    /// continue and step, `b` toggles a breakpoint, `K` evaluates the word
+    /// under the cursor. Entered by `:debug` once a session launches; `Esc`
+    /// returns to `Normal` without touching the session, which keeps
+    /// running. See `docs/specs/debug.md`.
+    Debug,
 }
 
 impl Mode {
@@ -156,6 +162,7 @@ impl Mode {
             Mode::Pick => "PICK",
             Mode::Label => "LABEL",
             Mode::Find => "FIND",
+            Mode::Debug => "DEBUG",
         }
     }
 
@@ -423,6 +430,10 @@ pub enum Action {
     /// A key in a window holding a tree. Handled beside the two above, and for
     /// the same reason: it changes what a window shows.
     Tree(TreeCmd),
+    /// A key in `Mode::Debug`, `:debug` or `:break` — one step of a running
+    /// session, or the ex surface that starts, stops or attaches one. See
+    /// `docs/specs/debug.md`.
+    Debug(DebugCmd),
 }
 
 impl Action {
@@ -1740,6 +1751,9 @@ enum ExLine {
     /// `:lsp` — where this buffer stands with its language server; `:lsp
     /// restart` and `:lsp stop` manage the instance. See `docs/specs/lsp.md`.
     Lsp(LspCmd),
+    /// `:debug`, `:debug stop`, `:debug attach`, `:break` — see
+    /// `docs/specs/debug.md`.
+    Debug(DebugCmd),
     /// `:definition` — `gd`. See `docs/specs/lsp-requests.md`.
     Definition,
     /// `:decl` — the declaration: the header's side of the question, where
@@ -2134,6 +2148,15 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 }
             },
         },
+        "debug" => match arg {
+            "" => ExLine::Debug(DebugCmd::Start { name: None }),
+            "stop" => ExLine::Debug(DebugCmd::Stop),
+            "attach" => ExLine::Debug(DebugCmd::AttachPid),
+            name => ExLine::Debug(DebugCmd::Start { name: Some(name.to_string()) }),
+        },
+        // Reachable from Normal mode without taking `b`, which is already
+        // `word_backward`. See `DebugCmd::ToggleBreakpoint`.
+        "break" => ExLine::Debug(DebugCmd::ToggleBreakpoint),
         "def" | "definition" => ExLine::Definition,
         "decl" | "declaration" => ExLine::Declaration,
         "impl" | "implementation" => ExLine::Implementation,
@@ -2262,6 +2285,32 @@ pub enum LspCmd {
     Install {
         filetype: Option<String>,
     },
+}
+
+/// What a key in `Mode::Debug` — or `:debug`/`:break` typed instead — asks
+/// the active session to do. See `docs/specs/debug.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugCmd {
+    Continue,
+    StepOver,
+    StepIn,
+    StepOut,
+    Pause,
+    /// `b` in `Mode::Debug`, and `:break` from anywhere else — `b` is
+    /// already `word_backward` in `[keys.normal]`, so this is how the
+    /// toggle reaches Normal mode without taking it.
+    ToggleBreakpoint,
+    /// `K` — the word under the cursor, evaluated in the top frame.
+    Evaluate,
+    /// `:debug`, `:debug <name>` — starts the named `[[debug.launch]]`, or
+    /// the only one there is, or asks which when there are several.
+    Start {
+        name: Option<String>,
+    },
+    /// `:debug attach` — Task 13's pid picker.
+    AttachPid,
+    /// `:debug stop` — disconnects the active session.
+    Stop,
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -6177,6 +6226,7 @@ impl Editor {
             ExLine::Symbols => self.open_symbol_picker(),
             ExLine::Themes => self.open_theme_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
+            ExLine::Debug(cmd) => self.debug_command(cmd),
             ExLine::Definition => self.lsp_goto(lsp::Goto::Definition),
             ExLine::Declaration => self.lsp_goto(lsp::Goto::Declaration),
             ExLine::Implementation => self.lsp_goto(lsp::Goto::Implementation),
@@ -6703,6 +6753,7 @@ impl Editor {
             Action::Buffer(buffer_cmd) => self.run_buffer_cmd(buffer_cmd),
             Action::Window(window_cmd) => self.run_window_cmd(window_cmd),
             Action::Tree(tree_cmd) => self.run_tree_cmd(tree_cmd),
+            Action::Debug(debug_cmd) => self.debug_command(debug_cmd),
             Action::Results(results_cmd) => {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
             }
@@ -7040,30 +7091,198 @@ impl Editor {
         }
     }
 
-    /// Resolves `name` against `[[debug.launch]]` and starts it. A
-    /// temporary, minimal surface — Task 9's `DebugCmd::Start` supersedes
-    /// this with the real `:debug` command.
+    /// A thin shim over [`Editor::debug_command`]`(DebugCmd::Start { .. })`,
+    /// kept for the callers (and tests) that named a launch config directly
+    /// before `:debug` existed. Prefer `:debug <name>` — this is the same
+    /// path, just without the ex line around it.
     pub fn debug_launch(&mut self, name: &str) {
+        self.debug_command(DebugCmd::Start { name: Some(name.to_string()) });
+    }
+
+    /// What `[keys.debug]`, `:debug` and `:break` all funnel into. See
+    /// `docs/specs/debug.md` for the semantics each arm implements.
+    fn debug_command(&mut self, cmd: DebugCmd) {
+        match cmd {
+            DebugCmd::Start { name } => self.debug_start(name),
+            DebugCmd::Stop => self.debug_stop(),
+            DebugCmd::Continue => self.debug_resume("continue", dap::client::Intent::Continue),
+            DebugCmd::StepOver => self.debug_resume("next", dap::client::Intent::Step),
+            DebugCmd::StepIn => self.debug_resume("stepIn", dap::client::Intent::Step),
+            DebugCmd::StepOut => self.debug_resume("stepOut", dap::client::Intent::Step),
+            DebugCmd::Pause => self.debug_pause(),
+            DebugCmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
+            DebugCmd::Evaluate => self.debug_evaluate(),
+            // Task 13's pid picker.
+            DebugCmd::AttachPid => self.session.status = "attach: not yet".into(),
+        }
+    }
+
+    /// `:debug` / `:debug <name>`. Resolves `name` against
+    /// `[[debug.launch]]` and starts it — or, with no name, starts the only
+    /// configured launch, lists the choices when there are several, or just
+    /// re-enters `Mode::Debug` when a session is already running.
+    fn debug_start(&mut self, name: Option<String>) {
         if !self.config.debug.enabled {
             self.session.status = "debug is off (`enabled = false` in [debug])".into();
             return;
         }
+        let name = match name {
+            Some(name) => name,
+            // A bare `:debug` while a session is already up is a way back
+            // into the mode, not a second launch.
+            None if self.dap.active().is_some() => {
+                self.session.mode = Mode::Debug;
+                return;
+            }
+            None => match self.config.debug.launch.as_slice() {
+                [] => {
+                    self.session.status = "no [[debug.launch]] configured".into();
+                    return;
+                }
+                [only] => only.name.clone(),
+                many => {
+                    let names: Vec<&str> = many.iter().map(|l| l.name.as_str()).collect();
+                    self.session.status = format!("which? `:debug <name>`: {}", names.join(", "));
+                    return;
+                }
+            },
+        };
         let Some(launch) = self.config.debug.launch.iter().find(|l| l.name == name) else {
-            self.session.status = format!("debug: no launch config named {name:?}");
+            self.session.status = format!("debug: no launch config named {name}");
             return;
         };
         let Some(adapter) = self.config.debug.adapters.get(&launch.adapter) else {
-            self.session.status = format!("debug: no adapter named {:?}", launch.adapter);
+            self.session.status = format!("debug: no adapter named {}", launch.adapter);
             return;
         };
         let root = self.session_root();
-        let name = launch.name.clone();
+        let launch_name = launch.name.clone();
         let command = adapter.command.clone();
         let request = launch.request.clone();
         let body = launch.body.clone();
-        if let Err(reason) = self.dap.launch(&name, &command, &root, &request, body) {
-            self.session.status = format!("debug: {reason}");
+        match self.dap.launch(&launch_name, &command, &root, &request, body) {
+            Ok(_) => self.session.mode = Mode::Debug,
+            Err(reason) => self.session.status = format!("debug: {reason}"),
         }
+    }
+
+    /// `:debug stop`. Disconnects the active session and leaves
+    /// `Mode::Debug` if it was up — the session ends either way, so the mode
+    /// that only makes sense while one is running should not linger.
+    fn debug_stop(&mut self) {
+        let Some(client) = self.dap.active_mut() else {
+            self.session.status = "debug: no active session".into();
+            return;
+        };
+        client.disconnect(true, std::time::Duration::from_millis(500));
+        self.session.status = "debug: stopped".into();
+        if self.session.mode == Mode::Debug {
+            self.session.mode = Mode::Normal;
+        }
+    }
+
+    /// `c`/`n`/`s`/`o` — continue or step. Only meaningful while the session
+    /// is parked at a `stopped` event; `on_continued` is the local echo that
+    /// resumes the phase optimistically, ahead of the `continued`/`stopped`
+    /// event that confirms or corrects it.
+    fn debug_resume(&mut self, command: &str, intent: dap::client::Intent) {
+        let Some(client) = self.dap.active_mut() else {
+            self.session.status = "debug: no active session".into();
+            return;
+        };
+        let dap::client::Phase::Stopped { thread } = client.phase else {
+            self.session.status = "not stopped".into();
+            return;
+        };
+        client.request(command, serde_json::json!({ "threadId": thread }), intent);
+        client.on_continued();
+    }
+
+    /// `p` — pause a running session. `last_thread` is the client's memory
+    /// of the last thread a `stopped` event named; DAP's `pause` still wants
+    /// a thread id even though most adapters pause every thread regardless.
+    fn debug_pause(&mut self) {
+        let Some(client) = self.dap.active_mut() else {
+            self.session.status = "debug: no active session".into();
+            return;
+        };
+        if !client.running() {
+            self.session.status = "not running".into();
+            return;
+        }
+        let thread = client.last_thread().unwrap_or(1);
+        let intent = dap::client::Intent::Pause;
+        client.request("pause", serde_json::json!({ "threadId": thread }), intent);
+    }
+
+    /// `b` in `Mode::Debug`, and `:break` from anywhere. Toggles the
+    /// cursor's row in the focused buffer, then — only while a session is
+    /// active — re-pushes every breakpoint in the file, in the order
+    /// [`dap::Registry::breakpoints_for`] holds them, since the registry
+    /// zips the answer back positionally.
+    fn debug_toggle_breakpoint(&mut self) {
+        let Some(path) = self.buffer().and_then(|b| b.path.clone()) else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        let Some(row) = self.cursor_row() else {
+            self.session.status = "no cursor here".into();
+            return;
+        };
+        let now_set = self.dap.toggle_breakpoint(&path, row);
+        if self.dap.active().is_some() {
+            let breakpoints: Vec<serde_json::Value> = self
+                .dap
+                .breakpoints_for(&path)
+                .iter()
+                .map(|bp| serde_json::json!({ "line": bp.line + 1 }))
+                .collect();
+            let source = serde_json::json!({ "path": path.to_string_lossy() });
+            if let Some(client) = self.dap.active_mut() {
+                client.request(
+                    "setBreakpoints",
+                    serde_json::json!({ "source": source, "breakpoints": breakpoints }),
+                    dap::client::Intent::SetBreakpoints { path: path.clone() },
+                );
+            }
+        }
+        self.session.status = match now_set {
+            true => format!("breakpoint set line {}", row + 1),
+            false => format!("breakpoint cleared line {}", row + 1),
+        };
+    }
+
+    /// `K` in `Mode::Debug` — the word under the cursor, evaluated in the
+    /// stopped session's top frame. The float that shows the answer is Task
+    /// 13's; for now `pump_dap`'s `Effect::Evaluated` arm puts it on the
+    /// status line.
+    fn debug_evaluate(&mut self) {
+        let Some(cursor) = self.cursor() else {
+            self.session.status = "no cursor here".into();
+            return;
+        };
+        let Some(buffer) = self.buffer() else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        let Some((start, end)) = buffer.word_at(cursor) else {
+            self.session.status = "no word under the cursor".into();
+            return;
+        };
+        let expr = buffer.slice(start, end);
+        let Some(client) = self.dap.active_mut() else {
+            self.session.status = "debug: no active session".into();
+            return;
+        };
+        if !matches!(client.phase, dap::client::Phase::Stopped { .. }) {
+            self.session.status = "not stopped".into();
+            return;
+        }
+        client.request(
+            "evaluate",
+            serde_json::json!({ "expression": expr, "context": "hover" }),
+            dap::client::Intent::Evaluate { context: dap::client::EvalContext::Hover, expr },
+        );
     }
 
     /// `didOpen` for any attached document whose server has finished its
@@ -10371,6 +10590,7 @@ impl View<'_> {
             | Action::Buffer(_)
             | Action::Window(_)
             | Action::Tree(_)
+            | Action::Debug(_)
             | Action::Results(_) => {}
         }
     }
@@ -23104,6 +23324,22 @@ int main(void) {
         }
     }
 
+    #[test]
+    fn colon_debug_parses_to_a_start_command() {
+        assert_eq!(parse_ex("debug"), Some(ExLine::Debug(DebugCmd::Start { name: None })));
+        assert_eq!(parse_ex("debug stop"), Some(ExLine::Debug(DebugCmd::Stop)));
+        assert_eq!(parse_ex("debug attach"), Some(ExLine::Debug(DebugCmd::AttachPid)));
+        assert_eq!(
+            parse_ex("debug run tests"),
+            Some(ExLine::Debug(DebugCmd::Start { name: Some("run tests".into()) }))
+        );
+    }
+
+    #[test]
+    fn colon_break_parses_to_toggle_breakpoint() {
+        assert_eq!(parse_ex("break"), Some(ExLine::Debug(DebugCmd::ToggleBreakpoint)));
+    }
+
     /// The editor's half of DAP: `debug_launch` driving the registry through
     /// `settle`. The protocol itself is tested in `src/dap/`; here the
     /// adapter is a fake and the interest is the wiring. See
@@ -23166,6 +23402,61 @@ int main(void) {
             ed.debug_launch("run tests");
 
             assert!(ed.session.status.contains("off"), "{}", ed.session.status);
+        }
+
+        // ---- the `:debug` surface --------------------------------------------
+
+        #[test]
+        fn colon_debug_enters_debug_mode_and_launches() {
+            let (_dir, mut ed, fake) = project("colon-debug");
+
+            ex(&mut ed, "debug run tests");
+            ed.settle();
+
+            assert_eq!(ed.session.mode, Mode::Debug);
+            assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
+        }
+
+        /// Drives a session all the way to `Stopped { thread: 7 }` through the
+        /// fake, the way a real handshake would: `initialize` answered,
+        /// `initialized` (no breakpoints, so `configurationDone` fires with no
+        /// `PushBreakpoints` effect to answer), then `stopped`.
+        fn stopped_at_thread_7(ed: &mut Editor, fake: &FakeSpawn) {
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            fake.event(SessionId(0), "stopped", json!({ "reason": "breakpoint", "threadId": 7 }));
+            ed.settle();
+        }
+
+        #[test]
+        fn step_over_sends_next_with_the_stopped_thread() {
+            let (_dir, mut ed, fake) = project("step-over");
+            stopped_at_thread_7(&mut ed, &fake);
+
+            ed.debug_command(DebugCmd::StepOver);
+
+            let sent = fake.last(SessionId(0), "next").expect("next sent");
+            assert_eq!(sent["arguments"]["threadId"], json!(7));
+        }
+
+        #[test]
+        fn toggle_breakpoint_while_running_repushes() {
+            let (_dir, mut ed, fake) = project("toggle-bp-repush");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+
+            ed.debug_command(DebugCmd::ToggleBreakpoint);
+
+            let sent = fake.last(SessionId(0), "setBreakpoints").expect("setBreakpoints sent");
+            assert_eq!(sent["arguments"]["breakpoints"][0]["line"], json!(1));
         }
 
         // ---- gutter: breakpoints and the stopped line -----------------------

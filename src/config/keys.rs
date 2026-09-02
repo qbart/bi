@@ -31,6 +31,11 @@ pub enum KeyMode {
     Normal,
     Visual,
     Tree,
+    /// `Mode::Debug` — plain keys stepping a running session. Borrows from
+    /// `Normal` the same way `Tree` does: its own vocabulary first, then
+    /// whatever `[keys.normal]` says for keys it does not claim. See
+    /// `docs/specs/debug.md`.
+    Debug,
 }
 
 impl KeyMode {
@@ -40,6 +45,7 @@ impl KeyMode {
             "normal" => Self::Normal,
             "visual" => Self::Visual,
             "tree" => Self::Tree,
+            "debug" => Self::Debug,
             _ => return None,
         })
     }
@@ -430,6 +436,16 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Tree, "window_focus_right", "<C-w>l"),
     (KeyMode::Tree, "tree_first", "gg"),
     (KeyMode::Tree, "tree_toggle_hidden", "gh"),
+    // `Mode::Debug`, whose own vocabulary is plain letters over the source
+    // window — everything else falls through to `[keys.normal]`.
+    (KeyMode::Debug, "debug_continue", "c"),
+    (KeyMode::Debug, "debug_step_over", "n"),
+    (KeyMode::Debug, "debug_step_in", "s"),
+    (KeyMode::Debug, "debug_step_out", "o"),
+    (KeyMode::Debug, "debug_pause", "p"),
+    (KeyMode::Debug, "debug_toggle_breakpoint", "b"),
+    (KeyMode::Debug, "debug_evaluate", "K"),
+    (KeyMode::Debug, "debug_leave", "<Esc>"),
 ];
 
 /// The keys `name` already means in `mode`.
@@ -438,7 +454,11 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
 /// anything visual does not claim, so a motion rebound there has to reach the
 /// same place.
 pub fn key_for_name(mode: KeyMode, name: &str) -> Option<Vec<Key>> {
-    let lookup = if mode == KeyMode::Tree { KeyMode::Tree } else { KeyMode::Normal };
+    let lookup = match mode {
+        KeyMode::Tree => KeyMode::Tree,
+        KeyMode::Debug => KeyMode::Debug,
+        _ => KeyMode::Normal,
+    };
     let spelling = NAMES.iter().find(|(m, n, _)| *m == lookup && *n == name).map(|(_, _, k)| *k)?;
     // No name spells `<leader>`: these are bi's own keys, not a user's.
     parse_keys(spelling, None).ok()
@@ -453,9 +473,12 @@ pub fn key_for_name(mode: KeyMode, name: &str) -> Option<Vec<Key>> {
 /// file a menu rather than a replacement.
 pub fn listing() -> String {
     let mut out = String::new();
-    for (mode, section) in
-        [(KeyMode::Normal, "normal"), (KeyMode::Visual, "visual"), (KeyMode::Tree, "tree")]
-    {
+    for (mode, section) in [
+        (KeyMode::Normal, "normal"),
+        (KeyMode::Visual, "visual"),
+        (KeyMode::Tree, "tree"),
+        (KeyMode::Debug, "debug"),
+    ] {
         out.push_str(&format!("[keys.{section}]\n"));
         if mode == KeyMode::Visual {
             out.push_str(
@@ -496,7 +519,11 @@ pub fn listing() -> String {
 /// `g` asked for — but silence would be a trap, and every name here can be
 /// bound back by name.
 pub fn shadowed(mode: KeyMode, bound: &[Key]) -> Vec<&'static str> {
-    let lookup = if mode == KeyMode::Tree { KeyMode::Tree } else { KeyMode::Normal };
+    let lookup = match mode {
+        KeyMode::Tree => KeyMode::Tree,
+        KeyMode::Debug => KeyMode::Debug,
+        _ => KeyMode::Normal,
+    };
     let Some(&first) = bound.first() else { return Vec::new() };
     NAMES
         .iter()
@@ -516,7 +543,11 @@ pub fn shadowed(mode: KeyMode, bound: &[Key]) -> Vec<&'static str> {
 /// none, so the answer is also dropped when it is not close — more than a
 /// third of the name rewritten is a different name, not a typo.
 pub fn nearest_name(mode: KeyMode, name: &str) -> Option<&'static str> {
-    let lookup = if mode == KeyMode::Tree { KeyMode::Tree } else { KeyMode::Normal };
+    let lookup = match mode {
+        KeyMode::Tree => KeyMode::Tree,
+        KeyMode::Debug => KeyMode::Debug,
+        _ => KeyMode::Normal,
+    };
     let (best, distance) = NAMES
         .iter()
         .filter(|(m, _, _)| *m == lookup)

@@ -11,7 +11,7 @@
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{
-    Action, BufferCmd, CmdMove, Command, FileOp, Mode, ResultsCmd, TreeCmd, WindowCmd,
+    Action, BufferCmd, CmdMove, Command, DebugCmd, FileOp, Mode, ResultsCmd, TreeCmd, WindowCmd,
 };
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -209,11 +209,13 @@ impl Input {
     /// has to be rebound here too or `v` then `j` would disagree with a bare
     /// `j`.
     ///
-    /// **A tree borrows the keys it has no meaning for.** Its own vocabulary
-    /// comes first, which is what stops `"j" = "left"` from turning `j` into
-    /// "collapse" in a pane sitting on a filesystem. Everything else falls
-    /// through: `"<C-b>" = "window_tree"` has to close the sidebar it opened,
-    /// and nothing in a tree spells `<C-b>`.
+    /// **A tree, and `Mode::Debug`, borrow the keys they have no meaning
+    /// for.** Each one's own vocabulary comes first, which is what stops
+    /// `"j" = "left"` from turning `j` into "collapse" in a pane sitting on
+    /// a filesystem, and what keeps a rebound `s` from taking `Mode::Debug`'s
+    /// step-in. Everything else falls through: `"<C-b>" = "window_tree"` has
+    /// to close the sidebar it opened, and `hjkl` keeps moving the cursor
+    /// while a session is stepped.
     ///
     /// The test is the *key*, not how long the binding is. Borrowing sequences
     /// only stood in for this first, and got the common case wrong — one key
@@ -223,15 +225,21 @@ impl Input {
     /// Claiming a prefix claims the whole sequence: `g` is the tree's `gg` and
     /// `gh`, so a normal-mode `"gd"` never fires here. The check is on the
     /// first key for that reason, and it runs ahead of [`Lookup::Prefix`] so a
-    /// half-typed borrow cannot swallow a key the tree needs.
+    /// half-typed borrow cannot swallow a key the tree — or the debugger —
+    /// needs.
     fn borrowed_from_normal(&self, mode: KeyMode) -> Lookup {
         let found = match mode {
             KeyMode::Normal => return Lookup::Miss,
             _ => self.keys.lookup(KeyMode::Normal, &self.remap_pending),
         };
+        let claims = match mode {
+            KeyMode::Tree => self.remap_pending.first().is_some_and(|&k| self.tree_claims(k)),
+            KeyMode::Debug => self.remap_pending.first().is_some_and(|&k| self.debug_claims(k)),
+            _ => false,
+        };
         match mode {
             KeyMode::Visual => found,
-            _ if self.remap_pending.first().is_some_and(|&k| self.tree_claims(k)) => Lookup::Miss,
+            _ if claims => Lookup::Miss,
             _ => found,
         }
     }
@@ -262,6 +270,7 @@ impl Input {
             Mode::Normal if content == ContentKind::Results => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
+            Mode::Debug => KeyMode::Debug,
             _ => {
                 self.remap_pending.clear();
                 return Remapped::Same(key);
@@ -346,6 +355,7 @@ impl Input {
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
             Mode::Visual(kind) => self.visual(key, *kind),
+            Mode::Debug => self.debug(key),
             Mode::Insert => Self::insert(key),
             Mode::Replace => Self::replace(key),
             Mode::Command(_) => Self::command_line(key),
@@ -813,6 +823,37 @@ impl Input {
             }
         };
         self.plain(Action::Tree(tree_cmd))
+    }
+
+    /// `Mode::Debug`'s own vocabulary, over a source window: `c`/`n`/`s`/`o`
+    /// step the session, `p` pauses it, `b` toggles a breakpoint, `K`
+    /// evaluates the word under the cursor, and `Esc` leaves the mode
+    /// without touching the session. Falls through to `normal` for anything
+    /// it does not claim, so `hjkl` and the rest of the grammar keep working
+    /// while a session is stepped — see [`Input::borrowed_from_normal`] for
+    /// the same rule applied to a `[keys.normal]` rebind.
+    fn debug(&mut self, key: Key) -> Option<Command> {
+        let action = match key.code {
+            KeyCode::Char('c') => Action::Debug(DebugCmd::Continue),
+            KeyCode::Char('n') => Action::Debug(DebugCmd::StepOver),
+            KeyCode::Char('s') => Action::Debug(DebugCmd::StepIn),
+            KeyCode::Char('o') => Action::Debug(DebugCmd::StepOut),
+            KeyCode::Char('p') => Action::Debug(DebugCmd::Pause),
+            KeyCode::Char('b') => Action::Debug(DebugCmd::ToggleBreakpoint),
+            KeyCode::Char('K') => Action::Debug(DebugCmd::Evaluate),
+            KeyCode::Esc => Action::EnterNormal,
+            _ => return self.normal(key),
+        };
+        self.plain(action)
+    }
+
+    /// Whether `Mode::Debug`'s own keymap has a meaning for `key` —
+    /// [`Input::debug`]'s allowlist as a predicate, the same role
+    /// [`Input::tree_claims`] plays for a tree. Asked by
+    /// [`Input::borrowed_from_normal`] before letting a `[keys.normal]`
+    /// binding through to the debugger.
+    fn debug_claims(&self, key: Key) -> bool {
+        matches!(key.code, KeyCode::Char('c' | 'n' | 's' | 'o' | 'p' | 'b' | 'K') | KeyCode::Esc)
     }
 
     fn normal(&mut self, key: Key) -> Option<Command> {
@@ -1624,6 +1665,21 @@ mod tests {
         in_tree(keys).unwrap_or_else(|| panic!("{keys:?} produced no command")).action
     }
 
+    /// Feeds `keys` to a window in `Mode::Debug`, returning what the last one
+    /// resolved to.
+    fn in_debug(keys: &str) -> Option<Command> {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in keys.chars() {
+            last = input.on_key(key(c), &Mode::Debug, ContentKind::Text);
+        }
+        last
+    }
+
+    fn debug_action(keys: &str) -> Action {
+        in_debug(keys).unwrap_or_else(|| panic!("{keys:?} produced no command")).action
+    }
+
     fn shifted(code: KeyCode) -> Key {
         Key { code, mods: crate::key::Mods { shift: true, ..Default::default() } }
     }
@@ -2196,6 +2252,33 @@ leader = \" \"
         assert_eq!(cmd.action, Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }));
 
         assert_eq!(tree_action(":"), Action::EnterCommandMode);
+    }
+
+    /// `Mode::Debug`'s own keys: the seven `DebugCmd`s a source window
+    /// reaches without leaving the mode.
+    #[test]
+    fn debug_keys_map_to_step_commands() {
+        assert_eq!(debug_action("c"), Action::Debug(DebugCmd::Continue));
+        assert_eq!(debug_action("n"), Action::Debug(DebugCmd::StepOver));
+        assert_eq!(debug_action("s"), Action::Debug(DebugCmd::StepIn));
+        assert_eq!(debug_action("o"), Action::Debug(DebugCmd::StepOut));
+        assert_eq!(debug_action("p"), Action::Debug(DebugCmd::Pause));
+        assert_eq!(debug_action("b"), Action::Debug(DebugCmd::ToggleBreakpoint));
+        assert_eq!(debug_action("K"), Action::Debug(DebugCmd::Evaluate));
+    }
+
+    /// `Esc` leaves the mode; anything else `Mode::Debug` does not claim
+    /// falls through to `normal` unchanged, so motions still work while a
+    /// session is being stepped.
+    #[test]
+    fn debug_esc_leaves_and_unclaimed_keys_fall_through_to_normal() {
+        let mut input = Input::default();
+        let esc = input
+            .on_key(Key::code(KeyCode::Esc), &Mode::Debug, ContentKind::Text)
+            .expect("resolved");
+        assert_eq!(esc.action, Action::EnterNormal);
+
+        assert_eq!(debug_action("j"), Action::Move(Motion::Down));
     }
 
     /// `<C-n>` takes a match, `<C-x>` passes it over. They are the same

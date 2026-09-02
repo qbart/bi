@@ -313,4 +313,8 @@ filetypes = ["c", "cpp"]
 leader = " "
 
 # The rest of the keymap is still `match` arms in src/input.rs; only your
-# overrides live in [keys.normal], [keys.visual] and [keys.tree].
+# overrides live in [keys.normal], [keys.visual], [keys.tree] and
+# [keys.debug] — the last is Mode::Debug, entered by `:debug` once a session
+# launches: "c" continues, "n"/"s"/"o" step over/in/out, "p" pauses, "b"
+# toggles a breakpoint, "K" evaluates the word under the cursor, and Esc
+# leaves the mode without touching the session.
