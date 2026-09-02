@@ -112,6 +112,12 @@ git_add      = "#84b360"                             # green
 git_change   = "#ffa14f"                             # orange, its DiffChange
 git_delete   = "#ff8170"                             # red, its DiffDelete
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#ff8170"             # red, same as diag_error/git_delete
+debug_breakpoint_unverified  = "#7f8c98"             # base5, dim
+debug_breakpoint_conditional = "#b281eb"             # todo_perf's purple
+debug_stopped                = "#84b360"             # git_add's green
+
 # The airline theme's normal, insert and visual sections, verbatim.
 mode_normal = { fg = "#292a30", bg = "#7f8c98", bold = true }
 mode_insert = { fg = "#292a30", bg = "#d9c97c", bold = true }

@@ -3451,7 +3451,22 @@ impl Editor {
             );
         }
         if options.color_swatches {
-            color_swatches(buffer, rows, &mut out);
+            color_swatches(buffer, rows.clone(), &mut out);
+        }
+        // The stopped line: the gutter's `▶` names the row, this repaints the
+        // row itself, so the line the program is on reads as a whole rather
+        // than only its gutter cell.
+        if let Some((path, row)) = self.dap.stopped_at()
+            && buffer.path.as_deref() == Some(path)
+            && rows.contains(&row)
+        {
+            let start = buffer.rope().line_to_char(row);
+            let end = start + buffer.line_len(row);
+            out.push(crate::decoration::Decoration::Repaint {
+                range: start..end,
+                style: self.theme.ui.debug_stopped,
+                layer: crate::decoration::Layer::Under,
+            });
         }
         if let Some(flash) = &self.session.flash
             && self.window_of(window).and_then(Window::buffer) == Some(flash.buffer)
@@ -8800,6 +8815,17 @@ impl Editor {
         self.dap.set_spawner(spawner);
     }
 
+    /// The debug registry — sessions and the editor-owned breakpoint store.
+    pub fn dap(&self) -> &dap::Registry {
+        &self.dap
+    }
+
+    /// The debug registry, mutably — how a test (and, soon, `Mode::Debug`'s
+    /// keys) toggles breakpoints and drives sessions.
+    pub fn dap_mut(&mut self) -> &mut dap::Registry {
+        &mut self.dap
+    }
+
     /// Replaces how external formatters run — the same arrangement as the
     /// spawner above. See `docs/specs/fmt.md`.
     pub fn set_fmt_runner(&mut self, runner: impl crate::fmt::Run + 'static) {
@@ -8967,6 +8993,21 @@ impl Editor {
         }
     }
 
+    /// The theme's style for one breakpoint: dim when unverified, a third
+    /// colour when conditional (which wins over dim — a condition is worth
+    /// knowing about even before the adapter confirms the line), plain
+    /// otherwise. The stopped-line arrow has its own key, read directly by
+    /// `gutter_signs` since it names no `Breakpoint`.
+    fn debug_style(&self, bp: &dap::Breakpoint) -> crate::theme::Style {
+        if bp.conditional {
+            self.theme.ui.debug_breakpoint_conditional
+        } else if !bp.verified {
+            self.theme.ui.debug_breakpoint_unverified
+        } else {
+            self.theme.ui.debug_breakpoint
+        }
+    }
+
     /// The gutter cell's marks for the rows on screen: `(row, sign, style)`.
     ///
     /// Its own call rather than a decoration, because the gutter has always
@@ -9012,6 +9053,29 @@ impl Editor {
                 // marks a range of text, and this is a mark about the line.
                 let style = crate::theme::Style { underline: false, ..self.diag_style(sev) };
                 cells.insert(row, ('•', style));
+            }
+        }
+        // The debugger's own two tenants, over git and diagnostics both: a
+        // breakpoint is a decision the user made about this exact line,
+        // which outranks what the tools found wrong with it. `moved_to`
+        // wins the row when the adapter placed the breakpoint somewhere
+        // other than where it was requested — the sign belongs where the
+        // adapter says it landed, not where it was asked for.
+        if let Some(path) = buffer.path.as_deref() {
+            for bp in self.dap.breakpoints_for(path) {
+                let row = bp.moved_to.unwrap_or(bp.line);
+                if rows.contains(&row) {
+                    cells.insert(row, ('●', self.debug_style(bp)));
+                }
+            }
+            // The stopped line last: it wins the cell over a breakpoint on
+            // the same row, since "the program is here right now" outranks
+            // "a breakpoint is set here".
+            if let Some((stopped_path, row)) = self.dap.stopped_at()
+                && stopped_path == path
+                && rows.contains(&row)
+            {
+                cells.insert(row, ('▶', self.theme.ui.debug_stopped));
             }
         }
         cells.into_iter().map(|(row, (sign, style))| (row, sign, style)).collect()
@@ -23094,6 +23158,71 @@ int main(void) {
             ed.debug_launch("run tests");
 
             assert!(ed.session.status.contains("off"), "{}", ed.session.status);
+        }
+
+        // ---- gutter: breakpoints and the stopped line -----------------------
+
+        #[test]
+        fn a_breakpoint_shows_a_dot_in_the_gutter() {
+            let (_dir, mut ed, _fake) = project("bp-dot");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ed.dap_mut().toggle_breakpoint(&path, 0);
+
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+
+            assert!(signs.iter().any(|&(row, ch, _)| row == 0 && ch == '●'), "{signs:?}");
+        }
+
+        #[test]
+        fn an_unverified_breakpoint_is_dim() {
+            let (_dir, mut ed, _fake) = project("bp-dim");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ed.dap_mut().toggle_breakpoint(&path, 0);
+            let unverified = ed.gutter_signs(ed.focus(), 0..2);
+            let unverified_style = unverified.iter().find(|&(row, ..)| *row == 0).unwrap().2;
+
+            // Wire line 1 (1-based) == row 0 — verified, unmoved.
+            ed.dap_mut().set_verified(
+                &path,
+                &[dap::types::Breakpoint { verified: true, line: Some(1), message: None }],
+            );
+            let verified = ed.gutter_signs(ed.focus(), 0..2);
+            let verified_style = verified.iter().find(|&(row, ..)| *row == 0).unwrap().2;
+
+            assert_ne!(unverified_style, verified_style, "unverified should read as dim");
+        }
+
+        #[test]
+        fn the_stopped_line_shows_an_arrow_over_a_breakpoint() {
+            let (_dir, mut ed, _fake) = project("bp-stopped");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ed.dap_mut().toggle_breakpoint(&path, 0);
+
+            ed.dap_mut().set_stopped_at(path, 0);
+
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert_eq!(
+                signs.iter().find(|&(r, ..)| *r == 0).map(|&(_, ch, _)| ch),
+                Some('▶'),
+                "{signs:?}"
+            );
+        }
+
+        #[test]
+        fn a_moved_breakpoint_draws_at_its_new_row() {
+            let (_dir, mut ed, _fake) = project("bp-moved");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ed.dap_mut().toggle_breakpoint(&path, 0);
+
+            // Wire line 2 (1-based) == row 1 — moved off the requested row 0.
+            ed.dap_mut().set_verified(
+                &path,
+                &[dap::types::Breakpoint { verified: true, line: Some(2), message: None }],
+            );
+
+            let signs = ed.gutter_signs(ed.focus(), 0..2);
+            assert!(signs.iter().any(|&(row, ch, _)| row == 1 && ch == '●'), "{signs:?}");
+            assert!(!signs.iter().any(|&(row, ch, _)| row == 0 && ch == '●'), "{signs:?}");
         }
     }
 

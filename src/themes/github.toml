@@ -123,6 +123,12 @@ git_add      = "#6cb6ff"                             # const
 git_change   = "#f69d50"                             # type
 git_delete   = "#f47067"                             # keyword
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#f47067"             # keyword coral, same as diag_error/git_delete
+debug_breakpoint_unverified  = "#768390"             # dim
+debug_breakpoint_conditional = "#dcbdfb"             # todo_perf's builtin purple
+debug_stopped                = "#6cb6ff"             # git_add's blue
+
 # Built rather than looked up: the repo ships no statusline theme of any kind
 # and does not even set `StatusLine`. Neutral for normal, blue for insert —
 # new text, the same hue as an addition — and orange for pick.

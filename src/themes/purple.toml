@@ -115,6 +115,12 @@ git_add      = "#00FF00"
 git_change   = "#FF9D00"
 git_delete   = "#FF000D"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#FF000D"             # same as diag_error/git_delete
+debug_breakpoint_unverified  = "#A599E9"             # foreground, dim
+debug_breakpoint_conditional = "#FB94FF"             # todo_perf's pink
+debug_stopped                = "#00FF00"             # git_add's green
+
 # The lightline theme's normal, insert and visual rows.
 mode_normal = { fg = "#1E1E3F", bg = "#A599E9", bold = true }
 mode_insert = { fg = "#1E1E3F", bg = "#00FF00", bold = true }

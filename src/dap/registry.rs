@@ -100,6 +100,14 @@ pub struct Registry {
     /// `initialized` push, counted down to the `configurationDone` it gates.
     /// See the module doc for why this lives here rather than in the editor.
     pending_pushes: HashMap<SessionId, usize>,
+    /// Where the active session is stopped, if anywhere: the file and
+    /// 0-based row the gutter's `▶` and stopped-line repaint read directly.
+    /// Task 10 populates this from the top stack frame once a `stopped`
+    /// event's `Effect::Stopped` chain resolves it; until then a test may
+    /// set it directly via [`Registry::set_stopped_at`]. Cleared on
+    /// `continued`, `terminated`, and the pipe closing (`Eof`/die) — see
+    /// `accept_event`/`accept`.
+    stopped_at: Option<(PathBuf, usize)>,
 }
 
 impl Registry {
@@ -160,6 +168,19 @@ impl Registry {
     /// must answer back in.
     pub fn breakpoints_for(&self, path: &Path) -> &[Breakpoint] {
         self.breakpoints.get(path).map_or(&[], Vec::as_slice)
+    }
+
+    /// The file and 0-based row the active session is stopped at, if any —
+    /// what the gutter's `▶` sign and stopped-line repaint read.
+    pub fn stopped_at(&self) -> Option<(&Path, usize)> {
+        self.stopped_at.as_ref().map(|(path, row)| (path.as_path(), *row))
+    }
+
+    /// Sets where the active session is stopped. Task 10's job once the
+    /// stack-trace chain resolves the top frame; exposed now so the gutter
+    /// and its tests have something to read ahead of that wiring.
+    pub fn set_stopped_at(&mut self, path: PathBuf, row: usize) {
+        self.stopped_at = Some((path, row));
     }
 
     /// Marks the adapter's `setBreakpoints` answer onto the stored rows, in
@@ -223,6 +244,7 @@ impl Registry {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 let reason = "pipe closed".to_string();
                 client.die(reason.clone());
+                self.stopped_at = None;
                 vec![Effect::Terminated { session: from, reason }]
             }
         }
@@ -392,6 +414,7 @@ impl Registry {
             "continued" => {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 client.on_continued();
+                self.stopped_at = None;
                 Vec::new()
             }
             "output" => match serde_json::from_value::<types::OutputEvent>(body) {
@@ -405,6 +428,7 @@ impl Registry {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 let reason = "terminated".to_string();
                 client.on_terminated(reason.clone());
+                self.stopped_at = None;
                 vec![Effect::Terminated { session: from, reason }]
             }
             // Adapters send others bi does not model yet (`thread`,

@@ -114,6 +114,12 @@ git_add      = "#B1B695"
 git_change   = "#F5D76E"
 git_delete   = "#e06b75"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#e06b75"             # ember, same as diag_error/git_delete
+debug_breakpoint_unverified  = "#6F5D63"             # dim
+debug_breakpoint_conditional = "#D1D1E0"             # todo_perf's mist
+debug_stopped                = "#B1B695"             # git_add's sage
+
 # The lualine theme's normal, insert and visual mode blocks, verbatim —
 # including the asymmetry that normal's foreground is bg1 while the others'
 # is bgbase, which is what the source says.

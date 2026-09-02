@@ -194,6 +194,15 @@ pub struct Ui {
     pub git_change: Style,
     pub git_delete: Style,
 
+    /// The debugger's own gutter marks: the breakpoint dot (dim when
+    /// unverified or moved, a third colour when conditional) and the
+    /// stopped-line arrow, which doubles as the whole-line repaint style.
+    /// See `docs/specs/debug.md`.
+    pub debug_breakpoint: Style,
+    pub debug_breakpoint_unverified: Style,
+    pub debug_breakpoint_conditional: Style,
+    pub debug_stopped: Style,
+
     /// The float surface — hover and the completion menu. One key: the
     /// menu's selection and badges reuse `picker_selected` / `picker_badge`,
     /// so choosing looks the same everywhere bi offers a choice.
@@ -256,6 +265,10 @@ impl Ui {
         "git_add",
         "git_change",
         "git_delete",
+        "debug_breakpoint",
+        "debug_breakpoint_unverified",
+        "debug_breakpoint_conditional",
+        "debug_stopped",
         "popup",
         "mode_normal",
         "mode_insert",
@@ -315,6 +328,10 @@ impl Ui {
             &mut self.git_add,
             &mut self.git_change,
             &mut self.git_delete,
+            &mut self.debug_breakpoint,
+            &mut self.debug_breakpoint_unverified,
+            &mut self.debug_breakpoint_conditional,
+            &mut self.debug_stopped,
             &mut self.popup,
             &mut self.mode_normal,
             &mut self.mode_insert,
@@ -371,6 +388,10 @@ impl Ui {
             "git_add" => self.git_add = style,
             "git_change" => self.git_change = style,
             "git_delete" => self.git_delete = style,
+            "debug_breakpoint" => self.debug_breakpoint = style,
+            "debug_breakpoint_unverified" => self.debug_breakpoint_unverified = style,
+            "debug_breakpoint_conditional" => self.debug_breakpoint_conditional = style,
+            "debug_stopped" => self.debug_stopped = style,
             "popup" => self.popup = style,
             "mode_normal" => self.mode_normal = style,
             "mode_insert" => self.mode_insert = style,

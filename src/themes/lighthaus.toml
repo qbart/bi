@@ -158,6 +158,12 @@ git_add      = "#44B273"                             # green
 git_change   = "#FFFF00"                             # hl_yellow
 git_delete   = "#FC2929"                             # red
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#FC2929"             # red, same as diag_error/git_delete
+debug_breakpoint_unverified  = "#8E8D8D"             # grey, dim
+debug_breakpoint_conditional = "#D16BB7"             # todo_perf's purple
+debug_stopped                = "#44B273"             # git_add's green
+
 # The float surface — hover, and the completion menu. The source's Pmenu.
 popup = { fg = "#CCCCCC", bg = "#21252D" }
 

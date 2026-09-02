@@ -108,6 +108,12 @@ git_add      = "#A6E22E"
 git_change   = "#66D9EF"
 git_delete   = "#F92672"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#F92672"             # same as diag_error/git_delete
+debug_breakpoint_unverified  = "#7E8E91"             # dim
+debug_breakpoint_conditional = "#AE81FF"             # todo_perf's purple
+debug_stopped                = "#A6E22E"             # git_add's green
+
 mode_normal = { fg = "#1B1D1E", bg = "#66D9EF", bold = true }
 mode_insert = { fg = "#1B1D1E", bg = "#A6E22E", bold = true }
 mode_pick   = { fg = "#1B1D1E", bg = "#F92672", bold = true }

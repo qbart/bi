@@ -147,6 +147,13 @@ git_add      = "#002611"
 git_change   = "#8A9A88"
 git_delete   = { fg = "#001008", bold = true }
 
+# The debugger's gutter marks — the same ramp as everything else here, per
+# the file's one rule. See docs/specs/debug.md.
+debug_breakpoint             = { fg = "#001008", bold = true }   # darkest rung, same as git_delete
+debug_breakpoint_unverified  = "#8A9A88"                         # dim
+debug_breakpoint_conditional = "#1A3620"                         # todo_todo's rung, a third shade
+debug_stopped                = "#002611"                         # git_add's rung
+
 # The float surface — hover, and the completion menu. The source's
 # NormalFloat, one rung lighter than the page so a float sits above it.
 popup = { fg = "#002611", bg = "#C5CFC2" }

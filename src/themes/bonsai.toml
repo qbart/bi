@@ -98,6 +98,12 @@ git_add      = "#4EC685"
 git_change   = "#6394F3"
 git_delete   = "#FA5371"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#FA5371"             # same as diag_error/git_delete
+debug_breakpoint_unverified  = "#7C98A1"             # dim
+debug_breakpoint_conditional = "#6394F3"             # todo_perf's blue
+debug_stopped                = "#4EC685"             # git_add's green
+
 # Built rather than looked up: the repo ships no statusline theme. Normal
 # takes the source's own TabLineSel — the colour it already uses for "this is
 # the active one" — and insert and pick follow the palette's green and purple.

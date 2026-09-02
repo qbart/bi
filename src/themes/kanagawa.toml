@@ -114,6 +114,12 @@ git_add      = "#76946A"
 git_change   = "#DCA561"
 git_delete   = "#C34043"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#C34043"             # same as diag_error/git_delete
+debug_breakpoint_unverified  = "#727169"             # fujiGray, dim
+debug_breakpoint_conditional = "#D27E99"             # todo_perf's sakuraPink
+debug_stopped                = "#76946A"             # git_add's green
+
 # The lualine theme's normal, insert and visual rows, verbatim.
 mode_normal = { fg = "#16161D", bg = "#7E9CD8", bold = true }
 mode_insert = { fg = "#1F1F28", bg = "#98BB6C", bold = true }

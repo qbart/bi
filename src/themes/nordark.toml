@@ -117,6 +117,12 @@ git_add      = "#A3BE8C"
 git_change   = "#63ADC2"
 git_delete   = "#D08770"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#D08770"             # dark_red, same as diag_error/git_delete
+debug_breakpoint_unverified  = "#616E88"             # grey, dim
+debug_breakpoint_conditional = "#B48EAD"             # todo_perf's dark_purple
+debug_stopped                = "#A3BE8C"             # git_add's green
+
 # Built rather than looked up: the repo ships no statusline theme. Normal
 # takes nord10, the frost blue the source already uses under `PmenuSel`.
 mode_normal = { fg = "#2E3440", bg = "#5E81AC", bold = true }

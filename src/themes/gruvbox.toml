@@ -115,6 +115,12 @@ git_add      = "#b8bb26"
 git_change   = "#83a598"
 git_delete   = "#fb4934"
 
+# The debugger's gutter marks. See docs/specs/debug.md.
+debug_breakpoint             = "#fb4934"             # same as diag_error/git_delete
+debug_breakpoint_unverified  = "#665c54"             # dim
+debug_breakpoint_conditional = "#d3869b"             # todo_perf's purple
+debug_stopped                = "#b8bb26"             # git_add's green
+
 # The float surface — hover, and the completion menu. Selection and badges
 # inside it reuse the picker keys, so choosing looks the same everywhere.
 popup = { fg = "#ebdbb2", bg = "#3c3836" }                  # bg1
