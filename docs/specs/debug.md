@@ -6,9 +6,8 @@ leaving the editor. One integration, every language.
 
 ## Status
 
-**Designed, not built.** This spec records the design; no code exists.
-Open decisions are listed at the end. `TODO.md` keeps the feature parked
-under "DO NOT DO IT NOW".
+**Approved for build.** All open decisions are resolved (see the end);
+implementation follows this spec.
 
 ## Why DAP, and what each language actually needs
 
@@ -165,11 +164,9 @@ as the no-install fallback on new-enough systems.
   breakpoint UI beyond pass-through, multi-session (`startDebugging`),
   disassembly views.
 
-## Open decisions
+## Resolved decisions
 
-1. **Mode shape** — full `Mode::Debug` as above (recommended), vs. no mode
-   and only Normal-mode bindings while a session exists.
-2. **v1 attach** — launch-only, or launch + attach-by-pid (recommended).
-3. **Panes** — dedicated persistent panes (recommended) vs. transient
-   picker/hover-style views only.
-4. **Default adapters** — bless CodeLLDB + `dlv dap` + gdb-14 fallback?
+1. **Mode shape** — full `Mode::Debug` as above.
+2. **v1 attach** — launch + attach-by-pid.
+3. **Panes** — dedicated persistent panes.
+4. **Default adapters** — CodeLLDB + `dlv dap` + `gdb -i dap` (gdb ≥ 14).
