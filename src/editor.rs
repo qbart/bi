@@ -8993,15 +8993,19 @@ impl Editor {
         }
     }
 
-    /// The theme's style for one breakpoint: dim when unverified, a third
-    /// colour when conditional (which wins over dim — a condition is worth
-    /// knowing about even before the adapter confirms the line), plain
-    /// otherwise. The stopped-line arrow has its own key, read directly by
-    /// `gutter_signs` since it names no `Breakpoint`.
+    /// The theme's style for one breakpoint: dim when unverified *or moved*,
+    /// a third colour when conditional (which wins over dim — a condition is
+    /// worth knowing about even before the adapter confirms the line), plain
+    /// otherwise. A moved breakpoint reads dim for the same reason an
+    /// unverified one does: the user asked for line N and the adapter put it
+    /// at N+1, and the dim sign is what tells them the row they are looking
+    /// at is not quite the one they set (`docs/specs/debug.md`'s "verified
+    /// flags and possibly moved lines"). The stopped-line arrow has its own
+    /// key, read directly by `gutter_signs` since it names no `Breakpoint`.
     fn debug_style(&self, bp: &dap::Breakpoint) -> crate::theme::Style {
         if bp.conditional {
             self.theme.ui.debug_breakpoint_conditional
-        } else if !bp.verified {
+        } else if !bp.verified || bp.moved_to.is_some() {
             self.theme.ui.debug_breakpoint_unverified
         } else {
             self.theme.ui.debug_breakpoint
@@ -9012,10 +9016,14 @@ impl Editor {
     ///
     /// Its own call rather than a decoration, because the gutter has always
     /// been the frontend's to draw — a decoration names columns of the text
-    /// area. Two tenants, one cell: the git sign underneath, the diagnostic
-    /// over it — the mark that says *wrong* beats the mark that says
-    /// *different* — and the worst severity on a row wins its one cell. See
-    /// `docs/specs/git-signs.md`.
+    /// area. Four tenants, one cell, painted in this order so each later one
+    /// wins the row it also claims: the git sign, the diagnostic over it —
+    /// the mark that says *wrong* beats the mark that says *different*, and
+    /// the worst severity on a row wins its one cell (see
+    /// `docs/specs/git-signs.md`) — then the breakpoint dot over both of
+    /// those, and the stopped-line arrow last of all, since "the program is
+    /// here right now" outranks everything else a row could be marked with.
+    /// See `docs/specs/debug.md`.
     pub fn gutter_signs(
         &self,
         window: WindowId,
@@ -23209,6 +23217,25 @@ int main(void) {
         }
 
         #[test]
+        fn the_stopped_line_gets_a_whole_line_repaint() {
+            let (_dir, mut ed, _fake) = project("bp-stopped-repaint");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            let row_len = ed.buffer().unwrap().line_len(0);
+
+            ed.dap_mut().set_stopped_at(path, 0);
+
+            let repaint = ed.decorations(ed.focus(), 0..2).into_iter().find_map(|d| match d {
+                crate::decoration::Decoration::Repaint { range, style, .. }
+                    if style == ed.theme().ui.debug_stopped =>
+                {
+                    Some(range)
+                }
+                _ => None,
+            });
+            assert_eq!(repaint, Some(0..row_len), "the whole stopped row, not just the sign");
+        }
+
+        #[test]
         fn a_moved_breakpoint_draws_at_its_new_row() {
             let (_dir, mut ed, _fake) = project("bp-moved");
             let path = ed.buffer().unwrap().path.clone().unwrap();
@@ -23221,8 +23248,13 @@ int main(void) {
             );
 
             let signs = ed.gutter_signs(ed.focus(), 0..2);
-            assert!(signs.iter().any(|&(row, ch, _)| row == 1 && ch == '●'), "{signs:?}");
+            let moved = signs.iter().find(|&&(row, ch, _)| row == 1 && ch == '●');
+            assert!(moved.is_some(), "{signs:?}");
             assert!(!signs.iter().any(|&(row, ch, _)| row == 0 && ch == '●'), "{signs:?}");
+            // Verified but moved still reads dim — the row it landed on is
+            // not quite the one that was asked for, and the sign says so.
+            assert_eq!(moved.unwrap().2, ed.theme().ui.debug_breakpoint_unverified);
+            assert_ne!(moved.unwrap().2, ed.theme().ui.debug_breakpoint);
         }
     }
 
