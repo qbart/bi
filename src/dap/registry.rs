@@ -785,6 +785,41 @@ mod tests {
         assert_eq!(reg.frame(), None, "and the acting frame with it");
     }
 
+    /// The reverse direction: the adapter asks *bi* for something. v1 grants
+    /// none of them, and `runInTerminal` — the only one in common use — is
+    /// refused rather than ignored, since an adapter waiting on an answer
+    /// that never comes is a session that hangs with nothing on screen to
+    /// say why. The refusal is a real DAP `response`, and the status line
+    /// explains the one case a user would otherwise sit through.
+    #[test]
+    fn a_run_in_terminal_reverse_request_is_refused_in_kind() {
+        let fake = FakeSpawn::default();
+        let mut reg = Registry::default();
+        reg.set_spawner(fake.clone());
+        let id = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect("spawner is set");
+
+        reg.inbox().deliver(
+            id,
+            Inbound::ReverseRequest {
+                seq: 9,
+                command: "runInTerminal".into(),
+                arguments: json!({ "args": ["./prog"] }),
+            },
+        );
+
+        match reg.pump().as_slice() {
+            [Effect::Status(status)] => assert!(status.contains("runInTerminal"), "{status}"),
+            other => panic!("{other:?}"),
+        }
+        let answer = fake.last(id, "runInTerminal").expect("answered");
+        assert_eq!(answer["type"], "response");
+        assert_eq!(answer["request_seq"], json!(9));
+        assert_eq!(answer["success"], json!(false));
+        assert_eq!(answer["command"], "runInTerminal");
+    }
+
     /// v1 shows one session — one `active`, one gutter, one set of panes —
     /// so a second launch behind the first would spawn an adapter nothing
     /// could see or stop. Refused, and the message says how to make room.
