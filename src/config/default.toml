@@ -252,6 +252,9 @@ command = ["bash-language-server", "start"]
 filetypes = ["bash"]
 roots = []
 
+# pherrymason's server resolves stdlib symbols itself. ManuLinares's c3_ls
+# wants the paths spelled out — override like:
+#   command = ["c3_ls", "--compiler-path", "/usr/bin/c3c", "--stdlib-path", "/opt/c3/lib/std"]
 [lsp.servers.c3-lsp]
 command = ["c3-lsp"]
 filetypes = ["c3"]

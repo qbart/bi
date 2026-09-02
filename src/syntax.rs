@@ -85,7 +85,8 @@ pub fn filetype(file: &str) -> Option<&'static str> {
         "cmake" => "cmake",
         "mk" | "mak" => "make",
         "go" => "go",
-        "c3" | "c3i" => "c3",
+        // `.c3i` is an interface file, `.c3t` a template — C3 either way.
+        "c3" | "c3i" | "c3t" => "c3",
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
         // `.h` is ambiguous and always will be. C, because a C++ project that
         // uses it gets a grammar that reads most of the file anyway, while a C
@@ -989,6 +990,7 @@ mod tests {
         "go",
         "c3",
         "c3i",
+        "c3t",
         "cpp",
         "cc",
         "cxx",

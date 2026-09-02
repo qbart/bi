@@ -329,7 +329,7 @@ The table, by the key that reaches it:
 | Rust | `rs` |
 | C | `c` `h` |
 | C++ | `cpp` `cc` `cxx` `hpp` `hxx` `hh` |
-| C3 | `c3` `c3i` |
+| C3 | `c3` `c3i` `c3t` |
 | Go | `go` |
 | Python | `py` `pyi` |
 | Lua | `lua` |
