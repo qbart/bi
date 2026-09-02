@@ -726,6 +726,11 @@ pub struct Session {
     /// directory — folding everything you had opened is what closing a pane
     /// must not cost. See `docs/specs/tree.md`.
     parked_tree: Option<Box<Tree>>,
+    /// The width the sidebar had when it closed, in cells. The next open uses
+    /// it in place of `Chrome::tree_width` — a `:resize` on the sidebar is
+    /// state you built, like the expansion parked above it, and hiding the
+    /// pane is not a reason to lose it. See `docs/specs/tree.md`.
+    tree_width: Option<u16>,
     /// Where each row of a [`PickerKind::Symbol`] list goes, by the same index
     /// the picker holds its items at.
     ///
@@ -1793,6 +1798,9 @@ enum ExLine {
     },
     /// `:results` — the last results list that left a window, put back.
     ResultsPane,
+    /// `:tree` — the sidebar, focused, with the current file revealed;
+    /// opened if there is none, never closed. See `docs/specs/tree.md`.
+    RevealTree,
     Unknown(String),
     /// Parsed, but cannot run — carrying its own message, already phrased.
     Error(String),
@@ -2154,6 +2162,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // needs.
         "replace" | "replace~" => ExLine::Replace { arg: arg.into(), regex: name == "replace~" },
         "results" => ExLine::ResultsPane,
+        "tree" if arg.is_empty() => ExLine::RevealTree,
+        "tree" => ExLine::Error("tree takes no argument — `:vs <dir>` opens one on a path".into()),
         "res" | "resize" => match crate::resize::parse(arg) {
             Ok(how) => ExLine::Resize(how),
             Err(message) => ExLine::Error(message),
@@ -3978,20 +3988,33 @@ impl Editor {
             self.session.status = "no results to bring back — `:find` something first".into();
             return;
         };
-        let focus = self.focus;
-        if let Some(window) = self.window_mut_of(focus) {
+        let target = self.results_window();
+        if let Some(window) = self.window_mut_of(target) {
             window.show(Content::Results(results));
+        }
+        self.set_focus(target);
+    }
+
+    /// Where a results list should go: the focused window when it shows text
+    /// or an older list, otherwise — a tree, an image — the window `Enter` on
+    /// a tree file would hand off to. A results pane wearing the sidebar's
+    /// column is neither thing done well. See `docs/specs/find-in-files.md`.
+    fn results_window(&self) -> WindowId {
+        match self.window().content {
+            Content::Text(_) | Content::Results(_) => self.focus,
+            _ => self.handoff_window(),
         }
     }
 
-    /// Shows `results` in the focused window, parking whatever list it
-    /// displaces.
+    /// Shows `results` in the window [`Editor::results_window`] picks, parking
+    /// whatever list it displaces, and moves focus to them.
     fn show_results(&mut self, results: crate::results::Results) {
-        let focus = self.focus;
-        self.park_results(focus);
-        if let Some(window) = self.window_mut_of(focus) {
+        let target = self.results_window();
+        self.park_results(target);
+        if let Some(window) = self.window_mut_of(target) {
             window.show(Content::Results(Box::new(results)));
         }
+        self.set_focus(target);
     }
 
     /// Splits a leading directory scope off a `:find`/`:replace` argument.
@@ -4559,6 +4582,14 @@ impl Editor {
     /// from a `bi .` session, and leaves a session that still has a window.
     fn close_tree(&mut self, id: WindowId) {
         self.park_results(id);
+        // The width goes with the expansion: a `:resize` on the sidebar
+        // should survive hiding it. Read before the close collapses the
+        // layout.
+        if self.window_of(id).is_some_and(|w| w.tree().is_some())
+            && let Some(rect) = self.layout.rect_of(id, self.area, &self.chrome)
+        {
+            self.session.tree_width = Some(rect.width);
+        }
         // The expansion is state you built; closing the pane is not a reason
         // to lose it. Parked the way the results list is, revived by the next
         // open on the same root.
@@ -4645,17 +4676,13 @@ impl Editor {
                     // why it is empty.
                     self.session.status = "nothing left in the list".into();
                     let focus = self.focus;
-                    self.close_tree(focus);
+                    self.close_results(focus);
                     return;
                 }
             }
             ResultsCmd::Close => {
-                // The pane displaced whatever was here to get on screen, and
-                // putting that back is exactly what `close_tree` already does
-                // for the other list pane — the last window cannot close, so
-                // it shows what it was showing instead.
                 let focus = self.focus;
-                self.close_tree(focus);
+                self.close_results(focus);
                 return;
             }
             ResultsCmd::Apply | ResultsCmd::ApplyAll => unreachable!("handled above"),
@@ -4872,13 +4899,16 @@ impl Editor {
         self.set_focus(new);
 
         // A half-screen tree is not a sidebar. Narrowed to the width the
-        // frontend asked for, which becomes a share of the terminal from here
-        // on, like every other pane.
+        // frontend asked for — or the width the last sidebar was resized to,
+        // which outranks the default for the same reason the parked tree
+        // does — and becoming a share of the terminal from here on, like
+        // every other pane.
+        let target = self.session.tree_width.unwrap_or(chrome.tree_width);
         let width = self
             .layout
             .rect_of(new, area, &chrome)
             .map_or(0, |rect| rect.width)
-            .saturating_sub(chrome.tree_width);
+            .saturating_sub(target);
         if width > 0 {
             self.layout.resize(new, Dir::Vertical, -(width as i32), area, &chrome);
         }
@@ -4960,31 +4990,10 @@ impl Editor {
                 // One tree, so the key that opened it is the key that puts it
                 // away. Two trees are two of the same thing, and the second is
                 // never the one you wanted.
-                if let Some(open) = self.tree_window() {
-                    return self.close_tree(open);
+                match self.tree_window() {
+                    Some(open) => self.close_tree(open),
+                    None => self.open_tree_sidebar(),
                 }
-
-                // Read before the split, because which file you are in is a
-                // fact about the window you are leaving rather than the one
-                // being made.
-                let path = self.buffer().and_then(|b| b.path.clone());
-                let root = self.session_root();
-                let tree = match self.revive_tree(&root) {
-                    Some(tree) => tree,
-                    None => match Tree::new(&root, self.options().gitignore) {
-                        Ok(tree) => tree,
-                        Err(e) => {
-                            self.session.status = format!("{e:#}");
-                            return;
-                        }
-                    },
-                };
-                self.session.tree_root = Some(tree.root().to_path_buf());
-
-                if self.open_tree_pane(tree).is_none() {
-                    return;
-                }
-                self.reveal_in_tree(path.as_deref());
             }
 
             WindowCmd::Focus(side) => {
@@ -5013,6 +5022,72 @@ impl Editor {
                 }
             }
             WindowCmd::Equalize => self.layout.equalize(),
+        }
+    }
+
+    /// `q`/`Esc` on a results pane: puts back what the pane displaced.
+    ///
+    /// The window's alternate — the file you were reading before `:find`
+    /// took the window — is restored, where closing the window took a split
+    /// (and the file in it) down with the list. A window with nothing
+    /// displaced closes instead, and the last window shows a buffer rather
+    /// than closing, as ever. See `docs/specs/find-in-files.md`.
+    fn close_results(&mut self, id: WindowId) {
+        self.park_results(id);
+        if let Some(alt) = self.window_mut_of(id).and_then(|w| w.alt.take()) {
+            if let Some(window) = self.window_mut_of(id) {
+                window.content = alt;
+            }
+            return;
+        }
+        if self.windows.len() > 1 {
+            self.close_window(id);
+            return;
+        }
+        let fallback = Content::Text(Text::new(self.buffer_ids()[0]));
+        if let Some(window) = self.window_mut_of(id) {
+            window.content = fallback;
+        }
+    }
+
+    /// Opens the sidebar on the session's root, focused, with the current
+    /// file revealed. The open half of `Ctrl-W e`, and all of `:tree` when no
+    /// tree is up.
+    fn open_tree_sidebar(&mut self) {
+        // Read before the split, because which file you are in is a fact
+        // about the window you are leaving rather than the one being made.
+        let path = self.buffer().and_then(|b| b.path.clone());
+        let root = self.session_root();
+        let tree = match self.revive_tree(&root) {
+            Some(tree) => tree,
+            None => match Tree::new(&root, self.options().gitignore) {
+                Ok(tree) => tree,
+                Err(e) => {
+                    self.session.status = format!("{e:#}");
+                    return;
+                }
+            },
+        };
+        self.session.tree_root = Some(tree.root().to_path_buf());
+
+        if self.open_tree_pane(tree).is_none() {
+            return;
+        }
+        self.reveal_in_tree(path.as_deref());
+    }
+
+    /// `:tree` — the sidebar with the current file selected, opened when
+    /// there is none, and never closed: "show me this file in the tree" is a
+    /// different question from "tree on / tree off". `<leader>e` ships bound
+    /// to it. See `docs/specs/tree.md`.
+    fn reveal_tree(&mut self) {
+        match self.tree_window() {
+            Some(open) => {
+                let path = self.buffer().and_then(|b| b.path.clone());
+                self.set_focus(open);
+                self.reveal_in_tree(path.as_deref());
+            }
+            None => self.open_tree_sidebar(),
         }
     }
 
@@ -6078,6 +6153,7 @@ impl Editor {
             ExLine::Find { pattern, regex } => self.run_find(&pattern, regex),
             ExLine::Replace { arg, regex } => self.run_replace(&arg, regex),
             ExLine::ResultsPane => self.reopen_results(),
+            ExLine::RevealTree => self.reveal_tree(),
             ExLine::Unknown(name) => self.session.status = format!("not a command: {name}"),
             ExLine::Error(message) => self.session.status = message,
             ExLine::ReloadConfig => self.reload_config(),
@@ -14646,6 +14722,56 @@ mod tests {
         );
     }
 
+    /// `:tree` reveals rather than toggles: it opens the sidebar when there
+    /// is none, goes over to it when there is, and never closes it.
+    #[test]
+    fn tree_reveals_the_current_file_and_never_toggles() {
+        let d = ScratchDir::new("tree-reveal").file("a.rs").file("b.rs");
+        let mut ed = Editor::open(format!("{}/b.rs", d.path())).unwrap();
+        sized(&mut ed);
+
+        ex(&mut ed, "tree");
+        let tree = ed.window().tree().expect("opened and focused");
+        assert!(
+            tree.selected_row().expect("a selection").path.ends_with("b.rs"),
+            "the file you were in is the selection",
+        );
+
+        ex(&mut ed, "tree");
+        assert!(ed.window().tree().is_some(), "a second :tree does not put it away");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Cycle { back: false })));
+        assert!(ed.window().tree().is_none(), "back in the file");
+        ex(&mut ed, "tree");
+        assert!(ed.window().tree().is_some(), "and :tree goes over to the open sidebar");
+    }
+
+    /// `:resize` on the sidebar survives hiding it: the next open comes back
+    /// at the width you set rather than the frontend's default.
+    #[test]
+    fn the_sidebar_comes_back_at_the_width_you_resized_it_to() {
+        let d = ScratchDir::new("tree-width").file("a.rs");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        let width = |ed: &Editor| {
+            ed.layout.rect_of(ed.focus(), ed.area, &ed.chrome).expect("laid out").width
+        };
+        let before = width(&ed);
+
+        ed.apply(cmd(Action::Window(WindowCmd::Resize { axis: Dir::Vertical, cells: 10 })));
+        let wider = width(&ed);
+        assert!(wider > before, "{wider} vs {before}");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // hide
+        ed.apply(cmd(Action::Window(WindowCmd::Tree))); // show
+        assert!(
+            ed.window().tree().is_some() && (width(&ed) as i32 - wider as i32).abs() <= 1,
+            "the width you set is the width that came back: {} vs {wider}",
+            width(&ed),
+        );
+    }
+
     /// Closing the tree pane must not touch any buffer's saved place. It
     /// briefly did: parking the tree swapped a text placeholder into the
     /// dying window, and `close_window`'s bookkeeping wrote that placeholder's
@@ -18001,6 +18127,62 @@ mod tests {
         ed.apply(cmd(Action::Results(ResultsCmd::Close)));
 
         assert_eq!(ed.buffer().unwrap().line(0), "nothing", "the file is back");
+    }
+
+    /// Esc restores the displaced file instead of closing the window: a
+    /// results pane in one half of a split must not take the split — and the
+    /// file you were editing in it — down with the list.
+    #[test]
+    fn closing_results_in_a_split_keeps_the_split_and_the_file() {
+        let files = project("find-close-split");
+        let mut ed = in_project(&files, "c.rs");
+        split(&mut ed, Dir::Vertical);
+        let windows = ed.window_ids().len();
+        ex(&mut ed, "find needle");
+        assert!(ed.window().results().is_some());
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Close)));
+
+        assert_eq!(ed.window_ids().len(), windows, "the split survives");
+        assert_eq!(ed.buffer().unwrap().line(0), "nothing", "with the file back in it");
+    }
+
+    /// `:find` typed in the sidebar lands in the last text window — a
+    /// results pane wearing the tree's column is neither thing done well.
+    #[test]
+    fn find_from_the_tree_lands_in_the_last_text_window() {
+        let files = project("find-from-tree");
+        let mut ed = in_project(&files, "c.rs");
+        sized(&mut ed);
+        ed.settle();
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        assert!(ed.window().tree().is_some(), "typing from the sidebar");
+
+        ex(&mut ed, "find needle");
+
+        assert!(ed.window().results().is_some(), "focus followed the results");
+        assert!(ed.tree_window().is_some(), "and the sidebar kept its column");
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Close)));
+        assert_eq!(ed.buffer().unwrap().line(0), "nothing", "Esc puts the file back");
+        assert!(ed.tree_window().is_some(), "not the tree away");
+    }
+
+    /// `:results` from the sidebar routes the same way.
+    #[test]
+    fn reopening_results_from_the_tree_uses_a_text_window_too() {
+        let files = project("results-from-tree");
+        let mut ed = in_project(&files, "c.rs");
+        sized(&mut ed);
+        ed.settle();
+        ex(&mut ed, "find needle");
+        ed.apply(cmd(Action::Results(ResultsCmd::Close)));
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+
+        ex(&mut ed, "results");
+
+        assert!(ed.window().results().is_some());
+        assert!(ed.tree_window().is_some(), "the sidebar is not the results window");
     }
 
     #[test]

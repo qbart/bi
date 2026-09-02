@@ -526,8 +526,31 @@ hard-coded thirty columns would be asserting one on every frontend. It is a
 of the terminal, because a genuinely fixed-width pane is a concept `Layout` does
 not have and this did not need.
 
+**The width you set is the width that comes back.** `:resize +10` on the
+sidebar, hide it, show it again: it reopens ten wider, not at the default.
+Closing records the pane's width beside the parked tree
+(`Session::tree_width`), and the next open uses it in place of
+`Chrome::tree_width` — the same argument as parking the expansion: hiding the
+pane is not a reason to lose what you did to it. Session state, not config —
+a fresh session starts at the frontend's width again.
+
 On a window already holding a tree it duplicates that tree's root, the way
 `Ctrl-W v` duplicates a window rather than refusing.
+
+### `:tree` — go to the file, in the sidebar
+
+`Ctrl-W e` toggles; `:tree` *reveals*. It puts the sidebar up if there is
+none, moves focus to it, and lands the selection on the current file, way
+down opened — and with the tree already open it never closes it, which is
+the half a toggle cannot say. "Show me this file in the tree" is a different
+question from "tree on / tree off", and the reason it is its own command
+rather than a second press of the toggle.
+
+`<leader>e` ships bound to it — the second shipped leader binding, after
+`<leader><leader>`, and under the same rules: `"<leader>e" = ":tree<CR>"` is
+what it means, rebinding it wins, `"<leader>e" = false` removes it, and it
+follows whatever `leader` is set to. The key is the one everybody writes by
+hand anyway; shipping it saves the config line without taking the key.
 
 ## File operations
 
