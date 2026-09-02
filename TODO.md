@@ -6,6 +6,10 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ## DO NOT DO IT NOW
 
+### refactors
+
+consolidate `src/lsp/transport.rs` and `src/dap/transport.rs` (thread trio + Process are ~70% identical)
+
 ### documentation of code
 
 ### snippets

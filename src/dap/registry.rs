@@ -85,15 +85,16 @@ pub enum Effect {
     /// A line for the status bar — a crash, or an unsupported reverse
     /// request answered so the adapter is not left hanging.
     Status(String),
-    /// A `stopped` event: the cue to walk
-    /// `threads` → `stackTrace` → `scopes` → `variables`.
+    /// A `stopped` event: the cue to walk the lazy chain
+    /// `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`. The event
+    /// already names the thread, so there is no `threads` round-trip — see
+    /// `docs/specs/debug.md`'s Deviations #2.
     Stopped { session: SessionId, thread: i64 },
     /// The `initialized` event, for one file that has breakpoints: send
     /// `setBreakpoints` for it, tagged `Intent::SetBreakpoints { path }` so
     /// the answer routes back to [`Registry::pump`]. See the module doc for
     /// how the registry itself tracks when every file has answered.
     PushBreakpoints { path: PathBuf },
-    Threads(Vec<types::Thread>),
     Stack { frames: Vec<types::StackFrame> },
     Scopes(Vec<types::Scope>),
     Variables { reference: i64, vars: Vec<types::Variable> },
@@ -499,14 +500,6 @@ impl Registry {
                 }
                 Vec::new()
             }
-            Intent::Threads => {
-                if success {
-                    let arr = body.get("threads").cloned().unwrap_or(Value::Array(Vec::new()));
-                    vec![Effect::Threads(serde_json::from_value(arr).unwrap_or_default())]
-                } else {
-                    failed("threads")
-                }
-            }
             Intent::StackTrace { .. } => {
                 if success {
                     let arr = body.get("stackFrames").cloned().unwrap_or(Value::Array(Vec::new()));
@@ -643,6 +636,14 @@ impl Registry {
 /// [`Registry::set_verified`]'s inner loop, factored out so it can run
 /// against `self.breakpoints`' entry directly without a `&mut self` method
 /// call fighting the `&mut Client` borrow live in [`Registry::accept_response`].
+///
+/// The zip is positional, so it assumes the answer describes the list that
+/// was sent. A breakpoint toggled while a `setBreakpoints` is in flight
+/// breaks that assumption — the older answer lands on the newer list — but
+/// harmlessly: `zip` truncates rather than panicking, and the toggle pushed
+/// the whole file again, so the newer answer overwrites every row a moment
+/// later. Self-healing, which is why the ordering is an assumption rather
+/// than a request id.
 fn apply_verified(list: &mut [Breakpoint], results: &[types::Breakpoint]) {
     for (bp, result) in list.iter_mut().zip(results) {
         bp.verified = result.verified;

@@ -576,19 +576,23 @@ impl Default for Lsp {
 ///
 /// Shaped like [`Lsp`] for the adapter table — same master switch, same
 /// merge-field-wise-over-the-built-in promise for `[debug.adapters.<name>]`
-/// — but `launch` has no built-in counterpart to merge over: a launch
-/// configuration names a program to run, which is inherently project-local,
-/// so `[[debug.launch]]` is read as-is rather than patched. See
-/// `docs/specs/debug.md`.
+/// — but `launch` merges by a different rule, because it is a list and not
+/// a table: each `[[debug.launch]]` **replaces the entry of the same
+/// `name`** across layers, later layer winning (local over main over
+/// defaults), and only a new name appends. See `read_launch`, and
+/// Deviations #5 in `docs/specs/debug.md` for why replacing beats stacking:
+/// a project overriding "run tests" wants one row in the picker, not two
+/// with the same label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Debug {
     pub enabled: bool,
     /// `[debug.adapters.<name>]`, the user's entries merged field-wise over
     /// the built-in defaults of the same name.
     pub adapters: std::collections::BTreeMap<String, crate::dap::AdapterConfig>,
-    /// `[[debug.launch]]`, in file order — the project's own list, appended
-    /// to rather than merged, since a launch config has no built-in of the
-    /// same name to patch.
+    /// `[[debug.launch]]`, in file order across layers: an entry whose
+    /// `name` a later layer repeats is replaced in place (keeping its slot
+    /// in the order), and only an unseen name is appended. See the struct's
+    /// doc and `read_launch`.
     pub launch: Vec<crate::dap::LaunchConfig>,
 }
 

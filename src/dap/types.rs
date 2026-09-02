@@ -39,7 +39,8 @@ pub struct Capabilities {
 }
 
 /// The `stopped` event — the cue, per the lifecycle doc, to walk
-/// `threads` → `stackTrace` → `scopes` → `variables`.
+/// `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`. It carries
+/// the thread itself, which is why bi never asks for `threads`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoppedEvent {
@@ -65,13 +66,6 @@ pub struct OutputEvent {
     #[serde(default)]
     pub category: Option<String>,
     pub output: String,
-}
-
-/// One row of a `threads` response.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Thread {
-    pub id: i64,
-    pub name: String,
 }
 
 /// One row of a `stackTrace` response — bi keeps only what draws the frame

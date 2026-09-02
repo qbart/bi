@@ -21,6 +21,20 @@ use crate::registers::Sink;
 use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
 
+/// The four debugger panes, which share one small grammar — see
+/// [`Input::dap_pane`]. Named once because both `remap` and `dispatch` ask
+/// the same question, and a list that appeared twice would eventually get a
+/// fifth pane added to only one of them.
+fn is_dap_pane(content: ContentKind) -> bool {
+    matches!(
+        content,
+        ContentKind::DapStack
+            | ContentKind::DapConsole
+            | ContentKind::DapVariables
+            | ContentKind::DapWatches
+    )
+}
+
 /// Where a surround command has got to.
 ///
 /// `ys` is the interesting one: it wants a motion, and rather than a second
@@ -268,18 +282,12 @@ impl Input {
             // than growing a third one for four keys that mean the same thing
             // in both: a list is a list.
             Mode::Normal if content == ContentKind::Results => KeyMode::Tree,
-            // Same borrowing, for the same reason — see `dap_pane`.
-            Mode::Normal
-                if matches!(
-                    content,
-                    ContentKind::DapStack
-                        | ContentKind::DapConsole
-                        | ContentKind::DapVariables
-                        | ContentKind::DapWatches
-                ) =>
-            {
-                KeyMode::Tree
-            }
+            // Same borrowing, for the same reason — see `dap_pane`. Listed
+            // ahead of `Mode::Debug` and matching it too: which keymap a
+            // debug pane runs is a property of the window, and entering the
+            // mode the panes exist for must not be what takes their keys
+            // away. Content kind wins over the mode.
+            Mode::Normal | Mode::Debug if is_dap_pane(content) => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             Mode::Debug => KeyMode::Debug,
@@ -365,18 +373,9 @@ impl Input {
             Mode::Normal if content == ContentKind::Results => self.results(key),
             // The four debug panes: a small slice of the tree's grammar,
             // since none of them has files or marks to speak of — see
-            // `dap_pane`.
-            Mode::Normal
-                if matches!(
-                    content,
-                    ContentKind::DapStack
-                        | ContentKind::DapConsole
-                        | ContentKind::DapVariables
-                        | ContentKind::DapWatches
-                ) =>
-            {
-                self.dap_pane(key, content)
-            }
+            // `dap_pane`. Ahead of `Mode::Debug` for the reason `remap`
+            // gives: the pane's grammar is the window's, not the session's.
+            Mode::Normal | Mode::Debug if is_dap_pane(content) => self.dap_pane(key, content),
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -2367,6 +2366,31 @@ leader = \" \"
         assert_eq!(esc.action, Action::EnterNormal);
 
         assert_eq!(debug_action("j"), Action::Move(Motion::Down));
+    }
+
+    /// A debug pane keeps its own grammar inside `Mode::Debug`. The content
+    /// kind wins over the mode: `j` in a focused Stack pane moves the frame
+    /// selection, and it would be absurd for entering the very mode the
+    /// panes exist for to be what takes their keys away — `Mode::Debug`'s
+    /// own vocabulary is over a *source* window.
+    #[test]
+    fn a_debug_pane_keeps_its_keymap_inside_debug_mode() {
+        let mut input = Input::default();
+        for content in [
+            ContentKind::DapStack,
+            ContentKind::DapConsole,
+            ContentKind::DapVariables,
+            ContentKind::DapWatches,
+        ] {
+            let cmd = input.on_key(key('j'), &Mode::Debug, content).expect("resolved");
+            assert_eq!(
+                cmd.action,
+                Action::Tree(TreeCmd::Select { down: true, count: 1 }),
+                "{content:?}"
+            );
+        }
+        // And the mode's own keys still reach a source window.
+        assert_eq!(debug_action("c"), Action::Debug(DebugCmd::Continue));
     }
 
     /// `<C-n>` takes a match, `<C-x>` passes it over. They are the same

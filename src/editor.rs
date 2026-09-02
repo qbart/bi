@@ -2345,7 +2345,11 @@ pub enum DebugCmd {
     /// `K` — the word under the cursor, evaluated in the top frame.
     Evaluate,
     /// `:debug`, `:debug <name>` — starts the named `[[debug.launch]]`, or
-    /// the only one there is, or asks which when there are several.
+    /// the only one there is. With several and no name it starts nothing:
+    /// the status line lists their names for `:debug <name>` to pick from,
+    /// since there is no picker in the way of a session that is one word
+    /// away. A bare `:debug` with a session already up is the way back into
+    /// `Mode::Debug`, not a second launch.
     Start {
         name: Option<String>,
     },
@@ -2877,6 +2881,64 @@ fn fill_matching_reference(node: &mut VarNode, reference: i64, children: &[VarNo
 /// nearest visible row above the selection that is shallower than it — the
 /// same rule `tree::Tree::select_parent` follows, worked out from
 /// [`DapVariables::visible`] since the pane keeps no depth of its own.
+/// A DAP `line` as a buffer row: the wire counts from 1 and bi's cursor and
+/// gutter count from 0, the same conversion `dap::Registry::set_verified`
+/// makes at its own edge. Saturating rather than wrapping — an adapter that
+/// answers line 0 (or, being JSON, something negative) gets row 0 rather
+/// than a row near `usize::MAX`.
+/// The movement half of a list pane's grammar, shared by the Stack,
+/// Variables and Watches panes: `j`/`k` by a count, `gg`/`G` to either end,
+/// `Ctrl-d`/`Ctrl-u` by half a screen, always clamped inside `0..len`.
+///
+/// The three panes select over different things — frames, flattened
+/// variable rows, watch expressions — but "which row is highlighted" is the
+/// same question in all three, and an index plus a length is all of it that
+/// differs. Returns whether the command was one of these, so a caller can
+/// tell a movement it handled from a command (`Enter`, `d`, `a`) that is
+/// the pane's own business. An empty list moves nothing but still counts as
+/// handled: `j` in an empty Stack pane is a movement with nowhere to go,
+/// not a key that should fall through to something else.
+fn move_list_selection(selected: &mut usize, len: usize, cmd: &TreeCmd, height: usize) -> bool {
+    let delta = match *cmd {
+        TreeCmd::Select { down, count } => count as isize * if down { 1 } else { -1 },
+        TreeCmd::HalfPage { down } => (height / 2).max(1) as isize * if down { 1 } else { -1 },
+        TreeCmd::First | TreeCmd::Last if len == 0 => return true,
+        TreeCmd::First => {
+            *selected = 0;
+            return true;
+        }
+        TreeCmd::Last => {
+            *selected = len - 1;
+            return true;
+        }
+        _ => return false,
+    };
+    if len > 0 {
+        *selected = (*selected as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+    true
+}
+
+fn wire_row(line: i64) -> usize {
+    line.saturating_sub(1).max(0) as usize
+}
+
+/// One `evaluate` request's arguments. `frameId` is *omitted* when there is
+/// no acting frame rather than sent as `null`: DAP reads an absent frame as
+/// "the global scope", which is the honest reading, while a literal `null`
+/// is a type error some adapters reject outright. The three callers —
+/// watches, `:eval`, and `K` — differ only in `context`, so they share this
+/// rather than three near-identical `json!`s that could drift apart.
+fn evaluate_args(expr: &str, frame: Option<i64>, context: &str) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    args.insert("expression".into(), serde_json::json!(expr));
+    if let Some(frame) = frame {
+        args.insert("frameId".into(), serde_json::json!(frame));
+    }
+    args.insert("context".into(), serde_json::json!(context));
+    serde_json::Value::Object(args)
+}
+
 fn variables_select_parent(vars: &mut DapVariables) {
     let parent = {
         let rows = vars.visible();
@@ -3758,6 +3820,7 @@ impl Editor {
         // row itself, so the line the program is on reads as a whole rather
         // than only its gutter cell.
         if let Some((path, row)) = self.dap.stopped_at()
+            // Exact-match on the path, for the reason `gutter_signs` gives.
             && buffer.path.as_deref() == Some(path)
             && rows.contains(&row)
         {
@@ -5203,30 +5266,9 @@ impl Editor {
         }
         let Content::DapStack(stack) = &mut self.window_mut().content else { return };
         let len = stack.frames.len();
-        if len == 0 {
-            return;
-        }
-        let last = len as isize - 1;
-        let delta = match cmd {
-            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
-            TreeCmd::First => {
-                stack.selected = 0;
-                None
-            }
-            TreeCmd::Last => {
-                stack.selected = last as usize;
-                None
-            }
-            TreeCmd::HalfPage { down } => {
-                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
-            }
-            // Everything else a list pane's grammar can send — `y`, `a`,
-            // `Prompt`, and the rest — means nothing here.
-            _ => None,
-        };
-        if let Some(delta) = delta {
-            stack.selected = (stack.selected as isize + delta).clamp(0, last) as usize;
-        }
+        // Everything else a list pane's grammar can send — `y`, `a`,
+        // `Prompt`, and the rest — means nothing here.
+        move_list_selection(&mut stack.selected, len, &cmd, height);
     }
 
     /// A key in the Console pane. There is nothing to select in a log, so
@@ -5256,28 +5298,7 @@ impl Editor {
         }
         let Content::DapVariables(vars) = &mut self.window_mut().content else { return };
         let len = vars.visible().len();
-        if len == 0 {
-            return;
-        }
-        let last = len as isize - 1;
-        let delta = match cmd {
-            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
-            TreeCmd::First => {
-                vars.selected = 0;
-                None
-            }
-            TreeCmd::Last => {
-                vars.selected = last as usize;
-                None
-            }
-            TreeCmd::HalfPage { down } => {
-                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
-            }
-            _ => None,
-        };
-        if let Some(delta) = delta {
-            vars.selected = (vars.selected as isize + delta).clamp(0, last) as usize;
-        }
+        move_list_selection(&mut vars.selected, len, &cmd, height);
     }
 
     /// `Expand`/`Enter` on the selected Variables row. A leaf (`reference ==
@@ -5344,29 +5365,8 @@ impl Editor {
             return;
         }
         let len = self.dap.watches().len();
-        if len == 0 {
-            return;
-        }
-        let last = len as isize - 1;
         let Content::DapWatches(watches) = &mut self.window_mut().content else { return };
-        let delta = match cmd {
-            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
-            TreeCmd::First => {
-                watches.selected = 0;
-                None
-            }
-            TreeCmd::Last => {
-                watches.selected = last as usize;
-                None
-            }
-            TreeCmd::HalfPage { down } => {
-                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
-            }
-            _ => None,
-        };
-        if let Some(delta) = delta {
-            watches.selected = (watches.selected as isize + delta).clamp(0, last) as usize;
-        }
+        move_list_selection(&mut watches.selected, len, &cmd, height);
     }
 
     fn fresh_window_id(&mut self) -> WindowId {
@@ -7564,9 +7564,6 @@ impl Editor {
                         );
                     }
                 }
-                // Not (yet) driven by anything on the `Stopped` chain — v1
-                // has no Threads pane, so nothing requests `threads`.
-                dap::Effect::Threads(_) => {}
                 // The top frame is where execution actually sits: jump the
                 // source window there and kick `scopes` so Task 12's
                 // Variables pane has data by the time it exists. Every open
@@ -7749,14 +7746,23 @@ impl Editor {
         // wrong) has nowhere to put `pid` beside, so it becomes the whole
         // body rather than silently dropping the pid on the floor.
         let mut body = launch.body.clone();
+        let launch_name = launch.name.clone();
         match body.as_object_mut() {
             Some(obj) => {
                 obj.insert("pid".to_string(), serde_json::json!(pid));
             }
-            None => body = serde_json::json!({ "pid": pid }),
+            None => {
+                body = serde_json::json!({ "pid": pid });
+                // Said out loud rather than done quietly: whatever the
+                // config meant by that body has just been dropped, and a
+                // silent replacement would look like the adapter ignoring
+                // settings that were never sent.
+                self.session.status = format!(
+                    "debug: {launch_name}'s body was not a table — using {{\"pid\": {pid}}}"
+                );
+            }
         }
         let root = self.session_root();
-        let launch_name = launch.name.clone();
         let command = adapter.command.clone();
         match self.dap.launch(&launch_name, &command, &root, "attach", body) {
             Ok(_) => self.session.mode = Mode::Debug,
@@ -7822,8 +7828,16 @@ impl Editor {
     /// [`dap::Registry::breakpoints_for`] holds them, since the registry
     /// zips the answer back positionally.
     fn debug_toggle_breakpoint(&mut self) {
-        let Some(path) = self.buffer().and_then(|b| b.path.clone()) else {
+        // Two different failures, and telling them apart is the whole
+        // difference between "focus a file" and "save this one first": a
+        // window showing a tree has no buffer at all, while a scratch buffer
+        // has one with nowhere on disk for a breakpoint to be set *in*.
+        let Some(buffer) = self.buffer() else {
             self.session.status = "no buffer in this window".into();
+            return;
+        };
+        let Some(path) = buffer.path.clone() else {
+            self.session.status = "this buffer has no file — save it first".into();
             return;
         };
         let Some(row) = self.cursor_row() else {
@@ -7831,9 +7845,10 @@ impl Editor {
             return;
         };
         let now_set = self.dap.toggle_breakpoint(&path, row);
-        if self.dap.active().is_some() {
-            self.push_breakpoints(&path);
-        }
+        // Unconditional: `push_breakpoints` resolves the session itself and
+        // does nothing without one, so asking `active()` here first would be
+        // the same lookup twice for the same answer.
+        self.push_breakpoints(&path);
         self.session.status = match now_set {
             true => format!("breakpoint set line {}", row + 1),
             false => format!("breakpoint cleared line {}", row + 1),
@@ -7882,10 +7897,7 @@ impl Editor {
         match top.source.as_ref().and_then(|s| s.path.as_deref()) {
             Some(path) => {
                 let path = path.to_string();
-                // Wire lines are 1-based; the buffer row bi's cursor and
-                // gutter use is 0-based, same conversion as
-                // `dap::Registry::set_verified`.
-                let row = (top.line - 1).max(0) as usize;
+                let row = wire_row(top.line);
                 self.dap.set_stopped_at(PathBuf::from(&path), row);
                 match self.jump_source_window(&path, row) {
                     Ok(()) => self.session.status = format!("stopped in {}", top.name),
@@ -7940,7 +7952,7 @@ impl Editor {
     fn jump_to_frame(&mut self, frame: &dap::types::StackFrame) {
         if let Some(path) = frame.source.as_ref().and_then(|s| s.path.as_deref()) {
             let path = path.to_string();
-            let row = (frame.line - 1).max(0) as usize;
+            let row = wire_row(frame.line);
             if let Err(e) = self.jump_source_window(&path, row) {
                 self.session.status = format!("debug: {e}");
             }
@@ -7987,7 +7999,7 @@ impl Editor {
         let Some(client) = self.dap.active_mut() else { return };
         client.request(
             "evaluate",
-            serde_json::json!({ "expression": expr, "frameId": frame, "context": "watch" }),
+            evaluate_args(expr, frame, "watch"),
             dap::client::Intent::Evaluate {
                 context: dap::client::EvalContext::Watch,
                 expr: expr.to_string(),
@@ -8145,7 +8157,7 @@ impl Editor {
         }
         client.request(
             "evaluate",
-            serde_json::json!({ "expression": expr, "frameId": frame, "context": "repl" }),
+            evaluate_args(&expr, frame, "repl"),
             dap::client::Intent::Evaluate { context: dap::client::EvalContext::Repl, expr },
         );
     }
@@ -8215,7 +8227,7 @@ impl Editor {
         }
         client.request(
             "evaluate",
-            serde_json::json!({ "expression": expr, "frameId": frame, "context": "hover" }),
+            evaluate_args(&expr, frame, "hover"),
             dap::client::Intent::Evaluate { context: dap::client::EvalContext::Hover, expr },
         );
     }
@@ -10231,6 +10243,12 @@ impl Editor {
         // wins the row when the adapter placed the breakpoint somewhere
         // other than where it was requested — the sign belongs where the
         // adapter says it landed, not where it was asked for.
+        // Both lookups match the adapter's path against the buffer's by
+        // exact bytes, with no canonicalization: codelldb, dlv and gdb all
+        // echo back the very `source.path` bi sent them (which is the
+        // buffer's own path), so the one shape that would need normalizing —
+        // a symlinked or relative spelling of the same file — is a shape
+        // none of them produce.
         if let Some(path) = buffer.path.as_deref() {
             for bp in self.dap.breakpoints_for(path) {
                 let row = bp.moved_to.unwrap_or(bp.line);
@@ -24691,6 +24709,28 @@ int main(void) {
         }
 
         /// `:debug stop` — the deliberate end, as against the adapter's own.
+        /// `frameId` is omitted rather than sent as `null` when there is no
+        /// acting frame — `:eval` between the `stopped` event and the
+        /// `stackTrace` answer is exactly that window. DAP reads an absent
+        /// frame as the global scope; a literal `null` is a type error some
+        /// adapters reject outright.
+        #[test]
+        fn an_evaluate_without_a_frame_omits_frame_id() {
+            let (_dir, mut ed, fake) = project("eval-no-frame");
+            stopped_at_thread_7(&mut ed, &fake);
+            assert_eq!(ed.dap().frame(), None, "stackTrace has not answered yet");
+
+            ex(&mut ed, "eval x");
+
+            let sent = fake.last(SessionId(0), "evaluate").expect("evaluate sent");
+            assert_eq!(sent["arguments"]["expression"], json!("x"));
+            assert!(
+                sent["arguments"].get("frameId").is_none(),
+                "no frame, so no key at all: {}",
+                sent["arguments"]
+            );
+        }
+
         #[test]
         fn debug_stop_disconnects_kills_and_returns_to_normal_mode() {
             let (_dir, mut ed, fake) = project("debug-stop");

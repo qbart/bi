@@ -197,7 +197,7 @@ as the no-install fallback on new-enough systems.
 
 ## Deviations from the design
 
-Six places where the build settled on something narrower or different than
+Seven places where the build settled on something narrower or different than
 this spec's text implies, each for a concrete reason:
 
 1. **`b` is not bound in Normal mode.** Normal already owns it for
@@ -227,3 +227,9 @@ this spec's text implies, each for a concrete reason:
    `debug_stopped`), not dotted. Every existing theme key in bi is flat;
    a dotted `debug.breakpoint` would have been the only one and bought
    nothing but inconsistency.
+7. **Conditional breakpoints have no v1 surface at all.** The punt above
+   says "beyond pass-through", but there is no pass-through either: nothing
+   sends a `condition`, because nothing can type one. `Breakpoint.conditional`
+   and the `debug_breakpoint_conditional` theme key are reserved — the
+   gutter already knows how to draw the state, so the flow that sets it
+   later needs no new plumbing — and today nothing ever sets them.

@@ -13,8 +13,10 @@
 //! crucial fork against `lsp::Client`, where the initialize response alone
 //! opens the gate. `configurationDone` starts or resumes the program, moving
 //! to **Running**. From there a `stopped` event parks the session at
-//! **Stopped { thread }** — the cue to walk `threads` → `stackTrace` →
-//! `scopes` → `variables` — and `continued` returns it to Running. **
+//! **Stopped { thread }** — the cue to walk the lazy chain
+//! `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`, with no
+//! `threads` round-trip because the event already named the thread — and
+//! `continued` returns it to Running. **
 //! Terminated { reason }** is either end: a `terminated` event, a protocol
 //! failure ([`Client::die`]), or a deliberate [`Client::disconnect`].
 
@@ -40,7 +42,6 @@ pub enum Intent {
     /// `setBreakpoints` for one file — the path names which file's gutter
     /// the answered `verified`/moved lines belong to.
     SetBreakpoints { path: PathBuf },
-    Threads,
     /// The lazy chain's first link once a thread is known to be stopped.
     StackTrace { thread: i64 },
     /// The lazy chain's second link for one frame.
@@ -256,7 +257,7 @@ impl Client {
     }
 
     /// A `stopped` event: the program is parked at `thread`, the cue to walk
-    /// `threads` → `stackTrace` → `scopes` → `variables`.
+    /// `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`.
     pub fn on_stopped(&mut self, thread: i64) {
         self.phase = Phase::Stopped { thread };
         self.last_thread = Some(thread);
