@@ -192,10 +192,15 @@ impl Client {
     }
 
     /// Tells the adapter breakpoints are in and it may start or resume the
-    /// program. Legal only after `initialized`; the editor is responsible
-    /// for checking [`Client::ready_to_configure`] first, same division of
-    /// labour as `lsp::Client::notify`'s phase gate.
+    /// program. A no-op before the `initialized` event: this is the crucial
+    /// fork the whole module exists to defend — `configurationDone` must
+    /// never go out ahead of it — so the gate is enforced here rather than
+    /// left to callers' discipline, same backstop reasoning as
+    /// `lsp::Client::notify`'s phase check.
     pub fn configuration_done(&mut self) {
+        if !self.ready_to_configure {
+            return;
+        }
         self.request("configurationDone", Value::Null, Intent::ConfigurationDone);
         self.phase = Phase::Running;
     }
@@ -292,6 +297,21 @@ mod tests {
         assert!(c.ready_to_configure());
         c.configuration_done();
         assert!(spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()));
+    }
+
+    #[test]
+    fn configuration_done_before_the_initialized_event_is_a_no_op() {
+        let spawn = FakeSpawn::default();
+        let mut c = started(&spawn);
+        c.finish_initialize(Default::default());
+        c.configuration_done();
+        assert!(!spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()));
+        assert!(matches!(c.phase, Phase::Configuring));
+
+        c.on_initialized_event();
+        c.configuration_done();
+        assert!(spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()));
+        assert!(matches!(c.phase, Phase::Running));
     }
 
     #[test]
