@@ -11,19 +11,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The body of `initialize`'s response — what the adapter can do. bi keeps
-/// only the three capabilities that change client behaviour; the rest of
-/// the (much larger) capabilities object is simply not modeled.
+/// Adapter capabilities bi gates features on, and the whole body of
+/// `initialize`'s response: DAP's initialize response body *is* the
+/// `Capabilities` object, with no wrapper key — there is no
+/// `{"capabilities": {…}}` envelope to unwrap, unlike LSP's `InitializeResult`.
+/// bi keeps only the three capabilities that change client behaviour; the
+/// rest of the (much larger) object is simply not modeled.
+///
+/// All default to `false` — an adapter that stays silent about a feature is
+/// assumed not to have it, same as `lsp::types::Capabilities`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub struct InitializeResponseBody {
-    #[serde(default)]
-    pub capabilities: Capabilities,
-}
-
-/// Adapter capabilities bi gates features on. All default to `false` —
-/// an adapter that stays silent about a feature is assumed not to have it,
-/// same as `lsp::types::Capabilities`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
     /// Whether `configurationDone` must be sent to let the program start —
@@ -160,15 +157,17 @@ pub struct SourceBreakpoint {
 mod tests {
     use super::*;
 
+    /// The wire shape, unwrapped: an `initialize` response's `body` is the
+    /// capabilities object itself, so it parses straight into
+    /// [`Capabilities`] — no envelope, and every capability the adapter
+    /// stayed quiet about defaults to false rather than failing the parse.
     #[test]
-    fn initialize_response_reads_capabilities_and_defaults_missing_ones() {
-        let v = serde_json::json!({
-            "capabilities": { "supportsConfigurationDoneRequest": true }
-        });
-        let body: InitializeResponseBody = serde_json::from_value(v).unwrap();
-        assert!(body.capabilities.supports_configuration_done_request);
+    fn capabilities_parse_directly_from_the_initialize_body() {
+        let v = serde_json::json!({ "supportsConfigurationDoneRequest": true });
+        let caps: Capabilities = serde_json::from_value(v).unwrap();
+        assert!(caps.supports_configuration_done_request);
         // Absent capability defaults to false, never an error.
-        assert!(!body.capabilities.supports_conditional_breakpoints);
+        assert!(!caps.supports_conditional_breakpoints);
     }
 
     #[test]

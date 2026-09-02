@@ -7520,7 +7520,7 @@ impl Editor {
         for effect in self.dap.pump() {
             match effect {
                 dap::Effect::Status(status) => self.session.status = status,
-                dap::Effect::Terminated { reason, .. } => {
+                dap::Effect::Terminated { session, reason } => {
                     self.session.status = format!("debug: session ended — {reason}");
                     // `Mode::Debug` only makes sense while a session is up —
                     // same call `debug_stop` makes when the editor ends it
@@ -7528,6 +7528,11 @@ impl Editor {
                     if self.session.mode == Mode::Debug {
                         self.session.mode = Mode::Normal;
                     }
+                    // The debuggee is gone; the *adapter* is not, and is owed
+                    // the `disconnect` that ends the session with it (the
+                    // lifecycle's step 7). Then it is reaped and dropped —
+                    // see `dap::Registry::end_session`.
+                    self.dap.end_session(session, std::time::Duration::from_millis(200));
                 }
                 // The registry already counted this file into
                 // `pending_pushes` on `initialized`; the editor's only job is
@@ -7538,8 +7543,16 @@ impl Editor {
                 // The client is already `Phase::Stopped{thread}` (the
                 // registry did `on_stopped`) — kick the lazy chain's first
                 // link, `stackTrace`, for that thread.
-                dap::Effect::Stopped { thread, .. } => {
-                    if let Some(client) = self.dap.active_mut() {
+                // Resolved by the id the effect carries, never by whichever
+                // session happens to be active: the two are the same today
+                // (one session at a time, enforced in `Registry::launch`)
+                // and a `stopped` sent to the wrong adapter would be a
+                // silent, baffling bug the day they are not.
+                dap::Effect::Stopped { session, thread } => {
+                    if self.dap.active().map(|client| client.id) != Some(session) {
+                        self.session.status =
+                            "debug: a stop from a session that is not the active one".into();
+                    } else if let Some(client) = self.dap.session_mut(session) {
                         client.request(
                             "stackTrace",
                             serde_json::json!({
@@ -7753,13 +7766,16 @@ impl Editor {
 
     /// `:debug stop`. Disconnects the active session and leaves
     /// `Mode::Debug` if it was up — the session ends either way, so the mode
-    /// that only makes sense while one is running should not linger.
+    /// that only makes sense while one is running should not linger. The
+    /// teardown itself is [`dap::Registry::end_session`]'s, the same one the
+    /// `terminated` event takes, so an adapter bi attached to is detached
+    /// from rather than killed.
     fn debug_stop(&mut self) {
-        let Some(client) = self.dap.active_mut() else {
+        let Some(id) = self.dap.active().map(|client| client.id) else {
             self.session.status = "debug: no active session".into();
             return;
         };
-        client.disconnect(true, std::time::Duration::from_millis(500));
+        self.dap.end_session(id, std::time::Duration::from_millis(500));
         self.session.status = "debug: stopped".into();
         if self.session.mode == Mode::Debug {
             self.session.mode = Mode::Normal;
@@ -9981,6 +9997,14 @@ impl Editor {
     /// terminal is handed back.
     pub fn shutdown_lsp(&mut self) {
         self.lsp.shutdown_all();
+    }
+
+    /// The same for debug adapters: every live session gets its
+    /// `disconnect`, a short wait, then the axe. Called once beside
+    /// [`Editor::shutdown_lsp`] — an adapter left running has a *debuggee*
+    /// left running behind it, which is a stopped process nobody owns.
+    pub fn shutdown_dap(&mut self) {
+        self.dap.shutdown_all(std::time::Duration::from_millis(200));
     }
 
     /// Installs how git baselines are fetched — [`crate::git::baseline`] from
@@ -24349,7 +24373,7 @@ int main(void) {
             assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
 
             // Answer initialize; the next settle sends launch.
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
             ed.settle();
             assert!(fake.methods(SessionId(0)).contains(&"launch".to_string()));
         }
@@ -24390,10 +24414,15 @@ int main(void) {
         /// fake, the way a real handshake would: `initialize` answered,
         /// `initialized` (no breakpoints, so `configurationDone` fires with no
         /// `PushBreakpoints` effect to answer), then `stopped`.
+        ///
+        /// The `initialize` body is the capabilities object itself — DAP has
+        /// no `{"capabilities": …}` envelope — and it claims
+        /// `supportsConfigurationDoneRequest`, without which the client
+        /// correctly skips that request altogether.
         fn stopped_at_thread_7(ed: &mut Editor, fake: &FakeSpawn) {
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24417,7 +24446,7 @@ int main(void) {
             let (_dir, mut ed, fake) = project("toggle-bp-repush");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24527,7 +24556,7 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24564,7 +24593,7 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24607,12 +24636,98 @@ int main(void) {
             assert_eq!(scopes["arguments"]["frameId"], json!(3));
         }
 
+        /// The lifecycle's step 7: the `terminated` event says the debuggee
+        /// is gone, and bi answers with the `disconnect` the adapter is owed
+        /// — then reaps it. Nothing of the session survives: a dead client
+        /// holding a transport for the editor's remaining life is exactly
+        /// the leak this closes.
+        #[test]
+        fn terminated_disconnects_and_reaps_the_session() {
+            let (_dir, mut ed, fake) = project("terminated-teardown");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
+            ed.settle();
+
+            fake.event(SessionId(0), "terminated", json!({}));
+            ed.settle();
+
+            let sent = fake.last(SessionId(0), "disconnect").expect("disconnect sent");
+            assert_eq!(
+                sent["arguments"]["terminateDebuggee"],
+                json!(true),
+                "bi launched this debuggee, so ending the session ends it too"
+            );
+            assert!(fake.killed.lock().unwrap().contains(&SessionId(0)), "the child was reaped");
+            assert!(ed.dap().active().is_none(), "and nothing is active any more");
+        }
+
+        /// Quitting bi with a session up: the DAP twin of `shutdown_lsp`,
+        /// called from the same place in `main`.
+        #[test]
+        fn shutdown_dap_disconnects_live_sessions() {
+            let (_dir, mut ed, fake) = project("shutdown-dap");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
+            ed.settle();
+
+            ed.shutdown_dap();
+
+            assert!(fake.last(SessionId(0), "disconnect").is_some(), "asked to leave");
+            assert!(fake.killed.lock().unwrap().contains(&SessionId(0)), "then made to");
+        }
+
+        /// `:debug stop` — the deliberate end, as against the adapter's own.
+        #[test]
+        fn debug_stop_disconnects_kills_and_returns_to_normal_mode() {
+            let (_dir, mut ed, fake) = project("debug-stop");
+            stopped_at_thread_7(&mut ed, &fake);
+            assert_eq!(ed.session.mode, Mode::Debug);
+
+            ex(&mut ed, "debug stop");
+
+            let sent = fake.last(SessionId(0), "disconnect").expect("disconnect sent");
+            assert_eq!(sent["arguments"]["terminateDebuggee"], json!(true), "a launch session");
+            assert!(fake.killed.lock().unwrap().contains(&SessionId(0)));
+            assert_eq!(ed.session.mode, Mode::Normal);
+            assert!(ed.dap().active().is_none());
+        }
+
+        /// `p` — `pause` carries the thread the last `stopped` event named,
+        /// since DAP wants one even where the adapter pauses everything.
+        #[test]
+        fn pause_sends_the_last_stopped_thread() {
+            let (_dir, mut ed, fake) = project("debug-pause");
+            stopped_at_thread_7(&mut ed, &fake);
+            // Back to Running, the way `c` leaves it — `pause` is refused
+            // outright while the session is already stopped.
+            ed.debug_command(DebugCmd::Continue);
+
+            ed.debug_command(DebugCmd::Pause);
+
+            let sent = fake.last(SessionId(0), "pause").expect("pause sent");
+            assert_eq!(sent["arguments"]["threadId"], json!(7));
+        }
+
         #[test]
         fn terminated_returns_to_normal_mode() {
             let (_dir, mut ed, fake) = project("terminated");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             assert_eq!(ed.session.mode, Mode::Debug);
 
@@ -24641,7 +24756,7 @@ int main(void) {
             ex(&mut ed, "debug stack");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24682,7 +24797,7 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
 
             fake.event(SessionId(0), "output", json!({"category": "stdout", "output": "a\n"}));
@@ -24723,7 +24838,7 @@ int main(void) {
             ex(&mut ed, "debug stack");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -24778,7 +24893,7 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -25027,7 +25142,7 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -25233,7 +25348,7 @@ int main(void) {
             assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
             assert_eq!(ed.session.mode, Mode::Debug);
 
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
             ed.settle();
 
             let attach = fake.last(SessionId(0), "attach").expect("attach sent");

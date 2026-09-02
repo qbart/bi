@@ -91,6 +91,9 @@ fn main() -> Result<()> {
     // Before `restore`, not after: the servers get their shutdown while the
     // screen is still bi's, and a hung one is killed rather than waited on.
     editor.shutdown_lsp();
+    // And the debug adapters, for the stronger version of the same reason:
+    // an adapter outliving bi keeps a *stopped debuggee* alive behind it.
+    editor.shutdown_dap();
     // Also before `restore`, for the same reason: leaving the alternate
     // screen does not take a kitty placement with it, and an editor that
     // quits leaving a photograph floating over the shell has not quit.

@@ -28,13 +28,23 @@
 //! the editor's only job is to answer each `PushBreakpoints` effect with a
 //! `setBreakpoints` request carrying `Intent::SetBreakpoints { path }`, and
 //! the registry takes it from there.
+//!
+//! **One session, and it is torn down here.** v1 has a single `active` and a
+//! single set of panes to show it in, so [`Registry::launch`] refuses while
+//! one is live rather than spawning an invisible second adapter
+//! (`startDebugging`/multi-session is a spec punt). Ending is the mirror
+//! image: [`Registry::end_session`] sends the `disconnect` the lifecycle's
+//! step 7 owes the adapter, reaps the child, and drops the client — the
+//! editor's `Effect::Terminated` arm and `:debug stop` both go through it,
+//! and [`Registry::shutdown_all`] does the same for every session at quit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
-use super::client::{Client, EvalContext, Intent};
+use super::client::{Client, EvalContext, Intent, Phase};
 use super::transport::Spawn;
 use super::{Inbound, Inbox, SessionId, types};
 
@@ -166,6 +176,20 @@ impl Registry {
         self.sessions.iter().find(|c| c.id == id)
     }
 
+    /// The same lookup for the side that sends: an effect names the session
+    /// it came from, and the request it provokes belongs to *that* session,
+    /// not to whichever one happens to be active by the time the editor gets
+    /// round to it.
+    pub fn session_mut(&mut self, id: SessionId) -> Option<&mut Client> {
+        self.sessions.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Whether any session is still alive — what makes a second
+    /// [`Registry::launch`] a refusal rather than a silent second adapter.
+    pub fn live(&self) -> bool {
+        self.sessions.iter().any(|c| !matches!(c.phase, Phase::Terminated { .. }))
+    }
+
     /// Toggles one breakpoint at `path`:`line` (0-based row). Returns
     /// whether it is now set. Pure bookkeeping — pushing it to a live
     /// session's adapter is the editor's job, driven by
@@ -244,6 +268,19 @@ impl Registry {
         }
     }
 
+    /// Everything that only means something while a session sits still:
+    /// where it is stopped, which frame is being looked at, and every
+    /// watch's last value. The three move together — a frame id, a `▶` row
+    /// and a value are all readings of one paused program — so the contract
+    /// lives here rather than being retyped at each of the five places a
+    /// session stops sitting still (`continued`, `terminated`, `Eof`, a new
+    /// [`Registry::launch`], and a session torn down).
+    fn clear_stop_state(&mut self) {
+        self.stopped_at = None;
+        self.frame = None;
+        self.clear_watch_values();
+    }
+
     /// Clears every watch's value without forgetting the expression —
     /// called everywhere `stopped_at` is cleared, so a value evaluated
     /// against a frame that no longer exists does not linger on screen.
@@ -277,6 +314,13 @@ impl Registry {
     /// `initialize` answers, never modelled (protocol-opaque, per
     /// `docs/specs/debug.md`). The new session becomes
     /// [`Registry::active`].
+    ///
+    /// **One session at a time.** v1 has a single `active` and a single set
+    /// of panes, gutter marks and watches to show it in; a second adapter
+    /// spawned behind the first would run, take the breakpoints and be
+    /// invisible — and `startDebugging`/multi-session is an explicit punt in
+    /// the spec. So a live session is a refusal, not a queue: the user is
+    /// told to stop the one they have.
     pub fn launch(
         &mut self,
         name: &str,
@@ -285,6 +329,9 @@ impl Registry {
         request: &str,
         body: Value,
     ) -> Result<SessionId, String> {
+        if self.live() {
+            return Err("a session is already running — :debug stop first".into());
+        }
         let Some(spawner) = self.spawner.as_deref() else {
             return Err("this frontend supplies no debug adapter spawner".into());
         };
@@ -294,7 +341,44 @@ impl Registry {
             Client::start(id, name, command, root, self.inbox.clone(), spawner, request, body)?;
         self.sessions.push(client);
         self.active = Some(id);
+        // A fresh session is not stopped anywhere, whatever the last one
+        // left behind. See [`Registry::clear_stop_state`].
+        self.clear_stop_state();
         Ok(id)
+    }
+
+    /// Ends one session for good: the `disconnect` the lifecycle's step 7
+    /// owes the adapter — with `terminateDebuggee` only when bi started the
+    /// program, since killing a server it merely attached to is killing
+    /// someone else's process — then the short wait and the axe, so the
+    /// `Child` is reaped and the three reader/writer/stderr threads end.
+    ///
+    /// The client is then dropped out of `sessions` rather than parked
+    /// there: a `Terminated` client answers nothing, and keeping it would
+    /// hold its transport (and the pipes behind it) for the editor's whole
+    /// life. Anything that only means something while a session is stopped
+    /// goes with it.
+    pub fn end_session(&mut self, id: SessionId, patience: Duration) {
+        let Some(at) = self.sessions.iter().position(|c| c.id == id) else { return };
+        let mut client = self.sessions.remove(at);
+        client.disconnect(client.launched(), patience);
+        self.pending_pushes.remove(&id);
+        if self.active == Some(id) {
+            self.active = None;
+            self.clear_stop_state();
+        }
+    }
+
+    /// Session end: every live adapter asked to leave, briefly waited for,
+    /// then killed. The DAP twin of `lsp::Registry::shutdown_all`, and
+    /// called from the same place — once, after the frontend's loop.
+    pub fn shutdown_all(&mut self, patience: Duration) {
+        for client in &mut self.sessions {
+            let terminate = client.launched();
+            client.disconnect(terminate, patience);
+        }
+        self.sessions.clear();
+        self.active = None;
     }
 
     /// Drains the inbox and advances every session whose turn has come,
@@ -322,9 +406,7 @@ impl Registry {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 let reason = "pipe closed".to_string();
                 client.die(reason.clone());
-                self.stopped_at = None;
-                self.frame = None;
-                self.clear_watch_values();
+                self.clear_stop_state();
                 vec![Effect::Terminated { session: from, reason }]
             }
         }
@@ -379,10 +461,21 @@ impl Registry {
                     vec![Effect::Status(format!("{name}: {reason}"))]
                 }
             }
-            // Nothing to do: the phase already moved to Running when this
-            // was sent, and a failure here means the adapter rejected a
-            // well-formed no-argument request — not actionable.
-            Intent::ConfigurationDone => Vec::new(),
+            // Success is silent — the phase already moved to Running when
+            // this was sent. A rejection is not: `configurationDone` is what
+            // starts the program, so an adapter refusing it means nothing
+            // will ever run, and no other message will ever say so. The one
+            // no-argument request whose failure is worth a status line.
+            Intent::ConfigurationDone => {
+                if success {
+                    Vec::new()
+                } else {
+                    vec![Effect::Status(format!(
+                        "debug: configurationDone rejected: {}",
+                        message.unwrap_or_else(|| "no reason given".into())
+                    ))]
+                }
+            }
             Intent::SetBreakpoints { path } => {
                 if success {
                     let arr = body.get("breakpoints").cloned().unwrap_or(Value::Array(Vec::new()));
@@ -503,9 +596,7 @@ impl Registry {
             "continued" => {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 client.on_continued();
-                self.stopped_at = None;
-                self.frame = None;
-                self.clear_watch_values();
+                self.clear_stop_state();
                 Vec::new()
             }
             "output" => match serde_json::from_value::<types::OutputEvent>(body) {
@@ -519,9 +610,7 @@ impl Registry {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 let reason = "terminated".to_string();
                 client.on_terminated(reason.clone());
-                self.stopped_at = None;
-                self.frame = None;
-                self.clear_watch_values();
+                self.clear_stop_state();
                 vec![Effect::Terminated { session: from, reason }]
             }
             // Adapters send others bi does not model yet (`thread`,
@@ -637,7 +726,9 @@ mod tests {
             .expect("spawner is set");
 
         let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
-        fake.respond(id, seq, "initialize", true, json!({}));
+        // The initialize response body *is* the capabilities object — and
+        // `configurationDone` below only goes out because it says so.
+        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
         assert!(reg.pump().is_empty(), "initialize answered, nothing for the editor yet");
 
         fake.event(id, "initialized", Value::Null);
@@ -694,6 +785,74 @@ mod tests {
         assert_eq!(reg.frame(), None, "and the acting frame with it");
     }
 
+    /// v1 shows one session — one `active`, one gutter, one set of panes —
+    /// so a second launch behind the first would spawn an adapter nothing
+    /// could see or stop. Refused, and the message says how to make room.
+    #[test]
+    fn a_second_launch_while_live_is_refused() {
+        let fake = FakeSpawn::default();
+        let mut reg = Registry::default();
+        reg.set_spawner(fake.clone());
+        let id = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect("the first one starts");
+
+        let err = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect_err("the second one does not");
+        assert!(err.contains(":debug stop"), "{err}");
+        assert_eq!(fake.spawned.lock().unwrap().len(), 1, "and no second adapter was spawned");
+
+        // Once the first is torn down the slot is free again.
+        reg.end_session(id, Duration::from_millis(0));
+        assert!(
+            reg.launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+                .is_ok()
+        );
+    }
+
+    /// The one failure the editor cannot shrug off: `configurationDone` is
+    /// what starts the program, so an adapter rejecting it means nothing
+    /// will ever run and no other message will say so. Every other
+    /// no-argument response stays silent; this one gets a status line.
+    #[test]
+    fn a_rejected_configuration_done_reaches_the_status_line() {
+        let fake = FakeSpawn::default();
+        let mut reg = Registry::default();
+        reg.set_spawner(fake.clone());
+        let id = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect("spawner is set");
+
+        let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
+        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+        reg.pump();
+        fake.event(id, "initialized", Value::Null);
+        reg.pump();
+
+        let done = fake.last(id, "configurationDone").expect("the gate fired");
+        // Delivered by hand rather than through `fake.respond`, which has no
+        // `message` to carry — the reason is the whole point of the status.
+        reg.inbox().deliver(
+            id,
+            Inbound::Response {
+                request_seq: done["seq"].as_i64().unwrap(),
+                success: false,
+                command: "configurationDone".into(),
+                body: Value::Null,
+                message: Some("not ready".into()),
+            },
+        );
+
+        match reg.pump().as_slice() {
+            [Effect::Status(status)] => {
+                assert!(status.contains("configurationDone"), "{status}");
+                assert!(status.contains("not ready"), "{status}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn configuration_done_waits_for_every_pushed_file_to_answer() {
         let fake = FakeSpawn::default();
@@ -708,7 +867,7 @@ mod tests {
             .expect("spawner is set");
 
         let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
-        fake.respond(id, seq, "initialize", true, json!({}));
+        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
         reg.pump();
 
         fake.event(id, "initialized", Value::Null);

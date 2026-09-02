@@ -94,6 +94,20 @@ pub struct Client {
     /// `"launch"` or `"attach"`; `body` is the adapter-specific JSON, passed
     /// through opaquely per the protocol's own design.
     stashed: Option<(String, Value)>,
+    /// Whether bi *launched* the debuggee rather than attaching to one that
+    /// was already running. Kept beside `stashed` rather than read out of it
+    /// because `stashed` is consumed the moment `initialize` answers, and
+    /// the question outlives it: `disconnect`'s `terminateDebuggee` turns on
+    /// exactly this — killing a program bi started is ending the session,
+    /// killing one it merely attached to is killing someone else's server.
+    launched: bool,
+    /// Whether `disconnect` has already gone out, or the transport is gone.
+    /// Not the same question as `Phase::Terminated`: the `terminated` event
+    /// says the *debuggee* is finished while the adapter is still up and
+    /// still owed its `disconnect` — the deliberate second act the lifecycle
+    /// describes. Without this flag the phase check would swallow exactly
+    /// the disconnect the protocol asks for.
+    disconnected: bool,
     /// The thread the last `stopped` event named. Cleared never — `pause`
     /// has no thread of its own to send and reaches for whichever one bi
     /// last saw stop, on the theory that most adapters pause every thread
@@ -132,6 +146,8 @@ impl Client {
             pending: HashMap::new(),
             ready_to_configure: false,
             stashed: Some((request.to_string(), body)),
+            launched: request != "attach",
+            disconnected: false,
             last_thread: None,
         };
         client.request(
@@ -151,6 +167,13 @@ impl Client {
 
     pub fn running(&self) -> bool {
         matches!(self.phase, Phase::Running)
+    }
+
+    /// Whether bi started the debuggee (`launch`) rather than attaching to a
+    /// process that was already there (`attach`) — which is exactly what
+    /// `disconnect`'s `terminateDebuggee` should be. See the field's doc.
+    pub fn launched(&self) -> bool {
+        self.launched
     }
 
     /// Whether the `initialized` event has arrived — the editor's gate to
@@ -215,11 +238,20 @@ impl Client {
     /// never go out ahead of it — so the gate is enforced here rather than
     /// left to callers' discipline, same backstop reasoning as
     /// `lsp::Client::notify`'s phase check.
+    ///
+    /// The request itself is optional, and gated on the capability: an
+    /// adapter that did not claim `supportsConfigurationDoneRequest` starts
+    /// the program on `launch`/`attach` and has nothing to be told, so
+    /// sending it anyway is a protocol error it either rejects or ignores.
+    /// The phase moves to `Running` either way — the difference is only in
+    /// what goes on the wire, never in what the editor believes.
     pub fn configuration_done(&mut self) {
         if !self.ready_to_configure {
             return;
         }
-        self.request("configurationDone", Value::Null, Intent::ConfigurationDone);
+        if self.caps.supports_configuration_done_request {
+            self.request("configurationDone", Value::Null, Intent::ConfigurationDone);
+        }
         self.phase = Phase::Running;
     }
 
@@ -257,6 +289,7 @@ impl Client {
         // outlive bi's opinion of it.
         self.transport.kill();
         self.phase = Phase::Terminated { reason };
+        self.disconnected = true;
         self.pending.clear();
     }
 
@@ -264,10 +297,17 @@ impl Client {
     /// it to kill the debuggee too, then a short wait before the axe. Unlike
     /// `lsp::Client::shutdown`'s `shutdown`+`exit` pair, DAP has one request
     /// for this, with `terminateDebuggee` as its only real choice.
+    ///
+    /// Guarded by `disconnected`, not by the phase: a session that reached
+    /// `Phase::Terminated` through the `terminated` *event* still owes the
+    /// adapter this request — the debuggee ending and the session ending are
+    /// two different things, and the lifecycle's step 7 is precisely the
+    /// second following the first. Only a second call is a no-op.
     pub fn disconnect(&mut self, terminate: bool, patience: Duration) {
-        if let Phase::Terminated { .. } = self.phase {
+        if self.disconnected {
             return;
         }
+        self.disconnected = true;
         self.request(
             "disconnect",
             json!({ "terminateDebuggee": terminate }),
@@ -293,6 +333,13 @@ mod tests {
         ).unwrap()
     }
 
+    /// What an adapter that speaks `configurationDone` answers `initialize`
+    /// with — the capability every test of the gate has to grant, since
+    /// without it the request is correctly skipped.
+    fn supports_configuration_done() -> Capabilities {
+        Capabilities { supports_configuration_done_request: true, ..Default::default() }
+    }
+
     #[test]
     fn start_sends_initialize_first() {
         let spawn = FakeSpawn::default();
@@ -316,7 +363,7 @@ mod tests {
     fn configuration_done_waits_for_the_initialized_event() {
         let spawn = FakeSpawn::default();
         let mut c = started(&spawn);
-        c.finish_initialize(Default::default());
+        c.finish_initialize(supports_configuration_done());
         assert!(!c.ready_to_configure());
         c.on_initialized_event();
         assert!(c.ready_to_configure());
@@ -328,7 +375,7 @@ mod tests {
     fn configuration_done_before_the_initialized_event_is_a_no_op() {
         let spawn = FakeSpawn::default();
         let mut c = started(&spawn);
-        c.finish_initialize(Default::default());
+        c.finish_initialize(supports_configuration_done());
         c.configuration_done();
         assert!(!spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()));
         assert!(matches!(c.phase, Phase::Configuring));
@@ -337,6 +384,28 @@ mod tests {
         c.configuration_done();
         assert!(spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()));
         assert!(matches!(c.phase, Phase::Running));
+    }
+
+    /// An adapter that never claimed `supportsConfigurationDoneRequest` is
+    /// one that starts the program on `launch`/`attach` — sending the
+    /// request anyway is a protocol error it may answer with a failure or
+    /// (worse) ignore, leaving bi waiting. The phase still moves: as far as
+    /// the editor is concerned the program is running either way.
+    #[test]
+    fn configuration_done_is_skipped_by_an_adapter_that_does_not_offer_it() {
+        let spawn = FakeSpawn::default();
+        let mut c = started(&spawn);
+        c.finish_initialize(Capabilities::default());
+        c.on_initialized_event();
+
+        c.configuration_done();
+
+        assert!(
+            !spawn.methods(SessionId(0)).contains(&"configurationDone".to_string()),
+            "{:?}",
+            spawn.methods(SessionId(0))
+        );
+        assert!(matches!(c.phase, Phase::Running), "{:?}", c.phase);
     }
 
     #[test]
