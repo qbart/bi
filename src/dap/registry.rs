@@ -52,6 +52,21 @@ pub struct Breakpoint {
     pub conditional: bool,
 }
 
+/// One expression in the Watches pane, and its last evaluated value.
+///
+/// Editor-owned and session-independent, like [`Breakpoint`] — see the
+/// module doc's rationale for breakpoints, which applies here unchanged: a
+/// watch typed before any session exists is still there when one starts,
+/// and two open Watches panes show the same list. `value` is `None` before
+/// the first `evaluate` answers and again whenever the session is not
+/// stopped (`Registry::clear_watch_values`, called everywhere `stopped_at`
+/// is) — a value from a frame that no longer exists must not linger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watch {
+    pub expr: String,
+    pub value: Option<String>,
+}
+
 /// What the editor must do about an inbound message — everything else
 /// (client phase transitions, filed intents, breakpoint bookkeeping) is
 /// handled inside [`Registry::pump`] before it ever reaches here.
@@ -115,6 +130,9 @@ pub struct Registry {
     /// everywhere `stopped_at` is, since a frame id from a session that is no
     /// longer stopped means nothing.
     frame: Option<i64>,
+    /// The Watches pane's expressions and last values — editor-owned,
+    /// session-independent. See [`Watch`]'s doc.
+    watches: Vec<Watch>,
 }
 
 impl Registry {
@@ -201,6 +219,48 @@ impl Registry {
         self.frame = frame;
     }
 
+    /// Every watch, in the order the Watches pane shows them.
+    pub fn watches(&self) -> &[Watch] {
+        &self.watches
+    }
+
+    /// `:watch <expr>` — appends `expr` unless it is already watched (no
+    /// duplicate by expression text, so a re-add is silently idempotent
+    /// rather than a doubled row). Starts with no value; the caller
+    /// evaluates it right away when the session is stopped, per
+    /// `docs/specs/debug.md` §UI.
+    pub fn add_watch(&mut self, expr: String) {
+        if !self.watches.iter().any(|w| w.expr == expr) {
+            self.watches.push(Watch { expr, value: None });
+        }
+    }
+
+    /// Removes the watch at `index` (0-based). Out of range is a silent
+    /// no-op — the caller (`:unwatch`, the Watches pane's `d`) has already
+    /// bounds-checked against [`Registry::watches`].
+    pub fn remove_watch(&mut self, index: usize) {
+        if index < self.watches.len() {
+            self.watches.remove(index);
+        }
+    }
+
+    /// Clears every watch's value without forgetting the expression —
+    /// called everywhere `stopped_at` is cleared, so a value evaluated
+    /// against a frame that no longer exists does not linger on screen.
+    pub fn clear_watch_values(&mut self) {
+        for watch in &mut self.watches {
+            watch.value = None;
+        }
+    }
+
+    /// Sets one watch's value by matching its expression text — what an
+    /// `Effect::Evaluated { context: EvalContext::Watch, .. }` answers with.
+    pub fn set_watch_value(&mut self, expr: &str, value: String) {
+        if let Some(watch) = self.watches.iter_mut().find(|w| w.expr == expr) {
+            watch.value = Some(value);
+        }
+    }
+
     /// Marks the adapter's `setBreakpoints` answer onto the stored rows, in
     /// the order they were asked. The wire's 1-based `line` becomes a
     /// 0-based `moved_to`, kept only when it actually differs from the row
@@ -264,6 +324,7 @@ impl Registry {
                 client.die(reason.clone());
                 self.stopped_at = None;
                 self.frame = None;
+                self.clear_watch_values();
                 vec![Effect::Terminated { session: from, reason }]
             }
         }
@@ -382,6 +443,15 @@ impl Registry {
                 if success {
                     let result = body.get("result").and_then(Value::as_str).unwrap_or("").to_string();
                     vec![Effect::Evaluated { context, expr, result }]
+                } else if context == EvalContext::Watch {
+                    // A failed watch still has to show *something* in its
+                    // row — a status line would vanish under the next
+                    // status and leave the row looking like it never asked.
+                    // So a watch's own failure becomes its "value" rather
+                    // than `Effect::Status`, which every other Evaluate
+                    // failure still uses.
+                    let msg = message.unwrap_or_else(|| "failed".into());
+                    vec![Effect::Evaluated { context, expr, result: format!("<error: {msg}>") }]
                 } else {
                     failed("evaluate")
                 }
@@ -435,6 +505,7 @@ impl Registry {
                 client.on_continued();
                 self.stopped_at = None;
                 self.frame = None;
+                self.clear_watch_values();
                 Vec::new()
             }
             "output" => match serde_json::from_value::<types::OutputEvent>(body) {
@@ -450,6 +521,7 @@ impl Registry {
                 client.on_terminated(reason.clone());
                 self.stopped_at = None;
                 self.frame = None;
+                self.clear_watch_values();
                 vec![Effect::Terminated { session: from, reason }]
             }
             // Adapters send others bi does not model yet (`thread`,
@@ -511,6 +583,33 @@ mod tests {
         assert_eq!(reg.breakpoints_for(Path::new("/a.rs")).len(), 1);
         assert!(!reg.toggle_breakpoint(Path::new("/a.rs"), 10));
         assert!(reg.breakpoints_for(Path::new("/a.rs")).is_empty());
+    }
+
+    #[test]
+    fn watches_add_without_duplicating_and_remove_by_index() {
+        let mut reg = Registry::default();
+        reg.add_watch("x + 1".into());
+        reg.add_watch("x + 1".into());
+        assert_eq!(reg.watches().len(), 1, "no duplicate by expression text");
+        assert_eq!(reg.watches()[0].value, None);
+
+        reg.add_watch("y".into());
+        assert_eq!(reg.watches().len(), 2);
+
+        reg.remove_watch(0);
+        assert_eq!(reg.watches(), [Watch { expr: "y".into(), value: None }]);
+    }
+
+    #[test]
+    fn a_watch_value_is_set_by_expression_and_cleared_without_forgetting_it() {
+        let mut reg = Registry::default();
+        reg.add_watch("x + 1".into());
+
+        reg.set_watch_value("x + 1", "2".into());
+        assert_eq!(reg.watches()[0].value.as_deref(), Some("2"));
+
+        reg.clear_watch_values();
+        assert_eq!(reg.watches()[0].value, None, "the expression stays, only the value clears");
     }
 
     #[test]

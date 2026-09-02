@@ -48,6 +48,15 @@ pub enum Content {
     /// transcript, oldest first. Boxed like `Results`, so a window showing
     /// text does not pay `Content`'s size for a pane it is not.
     DapConsole(Box<DapConsole>),
+    /// The lazy scope/variable tree — see `docs/specs/debug.md` §UI. View
+    /// state like `DapStack`: which nodes are expanded is a question about
+    /// this pane, not about the session, so two open Variables panes may
+    /// disagree. Boxed for the same reason `DapConsole` is.
+    DapVariables(Box<DapVariables>),
+    /// The Watches pane's view state — which row is selected. The
+    /// expressions and their values are `dap::Registry::watches`'s, not the
+    /// pane's: they outlive any one Watches window and any one session.
+    DapWatches(DapWatches),
 }
 
 /// One `stackTrace` answer, and which frame is selected — not necessarily the
@@ -89,6 +98,105 @@ impl DapConsole {
     }
 }
 
+/// One row of the Variables pane's tree — a scope at the root, or one level
+/// of a struct's fields / a `Vec`'s elements fetched lazily against
+/// `reference`. `reference == 0` is DAP's own signal there is nothing under
+/// it — the leaf case, the role `tree::Kind::File` plays for [`Tree`].
+/// `loaded` and `expanded` are independent: expanding an unloaded node fires
+/// the `variables` request (`editor.rs`) and does not actually open until
+/// the answer fills `children` — see `docs/specs/debug.md` §UI.
+#[derive(Debug, Clone)]
+pub struct VarNode {
+    pub name: String,
+    pub value: String,
+    pub ty: Option<String>,
+    pub reference: i64,
+    pub expanded: bool,
+    pub loaded: bool,
+    pub children: Vec<VarNode>,
+}
+
+/// The Variables pane: scopes at the root, filled lazily as `scopes` and
+/// `variables` answers arrive. View state like [`Tree`], not the registry —
+/// two open Variables panes are free to have expanded different nodes.
+#[derive(Debug, Clone, Default)]
+pub struct DapVariables {
+    pub roots: Vec<VarNode>,
+    /// Indexes [`DapVariables::visible`], not `roots` directly — a nested,
+    /// partly expanded tree has no single flat vec of that shape to index
+    /// instead.
+    pub selected: usize,
+}
+
+impl DapVariables {
+    /// Every visible row, depth-first — a scope is depth 0, and a node's
+    /// children appear only when it is `expanded`. What `render.rs` draws
+    /// and `selected` indexes into.
+    pub fn visible(&self) -> Vec<(usize, &VarNode)> {
+        let mut out = Vec::new();
+        for root in &self.roots {
+            push_visible(root, 0, &mut out);
+        }
+        out
+    }
+
+    /// The selected row, mutably — what `Expand`/`Collapse` act on.
+    /// [`DapVariables::visible`] cannot serve this itself: a flat
+    /// `Vec<&mut VarNode>` cannot coexist with the recursion into
+    /// `children` that produces it, so this walks the same shape directly,
+    /// counting rows down to `selected` instead of building a list of them.
+    pub fn selected_node_mut(&mut self) -> Option<&mut VarNode> {
+        let target = self.selected;
+        let mut at = 0usize;
+        for root in &mut self.roots {
+            if let Some(node) = find_node_mut(root, target, &mut at) {
+                return Some(node);
+            }
+        }
+        None
+    }
+}
+
+fn push_visible<'a>(node: &'a VarNode, depth: usize, out: &mut Vec<(usize, &'a VarNode)>) {
+    out.push((depth, node));
+    if node.expanded {
+        for child in &node.children {
+            push_visible(child, depth + 1, out);
+        }
+    }
+}
+
+/// [`DapVariables::selected_node_mut`]'s walk: the same depth-first,
+/// expanded-only order [`push_visible`] counts, but returning a mutable
+/// reference to the row at `target` instead of building a `Vec`.
+fn find_node_mut<'a>(
+    node: &'a mut VarNode,
+    target: usize,
+    at: &mut usize,
+) -> Option<&'a mut VarNode> {
+    let here = *at;
+    *at += 1;
+    if here == target {
+        return Some(node);
+    }
+    if node.expanded {
+        for child in &mut node.children {
+            if let Some(found) = find_node_mut(child, target, at) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The Watches pane's view state — which row is selected. The expressions
+/// and their values live in `dap::Registry::watches`, not here: they outlive
+/// any one Watches window, and two open panes show the same list.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DapWatches {
+    pub selected: usize,
+}
+
 /// Which keymap a window wants, and which renderer.
 ///
 /// An enum rather than an `is_tree` flag: the next pane kind should be a
@@ -101,6 +209,8 @@ pub enum ContentKind {
     Image,
     DapStack,
     DapConsole,
+    DapVariables,
+    DapWatches,
 }
 
 impl Content {
@@ -112,6 +222,8 @@ impl Content {
             Content::Image(_) => ContentKind::Image,
             Content::DapStack(_) => ContentKind::DapStack,
             Content::DapConsole(_) => ContentKind::DapConsole,
+            Content::DapVariables(_) => ContentKind::DapVariables,
+            Content::DapWatches(_) => ContentKind::DapWatches,
         }
     }
 
@@ -123,7 +235,9 @@ impl Content {
             | Content::Results(_)
             | Content::Image(_)
             | Content::DapStack(_)
-            | Content::DapConsole(_) => None,
+            | Content::DapConsole(_)
+            | Content::DapVariables(_)
+            | Content::DapWatches(_) => None,
         }
     }
 }
@@ -1154,5 +1268,46 @@ mod tests {
 
         layout.equalize();
         assert_eq!(layout.rect_of(w[1], area(), &CHROME).unwrap().width, 40);
+    }
+
+    fn var(name: &str, reference: i64, expanded: bool, children: Vec<VarNode>) -> VarNode {
+        VarNode {
+            name: name.into(),
+            value: String::new(),
+            ty: None,
+            reference,
+            expanded,
+            loaded: !children.is_empty(),
+            children,
+        }
+    }
+
+    #[test]
+    fn visible_flattens_expanded_nodes_and_skips_collapsed_ones() {
+        let vars = DapVariables {
+            roots: vec![
+                var(
+                    "Locals",
+                    3,
+                    true,
+                    vec![
+                        var("x", 0, false, Vec::new()),
+                        // Collapsed, so its own child ("hidden") must not show.
+                        var("v", 9, false, vec![var("hidden", 0, false, Vec::new())]),
+                    ],
+                ),
+                var("Globals", 4, false, Vec::new()),
+            ],
+            selected: 0,
+        };
+
+        let shown: Vec<(usize, &str)> =
+            vars.visible().into_iter().map(|(depth, node)| (depth, node.name.as_str())).collect();
+
+        assert_eq!(
+            shown,
+            vec![(0, "Locals"), (1, "x"), (1, "v"), (0, "Globals")],
+            "v is collapsed, so its own children stay hidden"
+        );
     }
 }

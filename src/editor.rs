@@ -28,8 +28,8 @@ use crate::syntax::Syntax;
 use crate::theme::Theme;
 use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
-    Chrome, Content, ContentKind, DapConsole, DapStack, Dir, Layout, Place, Rect, Side, Text,
-    Window, WindowId,
+    Chrome, Content, ContentKind, DapConsole, DapStack, DapVariables, DapWatches, Dir, Layout,
+    Place, Rect, Side, Text, VarNode, Window, WindowId,
 };
 
 /// What a `:` command with no scope of its own acts on.
@@ -2167,6 +2167,15 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             true => ExLine::Error("eval what?".into()),
             false => ExLine::Debug(DebugCmd::Eval(arg.to_string())),
         },
+        // The Watches pane's own two lines — see `docs/specs/debug.md` §UI.
+        "watch" => match arg.is_empty() {
+            true => ExLine::Error("watch what?".into()),
+            false => ExLine::Debug(DebugCmd::Watch(arg.to_string())),
+        },
+        "unwatch" => match arg.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => ExLine::Debug(DebugCmd::Unwatch(n)),
+            _ => ExLine::Error("unwatch which one? `:unwatch <n>` — see the Watches pane".into()),
+        },
         "def" | "definition" => ExLine::Definition,
         "decl" | "declaration" => ExLine::Declaration,
         "impl" | "implementation" => ExLine::Implementation,
@@ -2327,6 +2336,13 @@ pub enum DebugCmd {
     /// `:eval <expr>` — the Console pane's REPL line: evaluates in the
     /// current frame and appends the exchange to every open console.
     Eval(String),
+    /// `:watch <expr>` — adds an expression to the Watches list, evaluating
+    /// it right away if the session is currently stopped. See
+    /// `docs/specs/debug.md` §UI.
+    Watch(String),
+    /// `:unwatch <n>` — removes the `n`th watch, 1-based as the Watches
+    /// pane shows it.
+    Unwatch(usize),
 }
 
 /// Which pane `:debug <name>` opens. All four exist now even though
@@ -2616,6 +2632,17 @@ pub enum Pane<'a> {
         window: &'a Window,
         console: &'a DapConsole,
     },
+    DapVariables {
+        window: &'a Window,
+        vars: &'a DapVariables,
+    },
+    DapWatches {
+        window: &'a Window,
+        watches: &'a DapWatches,
+        /// The expressions and their values — `dap::Registry::watches`'s,
+        /// not the pane's. See `window::DapWatches`'s doc.
+        list: &'a [dap::Watch],
+    },
 }
 
 /// One buffer, one window, and the session, borrowed together for the length
@@ -2675,6 +2702,37 @@ fn wanted_syntax(buffer: &Buffer, options: &Options) -> Option<&'static str> {
     }
     let name = buffer.path.as_ref()?.file_name()?.to_str()?;
     crate::syntax::filetype(name)
+}
+
+/// [`Editor::fill_variable_children`]'s inner walk: fills in every node
+/// (there may be more than one — nothing in DAP forbids the same reference
+/// appearing twice) whose `reference` matches, then keeps walking into
+/// whatever is expanded, since a `variables` answer for a nested node can
+/// arrive after its ancestor's own children are already in place.
+fn fill_matching_reference(node: &mut VarNode, reference: i64, children: &[VarNode]) {
+    if node.reference == reference {
+        node.children = children.to_vec();
+        node.loaded = true;
+        node.expanded = true;
+    }
+    for child in &mut node.children {
+        fill_matching_reference(child, reference, children);
+    }
+}
+
+/// [`Editor::collapse_selected_variable`]'s "already closed" case: the
+/// nearest visible row above the selection that is shallower than it — the
+/// same rule `tree::Tree::select_parent` follows, worked out from
+/// [`DapVariables::visible`] since the pane keeps no depth of its own.
+fn variables_select_parent(vars: &mut DapVariables) {
+    let parent = {
+        let rows = vars.visible();
+        rows.get(vars.selected)
+            .and_then(|&(depth, _)| rows[..vars.selected].iter().rposition(|&(d, _)| d < depth))
+    };
+    if let Some(parent) = parent {
+        vars.selected = parent;
+    }
 }
 
 impl Editor {
@@ -3097,6 +3155,10 @@ impl Editor {
             Content::Image(img) => Pane::Image { window, img },
             Content::DapStack(stack) => Pane::DapStack { window, stack },
             Content::DapConsole(console) => Pane::DapConsole { window, console },
+            Content::DapVariables(vars) => Pane::DapVariables { window, vars },
+            Content::DapWatches(watches) => {
+                Pane::DapWatches { window, watches, list: self.dap.watches() }
+            }
             Content::Text(text) => {
                 let entry = self.entry(text.buffer);
                 Pane::Text {
@@ -4856,14 +4918,16 @@ impl Editor {
 
     fn run_tree_cmd(&mut self, cmd: TreeCmd) {
         let height = self.window().height;
-        // The Stack and Console panes borrow the tree's grammar (see
-        // `input.rs`'s `dap_pane`) but are not trees, and each reads only a
-        // handful of the commands it can send — everything else is a no-op
-        // rather than falling into the tree logic below, which has nothing
-        // to do with either pane.
+        // The four debug panes borrow the tree's grammar (see `input.rs`'s
+        // `dap_pane`) but are not trees, and each reads only a handful of
+        // the commands it can send — everything else is a no-op rather than
+        // falling into the tree logic below, which has nothing to do with
+        // any of them.
         match &self.window().content {
             Content::DapStack(_) => return self.run_stack_cmd(cmd, height),
             Content::DapConsole(_) => return self.run_console_cmd(cmd),
+            Content::DapVariables(_) => return self.run_variables_cmd(cmd, height),
+            Content::DapWatches(_) => return self.run_watches_cmd(cmd, height),
             _ => {}
         }
         if self.window().tree().is_none() {
@@ -5022,6 +5086,133 @@ impl Editor {
         if let TreeCmd::Enter = cmd {
             self.session.status.clear();
             self.session.mode = Mode::Command("eval ".into());
+        }
+    }
+
+    /// A key in the Variables pane. `Select`/`First`/`Last`/`HalfPage` move
+    /// `selected` over the flattened visible rows (`DapVariables::visible`).
+    /// `Expand`/`Enter` and `Collapse` are handled by
+    /// `Editor::expand_selected_variable`/`collapse_selected_variable` —
+    /// they need to reach into the tree itself, not just move an index.
+    fn run_variables_cmd(&mut self, cmd: TreeCmd, height: usize) {
+        if matches!(cmd, TreeCmd::Expand | TreeCmd::Enter) {
+            return self.expand_selected_variable();
+        }
+        if let TreeCmd::Collapse = cmd {
+            return self.collapse_selected_variable();
+        }
+        let Content::DapVariables(vars) = &mut self.window_mut().content else { return };
+        let len = vars.visible().len();
+        if len == 0 {
+            return;
+        }
+        let last = len as isize - 1;
+        let delta = match cmd {
+            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
+            TreeCmd::First => {
+                vars.selected = 0;
+                None
+            }
+            TreeCmd::Last => {
+                vars.selected = last as usize;
+                None
+            }
+            TreeCmd::HalfPage { down } => {
+                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
+            }
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            vars.selected = (vars.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// `Expand`/`Enter` on the selected Variables row. A leaf (`reference ==
+    /// 0`) does nothing; an already-loaded node just opens; an unloaded one
+    /// asks for its children (`variables(reference)`), which
+    /// `Editor::fill_variable_children` fills in and opens once the answer
+    /// arrives — CONTROLLER RULINGS #4.
+    fn expand_selected_variable(&mut self) {
+        let Content::DapVariables(vars) = &mut self.window_mut().content else { return };
+        let Some(node) = vars.selected_node_mut() else { return };
+        if node.reference == 0 {
+            return;
+        }
+        if node.loaded {
+            node.expanded = true;
+            return;
+        }
+        let reference = node.reference;
+        let Some(client) = self.dap.active_mut() else { return };
+        client.request(
+            "variables",
+            serde_json::json!({ "variablesReference": reference }),
+            dap::client::Intent::Variables { reference },
+        );
+    }
+
+    /// `Collapse` on the selected Variables row: closes it if it is open, or
+    /// — already closed, or a leaf — moves the selection to its parent row,
+    /// mirroring `tree::Tree::collapse`.
+    fn collapse_selected_variable(&mut self) {
+        let Content::DapVariables(vars) = &mut self.window_mut().content else { return };
+        let mut go_to_parent = false;
+        match vars.selected_node_mut() {
+            Some(node) if node.expanded => node.expanded = false,
+            Some(_) => go_to_parent = true,
+            None => return,
+        }
+        if go_to_parent {
+            variables_select_parent(vars);
+        }
+    }
+
+    /// A key in the Watches pane. `Select`/`First`/`Last`/`HalfPage` move
+    /// the selection over `dap.watches()`; `Delete` (`d`) removes the
+    /// selected watch; `Prompt(FileOp::Create)` (`a`) prefills the command
+    /// line with `:watch `, the same trick `run_console_cmd` uses for
+    /// `:eval `.
+    fn run_watches_cmd(&mut self, cmd: TreeCmd, height: usize) {
+        if let TreeCmd::Prompt(FileOp::Create) = cmd {
+            self.session.status.clear();
+            self.session.mode = Mode::Command("watch ".into());
+            return;
+        }
+        if let TreeCmd::Delete = cmd {
+            let index = match &self.window().content {
+                Content::DapWatches(watches) => watches.selected,
+                _ => return,
+            };
+            self.dap.remove_watch(index);
+            let len = self.dap.watches().len();
+            if let Content::DapWatches(watches) = &mut self.window_mut().content {
+                watches.selected = watches.selected.min(len.saturating_sub(1));
+            }
+            return;
+        }
+        let len = self.dap.watches().len();
+        if len == 0 {
+            return;
+        }
+        let last = len as isize - 1;
+        let Content::DapWatches(watches) = &mut self.window_mut().content else { return };
+        let delta = match cmd {
+            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
+            TreeCmd::First => {
+                watches.selected = 0;
+                None
+            }
+            TreeCmd::Last => {
+                watches.selected = last as usize;
+                None
+            }
+            TreeCmd::HalfPage { down } => {
+                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
+            }
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            watches.selected = (watches.selected as isize + delta).clamp(0, last) as usize;
         }
     }
 
@@ -7208,20 +7399,26 @@ impl Editor {
                     self.fill_stack_panes(&frames);
                     self.apply_stopped_frame(frames);
                 }
-                // Task 12's Variables pane fills in the tree.
-                dap::Effect::Scopes(_) => {}
-                // Task 12's Variables pane fills in the expanded node.
-                dap::Effect::Variables { .. } => {}
+                // Every open Variables pane's `roots` becomes one collapsed,
+                // unloaded node per scope.
+                dap::Effect::Scopes(scopes) => self.fill_variable_roots(scopes),
+                // Fills in whichever node(s), across every open Variables
+                // pane, asked for this reference.
+                dap::Effect::Variables { reference, vars } => {
+                    self.fill_variable_children(reference, vars)
+                }
                 // Every open Console pane gets the lines — a status line here
                 // would be spam on top of it.
                 dap::Effect::Output { category, text } => self.append_console(&category, &text),
-                // The REPL's answer joins the console it came from; a watch
-                // or a hover float is Task 12/13's to draw.
-                dap::Effect::Evaluated { context, expr, result } => {
-                    if context == dap::client::EvalContext::Repl {
-                        self.append_console_eval(&expr, &result);
-                    }
-                }
+                // The REPL's answer joins the console it came from; a watch's
+                // answer updates its row wherever it is shown. A hover float
+                // is Task 13's — for now its answer is a status line, same as
+                // any other one-off lookup.
+                dap::Effect::Evaluated { context, expr, result } => match context {
+                    dap::client::EvalContext::Repl => self.append_console_eval(&expr, &result),
+                    dap::client::EvalContext::Watch => self.dap.set_watch_value(&expr, result),
+                    dap::client::EvalContext::Hover => self.session.status = result,
+                },
             }
         }
     }
@@ -7251,6 +7448,8 @@ impl Editor {
             DebugCmd::AttachPid => self.session.status = "attach: not yet".into(),
             DebugCmd::Pane(pane) => self.open_debug_pane(pane),
             DebugCmd::Eval(expr) => self.debug_eval(expr),
+            DebugCmd::Watch(expr) => self.debug_watch(expr),
+            DebugCmd::Unwatch(n) => self.debug_unwatch(n),
         }
     }
 
@@ -7402,12 +7601,14 @@ impl Editor {
     /// [`dap::Effect::Stack`] once a `stopped` event's `stackTrace` answers:
     /// the top frame is where execution actually sits. A frame with a source
     /// path jumps there via [`Editor::jump_source_window`], records it as
-    /// `dap::Registry::stopped_at` for the gutter, and kicks `scopes` so
-    /// Task 12's Variables pane has data by the time it exists. A frame with
-    /// no source (library code with no debug info) cannot be jumped to —
+    /// `dap::Registry::stopped_at` for the gutter, and kicks `scopes` so the
+    /// Variables pane has data by the time it exists. A frame with no
+    /// source (library code with no debug info) cannot be jumped to —
     /// `stopped_at` is left alone and the status line says so. `frame` moves
     /// to the top frame's id either way — the Stack pane and `:eval` follow
-    /// execution until a frame is picked by hand.
+    /// execution until a frame is picked by hand. [`Editor::rescope`] clears
+    /// every open Variables pane and re-evaluates every watch against the
+    /// new frame.
     fn apply_stopped_frame(&mut self, frames: Vec<dap::types::StackFrame>) {
         let Some(top) = frames.into_iter().next() else {
             self.session.status = "debug: stopped with an empty stack".into();
@@ -7438,6 +7639,7 @@ impl Editor {
                 dap::client::Intent::Scopes { frame: top.id },
             );
         }
+        self.rescope();
     }
 
     /// Opens `path` in [`Editor::debug_source_window`] and puts the cursor at
@@ -7486,6 +7688,46 @@ impl Editor {
                 dap::client::Intent::Scopes { frame: frame.id },
             );
         }
+        self.rescope();
+    }
+
+    /// Re-scopes everything that depends on the acting frame (`dap.frame()`)
+    /// once it has changed: clears every open Variables pane's `roots` — the
+    /// caller has already sent the `scopes` request that will refill it, so
+    /// this only clears rather than re-asking — and re-evaluates every
+    /// watch against the new frame. The two callers are
+    /// [`Editor::apply_stopped_frame`] and [`Editor::jump_to_frame`], the
+    /// only places `dap.frame()` moves while a session is stopped. See
+    /// CONTROLLER RULINGS #2 in Task 12's brief.
+    fn rescope(&mut self) {
+        for window in &mut self.windows {
+            if let Content::DapVariables(vars) = &mut window.content {
+                vars.roots.clear();
+                vars.selected = 0;
+            }
+        }
+        let exprs: Vec<String> = self.dap.watches().iter().map(|w| w.expr.clone()).collect();
+        for expr in exprs {
+            self.evaluate_watch(&expr);
+        }
+    }
+
+    /// Sends `evaluate` for one watch expression against the acting frame,
+    /// tagged `Intent::Evaluate { context: Watch, .. }` so the answer routes
+    /// back to `dap::Registry::set_watch_value`. A no-op with no active
+    /// session — a watch typed before one starts just waits, per
+    /// `docs/specs/debug.md` §UI.
+    fn evaluate_watch(&mut self, expr: &str) {
+        let frame = self.dap.frame();
+        let Some(client) = self.dap.active_mut() else { return };
+        client.request(
+            "evaluate",
+            serde_json::json!({ "expression": expr, "frameId": frame, "context": "watch" }),
+            dap::client::Intent::Evaluate {
+                context: dap::client::EvalContext::Watch,
+                expr: expr.to_string(),
+            },
+        );
     }
 
     /// [`dap::Effect::Stack`]'s other half: every open Stack pane gets the
@@ -7496,6 +7738,54 @@ impl Editor {
             if let Content::DapStack(stack) = &mut window.content {
                 stack.frames = frames.to_vec();
                 stack.selected = 0;
+            }
+        }
+    }
+
+    /// [`dap::Effect::Scopes`]: every open Variables pane's `roots` becomes
+    /// one collapsed, unloaded [`VarNode`] per scope.
+    fn fill_variable_roots(&mut self, scopes: Vec<dap::types::Scope>) {
+        let roots: Vec<VarNode> = scopes
+            .into_iter()
+            .map(|s| VarNode {
+                name: s.name,
+                value: String::new(),
+                ty: None,
+                reference: s.variables_reference,
+                expanded: false,
+                loaded: false,
+                children: Vec::new(),
+            })
+            .collect();
+        for window in &mut self.windows {
+            if let Content::DapVariables(vars) = &mut window.content {
+                vars.roots = roots.clone();
+                vars.selected = 0;
+            }
+        }
+    }
+
+    /// [`dap::Effect::Variables`]: in every open Variables pane, finds the
+    /// node(s) whose `reference` matches (recursively — a `variables`
+    /// answer's own children may nest further) and fills them in.
+    fn fill_variable_children(&mut self, reference: i64, vars: Vec<dap::types::Variable>) {
+        let children: Vec<VarNode> = vars
+            .into_iter()
+            .map(|v| VarNode {
+                name: v.name,
+                value: v.value,
+                ty: v.ty,
+                reference: v.variables_reference,
+                expanded: false,
+                loaded: false,
+                children: Vec::new(),
+            })
+            .collect();
+        for window in &mut self.windows {
+            if let Content::DapVariables(dv) = &mut window.content {
+                for root in &mut dv.roots {
+                    fill_matching_reference(root, reference, &children);
+                }
             }
         }
     }
@@ -7534,16 +7824,17 @@ impl Editor {
     /// `:debug stack|console|vars|watches`. A window already showing the
     /// named pane is focused; otherwise a new one splits off the focused
     /// window, the way [`Editor::open_tree_pane`] makes room for the file
-    /// tree. Variables and Watches are Task 12's — asking for either now
-    /// just says so.
+    /// tree. A freshly opened Variables pane asks for the acting frame's
+    /// `scopes` right away when the session is already stopped somewhere —
+    /// otherwise it would sit empty until the next stop, since
+    /// `Effect::Scopes` only reaches panes that were already open when it
+    /// arrived.
     fn open_debug_pane(&mut self, pane: DebugPane) {
         let kind = match pane {
             DebugPane::Stack => ContentKind::DapStack,
             DebugPane::Console => ContentKind::DapConsole,
-            DebugPane::Variables | DebugPane::Watches => {
-                self.session.status = "not yet — task 12".into();
-                return;
-            }
+            DebugPane::Variables => ContentKind::DapVariables,
+            DebugPane::Watches => ContentKind::DapWatches,
         };
         if let Some(id) = self.windows.iter().find(|w| w.content.kind() == kind).map(|w| w.id) {
             self.set_focus(id);
@@ -7555,10 +7846,21 @@ impl Editor {
             DebugPane::Console => {
                 Content::DapConsole(Box::new(DapConsole { lines: Vec::new(), scroll: 0 }))
             }
-            DebugPane::Variables | DebugPane::Watches => unreachable!("handled above"),
+            DebugPane::Variables => Content::DapVariables(Box::default()),
+            DebugPane::Watches => Content::DapWatches(DapWatches::default()),
         };
         if let Some(window) = self.window_mut_of(new) {
             window.show(content);
+        }
+        if pane == DebugPane::Variables
+            && let Some(frame) = self.dap.frame()
+            && let Some(client) = self.dap.active_mut()
+        {
+            client.request(
+                "scopes",
+                serde_json::json!({ "frameId": frame }),
+                dap::client::Intent::Scopes { frame },
+            );
         }
     }
 
@@ -7581,6 +7883,27 @@ impl Editor {
             serde_json::json!({ "expression": expr, "frameId": frame, "context": "repl" }),
             dap::client::Intent::Evaluate { context: dap::client::EvalContext::Repl, expr },
         );
+    }
+
+    /// `:watch <expr>` — adds it to the registry (idempotent by expression
+    /// text), and evaluates it immediately when the session is already
+    /// stopped rather than waiting for the next one.
+    fn debug_watch(&mut self, expr: String) {
+        self.dap.add_watch(expr.clone());
+        if self.dap.frame().is_some() {
+            self.evaluate_watch(&expr);
+        }
+        self.session.status = format!("watching {expr}");
+    }
+
+    /// `:unwatch <n>` — 1-based, as the Watches pane numbers its rows.
+    fn debug_unwatch(&mut self, n: usize) {
+        let len = self.dap.watches().len();
+        if n == 0 || n > len {
+            self.session.status = format!("unwatch: no watch #{n}");
+            return;
+        }
+        self.dap.remove_watch(n - 1);
     }
 
     /// Which window a debugger jump lands in: the focused window if it is
@@ -23712,6 +24035,14 @@ int main(void) {
         assert!(matches!(parse_ex("eval"), Some(ExLine::Error(_))));
     }
 
+    #[test]
+    fn colon_watch_and_unwatch_parse() {
+        assert_eq!(parse_ex("watch a+b"), Some(ExLine::Debug(DebugCmd::Watch("a+b".into()))));
+        assert!(matches!(parse_ex("watch"), Some(ExLine::Error(_))));
+        assert_eq!(parse_ex("unwatch 2"), Some(ExLine::Debug(DebugCmd::Unwatch(2))));
+        assert!(matches!(parse_ex("unwatch x"), Some(ExLine::Error(_))));
+    }
+
     /// The editor's half of DAP: `debug_launch` driving the registry through
     /// `settle`. The protocol itself is tested in `src/dap/`; here the
     /// adapter is a fake and the interest is the wiring. See
@@ -24226,6 +24557,296 @@ int main(void) {
             };
             let n = console.lines.len();
             assert_eq!(&console.lines[n - 2..], ["> x + 1".to_string(), "3".to_string()]);
+        }
+
+        // ---- Task 12: Variables and Watches panes -----------------------
+
+        /// [`stopped_at_thread_7`] plus answering `stackTrace` with one frame
+        /// (`id`) at `path:line` — the shape `a_stack_effect_fills_the_stack_pane`
+        /// hand-assembles, factored out for the Variables/Watches tests.
+        fn stopped_at_frame(ed: &mut Editor, fake: &FakeSpawn, path: &Path, id: i64, line: i64) {
+            stopped_at_thread_7(ed, fake);
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [{
+                        "id": id,
+                        "name": "main",
+                        "source": {"path": path.to_string_lossy()},
+                        "line": line,
+                        "column": 1
+                    }],
+                    "totalFrames": 1
+                }),
+            );
+            ed.settle();
+        }
+
+        /// [`stopped_at_frame`] (frame id 3) plus answering `scopes` with two
+        /// scopes — Locals (ref 3), Globals (ref 4) — the fixture
+        /// `expanding_a_node_requests_its_children_then_fills_them` builds on.
+        fn stopped_with_two_scopes(ed: &mut Editor, fake: &FakeSpawn, path: &Path) {
+            ex(ed, "debug vars");
+            stopped_at_frame(ed, fake, path, 3, 1);
+            let scopes_req = fake.last(SessionId(0), "scopes").expect("scopes sent");
+            let seq = scopes_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "scopes",
+                true,
+                json!({"scopes": [
+                    {"name": "Locals", "variablesReference": 3, "expensive": false},
+                    {"name": "Globals", "variablesReference": 4, "expensive": false}
+                ]}),
+            );
+            ed.settle();
+        }
+
+        #[test]
+        fn scopes_become_the_variable_tree_roots() {
+            let (_dir, mut ed, fake) = project("vars-roots");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            stopped_with_two_scopes(&mut ed, &fake, &path);
+
+            let id = window_with(&ed, ContentKind::DapVariables);
+            let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                panic!("not a variables pane")
+            };
+            let rows: Vec<(usize, &str)> =
+                vars.visible().into_iter().map(|(depth, n)| (depth, n.name.as_str())).collect();
+            assert_eq!(rows, vec![(0, "Locals"), (0, "Globals")]);
+            assert!(vars.roots.iter().all(|n| !n.expanded && !n.loaded), "collapsed and unloaded");
+        }
+
+        #[test]
+        fn expanding_a_node_requests_its_children_then_fills_them() {
+            let (_dir, mut ed, fake) = project("vars-expand");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            stopped_with_two_scopes(&mut ed, &fake, &path);
+            let id = window_with(&ed, ContentKind::DapVariables);
+
+            // Locals is row 0, already selected — expand it.
+            ed.apply(cmd(Action::Tree(TreeCmd::Expand)));
+
+            let vars_req = fake.last(SessionId(0), "variables").expect("variables sent");
+            assert_eq!(vars_req["arguments"]["variablesReference"], json!(3));
+            let seq = vars_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "variables",
+                true,
+                json!({"variables": [
+                    {"name": "x", "value": "1", "variablesReference": 0},
+                    {"name": "v", "value": "Vec", "variablesReference": 9, "type": "Vec<u8>"}
+                ]}),
+            );
+            ed.settle();
+
+            {
+                let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                    panic!("not a variables pane")
+                };
+                assert!(vars.roots[0].expanded && vars.roots[0].loaded);
+                assert_eq!(vars.roots[0].children.len(), 2);
+                assert_eq!(vars.visible().len(), 4);
+            }
+
+            let requests_before = fake.methods(SessionId(0)).len();
+            ed.apply(cmd(Action::Tree(TreeCmd::Collapse)));
+            {
+                let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                    panic!("not a variables pane")
+                };
+                assert_eq!(vars.visible().len(), 2);
+            }
+            assert_eq!(fake.methods(SessionId(0)).len(), requests_before, "collapsing asks nothing");
+
+            let variables_calls = |fake: &FakeSpawn| {
+                fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "variables").count()
+            };
+            let before = variables_calls(&fake);
+            ed.apply(cmd(Action::Tree(TreeCmd::Expand)));
+            assert_eq!(variables_calls(&fake), before, "already loaded — no re-request");
+            let Content::DapVariables(vars) = &ed.window_of(id).unwrap().content else {
+                panic!("not a variables pane")
+            };
+            assert_eq!(vars.visible().len(), 4);
+        }
+
+        #[test]
+        fn watches_re_evaluate_on_every_stop() {
+            let (_dir, mut ed, fake) = project("watch-reeval");
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            ex(&mut ed, "watch x + 1");
+            assert_eq!(ed.dap().watches()[0].value, None);
+
+            stopped_at_frame(&mut ed, &fake, &path, 3, 1);
+
+            let eval_req = fake.last(SessionId(0), "evaluate").expect("evaluate sent");
+            assert_eq!(eval_req["arguments"]["context"], json!("watch"));
+            assert_eq!(eval_req["arguments"]["expression"], json!("x + 1"));
+            assert_eq!(eval_req["arguments"]["frameId"], json!(3));
+
+            let seq = eval_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "evaluate",
+                true,
+                json!({"result": "2", "variablesReference": 0}),
+            );
+            ed.settle();
+            assert_eq!(ed.dap().watches()[0].value.as_deref(), Some("2"));
+
+            fake.event(SessionId(0), "continued", json!({}));
+            ed.settle();
+            assert_eq!(ed.dap().watches()[0].value, None, "cleared on continued");
+
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 7}));
+            ed.settle();
+            let st2 = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent again");
+            let seq2 = st2["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq2,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [{
+                        "id": 5, "name": "main",
+                        "source": {"path": path.to_string_lossy()}, "line": 1, "column": 1
+                    }],
+                    "totalFrames": 1
+                }),
+            );
+            ed.settle();
+
+            let eval_calls =
+                fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "evaluate").count();
+            assert_eq!(eval_calls, 2, "a fresh evaluate went out for the new stop");
+        }
+
+        #[test]
+        fn enter_on_a_frame_rescopes_variables_and_watches() {
+            let dir = ScratchDir::new("dap-vars-watch-enter")
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", &"fn line() {}\n".repeat(25));
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            ed.load_config(ConfigText(Some(
+                "[[debug.launch]]\n\
+                 name = \"run tests\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"launch\"\n\
+                 body = { program = \"target/debug/bi\", args = [] }\n",
+            )));
+            let fake = FakeSpawn::default();
+            ed.set_dap_spawner(fake.clone());
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            ex(&mut ed, "watch y");
+            ex(&mut ed, "debug vars");
+            ex(&mut ed, "debug stack"); // opened, and focused, last
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 7}));
+            ed.settle();
+
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [
+                        {"id": 3, "name": "top", "source": {"path": path.to_string_lossy()}, "line": 2, "column": 1},
+                        {"id": 4, "name": "caller", "source": {"path": path.to_string_lossy()}, "line": 20, "column": 1}
+                    ],
+                    "totalFrames": 2
+                }),
+            );
+            ed.settle();
+
+            // Fill the Variables pane's roots for frame 3, so the test can
+            // show `rescope` clearing something real rather than nothing.
+            let scopes_req = fake.last(SessionId(0), "scopes").expect("scopes sent");
+            let seq = scopes_req["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "scopes",
+                true,
+                json!({"scopes": [{"name": "Locals", "variablesReference": 3, "expensive": false}]}),
+            );
+            ed.settle();
+            let vars_id = window_with(&ed, ContentKind::DapVariables);
+            {
+                let Content::DapVariables(vars) = &ed.window_of(vars_id).unwrap().content else {
+                    panic!("not a variables pane")
+                };
+                assert_eq!(vars.roots.len(), 1, "roots populated before Enter");
+            }
+
+            // Frame 1 (id 4), selected in the (focused) Stack pane, then Enter.
+            ed.apply(cmd(Action::Tree(TreeCmd::Select { down: true, count: 1 })));
+            ed.apply(cmd(Action::Tree(TreeCmd::Enter)));
+
+            assert_eq!(ed.dap().frame(), Some(4));
+            let scopes2 = fake.last(SessionId(0), "scopes").expect("scopes sent again");
+            assert_eq!(scopes2["arguments"]["frameId"], json!(4));
+            let eval = fake.last(SessionId(0), "evaluate").expect("evaluate sent for the watch");
+            assert_eq!(eval["arguments"]["frameId"], json!(4));
+            assert_eq!(eval["arguments"]["expression"], json!("y"));
+
+            let Content::DapVariables(vars) = &ed.window_of(vars_id).unwrap().content else {
+                panic!("not a variables pane")
+            };
+            assert!(vars.roots.is_empty(), "cleared by rescope — refilled only once scopes answers");
+        }
+
+        #[test]
+        fn unwatch_removes_and_delete_key_removes() {
+            let (_dir, mut ed, _fake) = project("unwatch");
+            sized(&mut ed);
+            ex(&mut ed, "watch a");
+            ex(&mut ed, "watch b");
+            assert_eq!(ed.dap().watches().len(), 2);
+
+            ex(&mut ed, "unwatch 1");
+            assert_eq!(
+                ed.dap().watches().iter().map(|w| w.expr.as_str()).collect::<Vec<_>>(),
+                vec!["b"],
+                "the first was removed"
+            );
+
+            ex(&mut ed, "debug watches");
+            let id = window_with(&ed, ContentKind::DapWatches);
+            let Content::DapWatches(watches) = &ed.window_of(id).unwrap().content else {
+                panic!("not a watches pane")
+            };
+            assert_eq!(watches.selected, 0);
+
+            ed.apply(cmd(Action::Tree(TreeCmd::Delete)));
+
+            assert!(ed.dap().watches().is_empty());
         }
     }
 

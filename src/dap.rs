@@ -14,7 +14,7 @@ pub mod types;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-pub use registry::{Breakpoint, Effect, Registry};
+pub use registry::{Breakpoint, Effect, Registry, Watch};
 
 /// One `[debug.adapters.<name>]` — the argv that starts a DAP adapter.
 ///

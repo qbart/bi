@@ -135,13 +135,18 @@ It needs the usual four touches: a `Mode` variant + `label()`, arms in
   **Watches** (expressions re-evaluated on every stop).
 - Frame navigation moves the source window and re-scopes Variables/Watches
   to the selected frame.
-- `:debug stack` / `:debug console` (also `vars`/`watches`, Task 12) open the
-  named pane in a split, or focus it if one is already open. Stack and
-  Console use the tree pane's keymap: `j`/`k`/`gg`/`G`/`Ctrl-d`/`Ctrl-u` move
-  the selection, `Enter` (or `i` on Console) acts.
+- `:debug stack` / `:debug console` / `:debug vars` / `:debug watches` open
+  the named pane in a split, or focus it if one is already open. All four
+  use the tree pane's keymap: `j`/`k`/`gg`/`G`/`Ctrl-d`/`Ctrl-u` move the
+  selection, `Enter` (or `i` on Console) acts. Variables adds `l`/`h` to
+  expand/collapse a node — expanding an unloaded one fetches its children
+  lazily. Watches adds `a` to prefill `:watch ` and `d` to remove the
+  selected watch.
 - `:eval <expr>` is the Console pane's REPL line: evaluates in the current
   frame while stopped and appends `"> {expr}"` and the result to every open
-  console.
+  console. `:watch <expr>` adds an expression to the Watches list
+  (re-evaluated on every stop, and immediately if already stopped);
+  `:unwatch <n>` removes the `n`th watch, 1-based as the pane numbers rows.
 
 ## Config
 

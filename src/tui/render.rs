@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use bi::buffer::Cursor;
 use bi::config::Options;
+use bi::dap::Watch;
 use bi::decoration::{Decoration, Layer};
 use bi::editor::{Editor, Mode, Pane};
 use bi::indent::{char_width, display_col, expand_tabs};
@@ -20,7 +21,9 @@ use bi::selection::Selections;
 use bi::syntax::{Span as HlSpan, Syntax};
 use bi::theme::{Ansi, Color as ThemeColor, Style as ThemeStyle, Theme, Ui};
 use bi::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
-use bi::window::{Chrome, ContentKind, DapConsole, DapStack, Rect as CoreRect, WindowId};
+use bi::window::{
+    Chrome, ContentKind, DapConsole, DapStack, DapVariables, DapWatches, Rect as CoreRect, WindowId,
+};
 
 /// A theme colour, in the one spelling a terminal understands.
 ///
@@ -846,6 +849,96 @@ fn render_console(frame: &mut Frame, console: &DapConsole, area: Rect) -> Option
     None
 }
 
+/// One window's Variables pane: the lazy scope/variable tree, one row per
+/// [`bi::window::DapVariables::visible`] entry — `"{indent}{marker}
+/// {name} = {value}"`, with `: {ty}` appended dimmed when the adapter sent
+/// one. `▸` marks a node with something to expand and not yet opened, `▾`
+/// one that is open, and a blank the tree's own leaf marker (`render_tree`'s
+/// files have no marker either) — a value with nothing under it, `reference
+/// == 0`. Selection is drawn the same whole-row way as every other list pane
+/// here.
+fn render_variables(
+    frame: &mut Frame,
+    vars: &DapVariables,
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    let rows = vars.visible();
+    let height = area.height as usize;
+    let first = if height == 0 || vars.selected < height { 0 } else { vars.selected + 1 - height };
+    let last = (first + height).min(rows.len());
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(height);
+
+    for (index, &(depth, node)) in rows.iter().enumerate().take(last).skip(first) {
+        let marker = match (node.reference != 0, node.expanded) {
+            (true, true) => '▾',
+            (true, false) => '▸',
+            (false, _) => ' ',
+        };
+        let indent = "  ".repeat(depth);
+        let mut spans =
+            vec![Span::raw(format!("{indent}{marker} {} = {}", node.name, node.value))];
+        if let Some(ty) = &node.ty {
+            spans.push(Span::styled(format!(": {ty}"), tui(ui.status_muted)));
+        }
+
+        if index != vars.selected {
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        if focused {
+            cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
+/// One window's Watches pane: `"{i}. {expr} = {value}"`, one row per
+/// `dap::Registry::watches` entry — `list`, not `watches` itself, since the
+/// expressions live in the registry and the pane only holds `selected`. A
+/// watch with no value yet (freshly added, or the session is not stopped)
+/// shows `…` rather than an empty string, so the row still reads as "this is
+/// being watched" instead of looking blank.
+fn render_watches(
+    frame: &mut Frame,
+    watches: &DapWatches,
+    list: &[Watch],
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    let height = area.height as usize;
+    let first =
+        if height == 0 || watches.selected < height { 0 } else { watches.selected + 1 - height };
+    let last = (first + height).min(list.len());
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(height);
+
+    for (index, watch) in list.iter().enumerate().take(last).skip(first) {
+        let value = watch.value.as_deref().unwrap_or("…");
+        let spans = vec![Span::raw(format!("{}. {} = {value}", index + 1, watch.expr))];
+
+        if index != watches.selected {
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        if focused {
+            cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
 /// One window's image: a placement for the graphics module when the terminal
 /// draws pixels, a centered line about them when it does not.
 ///
@@ -939,6 +1032,12 @@ fn render_window(
             return render_stack(frame, stack, text_area, focused, &ed.theme().ui);
         }
         Pane::DapConsole { console, .. } => return render_console(frame, console, text_area),
+        Pane::DapVariables { vars, .. } => {
+            return render_variables(frame, vars, text_area, focused, &ed.theme().ui);
+        }
+        Pane::DapWatches { watches, list, .. } => {
+            return render_watches(frame, watches, list, text_area, focused, &ed.theme().ui);
+        }
     };
     let (scroll, left, selections) = (text.scroll, text.left, &text.selections);
 
@@ -1605,6 +1704,10 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         Some(Pane::DapConsole { console, .. }) => {
             ("Console".into(), format!("{} lines", console.lines.len()))
         }
+        Some(Pane::DapVariables { vars, .. }) => {
+            ("Variables".into(), format!("{} rows", vars.visible().len()))
+        }
+        Some(Pane::DapWatches { list, .. }) => ("Watches".into(), format!("{} watches", list.len())),
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
             // picker; a pane thirty columns wide has no room to say it twice.

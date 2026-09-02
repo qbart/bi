@@ -269,7 +269,15 @@ impl Input {
             // in both: a list is a list.
             Mode::Normal if content == ContentKind::Results => KeyMode::Tree,
             // Same borrowing, for the same reason — see `dap_pane`.
-            Mode::Normal if content == ContentKind::DapStack || content == ContentKind::DapConsole => {
+            Mode::Normal
+                if matches!(
+                    content,
+                    ContentKind::DapStack
+                        | ContentKind::DapConsole
+                        | ContentKind::DapVariables
+                        | ContentKind::DapWatches
+                ) =>
+            {
                 KeyMode::Tree
             }
             Mode::Normal => KeyMode::Normal,
@@ -355,11 +363,19 @@ impl Input {
             // a second copy of a fact the window already holds.
             Mode::Normal if content == ContentKind::Tree => self.tree(key),
             Mode::Normal if content == ContentKind::Results => self.results(key),
-            // The Stack and Console panes: a small slice of the tree's
-            // grammar, since neither has files, marks, or anything to
-            // prompt for — see `dap_pane`.
-            Mode::Normal if content == ContentKind::DapStack || content == ContentKind::DapConsole => {
-                self.dap_pane(key)
+            // The four debug panes: a small slice of the tree's grammar,
+            // since none of them has files or marks to speak of — see
+            // `dap_pane`.
+            Mode::Normal
+                if matches!(
+                    content,
+                    ContentKind::DapStack
+                        | ContentKind::DapConsole
+                        | ContentKind::DapVariables
+                        | ContentKind::DapWatches
+                ) =>
+            {
+                self.dap_pane(key, content)
             }
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
@@ -731,14 +747,18 @@ impl Input {
         Some(Command { count, action: Action::Results(cmd) })
     }
 
-    /// The Stack and Console panes' keys. Shaped like [`Self::results`]
-    /// rather than [`Self::tree`]: neither pane has files or marks, only a
-    /// selection to move and `Enter` — reusing `TreeCmd` for that (rather
-    /// than growing a fifth command enum) is what `editor.rs`'s
-    /// `run_stack_cmd`/`run_console_cmd` read back. `i` is a second spelling
-    /// of `Enter`: the Console pane has no selection to move, so on it both
-    /// keys mean "give me the eval line" — see `run_console_cmd`.
-    fn dap_pane(&mut self, key: Key) -> Option<Command> {
+    /// The four debug panes' keys. Shaped like [`Self::results`] rather than
+    /// [`Self::tree`]: none of the four has files or marks — reusing
+    /// `TreeCmd` for the shared vocabulary (rather than growing a fifth
+    /// command enum) is what `editor.rs`'s `run_stack_cmd`/`run_console_cmd`/
+    /// `run_variables_cmd`/`run_watches_cmd` read back. `i` is a second
+    /// spelling of `Enter`: the Console pane has no selection to move, so on
+    /// it both keys mean "give me the eval line" — see `run_console_cmd`.
+    /// `content` gates the two panes with a little more of the tree's own
+    /// grammar: `h`/`l` expand and collapse a Variables node, `a` and `d` add
+    /// and remove a watch — meaningless on Stack/Console, so they stay
+    /// behind the check rather than a fifth keymap.
+    fn dap_pane(&mut self, key: Key, content: ContentKind) -> Option<Command> {
         if self.window_pending {
             return self.window_key(key);
         }
@@ -766,6 +786,16 @@ impl Input {
             KeyCode::Char('d') if ctrl => TreeCmd::HalfPage { down: true },
             KeyCode::Char('u') if ctrl => TreeCmd::HalfPage { down: false },
             KeyCode::Enter | KeyCode::Char('i') => TreeCmd::Enter,
+            KeyCode::Char('l') | KeyCode::Right if content == ContentKind::DapVariables => {
+                TreeCmd::Expand
+            }
+            KeyCode::Char('h') | KeyCode::Left if content == ContentKind::DapVariables => {
+                TreeCmd::Collapse
+            }
+            KeyCode::Char('a') if content == ContentKind::DapWatches => {
+                TreeCmd::Prompt(FileOp::Create)
+            }
+            KeyCode::Char('d') if content == ContentKind::DapWatches => TreeCmd::Delete,
             _ => {
                 self.reset();
                 return None;
