@@ -81,6 +81,12 @@ pub enum PickerKind {
     /// keeps `:set theme ?` to one spelling per screen. See
     /// `docs/specs/theme.md`.
     Theme,
+    /// `:debug attach [name]` — every running process to attach to, one pid
+    /// per row (`"{pid}  {name}  {cmdline}"`), sourced from `/proc` where
+    /// there is one. Accepting parses the pid back out of the row's leading
+    /// number and dispatches `DebugCmd::AttachTo`, the same platform-free
+    /// path `:debug attach-pid <n>` runs directly. See `docs/specs/debug.md`.
+    Process,
 }
 
 impl PickerKind {

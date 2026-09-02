@@ -1808,6 +1808,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             PickerKind::CodeAction => " actions ",
             PickerKind::History => " history ",
             PickerKind::Theme => " themes ",
+            PickerKind::Process => " attach ",
         });
     let inner = outer.inner(rect);
     frame.render_widget(outer, rect);

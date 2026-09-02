@@ -114,9 +114,17 @@ over the source window:
 
 - `c` continue, `n` step over, `s` step in, `o` step out, `p` pause
 - `b` toggle breakpoint on the cursor line
-- `K` evaluate the expression under the cursor (hover-style float)
+- `K` evaluate the expression under the cursor — the answer floats over the
+  cursor in the same float LSP's own `K` uses (`Effect::Evaluated { context:
+  Hover, .. }`, no status-line fallback)
 - `Esc` back to Normal for editing; breakpoint toggle is also reachable from
   Normal so setting breakpoints never requires the mode
+
+`:debug attach [name]` resolves `name` (or the single `request = "attach"`
+launch config there is) and opens bi's picker as the process picker — every
+readable `/proc` entry, one pid per row; accepting attaches. `:debug
+attach-pid <n>` is the platform-free path underneath it: same config
+resolution, no picker, attaches straight to `n`.
 
 It needs the usual four touches: a `Mode` variant + `label()`, arms in
 `input.rs`, a `KeyMode` for `[keys.debug]`, and dispatch through a new

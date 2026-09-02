@@ -755,6 +755,12 @@ pub struct Session {
     /// context to run it in — beside the picker for the same reason
     /// `symbol_targets` is. See `docs/specs/code-actions.md`.
     pending_actions: Option<PendingActions>,
+    /// The `[[debug.launch]]` name [`PickerKind::Process`] was opened over,
+    /// already resolved by `Editor::debug_attach_pid` — beside the picker
+    /// for the same reason `pending_actions` is, and taken by
+    /// `Editor::accept_pick` to name which config the chosen pid attaches
+    /// under. See `docs/specs/debug.md`.
+    pending_attach: Option<String>,
     /// The last `f`/`F`/`t`/`T`, for `;` and `,` to repeat. Here rather than in
     /// the keymap because it must outlive `Input::reset()`.
     last_find: Option<Motion>,
@@ -2152,11 +2158,28 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "debug" => match arg {
             "" => ExLine::Debug(DebugCmd::Start { name: None }),
             "stop" => ExLine::Debug(DebugCmd::Stop),
-            "attach" => ExLine::Debug(DebugCmd::AttachPid),
+            "attach" => ExLine::Debug(DebugCmd::AttachPid { name: None }),
             "stack" => ExLine::Debug(DebugCmd::Pane(DebugPane::Stack)),
             "console" => ExLine::Debug(DebugCmd::Pane(DebugPane::Console)),
             "vars" => ExLine::Debug(DebugCmd::Pane(DebugPane::Variables)),
             "watches" => ExLine::Debug(DebugCmd::Pane(DebugPane::Watches)),
+            // `:debug attach <name>` — the named `[[debug.launch]]`, which
+            // must be `request = "attach"`. See `DebugCmd::AttachPid`.
+            _ if arg.starts_with("attach ") => ExLine::Debug(DebugCmd::AttachPid {
+                name: Some(arg["attach ".len()..].trim().to_string()),
+            }),
+            // `:debug attach-pid <n>` — the platform-free path the process
+            // picker's accept also runs, for when there is no `/proc` to
+            // pick from (or you already know the pid).
+            _ if arg == "attach-pid" || arg.starts_with("attach-pid ") => {
+                let pid_arg = arg["attach-pid".len()..].trim();
+                match pid_arg.parse::<u32>() {
+                    Ok(pid) => ExLine::Debug(DebugCmd::AttachTo { name: None, pid }),
+                    Err(_) => {
+                        ExLine::Error(format!("attach-pid wants a number — got `{pid_arg}`"))
+                    }
+                }
+            }
             name => ExLine::Debug(DebugCmd::Start { name: Some(name.to_string()) }),
         },
         // Reachable from Normal mode without taking `b`, which is already
@@ -2326,8 +2349,21 @@ pub enum DebugCmd {
     Start {
         name: Option<String>,
     },
-    /// `:debug attach` — Task 13's pid picker.
-    AttachPid,
+    /// `:debug attach` / `:debug attach <name>` — resolves the attach
+    /// config (`name`, or the single `request = "attach"` config there is)
+    /// and opens the process picker over it. See
+    /// `Editor::resolve_attach_config` and `docs/specs/debug.md`.
+    AttachPid {
+        name: Option<String>,
+    },
+    /// `:debug attach-pid <n>` — the platform-free path: attaches straight
+    /// to `pid` under the resolved config, no picker. Also what the
+    /// process picker's own accept dispatches, with `name` already
+    /// resolved to the config it opened over.
+    AttachTo {
+        name: Option<String>,
+        pid: u32,
+    },
     /// `:debug stop` — disconnects the active session.
     Stop,
     /// `:debug stack|console|vars|watches` — opens the named pane, or
@@ -2354,6 +2390,111 @@ pub enum DebugPane {
     Console,
     Variables,
     Watches,
+}
+
+/// `DebugCmd::AttachPid` and `DebugCmd::AttachTo`'s shared resolution —
+/// which `[[debug.launch]]` an attach names. `name` is that config by name
+/// (which must be `request == "attach"`, never guessed at by adapter); with
+/// no name, it is the single attach-typed config there is — zero or several
+/// both explain themselves on the status line rather than picking for you.
+/// A free function over the slice, not a method, so it borrows only
+/// `config.debug.launch` and leaves the rest of `self` free for the
+/// `dap.launch` call that follows a successful resolve. See
+/// `docs/specs/debug.md`.
+fn resolve_attach_config<'a>(
+    launch: &'a [dap::LaunchConfig],
+    name: Option<&str>,
+) -> Result<&'a dap::LaunchConfig, String> {
+    match name {
+        Some(name) => match launch.iter().find(|l| l.name == name) {
+            Some(l) if l.request == "attach" => Ok(l),
+            Some(_) => Err(format!("debug: {name} is a launch config, not attach")),
+            None => Err(format!("debug: no launch config named {name}")),
+        },
+        None => {
+            let attach: Vec<&dap::LaunchConfig> =
+                launch.iter().filter(|l| l.request == "attach").collect();
+            match attach.as_slice() {
+                [] => {
+                    Err("no attach config: add [[debug.launch]] with request = \"attach\"".into())
+                }
+                [only] => Ok(*only),
+                many => {
+                    let names: Vec<&str> = many.iter().map(|l| l.name.as_str()).collect();
+                    Err(format!("which? `:debug attach <name>`: {}", names.join(", ")))
+                }
+            }
+        }
+    }
+}
+
+/// The process picker's rows. On Linux, every process this user can read
+/// out of `/proc`, minus bi's own pid, sorted by pid and formatted
+/// `"{pid}  {comm}  {cmdline}"` — [`scan_processes`] does the reading, this
+/// turns it into picker items and drops the one pid that could never be a
+/// sane attach target. Off Linux there is no `/proc` to walk, so the list
+/// is a single row pointing at the platform-free path that does not need
+/// one. See `docs/specs/debug.md`.
+#[cfg(target_os = "linux")]
+fn attach_picker_items() -> Vec<Item> {
+    let own = std::process::id();
+    scan_processes(Path::new("/proc"))
+        .into_iter()
+        .filter(|&(pid, ..)| pid != own)
+        .map(|(pid, comm, cmdline)| Item {
+            text: format!("{pid}  {comm}  {}", truncate_cmdline(&cmdline)),
+            badge: None,
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attach_picker_items() -> Vec<Item> {
+    vec![Item { text: "enter a pid: :debug attach-pid <n>".into(), badge: None }]
+}
+
+/// A command line long enough to blow out the picker's width becomes a
+/// trailing `…` instead — the pid and the name it is attached to are the
+/// part that identifies the row; the rest is context.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn truncate_cmdline(cmdline: &str) -> String {
+    const MAX: usize = 60;
+    if cmdline.chars().count() <= MAX {
+        cmdline.to_string()
+    } else {
+        format!("{}…", cmdline.chars().take(MAX).collect::<String>())
+    }
+}
+
+/// Every process readable under `proc_root`: its pid, `comm` (trimmed of
+/// the newline the kernel puts on it), and `cmdline` (NUL-separated on the
+/// wire, turned into a space-separated string). Pure and file-io only — no
+/// process listing syscalls, no notion of "this process" — so a fake
+/// directory tree drives the unit test; [`attach_picker_items`] is what
+/// calls it with the real `/proc` and excludes bi's own pid. An entry this
+/// process cannot read (raced away, owned by another user, missing
+/// `comm`), and a directory name that is not a pid at all (`self`, `net`,
+/// every other non-numeric entry `/proc` holds), are both skipped rather
+/// than failing the whole scan. Sorted by pid, ascending.
+///
+/// Not `#[cfg(target_os = "linux")]` itself, unlike its caller: nothing
+/// here is Linux-specific — it just reads whatever directory tree it is
+/// pointed at — so the unit test drives it on every platform CI runs on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn scan_processes(proc_root: &Path) -> Vec<(u32, String, String)> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else { return Vec::new() };
+    let mut rows: Vec<(u32, String, String)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            let cmdline = std::fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
+            let cmdline = cmdline.split('\0').filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+            Some((pid, comm.trim().to_string(), cmdline))
+        })
+        .collect();
+    rows.sort_by_key(|&(pid, ..)| pid);
+    rows
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -5858,6 +5999,16 @@ impl Editor {
                 let name = picker.items()[chosen].text.clone();
                 self.set_option(&format!("theme {name}"));
             }
+            // The pid is the row's leading number; off Linux the one row is
+            // the "enter a pid" prompt, which has none, and accepting it is
+            // a no-op — the prompt already said what to type instead.
+            PickerKind::Process => {
+                let text = picker.items()[chosen].text.clone();
+                let name = self.session.pending_attach.take();
+                if let Some(pid) = text.split_whitespace().next().and_then(|s| s.parse().ok()) {
+                    self.debug_attach_to(name, pid);
+                }
+            }
         }
     }
 
@@ -7422,14 +7573,32 @@ impl Editor {
                 // Every open Console pane gets the lines — a status line here
                 // would be spam on top of it.
                 dap::Effect::Output { category, text } => self.append_console(&category, &text),
-                // The REPL's answer joins the console it came from; a watch's
-                // answer updates its row wherever it is shown. A hover float
-                // is Task 13's — for now its answer is a status line, same as
-                // any other one-off lookup.
+                // The REPL's answer joins the console it came from; a
+                // watch's answer updates its row wherever it is shown; a
+                // hover's floats over the cursor that asked it, the same
+                // float `K`'s LSP hover uses — see `Editor::apply_hover`
+                // and `docs/specs/hover.md`. Text, not `Code`: it is a
+                // `name = value` fact, not a snippet in the buffer's
+                // grammar, and `HoverLine::Code` would try to highlight
+                // "42" as source and fail to say anything useful.
                 dap::Effect::Evaluated { context, expr, result } => match context {
                     dap::client::EvalContext::Repl => self.append_console_eval(&expr, &result),
                     dap::client::EvalContext::Watch => self.dap.set_watch_value(&expr, result),
-                    dap::client::EvalContext::Hover => self.session.status = result,
+                    // No status-line fallback: a hover answer with nowhere
+                    // to anchor (the focused window stopped holding text
+                    // while the request was in flight — a tree pane, say)
+                    // is simply not shown, the same as `apply_hover` does
+                    // when its window has since gone away.
+                    dap::client::EvalContext::Hover => {
+                        if let Some(anchor) = self.cursor().map(|c| c.at) {
+                            self.session.hover = Some(Hover {
+                                window: self.focus,
+                                anchor,
+                                lines: vec![HoverLine::Text(format!("{expr} = {result}"))],
+                                language: None,
+                            });
+                        }
+                    }
                 },
             }
         }
@@ -7456,8 +7625,8 @@ impl Editor {
             DebugCmd::Pause => self.debug_pause(),
             DebugCmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             DebugCmd::Evaluate => self.debug_evaluate(),
-            // Task 13's pid picker.
-            DebugCmd::AttachPid => self.session.status = "attach: not yet".into(),
+            DebugCmd::AttachPid { name } => self.debug_attach_pid(name),
+            DebugCmd::AttachTo { name, pid } => self.debug_attach_to(name, pid),
             DebugCmd::Pane(pane) => self.open_debug_pane(pane),
             DebugCmd::Eval(expr) => self.debug_eval(expr),
             DebugCmd::Watch(expr) => self.debug_watch(expr),
@@ -7509,6 +7678,74 @@ impl Editor {
         let request = launch.request.clone();
         let body = launch.body.clone();
         match self.dap.launch(&launch_name, &command, &root, &request, body) {
+            Ok(_) => self.session.mode = Mode::Debug,
+            Err(reason) => self.session.status = format!("debug: {reason}"),
+        }
+    }
+
+    /// `:debug attach` / `:debug attach <name>`. Resolves the attach config
+    /// per [`resolve_attach_config`] and opens the process picker over it —
+    /// accepting a row is [`Editor::debug_attach_to`] with the pid parsed
+    /// back out of it. Resolution happens here, before the picker opens,
+    /// so an unknown or ambiguous name is a status line, never an empty or
+    /// misleading overlay.
+    fn debug_attach_pid(&mut self, name: Option<String>) {
+        if !self.config.debug.enabled {
+            self.session.status = "debug is off (`enabled = false` in [debug])".into();
+            return;
+        }
+        let launch_name = match resolve_attach_config(&self.config.debug.launch, name.as_deref())
+        {
+            Ok(launch) => launch.name.clone(),
+            Err(status) => {
+                self.session.status = status;
+                return;
+            }
+        };
+        self.session.pending_attach = Some(launch_name);
+        self.session.picker = Some(Picker::new(PickerKind::Process, attach_picker_items(), 0));
+        self.session.pick_from = Some(std::mem::replace(&mut self.session.mode, Mode::Pick));
+    }
+
+    /// `:debug attach-pid <n>`, and what the process picker's accept
+    /// dispatches once it has parsed a pid out of the chosen row. Resolves
+    /// the attach config exactly as [`Editor::debug_attach_pid`] does, sets
+    /// `body["pid"]` — the only key bi writes into an otherwise opaque,
+    /// adapter-specific body — and launches through the same
+    /// [`dap::Registry::launch`] path `:debug <name>` uses, with
+    /// `request = "attach"`.
+    fn debug_attach_to(&mut self, name: Option<String>, pid: u32) {
+        if !self.config.debug.enabled {
+            self.session.status = "debug is off (`enabled = false` in [debug])".into();
+            return;
+        }
+        let launch = match resolve_attach_config(&self.config.debug.launch, name.as_deref()) {
+            Ok(launch) => launch,
+            Err(status) => {
+                self.session.status = status;
+                return;
+            }
+        };
+        let Some(adapter) = self.config.debug.adapters.get(&launch.adapter) else {
+            self.session.status = format!("debug: no adapter named {}", launch.adapter);
+            return;
+        };
+        // The body is opaque per `docs/specs/debug.md` — every key but
+        // `pid` travels through untouched. A body that is not an object
+        // (the empty `LaunchConfig` default, or a project that wrote one
+        // wrong) has nowhere to put `pid` beside, so it becomes the whole
+        // body rather than silently dropping the pid on the floor.
+        let mut body = launch.body.clone();
+        match body.as_object_mut() {
+            Some(obj) => {
+                obj.insert("pid".to_string(), serde_json::json!(pid));
+            }
+            None => body = serde_json::json!({ "pid": pid }),
+        }
+        let root = self.session_root();
+        let launch_name = launch.name.clone();
+        let command = adapter.command.clone();
+        match self.dap.launch(&launch_name, &command, &root, "attach", body) {
             Ok(_) => self.session.mode = Mode::Debug,
             Err(reason) => self.session.status = format!("debug: {reason}"),
         }
@@ -7934,9 +8171,9 @@ impl Editor {
     }
 
     /// `K` in `Mode::Debug` — the word under the cursor, evaluated in the
-    /// stopped session's top frame. The float that shows the answer is Task
-    /// 13's; for now `pump_dap`'s `Effect::Evaluated` arm puts it on the
-    /// status line.
+    /// stopped session's top frame. The answer floats over the word it
+    /// asked about, through `pump_dap`'s `Effect::Evaluated` arm — the same
+    /// float LSP's own `K` uses. See `docs/specs/debug.md`.
     fn debug_evaluate(&mut self) {
         let Some(cursor) = self.cursor() else {
             self.session.status = "no cursor here".into();
@@ -7951,6 +8188,7 @@ impl Editor {
             return;
         };
         let expr = buffer.slice(start, end);
+        let frame = self.dap.frame();
         let Some(client) = self.dap.active_mut() else {
             self.session.status = "debug: no active session".into();
             return;
@@ -7961,7 +8199,7 @@ impl Editor {
         }
         client.request(
             "evaluate",
-            serde_json::json!({ "expression": expr, "context": "hover" }),
+            serde_json::json!({ "expression": expr, "frameId": frame, "context": "hover" }),
             dap::client::Intent::Evaluate { context: dap::client::EvalContext::Hover, expr },
         );
     }
@@ -24009,11 +24247,27 @@ int main(void) {
     fn colon_debug_parses_to_a_start_command() {
         assert_eq!(parse_ex("debug"), Some(ExLine::Debug(DebugCmd::Start { name: None })));
         assert_eq!(parse_ex("debug stop"), Some(ExLine::Debug(DebugCmd::Stop)));
-        assert_eq!(parse_ex("debug attach"), Some(ExLine::Debug(DebugCmd::AttachPid)));
+        assert_eq!(
+            parse_ex("debug attach"),
+            Some(ExLine::Debug(DebugCmd::AttachPid { name: None }))
+        );
         assert_eq!(
             parse_ex("debug run tests"),
             Some(ExLine::Debug(DebugCmd::Start { name: Some("run tests".into()) }))
         );
+    }
+
+    #[test]
+    fn colon_debug_attach_parses_name_and_pid_forms() {
+        assert_eq!(
+            parse_ex("debug attach srv"),
+            Some(ExLine::Debug(DebugCmd::AttachPid { name: Some("srv".into()) }))
+        );
+        assert_eq!(
+            parse_ex("debug attach-pid 7"),
+            Some(ExLine::Debug(DebugCmd::AttachTo { name: None, pid: 7 }))
+        );
+        assert!(matches!(parse_ex("debug attach-pid x"), Some(ExLine::Error(_))));
     }
 
     #[test]
@@ -24945,6 +25199,183 @@ int main(void) {
                 panic!("not a variables pane")
             };
             assert_eq!(vars.roots.len(), 1, "the late-open request's answer filled the pane");
+        }
+
+        // ---- Task 13: attach-by-pid, evaluate-under-cursor -------------------
+
+        /// Like `project`, but with a caller-chosen `[[debug.launch]]` block
+        /// instead of the request-"launch" one `project` always writes —
+        /// attach tests want `request = "attach"` configs, sometimes more
+        /// than one.
+        fn attach_project(name: &str, launch_toml: &'static str) -> (ScratchDir, Editor, FakeSpawn) {
+            let dir = ScratchDir::new(&format!("dap-{name}"))
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", "fn main() {\n}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            ed.load_config(ConfigText(Some(launch_toml)));
+            let fake = FakeSpawn::default();
+            ed.set_dap_spawner(fake.clone());
+            (dir, ed, fake)
+        }
+
+        #[test]
+        fn attach_launches_with_the_chosen_pid_as_an_opaque_body() {
+            let (_dir, mut ed, fake) = attach_project(
+                "attach-body",
+                "[[debug.launch]]\n\
+                 name = \"srv\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"attach\"\n\
+                 body = { foo = \"bar\" }\n",
+            );
+
+            ed.debug_command(DebugCmd::AttachTo { name: None, pid: 4242 });
+            assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
+            assert_eq!(ed.session.mode, Mode::Debug);
+
+            fake.respond(SessionId(0), 1, "initialize", true, json!({ "capabilities": {} }));
+            ed.settle();
+
+            let attach = fake.last(SessionId(0), "attach").expect("attach sent");
+            assert_eq!(attach["arguments"], json!({ "foo": "bar", "pid": 4242 }));
+        }
+
+        #[test]
+        fn attach_refuses_a_launch_typed_config_and_reports_none() {
+            let (_dir, mut ed, fake) = attach_project(
+                "attach-launch-typed",
+                "[[debug.launch]]\n\
+                 name = \"run tests\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"launch\"\n\
+                 body = { program = \"target/debug/bi\" }\n",
+            );
+
+            ed.debug_command(DebugCmd::AttachTo { name: None, pid: 1 });
+
+            assert!(ed.session.status.contains("no attach config"), "{}", ed.session.status);
+            assert!(fake.spawned.lock().unwrap().is_empty(), "no spawn");
+        }
+
+        #[test]
+        fn attach_with_several_attach_configs_lists_them() {
+            let (_dir, mut ed, fake) = attach_project(
+                "attach-several",
+                "[[debug.launch]]\n\
+                 name = \"svc-a\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"attach\"\n\
+                 body = { x = 1 }\n\
+                 [[debug.launch]]\n\
+                 name = \"svc-b\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"attach\"\n\
+                 body = { y = 2 }\n",
+            );
+
+            ed.debug_command(DebugCmd::AttachTo { name: None, pid: 99 });
+            assert!(ed.session.status.contains("svc-a"), "{}", ed.session.status);
+            assert!(ed.session.status.contains("svc-b"), "{}", ed.session.status);
+            assert!(fake.spawned.lock().unwrap().is_empty(), "no spawn — ambiguous");
+
+            ed.debug_command(DebugCmd::AttachTo { name: Some("svc-b".into()), pid: 99 });
+            assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
+            assert_eq!(ed.session.mode, Mode::Debug);
+        }
+
+        #[test]
+        fn accepting_a_process_picker_row_attaches_by_its_leading_pid() {
+            let (_dir, mut ed, fake) = attach_project(
+                "attach-picker",
+                "[[debug.launch]]\n\
+                 name = \"srv\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"attach\"\n\
+                 body = { foo = \"bar\" }\n",
+            );
+            // Standing in for what `debug_attach_pid` would have built —
+            // the accept path is what this test is about, not the /proc
+            // walk, which the live system makes non-deterministic.
+            ed.session.picker = Some(Picker::new(
+                PickerKind::Process,
+                vec![Item { text: "4242  proc  some cmdline here".into(), badge: None }],
+                0,
+            ));
+            ed.session.pending_attach = Some("srv".into());
+
+            ed.apply(cmd(Action::PickAccept));
+
+            assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
+            assert_eq!(ed.session.mode, Mode::Debug);
+        }
+
+        /// Off Linux — or anywhere the row has no leading number, like the
+        /// single "enter a pid" prompt — accepting does nothing, since the
+        /// row already said what to type instead.
+        #[test]
+        fn accepting_a_pidless_process_row_is_a_no_op() {
+            let (_dir, mut ed, fake) = attach_project(
+                "attach-picker-no-pid",
+                "[[debug.launch]]\n\
+                 name = \"srv\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"attach\"\n\
+                 body = { foo = \"bar\" }\n",
+            );
+            ed.session.picker = Some(Picker::new(
+                PickerKind::Process,
+                vec![Item { text: "enter a pid: :debug attach-pid <n>".into(), badge: None }],
+                0,
+            ));
+            ed.session.pending_attach = Some("srv".into());
+
+            ed.apply(cmd(Action::PickAccept));
+
+            assert!(fake.spawned.lock().unwrap().is_empty(), "no spawn");
+            assert_ne!(ed.session.mode, Mode::Debug);
+        }
+
+        #[test]
+        fn proc_scan_reads_pid_comm_and_cmdline() {
+            let dir = ScratchDir::new("proc-scan")
+                .written("123/comm", "foo\n")
+                .written("123/cmdline", "foo\0--flag\0")
+                // No `comm` — skipped rather than failing the whole scan.
+                .written("456/cmdline", "bar\0")
+                // Not a pid at all — `/proc` is full of these.
+                .dir("self");
+
+            let rows = scan_processes(std::path::Path::new(dir.path()));
+
+            assert_eq!(rows, vec![(123, "foo".to_string(), "foo --flag".to_string())]);
+        }
+
+        #[test]
+        fn evaluate_under_cursor_shows_the_answer_in_the_hover_float() {
+            let (_dir, mut ed, fake) = project("evaluate-float");
+            stopped_at_thread_7(&mut ed, &fake);
+            // The buffer's first word, where the cursor already sits.
+            let word = ed.buffer().unwrap().slice(0, 2);
+            assert_eq!(word, "fn");
+
+            ed.debug_command(DebugCmd::Evaluate);
+
+            let sent = fake.last(SessionId(0), "evaluate").expect("evaluate sent");
+            assert_eq!(sent["arguments"]["context"], json!("hover"));
+            assert_eq!(sent["arguments"]["expression"], json!("fn"));
+
+            let seq = sent["seq"].as_i64().expect("a request carries its own seq");
+            fake.respond(
+                SessionId(0),
+                seq,
+                "evaluate",
+                true,
+                json!({ "result": "42", "variablesReference": 0 }),
+            );
+            ed.settle();
+
+            let hover = ed.session.hover.as_ref().expect("a float");
+            assert_eq!(hover.lines, vec![HoverLine::Text("fn = 42".into())]);
         }
     }
 
