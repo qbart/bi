@@ -268,6 +268,10 @@ impl Input {
             // than growing a third one for four keys that mean the same thing
             // in both: a list is a list.
             Mode::Normal if content == ContentKind::Results => KeyMode::Tree,
+            // Same borrowing, for the same reason — see `dap_pane`.
+            Mode::Normal if content == ContentKind::DapStack || content == ContentKind::DapConsole => {
+                KeyMode::Tree
+            }
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             Mode::Debug => KeyMode::Debug,
@@ -351,6 +355,12 @@ impl Input {
             // a second copy of a fact the window already holds.
             Mode::Normal if content == ContentKind::Tree => self.tree(key),
             Mode::Normal if content == ContentKind::Results => self.results(key),
+            // The Stack and Console panes: a small slice of the tree's
+            // grammar, since neither has files, marks, or anything to
+            // prompt for — see `dap_pane`.
+            Mode::Normal if content == ContentKind::DapStack || content == ContentKind::DapConsole => {
+                self.dap_pane(key)
+            }
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -719,6 +729,54 @@ impl Input {
         };
         self.reset();
         Some(Command { count, action: Action::Results(cmd) })
+    }
+
+    /// The Stack and Console panes' keys. Shaped like [`Self::results`]
+    /// rather than [`Self::tree`]: neither pane has files or marks, only a
+    /// selection to move and `Enter` — reusing `TreeCmd` for that (rather
+    /// than growing a fifth command enum) is what `editor.rs`'s
+    /// `run_stack_cmd`/`run_console_cmd` read back. `i` is a second spelling
+    /// of `Enter`: the Console pane has no selection to move, so on it both
+    /// keys mean "give me the eval line" — see `run_console_cmd`.
+    fn dap_pane(&mut self, key: Key) -> Option<Command> {
+        if self.window_pending {
+            return self.window_key(key);
+        }
+        let ctrl = key.mods.ctrl;
+        let count = self.count.unwrap_or(1).max(1);
+        let g = std::mem::take(&mut self.g_pending);
+
+        let cmd = match key.code {
+            KeyCode::Char('g') if g => TreeCmd::First,
+            KeyCode::Char('g') => {
+                self.g_pending = true;
+                return None;
+            }
+            KeyCode::Char('G') => TreeCmd::Last,
+            KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                self.count = Some(self.count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as usize);
+                return None;
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                return None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => TreeCmd::Select { down: true, count },
+            KeyCode::Char('k') | KeyCode::Up => TreeCmd::Select { down: false, count },
+            KeyCode::Char('d') if ctrl => TreeCmd::HalfPage { down: true },
+            KeyCode::Char('u') if ctrl => TreeCmd::HalfPage { down: false },
+            KeyCode::Enter | KeyCode::Char('i') => TreeCmd::Enter,
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        let count = match cmd {
+            TreeCmd::Select { .. } => count,
+            _ => 1,
+        };
+        self.reset();
+        Some(Command { count, action: Action::Tree(cmd) })
     }
 
     fn tree(&mut self, key: Key) -> Option<Command> {

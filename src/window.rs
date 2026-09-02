@@ -40,6 +40,53 @@ pub enum Content {
     /// position, which is view state, and two panes wanting different crops
     /// is why you would open the second.
     Image(Img),
+    /// The stopped session's call stack — see `docs/specs/debug.md` §UI. Held
+    /// whole for the same reason `Tree`/`Results` are: which frame is
+    /// selected is view state, not something two panes would want to share.
+    DapStack(DapStack),
+    /// The debug session's console: `output` events and the `:eval`
+    /// transcript, oldest first. Boxed like `Results`, so a window showing
+    /// text does not pay `Content`'s size for a pane it is not.
+    DapConsole(Box<DapConsole>),
+}
+
+/// One `stackTrace` answer, and which frame is selected — not necessarily the
+/// stopped (`▶`) one: selecting another frame moves the source window and
+/// re-scopes without moving where execution is actually stopped. See
+/// `docs/specs/debug.md` §UI.
+#[derive(Debug, Clone)]
+pub struct DapStack {
+    pub frames: Vec<crate::dap::types::StackFrame>,
+    pub selected: usize,
+}
+
+/// The debug session's console. `scroll` names the *last* visible line
+/// rather than the first the way `Tree`/`Results` do — a console reads
+/// bottom-up, so [`DapConsole::push`] moves it to the newest line, and
+/// walking it away from the tail is what a selection motion on this pane
+/// means.
+#[derive(Debug, Clone)]
+pub struct DapConsole {
+    pub lines: Vec<String>,
+    pub scroll: usize,
+}
+
+impl DapConsole {
+    /// Lines kept before the oldest starts dropping. A debuggee's stdout has
+    /// no natural end, and once a session has produced this much output the
+    /// newest of it is what a crash-chasing user actually wants — so the
+    /// cap drops the oldest lines rather than refusing new ones.
+    pub const MAX_LINES: usize = 2000;
+
+    /// Appends one line and pins `scroll` to it, so the pane always shows
+    /// what just arrived until something scrolls it away.
+    pub fn push(&mut self, line: String) {
+        self.lines.push(line);
+        if self.lines.len() > Self::MAX_LINES {
+            self.lines.remove(0);
+        }
+        self.scroll = self.lines.len() - 1;
+    }
 }
 
 /// Which keymap a window wants, and which renderer.
@@ -52,6 +99,8 @@ pub enum ContentKind {
     Tree,
     Results,
     Image,
+    DapStack,
+    DapConsole,
 }
 
 impl Content {
@@ -61,6 +110,8 @@ impl Content {
             Content::Tree(_) => ContentKind::Tree,
             Content::Results(_) => ContentKind::Results,
             Content::Image(_) => ContentKind::Image,
+            Content::DapStack(_) => ContentKind::DapStack,
+            Content::DapConsole(_) => ContentKind::DapConsole,
         }
     }
 
@@ -68,7 +119,11 @@ impl Content {
     pub fn buffer(&self) -> Option<BufferId> {
         match self {
             Content::Text(text) => Some(text.buffer),
-            Content::Tree(_) | Content::Results(_) | Content::Image(_) => None,
+            Content::Tree(_)
+            | Content::Results(_)
+            | Content::Image(_)
+            | Content::DapStack(_)
+            | Content::DapConsole(_) => None,
         }
     }
 }

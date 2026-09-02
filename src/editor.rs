@@ -28,7 +28,8 @@ use crate::syntax::Syntax;
 use crate::theme::Theme;
 use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
 use crate::window::{
-    Chrome, Content, ContentKind, Dir, Layout, Place, Rect, Side, Text, Window, WindowId,
+    Chrome, Content, ContentKind, DapConsole, DapStack, Dir, Layout, Place, Rect, Side, Text,
+    Window, WindowId,
 };
 
 /// What a `:` command with no scope of its own acts on.
@@ -2152,11 +2153,20 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             "" => ExLine::Debug(DebugCmd::Start { name: None }),
             "stop" => ExLine::Debug(DebugCmd::Stop),
             "attach" => ExLine::Debug(DebugCmd::AttachPid),
+            "stack" => ExLine::Debug(DebugCmd::Pane(DebugPane::Stack)),
+            "console" => ExLine::Debug(DebugCmd::Pane(DebugPane::Console)),
+            "vars" => ExLine::Debug(DebugCmd::Pane(DebugPane::Variables)),
+            "watches" => ExLine::Debug(DebugCmd::Pane(DebugPane::Watches)),
             name => ExLine::Debug(DebugCmd::Start { name: Some(name.to_string()) }),
         },
         // Reachable from Normal mode without taking `b`, which is already
         // `word_backward`. See `DebugCmd::ToggleBreakpoint`.
         "break" => ExLine::Debug(DebugCmd::ToggleBreakpoint),
+        // The Console pane's REPL line — see `docs/specs/debug.md` §UI.
+        "eval" => match arg.is_empty() {
+            true => ExLine::Error("eval what?".into()),
+            false => ExLine::Debug(DebugCmd::Eval(arg.to_string())),
+        },
         "def" | "definition" => ExLine::Definition,
         "decl" | "declaration" => ExLine::Declaration,
         "impl" | "implementation" => ExLine::Implementation,
@@ -2311,6 +2321,23 @@ pub enum DebugCmd {
     AttachPid,
     /// `:debug stop` — disconnects the active session.
     Stop,
+    /// `:debug stack|console|vars|watches` — opens the named pane, or
+    /// focuses it when a window already shows it.
+    Pane(DebugPane),
+    /// `:eval <expr>` — the Console pane's REPL line: evaluates in the
+    /// current frame and appends the exchange to every open console.
+    Eval(String),
+}
+
+/// Which pane `:debug <name>` opens. All four exist now even though
+/// Variables and Watches are Task 12's — the ex parser and the keymap only
+/// want to learn this enum once. See `docs/specs/debug.md` §UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugPane {
+    Stack,
+    Console,
+    Variables,
+    Watches,
 }
 
 /// What `Ctrl-W` and the split commands do.
@@ -2580,6 +2607,14 @@ pub enum Pane<'a> {
     Image {
         window: &'a Window,
         img: &'a crate::img::Img,
+    },
+    DapStack {
+        window: &'a Window,
+        stack: &'a DapStack,
+    },
+    DapConsole {
+        window: &'a Window,
+        console: &'a DapConsole,
     },
 }
 
@@ -3060,6 +3095,8 @@ impl Editor {
             Content::Tree(tree) => Pane::Tree { window, tree },
             Content::Results(results) => Pane::Results { window, results },
             Content::Image(img) => Pane::Image { window, img },
+            Content::DapStack(stack) => Pane::DapStack { window, stack },
+            Content::DapConsole(console) => Pane::DapConsole { window, console },
             Content::Text(text) => {
                 let entry = self.entry(text.buffer);
                 Pane::Text {
@@ -4819,6 +4856,16 @@ impl Editor {
 
     fn run_tree_cmd(&mut self, cmd: TreeCmd) {
         let height = self.window().height;
+        // The Stack and Console panes borrow the tree's grammar (see
+        // `input.rs`'s `dap_pane`) but are not trees, and each reads only a
+        // handful of the commands it can send — everything else is a no-op
+        // rather than falling into the tree logic below, which has nothing
+        // to do with either pane.
+        match &self.window().content {
+            Content::DapStack(_) => return self.run_stack_cmd(cmd, height),
+            Content::DapConsole(_) => return self.run_console_cmd(cmd),
+            _ => {}
+        }
         if self.window().tree().is_none() {
             // `-` is the same key in the other direction: out of the file and
             // into the tree on the directory holding it — or, when one is
@@ -4918,6 +4965,63 @@ impl Editor {
                 self.session.status = self.name_of(id);
             }
             Err(e) => self.session.status = format!("{e:#}"),
+        }
+    }
+
+    /// A key in the Stack pane. `Select`/`First`/`Last`/`HalfPage` move the
+    /// selection; `Enter` jumps the source window to the selected frame and
+    /// re-scopes it via [`Editor::jump_to_frame`]. `stopped_at` — the `▶`
+    /// sign — stays on the top frame throughout: selecting a frame here is
+    /// looking around, not stepping the program.
+    fn run_stack_cmd(&mut self, cmd: TreeCmd, height: usize) {
+        if let TreeCmd::Enter = cmd {
+            let frame = match &self.window().content {
+                Content::DapStack(stack) => stack.frames.get(stack.selected).cloned(),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                self.jump_to_frame(&frame);
+            }
+            return;
+        }
+        let Content::DapStack(stack) = &mut self.window_mut().content else { return };
+        let len = stack.frames.len();
+        if len == 0 {
+            return;
+        }
+        let last = len as isize - 1;
+        let delta = match cmd {
+            TreeCmd::Select { down, count } => Some(count as isize * if down { 1 } else { -1 }),
+            TreeCmd::First => {
+                stack.selected = 0;
+                None
+            }
+            TreeCmd::Last => {
+                stack.selected = last as usize;
+                None
+            }
+            TreeCmd::HalfPage { down } => {
+                Some((height / 2).max(1) as isize * if down { 1 } else { -1 })
+            }
+            // Everything else a list pane's grammar can send — `y`, `a`,
+            // `Prompt`, and the rest — means nothing here.
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            stack.selected = (stack.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// A key in the Console pane. There is nothing to select in a log, so
+    /// only `Enter` (and `i`, dispatched the same way — see `input.rs`'s
+    /// `dap_pane`) does anything: it prefills the command line with
+    /// `:eval `, the same "a prefilled line is the confirmation" trick
+    /// `Editor::prompt_file_op` uses for `:create`/`:rename`. Everything
+    /// else is a no-op.
+    fn run_console_cmd(&mut self, cmd: TreeCmd) {
+        if let TreeCmd::Enter = cmd {
+            self.session.status.clear();
+            self.session.mode = Mode::Command("eval ".into());
         }
     }
 
@@ -7098,19 +7202,26 @@ impl Editor {
                 dap::Effect::Threads(_) => {}
                 // The top frame is where execution actually sits: jump the
                 // source window there and kick `scopes` so Task 12's
-                // Variables pane has data by the time it exists. Task 11's
-                // Stack pane shows the rest of `frames`.
-                dap::Effect::Stack { frames } => self.apply_stopped_frame(frames),
+                // Variables pane has data by the time it exists. Every open
+                // Stack pane gets the whole list.
+                dap::Effect::Stack { frames } => {
+                    self.fill_stack_panes(&frames);
+                    self.apply_stopped_frame(frames);
+                }
                 // Task 12's Variables pane fills in the tree.
                 dap::Effect::Scopes(_) => {}
                 // Task 12's Variables pane fills in the expanded node.
                 dap::Effect::Variables { .. } => {}
-                // Task 11's Console pane consumes this — a status line here
-                // would be spam.
-                dap::Effect::Output { .. } => {}
-                // Task 12's Watches pane and Task 13's evaluate float show
-                // the result.
-                dap::Effect::Evaluated { .. } => {}
+                // Every open Console pane gets the lines — a status line here
+                // would be spam on top of it.
+                dap::Effect::Output { category, text } => self.append_console(&category, &text),
+                // The REPL's answer joins the console it came from; a watch
+                // or a hover float is Task 12/13's to draw.
+                dap::Effect::Evaluated { context, expr, result } => {
+                    if context == dap::client::EvalContext::Repl {
+                        self.append_console_eval(&expr, &result);
+                    }
+                }
             }
         }
     }
@@ -7138,6 +7249,8 @@ impl Editor {
             DebugCmd::Evaluate => self.debug_evaluate(),
             // Task 13's pid picker.
             DebugCmd::AttachPid => self.session.status = "attach: not yet".into(),
+            DebugCmd::Pane(pane) => self.open_debug_pane(pane),
+            DebugCmd::Eval(expr) => self.debug_eval(expr),
         }
     }
 
@@ -7288,11 +7401,13 @@ impl Editor {
 
     /// [`dap::Effect::Stack`] once a `stopped` event's `stackTrace` answers:
     /// the top frame is where execution actually sits. A frame with a source
-    /// path jumps [`Editor::debug_source_window`] there, records it as
+    /// path jumps there via [`Editor::jump_source_window`], records it as
     /// `dap::Registry::stopped_at` for the gutter, and kicks `scopes` so
     /// Task 12's Variables pane has data by the time it exists. A frame with
     /// no source (library code with no debug info) cannot be jumped to —
-    /// `stopped_at` is left alone and the status line says so.
+    /// `stopped_at` is left alone and the status line says so. `frame` moves
+    /// to the top frame's id either way — the Stack pane and `:eval` follow
+    /// execution until a frame is picked by hand.
     fn apply_stopped_frame(&mut self, frames: Vec<dap::types::StackFrame>) {
         let Some(top) = frames.into_iter().next() else {
             self.session.status = "debug: stopped with an empty stack".into();
@@ -7300,36 +7415,22 @@ impl Editor {
         };
         match top.source.as_ref().and_then(|s| s.path.as_deref()) {
             Some(path) => {
-                let path = PathBuf::from(path);
+                let path = path.to_string();
                 // Wire lines are 1-based; the buffer row bi's cursor and
                 // gutter use is 0-based, same conversion as
                 // `dap::Registry::set_verified`.
                 let row = (top.line - 1).max(0) as usize;
-                self.dap.set_stopped_at(path.clone(), row);
-                let window = self.debug_source_window();
-                match self.open_path(&path.to_string_lossy()) {
-                    Ok(id) => {
-                        self.show(window, id);
-                        // Column 0: DAP's `column` is in units the adapter
-                        // never names (bi's LSP side only gets this right by
-                        // carrying an explicit encoding across the wire —
-                        // see `lsp::pos`) and the gutter's own stopped-line
-                        // marker already points at the whole row, so the
-                        // start of the line is the reading a debugger jump
-                        // owes without inventing an encoding DAP does not
-                        // give.
-                        if let Some(mut view) = self.view(window) {
-                            view.goto_row(row + 1);
-                        }
-                        self.session.status = format!("stopped in {}", top.name);
-                    }
-                    Err(e) => self.session.status = format!("debug: {e:#}"),
+                self.dap.set_stopped_at(PathBuf::from(&path), row);
+                match self.jump_source_window(&path, row) {
+                    Ok(()) => self.session.status = format!("stopped in {}", top.name),
+                    Err(e) => self.session.status = format!("debug: {e}"),
                 }
             }
             None => {
                 self.session.status = format!("stopped in {} (no source)", top.name);
             }
         }
+        self.dap.set_frame(Some(top.id));
         if let Some(client) = self.dap.active_mut() {
             client.request(
                 "scopes",
@@ -7337,6 +7438,149 @@ impl Editor {
                 dap::client::Intent::Scopes { frame: top.id },
             );
         }
+    }
+
+    /// Opens `path` in [`Editor::debug_source_window`] and puts the cursor at
+    /// `row` (0-based). The jump [`Editor::apply_stopped_frame`] makes on a
+    /// `stopped` event, and [`Editor::jump_to_frame`] makes on `Enter` in the
+    /// Stack pane — the only difference between the two call sites is
+    /// whether `stopped_at` moves with it.
+    fn jump_source_window(&mut self, path: &str, row: usize) -> Result<(), String> {
+        let window = self.debug_source_window();
+        match self.open_path(path) {
+            Ok(id) => {
+                self.show(window, id);
+                // Column 0: DAP's `column` is in units the adapter never
+                // names (bi's LSP side only gets this right by carrying an
+                // explicit encoding across the wire — see `lsp::pos`) and the
+                // gutter's own stopped-line marker already points at the
+                // whole row, so the start of the line is the reading a
+                // debugger jump owes without inventing an encoding DAP does
+                // not give.
+                if let Some(mut view) = self.view(window) {
+                    view.goto_row(row + 1);
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// `Enter` on a frame in the Stack pane: moves the source window there
+    /// and re-scopes it, without touching `stopped_at` — selecting a frame
+    /// looks around, it does not move where execution is stopped. See
+    /// `docs/specs/debug.md` §UI.
+    fn jump_to_frame(&mut self, frame: &dap::types::StackFrame) {
+        if let Some(path) = frame.source.as_ref().and_then(|s| s.path.as_deref()) {
+            let path = path.to_string();
+            let row = (frame.line - 1).max(0) as usize;
+            if let Err(e) = self.jump_source_window(&path, row) {
+                self.session.status = format!("debug: {e}");
+            }
+        }
+        self.dap.set_frame(Some(frame.id));
+        if let Some(client) = self.dap.active_mut() {
+            client.request(
+                "scopes",
+                serde_json::json!({ "frameId": frame.id }),
+                dap::client::Intent::Scopes { frame: frame.id },
+            );
+        }
+    }
+
+    /// [`dap::Effect::Stack`]'s other half: every open Stack pane gets the
+    /// whole frame list, selection reset to the top — the same top frame
+    /// `apply_stopped_frame` jumped the source window to.
+    fn fill_stack_panes(&mut self, frames: &[dap::types::StackFrame]) {
+        for window in &mut self.windows {
+            if let Content::DapStack(stack) = &mut window.content {
+                stack.frames = frames.to_vec();
+                stack.selected = 0;
+            }
+        }
+    }
+
+    /// [`dap::Effect::Output`]: an `output` event's text, split on newlines,
+    /// appended to every open Console pane. `stderr` lines get a `"! "`
+    /// prefix — the console has no colour of its own to lean on, and a
+    /// prefix survives being copied out of the pane the way a style would
+    /// not.
+    fn append_console(&mut self, category: &str, text: &str) {
+        let prefix = if category == "stderr" { "! " } else { "" };
+        let lines: Vec<String> = text.lines().map(|line| format!("{prefix}{line}")).collect();
+        self.push_console_lines(&lines);
+    }
+
+    /// [`dap::Effect::Evaluated`] in [`dap::client::EvalContext::Repl`]: the
+    /// `:eval` line that asked, then the answer — `"> {expr}"` first, since
+    /// that is what a REPL's own echo would show, then `result` split on
+    /// newlines the way `Output` is.
+    fn append_console_eval(&mut self, expr: &str, result: &str) {
+        let mut lines = vec![format!("> {expr}")];
+        lines.extend(result.lines().map(str::to_string));
+        self.push_console_lines(&lines);
+    }
+
+    fn push_console_lines(&mut self, lines: &[String]) {
+        for window in &mut self.windows {
+            if let Content::DapConsole(console) = &mut window.content {
+                for line in lines {
+                    console.push(line.clone());
+                }
+            }
+        }
+    }
+
+    /// `:debug stack|console|vars|watches`. A window already showing the
+    /// named pane is focused; otherwise a new one splits off the focused
+    /// window, the way [`Editor::open_tree_pane`] makes room for the file
+    /// tree. Variables and Watches are Task 12's — asking for either now
+    /// just says so.
+    fn open_debug_pane(&mut self, pane: DebugPane) {
+        let kind = match pane {
+            DebugPane::Stack => ContentKind::DapStack,
+            DebugPane::Console => ContentKind::DapConsole,
+            DebugPane::Variables | DebugPane::Watches => {
+                self.session.status = "not yet — task 12".into();
+                return;
+            }
+        };
+        if let Some(id) = self.windows.iter().find(|w| w.content.kind() == kind).map(|w| w.id) {
+            self.set_focus(id);
+            return;
+        }
+        let Some(new) = self.split_focus(Dir::Horizontal) else { return };
+        let content = match pane {
+            DebugPane::Stack => Content::DapStack(DapStack { frames: Vec::new(), selected: 0 }),
+            DebugPane::Console => {
+                Content::DapConsole(Box::new(DapConsole { lines: Vec::new(), scroll: 0 }))
+            }
+            DebugPane::Variables | DebugPane::Watches => unreachable!("handled above"),
+        };
+        if let Some(window) = self.window_mut_of(new) {
+            window.show(content);
+        }
+    }
+
+    /// `:eval <expr>` — the Console pane's REPL line. Only meaningful while
+    /// the session is stopped, same guard as `K` (`Editor::debug_evaluate`);
+    /// the answer arrives through `Effect::Evaluated` and
+    /// `Editor::append_console_eval`.
+    fn debug_eval(&mut self, expr: String) {
+        let frame = self.dap.frame();
+        let Some(client) = self.dap.active_mut() else {
+            self.session.status = "debug: no active session".into();
+            return;
+        };
+        if !matches!(client.phase, dap::client::Phase::Stopped { .. }) {
+            self.session.status = "not stopped".into();
+            return;
+        }
+        client.request(
+            "evaluate",
+            serde_json::json!({ "expression": expr, "frameId": frame, "context": "repl" }),
+            dap::client::Intent::Evaluate { context: dap::client::EvalContext::Repl, expr },
+        );
     }
 
     /// Which window a debugger jump lands in: the focused window if it is
@@ -23442,6 +23686,32 @@ int main(void) {
         assert_eq!(parse_ex("break"), Some(ExLine::Debug(DebugCmd::ToggleBreakpoint)));
     }
 
+    #[test]
+    fn colon_debug_pane_names_parse_to_pane_commands() {
+        assert_eq!(
+            parse_ex("debug stack"),
+            Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Stack)))
+        );
+        assert_eq!(
+            parse_ex("debug console"),
+            Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Console)))
+        );
+        assert_eq!(
+            parse_ex("debug vars"),
+            Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Variables)))
+        );
+        assert_eq!(
+            parse_ex("debug watches"),
+            Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Watches)))
+        );
+    }
+
+    #[test]
+    fn colon_eval_parses_to_an_eval_command_and_refuses_empty() {
+        assert_eq!(parse_ex("eval foo"), Some(ExLine::Debug(DebugCmd::Eval("foo".into()))));
+        assert!(matches!(parse_ex("eval"), Some(ExLine::Error(_))));
+    }
+
     /// The editor's half of DAP: `debug_launch` driving the registry through
     /// `settle`. The protocol itself is tested in `src/dap/`; here the
     /// adapter is a fake and the interest is the wiring. See
@@ -23754,6 +24024,208 @@ int main(void) {
 
             assert_eq!(ed.session.mode, Mode::Normal);
             assert!(ed.session.status.contains("end"), "{}", ed.session.status);
+        }
+
+        // ---- Task 11: Stack and Console panes ---------------------------------
+
+        fn window_with(ed: &Editor, kind: ContentKind) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&id| ed.content_kind_of(id) == Some(kind))
+                .unwrap_or_else(|| panic!("no {kind:?} pane open"))
+        }
+
+        #[test]
+        fn a_stack_effect_fills_the_stack_pane() {
+            let (_dir, mut ed, fake) = project("stack-fill");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+
+            ex(&mut ed, "debug stack");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 7}));
+            ed.settle();
+
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [
+                        {"id": 3, "name": "main", "source": {"path": path.to_string_lossy()}, "line": 1, "column": 1},
+                        {"id": 4, "name": "caller", "source": null, "line": 1, "column": 1}
+                    ],
+                    "totalFrames": 2
+                }),
+            );
+            ed.settle();
+
+            let id = window_with(&ed, ContentKind::DapStack);
+            let Content::DapStack(stack) = &ed.window_of(id).unwrap().content else {
+                panic!("not a stack pane")
+            };
+            assert_eq!(stack.frames.len(), 2);
+            assert_eq!(stack.selected, 0);
+            assert_eq!(ed.dap().frame(), Some(3), "the top frame's id");
+        }
+
+        #[test]
+        fn output_events_append_to_the_console() {
+            let (_dir, mut ed, fake) = project("console-output");
+            sized(&mut ed);
+            ex(&mut ed, "debug console");
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+
+            fake.event(SessionId(0), "output", json!({"category": "stdout", "output": "a\n"}));
+            ed.settle();
+            fake.event(SessionId(0), "output", json!({"category": "stderr", "output": "b\n"}));
+            ed.settle();
+
+            let id = window_with(&ed, ContentKind::DapConsole);
+            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
+                panic!("not a console pane")
+            };
+            assert_eq!(
+                console.lines,
+                vec!["a".to_string(), "! b".to_string()],
+                "in order, stderr marked"
+            );
+        }
+
+        #[test]
+        fn enter_on_a_frame_moves_the_source_window_and_rescopes() {
+            let dir = ScratchDir::new("dap-stack-enter")
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", &"fn line() {}\n".repeat(25));
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            ed.load_config(ConfigText(Some(
+                "[[debug.launch]]\n\
+                 name = \"run tests\"\n\
+                 adapter = \"codelldb\"\n\
+                 request = \"launch\"\n\
+                 body = { program = \"target/debug/bi\", args = [] }\n",
+            )));
+            let fake = FakeSpawn::default();
+            ed.set_dap_spawner(fake.clone());
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            let source_win = ed.focus();
+
+            ex(&mut ed, "debug stack");
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 7}));
+            ed.settle();
+
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [
+                        {"id": 3, "name": "top", "source": {"path": path.to_string_lossy()}, "line": 2, "column": 1},
+                        {"id": 4, "name": "caller", "source": {"path": path.to_string_lossy()}, "line": 20, "column": 1}
+                    ],
+                    "totalFrames": 2
+                }),
+            );
+            ed.settle();
+            assert_eq!(
+                ed.dap().stopped_at(),
+                Some((path.as_path(), 1)),
+                "top frame's row, before Enter"
+            );
+
+            // Frame 1 (`a.rs:20`), selected in the Stack pane, which still has
+            // focus — `apply_stopped_frame`'s jump moved the source window's
+            // content without stealing focus from it.
+            ed.apply(cmd(Action::Tree(TreeCmd::Select { down: true, count: 1 })));
+            ed.apply(cmd(Action::Tree(TreeCmd::Enter)));
+
+            assert_eq!(row_in(&ed, source_win), 19, "1-based line 20 -> row 19");
+            assert_eq!(ed.dap().frame(), Some(4));
+            let scopes = fake.last(SessionId(0), "scopes").expect("scopes sent after Enter");
+            assert_eq!(scopes["arguments"]["frameId"], json!(4));
+            assert_eq!(
+                ed.dap().stopped_at(),
+                Some((path.as_path(), 1)),
+                "unchanged — still the top frame's row"
+            );
+        }
+
+        #[test]
+        fn eval_appends_the_answer_to_the_console() {
+            let (_dir, mut ed, fake) = project("eval-console");
+            sized(&mut ed);
+            let path = ed.buffer().unwrap().path.clone().unwrap();
+            ex(&mut ed, "debug console");
+
+            ed.debug_launch("run tests");
+            ed.settle();
+            fake.respond(SessionId(0), 1, "initialize", true, json!({"capabilities":{}}));
+            ed.settle();
+            fake.event(SessionId(0), "initialized", json!({}));
+            ed.settle();
+            fake.event(SessionId(0), "stopped", json!({"reason": "breakpoint", "threadId": 7}));
+            ed.settle();
+            let st = fake.last(SessionId(0), "stackTrace").expect("stackTrace sent");
+            let seq = st["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                seq,
+                "stackTrace",
+                true,
+                json!({
+                    "stackFrames": [
+                        {"id": 3, "name": "main", "source": {"path": path.to_string_lossy()}, "line": 1, "column": 1}
+                    ],
+                    "totalFrames": 1
+                }),
+            );
+            ed.settle();
+            assert_eq!(ed.dap().frame(), Some(3));
+
+            ex(&mut ed, "eval x + 1");
+
+            let sent = fake.last(SessionId(0), "evaluate").expect("evaluate sent");
+            assert_eq!(sent["arguments"]["context"], json!("repl"));
+            assert_eq!(sent["arguments"]["frameId"], json!(3));
+
+            let eval_seq = sent["seq"].as_i64().unwrap();
+            fake.respond(
+                SessionId(0),
+                eval_seq,
+                "evaluate",
+                true,
+                json!({"result": "3", "variablesReference": 0}),
+            );
+            ed.settle();
+
+            let id = window_with(&ed, ContentKind::DapConsole);
+            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
+                panic!("not a console pane")
+            };
+            let n = console.lines.len();
+            assert_eq!(&console.lines[n - 2..], ["> x + 1".to_string(), "3".to_string()]);
         }
     }
 

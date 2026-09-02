@@ -108,6 +108,13 @@ pub struct Registry {
     /// `continued`, `terminated`, and the pipe closing (`Eof`/die) — see
     /// `accept_event`/`accept`.
     stopped_at: Option<(PathBuf, usize)>,
+    /// The frame the Stack pane and `:eval` act on — not necessarily the
+    /// stopped (`▶`) one: selecting a frame in the pane moves this without
+    /// moving `stopped_at`. Set to the top frame's id whenever a `stackTrace`
+    /// answer arrives (the editor's `Effect::Stack` applier), and cleared
+    /// everywhere `stopped_at` is, since a frame id from a session that is no
+    /// longer stopped means nothing.
+    frame: Option<i64>,
 }
 
 impl Registry {
@@ -183,6 +190,17 @@ impl Registry {
         self.stopped_at = Some((path, row));
     }
 
+    /// The frame the Stack pane and `:eval` currently act on.
+    pub fn frame(&self) -> Option<i64> {
+        self.frame
+    }
+
+    /// Sets the acting frame — the top frame on a `stackTrace` answer, or
+    /// whichever one `Enter` on the Stack pane selected.
+    pub fn set_frame(&mut self, frame: Option<i64>) {
+        self.frame = frame;
+    }
+
     /// Marks the adapter's `setBreakpoints` answer onto the stored rows, in
     /// the order they were asked. The wire's 1-based `line` becomes a
     /// 0-based `moved_to`, kept only when it actually differs from the row
@@ -245,6 +263,7 @@ impl Registry {
                 let reason = "pipe closed".to_string();
                 client.die(reason.clone());
                 self.stopped_at = None;
+                self.frame = None;
                 vec![Effect::Terminated { session: from, reason }]
             }
         }
@@ -415,6 +434,7 @@ impl Registry {
                 let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
                 client.on_continued();
                 self.stopped_at = None;
+                self.frame = None;
                 Vec::new()
             }
             "output" => match serde_json::from_value::<types::OutputEvent>(body) {
@@ -429,6 +449,7 @@ impl Registry {
                 let reason = "terminated".to_string();
                 client.on_terminated(reason.clone());
                 self.stopped_at = None;
+                self.frame = None;
                 vec![Effect::Terminated { session: from, reason }]
             }
             // Adapters send others bi does not model yet (`thread`,
@@ -535,11 +556,13 @@ mod tests {
         }
     }
 
-    /// `stopped_at` is what the gutter's `▶` reads — it must not survive past
-    /// the moment the program is no longer sitting still: `continued`,
-    /// `terminated`, and the pipe closing all clear it. Task 10 will be the
-    /// one to *set* it for real (from the top stack frame); this only
-    /// exercises the clearing side, via the test-only `set_stopped_at`.
+    /// `stopped_at` is what the gutter's `▶` reads, and `frame` is what the
+    /// Stack pane and `:eval` act on — neither must survive past the moment
+    /// the program is no longer sitting still: `continued`, `terminated`,
+    /// and the pipe closing all clear both. Task 10 will be the one to *set*
+    /// `stopped_at` for real (from the top stack frame), and the editor sets
+    /// `frame` from the same answer; this only exercises the clearing side,
+    /// via the test-only `set_stopped_at`/`set_frame`.
     #[test]
     fn stopped_at_clears_on_continued_terminated_and_eof() {
         let fake = FakeSpawn::default();
@@ -550,20 +573,26 @@ mod tests {
             .expect("spawner is set");
 
         reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        reg.set_frame(Some(3));
         assert_eq!(reg.stopped_at(), Some((Path::new("/a.rs"), 10)));
         fake.event(id, "continued", Value::Null);
         reg.pump();
         assert_eq!(reg.stopped_at(), None, "continued clears it");
+        assert_eq!(reg.frame(), None, "and the acting frame with it");
 
         reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        reg.set_frame(Some(3));
         fake.event(id, "terminated", Value::Null);
         reg.pump();
         assert_eq!(reg.stopped_at(), None, "terminated clears it");
+        assert_eq!(reg.frame(), None, "and the acting frame with it");
 
         reg.set_stopped_at(PathBuf::from("/a.rs"), 10);
+        reg.set_frame(Some(3));
         reg.inbox().deliver(id, Inbound::Eof);
         reg.pump();
         assert_eq!(reg.stopped_at(), None, "the pipe closing (Eof) clears it");
+        assert_eq!(reg.frame(), None, "and the acting frame with it");
     }
 
     #[test]

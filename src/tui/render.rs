@@ -20,7 +20,7 @@ use bi::selection::Selections;
 use bi::syntax::{Span as HlSpan, Syntax};
 use bi::theme::{Ansi, Color as ThemeColor, Style as ThemeStyle, Theme, Ui};
 use bi::tree::{ClipMode, Clipboard, Kind, Row as TreeRow, Tree};
-use bi::window::{Chrome, ContentKind, Rect as CoreRect, WindowId};
+use bi::window::{Chrome, ContentKind, DapConsole, DapStack, Rect as CoreRect, WindowId};
 
 /// A theme colour, in the one spelling a terminal understands.
 ///
@@ -784,6 +784,68 @@ fn render_results(
     cursor_at
 }
 
+/// One window's Stack pane: `#{i} {name}  {file}:{line}`, one row per frame,
+/// the selected one highlighted the way `render_tree`/`render_results` paint
+/// their own selection — a whole row rather than a text cursor, since this is
+/// where the next `Enter` goes rather than where a cursor sits.
+///
+/// `DapStack` keeps no scroll of its own (unlike `Tree`/`Results`) — a
+/// `stackTrace` answer is at most the 20 frames bi asks for, so keeping the
+/// selection on screen is worked out fresh each frame instead of carried as
+/// state nothing else needs.
+fn render_stack(
+    frame: &mut Frame,
+    stack: &DapStack,
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    let height = area.height as usize;
+    let first = if height == 0 || stack.selected < height { 0 } else { stack.selected + 1 - height };
+    let last = (first + height).min(stack.frames.len());
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(height);
+
+    for (index, f) in stack.frames.iter().enumerate().take(last).skip(first) {
+        let at = match f.source.as_ref().and_then(|s| s.path.as_deref()) {
+            Some(path) => format!("  {path}:{}", f.line),
+            None => String::new(),
+        };
+        let spans = vec![Span::raw(format!("#{index} {}{at}", f.name))];
+
+        if index != stack.selected {
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        if focused {
+            cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
+/// One window's Console pane: `output` events and the `:eval` transcript,
+/// oldest first. `DapConsole::scroll` names the *last* line to show — see its
+/// doc — so the window is worked out backward from it, the same `height`
+/// rows `render_tree`/`render_results` show forward from their own `scroll`.
+fn render_console(frame: &mut Frame, console: &DapConsole, area: Rect) -> Option<(u16, u16)> {
+    let height = area.height as usize;
+    if console.lines.is_empty() || height == 0 {
+        frame.render_widget(Paragraph::new(Vec::<Line>::new()), area);
+        return None;
+    }
+    let last = console.scroll.min(console.lines.len() - 1);
+    let first = (last + 1).saturating_sub(height);
+    let lines: Vec<Line> =
+        console.lines[first..=last].iter().map(|line| Line::from(Span::raw(line.clone()))).collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    None
+}
+
 /// One window's image: a placement for the graphics module when the terminal
 /// draws pixels, a centered line about them when it does not.
 ///
@@ -873,6 +935,10 @@ fn render_window(
         // Routed to `render_image` before this is called — it needs the
         // editor mutably, which one shared entry point cannot offer.
         Pane::Image { .. } => return None,
+        Pane::DapStack { stack, .. } => {
+            return render_stack(frame, stack, text_area, focused, &ed.theme().ui);
+        }
+        Pane::DapConsole { console, .. } => return render_console(frame, console, text_area),
     };
     let (scroll, left, selections) = (text.scroll, text.left, &text.selections);
 
@@ -1531,6 +1597,13 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| img.path.display().to_string());
             (name, format!("{}×{}", img.width, img.height))
+        }
+        // Stack and Console say what they are and how much they hold — the
+        // same shape as the results pane's row, since neither has a text
+        // cursor position to report either.
+        Some(Pane::DapStack { stack, .. }) => ("Stack".into(), format!("{} frames", stack.frames.len())),
+        Some(Pane::DapConsole { console, .. }) => {
+            ("Console".into(), format!("{} lines", console.lines.len()))
         }
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
