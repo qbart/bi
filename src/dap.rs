@@ -6,7 +6,19 @@
 //! The editor stays the single owner of truth, exactly as with LSP.
 
 pub mod rpc;
+pub mod transport;
 pub mod types;
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+/// A running adapter instance's identity within a session.
+///
+/// Handed out monotonically and never reused, like `lsp::ServerId` and for
+/// the same reason: a restarted adapter is a *new* instance, and a message
+/// queued by the old one must not be mistaken for the new one's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u32);
 
 /// One decoded message from the adapter, classified by DAP's `type` field
 /// rather than LSP's id-vs-method scheme. Four shapes, because DAP's wire is
@@ -34,4 +46,47 @@ pub enum Inbound {
     ReverseRequest { seq: i64, command: String, arguments: serde_json::Value },
     /// The adapter closed its end of the pipe.
     Eof,
+}
+
+/// Where reader threads put what arrived, and how the frontend hears of it.
+///
+/// One queue for every session, because the consumer is one editor thread.
+/// The waker is whatever the frontend registered — for the terminal, a send
+/// on the same channel its key events arrive on; for a headless embedder,
+/// nothing, and it pumps on its own schedule. A copy of `lsp::Inbox`, keyed
+/// by `SessionId` instead of `ServerId` — the two protocols never share a
+/// queue, since a debug session and a language server are different kinds
+/// of thing even when the same editor thread drains both.
+#[derive(Clone, Default)]
+pub struct Inbox {
+    queue: Arc<Mutex<VecDeque<(SessionId, Inbound)>>>,
+    #[allow(clippy::type_complexity, reason = "an alias would name it once and hide it")]
+    waker: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+}
+
+impl Inbox {
+    /// Called from reader threads: queue the message, wake the frontend.
+    pub fn deliver(&self, from: SessionId, msg: Inbound) {
+        self.queue.lock().expect("inbox queue poisoned").push_back((from, msg));
+        self.wake();
+    }
+
+    /// Rings the waker without a message — how a background completion that
+    /// is not a session (e.g. a launch that resolved) gets the next settle
+    /// to run rather than waiting for a keystroke.
+    pub fn wake(&self) {
+        let waker = self.waker.lock().expect("inbox waker poisoned").clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+
+    /// Everything that has arrived, in order. Called from the editor thread.
+    pub fn drain(&self) -> Vec<(SessionId, Inbound)> {
+        self.queue.lock().expect("inbox queue poisoned").drain(..).collect()
+    }
+
+    pub fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.waker.lock().expect("inbox waker poisoned") = Some(Arc::new(wake));
+    }
 }
