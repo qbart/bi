@@ -6,8 +6,9 @@ leaving the editor. One integration, every language.
 
 ## Status
 
-**Approved for build.** All open decisions are resolved (see the end);
-implementation follows this spec.
+**Built.** `src/dap/` and the editor wiring (`Mode::Debug`, `DebugCmd`, the
+gutter and panes, `[debug]` config) landed across fourteen tasks; six small
+deviations from the text below are recorded at the end.
 
 ## Why DAP, and what each language actually needs
 
@@ -117,8 +118,9 @@ over the source window:
 - `K` evaluate the expression under the cursor — the answer floats over the
   cursor in the same float LSP's own `K` uses (`Effect::Evaluated { context:
   Hover, .. }`, no status-line fallback)
-- `Esc` back to Normal for editing; breakpoint toggle is also reachable from
-  Normal so setting breakpoints never requires the mode
+- `Esc` back to Normal for editing; `:break` toggles the same breakpoint from
+  Normal (or anywhere), so setting one never requires the mode — `b` itself
+  is not rebound in Normal, where it already means `word_backward`
 
 `:debug attach [name]` resolves `name` (or the single `request = "attach"`
 launch config there is) and opens bi's picker as the process picker — every
@@ -190,3 +192,36 @@ as the no-install fallback on new-enough systems.
 2. **v1 attach** — launch + attach-by-pid.
 3. **Panes** — dedicated persistent panes.
 4. **Default adapters** — CodeLLDB + `dlv dap` + `gdb -i dap` (gdb ≥ 14).
+
+## Deviations from the design
+
+Six places where the build settled on something narrower or different than
+this spec's text implies, each for a concrete reason:
+
+1. **`b` is not bound in Normal mode.** Normal already owns it for
+   `word_backward`, and stealing it would break a motion nobody asked to
+   lose. `:break` is the Normal-reachable toggle instead — `b` still works
+   as the breakpoint toggle, but only inside `Mode::Debug`.
+2. **`stopped` goes straight to `stackTrace`, skipping `threads`.** v1 has
+   no Threads pane to populate, and every adapter bi ships accepts a
+   `threadId` straight off the `stopped` event, so the round-trip would
+   have bought nothing yet.
+3. **The Console's REPL line is `:eval`, not an in-pane input.** bi has no
+   text-entry widget inside a pane — every other REPL-like surface (`:s`,
+   `:find`) is already the ex line — so reusing it kept the Console a pure
+   display and avoided inventing a second input mechanism for one pane.
+4. **`[debug.adapters.*].command` is refused from project-local config.**
+   Same trap as `[lsp.servers.*].command` and `[fmt.tools.*].command`: a
+   repository that can name the binary bi spawns is arbitrary code
+   execution by `git clone`. `[debug]`'s own `enabled` and
+   `[[debug.launch]]` are still read, since launch configs are inherently
+   project-local — the whole point of the section.
+5. **`[[debug.launch]]` dedups by `name` across config layers.** A project
+   overriding "run tests" should replace it, not stack a second entry with
+   the same label in the picker — later layer (local over main over
+   defaults) wins the slot.
+6. **Theme keys are flat snake_case** (`debug_breakpoint`,
+   `debug_breakpoint_unverified`, `debug_breakpoint_conditional`,
+   `debug_stopped`), not dotted. Every existing theme key in bi is flat;
+   a dotted `debug.breakpoint` would have been the only one and bought
+   nothing but inconsistency.

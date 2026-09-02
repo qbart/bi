@@ -20,7 +20,10 @@ cursor onto a line per element and back. Git is built in the minimal way: a
 sign in the gutter for every line the index does not have, and a `+3 ~1 -2`
 numstat in the status row. `:diags` lists every stored diagnostic in a pane
 to jump from, and `:zen` strips the chrome — gutter, numbers, status rows —
-until you ask for it back.
+until you ask for it back. `:debug [name]` launches or attaches a debug
+session over the Debug Adapter Protocol — breakpoints in the gutter,
+`c`/`n`/`s`/`o`/`p` to run it from Debug mode, Stack/Console/Variables/Watches
+panes for the rest.
 A latin1 or CRLF file opens without being asked and saves back byte-identical
 — encoding, BOM and line endings are detected at open, shown in the status
 row, and switched with `:set fileencoding` / `:set fileformat` / `:e ++enc=`.
@@ -431,12 +434,47 @@ opened and thought better of loses its indent again on `Esc`, rather than
 leaving whitespace nothing can see. See
 [docs/specs/indent.md](specs/indent.md).
 
+### Debug mode
+
+`:debug [name]` resolves a `[[debug.launch]]` — the named one, or the only
+one there is — spawns its adapter and enters the mode once the session is up;
+`:debug attach [name]` does the same for an `attach` config, opening bi's
+picker as a process picker first, and `:debug attach-pid <n>` skips the
+picker and attaches straight to `n`. Plain keys then drive the session over
+the source window:
+
+| Key | Does |
+|---|---|
+| `c` | continue |
+| `n` `s` `o` | step over / in / out |
+| `p` | pause |
+| `K` | evaluate the expression under the cursor, floated the way LSP's own `K` does |
+| `Esc` | back to Normal — the session keeps running |
+
+Breakpoints are not gated on the mode: `:break` toggles one on the cursor's
+line from anywhere, including Normal, which is where `b` stays
+`word_backward`; `b` is Debug mode's own spelling of the same toggle. A
+breakpoint shows in the gutter as `●` (dim until the adapter verifies it or
+moves it to a line that has code), and the stopped line gets `▶` plus a
+whole-line highlight.
+
+`:debug stack` `:debug console` `:debug vars` `:debug watches` open the four
+panes — Stack, Console, Variables, Watches — in a split, or focus one
+already open; all four share the tree pane's keymap (`j`/`k`/`gg`/`G`/
+`Ctrl-d`/`Ctrl-u` to move, `Enter` to act), and Variables adds `l`/`h` to
+expand/collapse a node. `:eval <expr>` evaluates in the frame that is
+stopped and appends the result to every open console; `:watch <expr>` /
+`:unwatch <n>` add to or remove from the Watches list. `:debug stop` ends
+the session. See [docs/specs/debug.md](specs/debug.md).
+
 ### Picker
 
-One overlay over six lists: the register ring (`"p` / `"P`), the named
+One overlay over seven lists: the register ring (`"p` / `"P`), the named
 registers (`"np` / `"nP`), the open buffers (`:ls`), every file under the
 session's root (`gf`), a tree pane's paths (`gf` in a tree, `/` for the rows
-on screen), and the `:` lines you have run (`Ctrl-R` on the command line). Typing filters by substring — every whitespace-separated term must
+on screen), every readable `/proc` entry when `:debug attach` opens it as a
+process picker, and the `:` lines you have run (`Ctrl-R` on the command
+line). Typing filters by substring — every whitespace-separated term must
 appear somewhere, in any order, case-insensitively. Matches keep the order they
 were given, so the most recent is first — which is an answer to "which one did
 you mean" that only the tree list has no version of, and so the only one that
@@ -549,6 +587,13 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:ts` | toggle the tree-sitter boundary marks |
 | `:tssplit` `:tsjoin` | the bracketed list at the cursor: one element per line, or back onto one |
 | `:diags` | every open buffer's diagnostics in a results pane, worst first |
+| `:debug [name]` | launch a session — the named `[[debug.launch]]`, or the only one there is |
+| `:debug attach [name]` `:debug attach-pid <n>` | attach — by process picker, or straight to a pid |
+| `:debug stop` | end the running session |
+| `:debug stack` `:debug console` `:debug vars` `:debug watches` | open the four debug panes, or focus one already open |
+| `:break` | toggle a breakpoint on the cursor's line, from any mode |
+| `:eval <expr>` | evaluate an expression in the stopped frame, appended to every open console |
+| `:watch <expr>` `:unwatch <n>` | add / remove a Watches expression, 1-based |
 | `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
@@ -776,9 +821,10 @@ A project gets a say too: `.bi.toml`, found in the working directory or the
 nearest ancestor holding one, is laid over the main config the same way —
 only what it mentions wins. The lookup is silent (missing, unreadable, and
 forbidden all just mean "keep walking up"), a found file's mistakes are
-reported with its path, and two sections are refused with a diagnostic
-rather than read: `[keys]`, and a server's `command` — a repository does not
-get to name the binary bi runs or the ex line a key fires. See
+reported with its path, and a handful of keys are refused with a diagnostic
+rather than read: `[keys]`, a language server's `command`, a formatter's, and
+a debug adapter's — a repository does not get to name the binary bi runs or
+the ex line a key fires. See
 [docs/specs/local-config.md](specs/local-config.md).
 
 `[options]` **is** the `:set` namespace — one key per option, spelled identically, so

@@ -8,8 +8,6 @@ analyze each carefully, if you see that there are conceputal gaps in the core an
 
 ### documentation of code
 
-### debugger
-
 ### snippets
 
 ### macro
