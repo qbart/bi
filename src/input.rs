@@ -158,15 +158,21 @@ impl Input {
     /// would be answering a question nobody asked.
     pub fn set_keys(&mut self, keys: Keymap) {
         self.keys = keys;
-        // The one default leader binding bi ships — `<leader><leader>` is
-        // `:actions`. Installed against the live leader after the user's own
-        // bindings, so rebinding it or `= false` wins, and a changed leader
-        // carries it along. See `docs/specs/code-actions.md`.
+        // The default leader bindings bi ships — `<leader><leader>` is
+        // `:actions`, `<leader>e` is `:tree`. Installed against the live
+        // leader after the user's own bindings, so rebinding either or
+        // `= false` wins, and a changed leader carries them along. See
+        // `docs/specs/code-actions.md` and `docs/specs/tree.md`.
         if let Some(leader) = self.keys.leader() {
             self.keys.insert_default(
                 KeyMode::Normal,
                 vec![leader, leader],
                 Bind::Ex { line: "actions".into(), run: true },
+            );
+            self.keys.insert_default(
+                KeyMode::Normal,
+                vec![leader, Key::char('e')],
+                Bind::Ex { line: "tree".into(), run: true },
             );
         }
         self.remap_pending.clear();
@@ -1846,14 +1852,32 @@ leader = \" \"
         let mut plain = with_leader("[keys]\nleader = \" \"\n");
         assert!(plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
 
-        // …and taking the shipped binding off gives the key itself back.
-        let mut unbound =
-            with_leader("[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = false\n");
+        // …and taking every shipped binding off gives the key itself back.
+        let mut unbound = with_leader(
+            "[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = false\n\"<leader>e\" = false\n",
+        );
         let cmd = unbound.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
         assert_eq!(cmd.action, Action::Move(Motion::Right));
     }
 
-    /// The one default leader binding bi ships, and the two ways you win:
+    /// The other shipped leader binding: `<leader>e` is `:tree`, the sidebar
+    /// revealed on the current file. See `docs/specs/tree.md`.
+    #[test]
+    fn leader_e_reveals_the_tree_out_of_the_box_and_stays_yours() {
+        let mut input = with_leader("[keys]\nleader = \" \"\n");
+        input.on_key(key(' '), &Mode::Normal, ContentKind::Text);
+        let cmd = input.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Ex { line: "tree".into(), run: true });
+
+        // Your own binding on the sequence replaces it.
+        let mut rebound =
+            with_leader("[keys]\nleader = \" \"\n[keys.normal]\n\"<leader>e\" = \"window_tree\"\n");
+        rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text);
+        let cmd = rebound.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::Window(WindowCmd::Tree), "the toggle, as asked");
+    }
+
+    /// The first default leader binding bi ships, and the two ways you win:
     /// your own binding on the sequence replaces it, `= false` removes it.
     #[test]
     fn leader_leader_runs_actions_out_of_the_box_and_stays_yours() {

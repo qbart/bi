@@ -276,10 +276,11 @@ filetypes = ["c", "cpp"]
 [keys]
 # The key <leader> stands for in a binding. The moment any binding spells it,
 # this key stops meaning whatever it meant on its own, because there is no
-# timeout to decide between them. bi ships exactly one such binding —
-# "<leader><leader>" is ":actions", the LSP code action menu — so the bare
-# leader waits by default; rebind the sequence to change it, or set it to
-# false to remove it and get the key itself back.
+# timeout to decide between them. bi ships two such bindings —
+# "<leader><leader>" is ":actions", the LSP code action menu, and "<leader>e"
+# is ":tree", the sidebar revealed on the current file — so the bare leader
+# waits by default; rebind either sequence to change it, or set it to false
+# to remove it (both, to get the key itself back).
 leader = " "
 
 # The rest of the keymap is still `match` arms in src/input.rs; only your
