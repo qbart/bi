@@ -79,6 +79,7 @@ pub enum Effect {
     Terminated { session: SessionId, reason: String },
 }
 
+#[derive(Default)]
 pub struct Registry {
     inbox: Inbox,
     /// How adapters come to exist — supplied by the frontend, exactly as
@@ -99,20 +100,6 @@ pub struct Registry {
     /// `initialized` push, counted down to the `configurationDone` it gates.
     /// See the module doc for why this lives here rather than in the editor.
     pending_pushes: HashMap<SessionId, usize>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self {
-            inbox: Inbox::default(),
-            spawner: None,
-            sessions: Vec::new(),
-            next_id: 0,
-            breakpoints: BTreeMap::new(),
-            active: None,
-            pending_pushes: HashMap::new(),
-        }
-    }
 }
 
 impl Registry {
@@ -181,16 +168,8 @@ impl Registry {
     /// that was requested — an adapter that dutifully echoes the unmoved
     /// line back should not read as "moved".
     pub fn set_verified(&mut self, path: &Path, results: &[types::Breakpoint]) {
-        let Some(list) = self.breakpoints.get_mut(path) else { return };
-        for (bp, result) in list.iter_mut().zip(results) {
-            bp.verified = result.verified;
-            bp.moved_to = match result.line {
-                Some(wire) => {
-                    let row = wire.max(1) as usize - 1;
-                    (row != bp.line).then_some(row)
-                }
-                None => None,
-            };
+        if let Some(list) = self.breakpoints.get_mut(path) {
+            apply_verified(list, results);
         }
     }
 
@@ -530,5 +509,79 @@ mod tests {
             [Effect::Stopped { session, thread: 1 }] => assert_eq!(*session, id),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn configuration_done_waits_for_every_pushed_file_to_answer() {
+        let fake = FakeSpawn::default();
+        let mut reg = Registry::default();
+        reg.set_spawner(fake.clone());
+
+        reg.toggle_breakpoint(Path::new("/a.rs"), 10); // 0-based row 10
+        reg.toggle_breakpoint(Path::new("/b.rs"), 4);
+
+        let id = reg
+            .launch("codelldb", &["codelldb".into()], Path::new("/proj"), "launch", json!({}))
+            .expect("spawner is set");
+
+        let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
+        fake.respond(id, seq, "initialize", true, json!({}));
+        reg.pump();
+
+        fake.event(id, "initialized", Value::Null);
+        let mut paths: Vec<PathBuf> = reg
+            .pump()
+            .into_iter()
+            .map(|effect| match effect {
+                Effect::PushBreakpoints { path } => path,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec![PathBuf::from("/a.rs"), PathBuf::from("/b.rs")]);
+        assert!(
+            !fake.methods(id).contains(&"configurationDone".to_string()),
+            "two files pushed, neither answered yet"
+        );
+
+        // The editor answers each `setBreakpoints` through its own Intent —
+        // here sent directly (driving the outbound request itself is Task
+        // 7's job, not under test). `/a.rs`'s breakpoint moves (wire line
+        // 12, 1-based, == row 11); `/b.rs`'s adapter rejects it outright.
+        let a_seq = reg.active_mut().unwrap().request(
+            "setBreakpoints",
+            json!({}),
+            Intent::SetBreakpoints { path: PathBuf::from("/a.rs") },
+        );
+        fake.respond(
+            id,
+            a_seq,
+            "setBreakpoints",
+            true,
+            json!({ "breakpoints": [{ "verified": true, "line": 12 }] }),
+        );
+        assert!(reg.pump().is_empty());
+        assert!(
+            !fake.methods(id).contains(&"configurationDone".to_string()),
+            "one of two files answered — gate still closed"
+        );
+        let a = &reg.breakpoints_for(Path::new("/a.rs"))[0];
+        assert!(a.verified);
+        assert_eq!(a.moved_to, Some(11));
+
+        let b_seq = reg.active_mut().unwrap().request(
+            "setBreakpoints",
+            json!({}),
+            Intent::SetBreakpoints { path: PathBuf::from("/b.rs") },
+        );
+        fake.respond(id, b_seq, "setBreakpoints", false, json!({ "message": "no symbols" }));
+        assert!(reg.pump().is_empty());
+        assert!(
+            fake.methods(id).contains(&"configurationDone".to_string()),
+            "the second (failed) answer still ticks the gate down: {:?}",
+            fake.methods(id)
+        );
+        // A rejected file is not marked verified, and never crashes the count.
+        assert!(!reg.breakpoints_for(Path::new("/b.rs"))[0].verified);
     }
 }
