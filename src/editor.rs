@@ -2877,15 +2877,6 @@ fn fill_matching_reference(node: &mut VarNode, reference: i64, children: &[VarNo
     }
 }
 
-/// [`Editor::collapse_selected_variable`]'s "already closed" case: the
-/// nearest visible row above the selection that is shallower than it — the
-/// same rule `tree::Tree::select_parent` follows, worked out from
-/// [`DapVariables::visible`] since the pane keeps no depth of its own.
-/// A DAP `line` as a buffer row: the wire counts from 1 and bi's cursor and
-/// gutter count from 0, the same conversion `dap::Registry::set_verified`
-/// makes at its own edge. Saturating rather than wrapping — an adapter that
-/// answers line 0 (or, being JSON, something negative) gets row 0 rather
-/// than a row near `usize::MAX`.
 /// The movement half of a list pane's grammar, shared by the Stack,
 /// Variables and Watches panes: `j`/`k` by a count, `gg`/`G` to either end,
 /// `Ctrl-d`/`Ctrl-u` by half a screen, always clamped inside `0..len`.
@@ -2919,6 +2910,11 @@ fn move_list_selection(selected: &mut usize, len: usize, cmd: &TreeCmd, height: 
     true
 }
 
+/// A DAP `line` as a buffer row: the wire counts from 1 and bi's cursor and
+/// gutter count from 0, the same conversion `dap::Registry::set_verified`
+/// makes at its own edge. Saturating rather than wrapping — an adapter that
+/// answers line 0 (or, being JSON, something negative) gets row 0 rather
+/// than a row near `usize::MAX`.
 fn wire_row(line: i64) -> usize {
     line.saturating_sub(1).max(0) as usize
 }
@@ -2939,6 +2935,10 @@ fn evaluate_args(expr: &str, frame: Option<i64>, context: &str) -> serde_json::V
     serde_json::Value::Object(args)
 }
 
+/// [`Editor::collapse_selected_variable`]'s "already closed" case: the
+/// nearest visible row above the selection that is shallower than it — the
+/// same rule `tree::Tree::select_parent` follows, worked out from
+/// [`DapVariables::visible`] since the pane keeps no depth of its own.
 fn variables_select_parent(vars: &mut DapVariables) {
     let parent = {
         let rows = vars.visible();
