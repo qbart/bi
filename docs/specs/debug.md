@@ -177,6 +177,12 @@ body = { program = "target/debug/bi", args = [] }   # passed through verbatim
 Default-blessed adapters: CodeLLDB (Rust/C++), `dlv dap` (Go), `gdb -i dap`
 as the no-install fallback on new-enough systems.
 
+`bi debug init` seeds a project's `.bi.toml` with one commented-out launch
+block per blessed adapter plus an attach block (`config::DEBUG_SAMPLE`, held
+parseable by a test). It never overwrites: an existing file is left alone and
+the sample is printed to stdout instead, with a warning on stderr — so asking
+for the sample always yields it.
+
 ## v1 scope and punts
 
 - **In**: launch; attach by pid (cheap given the picker); breakpoints with

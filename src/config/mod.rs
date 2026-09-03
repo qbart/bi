@@ -77,6 +77,46 @@ pub struct Diagnostic {
 /// bi's defaults, as the file that documents them.
 pub const DEFAULT_TOML: &str = include_str!("default.toml");
 
+/// What `bi debug init` offers a project: one launch per blessed adapter and
+/// one attach, live, so the text is itself a config the parser accepts —
+/// `the_debug_sample_parses_as_a_clean_project_config` holds it to that. The
+/// frontend comments it out before writing; here it stays live so the test
+/// reads exactly what a user would get after uncommenting a block.
+///
+/// No `[debug.adapters.*]`: a project file may not name an adapter's command
+/// (see `docs/specs/local-config.md`), and the sample must not teach a line
+/// the parser would refuse. The `body` tables are the adapters' own launch
+/// shapes, passed through verbatim — see `docs/specs/debug.md`.
+pub const DEBUG_SAMPLE: &str = "\
+# One block per blessed adapter. `body` is handed to the adapter as-is, so
+# its keys are the adapter's own. `:debug <name>` starts a launch block;
+# `:debug attach` picks a process for an attach block.
+
+[[debug.launch]]
+name = \"codelldb: run\"
+adapter = \"codelldb\"          # Rust, C, C++ — best data visualization
+request = \"launch\"
+body = { program = \"target/debug/PROGRAM\", args = [] }
+
+[[debug.launch]]
+name = \"dlv: run\"
+adapter = \"dlv\"               # Go — delve's own dap server
+request = \"launch\"
+body = { mode = \"debug\", program = \".\" }
+
+[[debug.launch]]
+name = \"gdb: run\"
+adapter = \"gdb\"               # anything with DWARF, on gdb >= 14
+request = \"launch\"
+body = { program = \"./PROGRAM\" }
+
+[[debug.launch]]
+name = \"codelldb: attach\"
+adapter = \"codelldb\"
+request = \"attach\"            # the pid comes from the picker
+body = {}
+";
+
 /// A value an option can hold, in the one shape both `:set` and TOML can
 /// produce. `:set` parses a string into one; the parser converts a TOML value
 /// into one. Neither needs to know what any particular option is.
@@ -680,6 +720,27 @@ mod tests {
     fn the_shipped_leader_agrees_with_the_rust_fallback() {
         assert_eq!(Config::default().keys.leader(), Keymap::default().leader());
         assert_eq!(Keymap::default().leader(), Some(crate::key::Key::char(' ')));
+    }
+
+    /// The sample `bi debug init` writes must stay a config the parser
+    /// accepts: one launch per blessed adapter plus an attach, read as a
+    /// project file (so it may not name an adapter's command), with no
+    /// diagnostics. Nothing but this test keeps the sample from rotting.
+    #[test]
+    fn the_debug_sample_parses_as_a_clean_project_config() {
+        let (config, problems) = parse::parse_local(DEBUG_SAMPLE, Config::default())
+            .expect("the sample is well-formed toml");
+        assert!(problems.is_empty(), "{problems:?}");
+        let names: Vec<&str> = config.debug.launch.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(config.debug.launch.len(), 4, "{names:?}");
+        for adapter in ["codelldb", "dlv", "gdb"] {
+            assert!(
+                config.debug.launch.iter().any(|l| l.adapter == adapter && l.request == "launch"),
+                "a launch for {adapter}: {names:?}"
+            );
+            assert!(Config::default().debug.adapters.contains_key(adapter), "{adapter} is blessed");
+        }
+        assert!(config.debug.launch.iter().any(|l| l.request == "attach"), "{names:?}");
     }
 
     #[test]

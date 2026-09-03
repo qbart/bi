@@ -811,7 +811,11 @@ numbering on.
 `$XDG_CONFIG_HOME/bi`; else `~/.config/bi`. `bi config init` creates it,
 writing bi's defaults commented out, and never overwrites one that already
 exists; `bi config edit` opens the directory as a tree. Neither runs on its
-own — a config file appears because you asked for one.
+own — a config file appears because you asked for one. `bi debug init` does
+the same for a *project*: it writes `.bi.toml` in the working directory with
+a commented-out launch block per blessed debugger (and one attach block), and
+if the file already exists it prints that sample to stdout and says so on
+stderr rather than touching it.
 
 The file is a *patch* over bi's compiled-in defaults, never a replacement:
 an option you never mention keeps doing what bi already does, including

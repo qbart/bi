@@ -41,6 +41,23 @@ fn main() -> Result<()> {
             let dir = config_dir().context("no HOME and no XDG_CONFIG_HOME — nowhere to look")?;
             Some(config_edit_path(&dir)?.to_string_lossy().into_owned())
         }
+        Invocation::DebugInit => {
+            let dir = std::env::current_dir().context("no working directory to write into")?;
+            match debug_init(&dir)? {
+                DebugInit::Wrote(path) => println!("wrote {}", path.display()),
+                // The sample still reaches the user — on stdout, where it
+                // can be redirected or read — and the warning goes where a
+                // warning belongs, so `bi debug init > x` stays clean.
+                DebugInit::Existed(path) => {
+                    print!("{}", debug_menu());
+                    eprintln!(
+                        "{} already exists — printed the sample instead of creating it",
+                        path.display()
+                    );
+                }
+            }
+            return Ok(());
+        }
         Invocation::Open(path) => path,
     };
 
@@ -107,10 +124,12 @@ enum Invocation {
     Open(Option<String>),
     ConfigInit,
     ConfigEdit,
+    /// `bi debug init` — a project's `.bi.toml` seeded with launch configs.
+    DebugInit,
 }
 
-/// `config` is a subcommand only in the two-word form, so a file actually
-/// named `config` still opens.
+/// `config` and `debug` are subcommands only in the two-word form, so a file
+/// actually named `config` still opens.
 fn parse_args(args: &[String]) -> Result<Invocation> {
     match args {
         [] => Ok(Invocation::Open(None)),
@@ -120,7 +139,11 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
             "edit" => Ok(Invocation::ConfigEdit),
             other => bail!("no such command: bi config {other} — try `init` or `edit`"),
         },
-        _ => bail!("usage: bi [path] | bi config init | bi config edit"),
+        [first, sub] if first == "debug" => match sub.as_str() {
+            "init" => Ok(Invocation::DebugInit),
+            other => bail!("no such command: bi debug {other} — try `init`"),
+        },
+        _ => bail!("usage: bi [path] | bi config init | bi config edit | bi debug init"),
     }
 }
 
@@ -213,6 +236,59 @@ fn config_edit_path(dir: &Path) -> Result<PathBuf> {
         bail!("no config yet — run `bi config init`");
     }
     Ok(dir.to_path_buf())
+}
+
+/// The header on a freshly written `.bi.toml`: what the file is, and the
+/// one rule that differs from the user config — an adapter's command is not
+/// a project's to set.
+const DEBUG_HEADER: &str = "\
+# bi project config — debug launch configurations
+#
+# This file is a PATCH over your user config, read from the working
+# directory (or the nearest parent that has one). Everything below is
+# commented out: uncomment one whole block, `[[debug.launch]]` line included,
+# and set `program`. Adapters themselves (`[debug.adapters.*]`) are configured
+# in the user config — `bi config init` — never here.
+
+";
+
+/// The debug sample as a menu: every block commented out *whole*.
+///
+/// Not [`commented`]'s transform, which leaves table headers live: a live
+/// `[[debug.launch]]` over commented keys is an empty entry the parser
+/// rejects, so here the header is commented with its keys. The prose lines
+/// are already comments and pass through.
+fn debug_menu() -> String {
+    let mut out = String::from(DEBUG_HEADER);
+    for line in bi::config::DEBUG_SAMPLE.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            out.push_str(line);
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// What `bi debug init` found, for the caller to narrate.
+enum DebugInit {
+    Wrote(PathBuf),
+    /// The file was there already — untouched. The caller prints the sample
+    /// instead, so asking for one is never a no-op.
+    Existed(PathBuf),
+}
+
+/// Writes `.bi.toml` in `dir` if it is absent. Never overwrites: a project's
+/// config is the project's, and this seeds one only where there is none.
+fn debug_init(dir: &Path) -> Result<DebugInit> {
+    let path = dir.join(".bi.toml");
+    if path.exists() {
+        return Ok(DebugInit::Existed(path));
+    }
+    std::fs::write(&path, debug_menu()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(DebugInit::Wrote(path))
 }
 
 /// bi's config directory: `$BI_CONFIG`, else `$XDG_CONFIG_HOME/bi`, else
@@ -537,7 +613,43 @@ mod tests {
         assert!(matches!(parse_args(&args(&["config", "init"])).unwrap(), Invocation::ConfigInit));
         assert!(matches!(parse_args(&args(&["config", "edit"])).unwrap(), Invocation::ConfigEdit));
         assert!(parse_args(&args(&["config", "nope"])).is_err());
+        assert!(matches!(parse_args(&args(&["debug", "init"])).unwrap(), Invocation::DebugInit));
+        assert!(parse_args(&args(&["debug", "nope"])).is_err());
         assert!(parse_args(&args(&["a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn debug_init_writes_once_then_reports_the_existing_file() {
+        let dir = std::env::temp_dir().join(format!("bi-debug-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = debug_init(&dir).unwrap();
+        assert!(matches!(first, DebugInit::Wrote(_)));
+        let written = std::fs::read_to_string(dir.join(".bi.toml")).unwrap();
+        assert!(written.contains("[[debug.launch]]"), "{written}");
+
+        std::fs::write(dir.join(".bi.toml"), "mine\n").unwrap();
+        let second = debug_init(&dir).unwrap();
+        assert!(matches!(second, DebugInit::Existed(_)), "the file is reported, not replaced");
+        assert_eq!(std::fs::read_to_string(dir.join(".bi.toml")).unwrap(), "mine\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_debug_menu_has_no_live_line() {
+        // Whole blocks commented, headers included: an uncommented
+        // `[[debug.launch]]` over commented keys would be an empty entry the
+        // parser rejects, not a menu.
+        let menu = debug_menu();
+        for line in menu.lines() {
+            assert!(
+                line.trim().is_empty() || line.starts_with('#'),
+                "live line in the menu: {line:?}"
+            );
+        }
+        assert!(menu.contains("# [[debug.launch]]"), "{menu}");
     }
 
     #[test]
