@@ -347,6 +347,10 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Normal, "till_backward", "T"),
     (KeyMode::Normal, "repeat_find", ";"),
     (KeyMode::Normal, "repeat_find_reverse", ","),
+    // The jump list. See `docs/specs/jumplist.md`.
+    (KeyMode::Normal, "jump_back", "<C-o>"),
+    (KeyMode::Normal, "jump_forward", "<C-i>"),
+    (KeyMode::Normal, "jump_last", "''"),
     // Operators.
     (KeyMode::Normal, "delete", "d"),
     (KeyMode::Normal, "change", "c"),

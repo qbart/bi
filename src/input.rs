@@ -69,6 +69,11 @@ pub struct Input {
     bracket_pending: Option<bool>,
     /// `"` has been typed and is waiting for the register it names.
     quote_pending: bool,
+    /// `'` or `` ` `` has been typed and is waiting for its second key — the
+    /// char held is which one, so only the doubled form (`''`/`` `` ``)
+    /// resolves. Marks (`'x`/`` `x ``) do not exist yet — see
+    /// `docs/specs/jumplist.md`.
+    jump_last_pending: Option<char>,
     /// `ys`, `ds`, `cs` and visual `S` — see `docs/specs/surround.md`.
     surround: Option<Surround>,
     /// `r` has been typed and is waiting for the character to write.
@@ -214,6 +219,7 @@ impl Input {
             || self.g_pending
             || self.bracket_pending.is_some()
             || self.delete_pending
+            || self.jump_last_pending.is_some()
     }
 
     /// What `[keys.normal]` lends to another mode for the keys held so far.
@@ -441,6 +447,9 @@ impl Input {
         if self.quote_pending {
             s.push('"');
         }
+        if let Some(opener) = self.jump_last_pending {
+            s.push(opener);
+        }
         if self.sink == Sink::BlackHole {
             s.push_str("\"_");
         }
@@ -584,6 +593,17 @@ impl Input {
         let count = self.fold_count();
         self.reset();
         Some(Command { count, action })
+    }
+
+    /// `Ctrl-O`/`Ctrl-I`/`Tab` — the jump list's keys. Unlike `plain`, the
+    /// count lives in the action itself (`Action::JumpBack`/`JumpForward`
+    /// carry it), the same shape `ReplaceChar`'s count takes. See
+    /// `docs/specs/jumplist.md`.
+    fn jump(&mut self, back: bool) -> Option<Command> {
+        let count = self.fold_count();
+        self.reset();
+        let action = if back { Action::JumpBack { count } } else { Action::JumpForward { count } };
+        Some(Command { count: 1, action })
     }
 
     /// Resolves the key after `Ctrl-W`.
@@ -854,10 +874,12 @@ impl Input {
             }
             KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
             KeyCode::Char('^') if ctrl => return self.plain(Action::Buffer(BufferCmd::Alternate)),
-            // Asking to see a buffer here, which is what `:bn` means in a tree.
-            KeyCode::Char('i') if ctrl => return self.plain(Action::Buffer(BufferCmd::Next)),
-            KeyCode::Char('o') if ctrl => return self.plain(Action::Buffer(BufferCmd::Prev)),
-            KeyCode::Tab => return self.plain(Action::Buffer(BufferCmd::Next)),
+            // The jump list's keys, same as a text window's. A tree has no
+            // jump list of its own — `Editor::walk_jumps` no-ops with a
+            // status rather than panicking. See `docs/specs/jumplist.md`.
+            KeyCode::Char('o') if ctrl => return self.jump(true),
+            KeyCode::Char('i') if ctrl => return self.jump(false),
+            KeyCode::Tab => return self.jump(false),
             // Before `p`, which is paste: a tree is a place you look files up,
             // so the key that looks one up by name belongs here more than
             // anywhere. Without this it read as `p` and pasted.
@@ -995,19 +1017,20 @@ impl Input {
             // moves the cursor — and `:m` works everywhere.
             KeyCode::Down if key.mods.shift => self.plain(Action::MoveLines { down: true }),
             KeyCode::Up if key.mods.shift => self.plain(Action::MoveLines { down: false }),
-            // Vim spells its jump list this way; bi has no jump list and
-            // these are the keys the fingers reach for. Checked before the
-            // plain `i` and `o`, which would otherwise swallow them — and
-            // `Tab` is listed because it *is* Ctrl-I, byte for byte.
-            KeyCode::Char('i') if ctrl => self.plain(Action::Buffer(BufferCmd::Next)),
-            KeyCode::Char('o') if ctrl => self.plain(Action::Buffer(BufferCmd::Prev)),
+            // These ARE the jump list — `docs/specs/jumplist.md`. Checked
+            // before the plain `i` and `o`, which would otherwise swallow
+            // them — and `Tab` is listed because it *is* Ctrl-I, byte for
+            // byte.
+            KeyCode::Char('o') if ctrl => self.jump(true),
+            KeyCode::Char('i') if ctrl => self.jump(false),
             // `Ctrl-Tab` for the buffer switcher, where the terminal sends
             // one — kitty and alacritty do, with the protocol that tells
             // `Ctrl-I` and `Ctrl-Tab` apart. Where it does not, this arm never
-            // fires and the plain `Tab` below is what arrives, which is
-            // exactly what it always did. See `docs/specs/buffers.md`.
+            // fires and the plain `Tab` below is what arrives, which is now
+            // the jump list's forward key rather than buffer-next. See
+            // `docs/specs/buffers.md`.
             KeyCode::Tab if ctrl => self.plain(Action::Buffer(BufferCmd::List)),
-            KeyCode::Tab => self.plain(Action::Buffer(BufferCmd::Next)),
+            KeyCode::Tab => self.jump(false),
             // The start of a key, not a key. Any count already typed stays,
             // because it belongs to the resize forms.
             KeyCode::Char('w') if ctrl => {
@@ -1124,6 +1147,18 @@ impl Input {
                     self.reset();
                     None
                 }
+            };
+        }
+
+        // `'` or `` ` `` is holding out for its second key. Only the doubled
+        // form resolves — `'x`/`` `x `` would be marks, which do not exist
+        // yet, so any other key is a miss. See `docs/specs/jumplist.md`.
+        if let Some(opener) = self.jump_last_pending.take() {
+            return if c == opener {
+                self.plain(Action::JumpLast)
+            } else {
+                self.reset();
+                None
             };
         }
 
@@ -1401,6 +1436,10 @@ impl Input {
             }
             'g' => {
                 self.g_pending = true;
+                return None;
+            }
+            '\'' | '`' => {
+                self.jump_last_pending = Some(c);
                 return None;
             }
             // Not under an operator: `d]` is not a motion bi has, and the
@@ -2420,31 +2459,31 @@ leader = \" \"
         );
     }
 
-    /// Vim spells the jump list this way, not the buffer list — but bi has no
-    /// jump list, and these are the keys the fingers reach for. Ctrl-I *is*
-    /// Tab: both are 0x09, and no terminal bi talks to tells them apart, so
-    /// binding one binds the other whether or not you meant to.
+    /// Vim's jump list keys, and `Tab` with them because `Tab` *is* Ctrl-I —
+    /// the same byte, told apart by no terminal without the kitty protocol.
+    /// See `docs/specs/jumplist.md`.
     #[test]
-    fn ctrl_i_and_ctrl_o_cycle_the_buffer_list() {
-        let mut input = Input::default();
-        let next = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Text).unwrap();
-        assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
-
-        let tab = Key::code(KeyCode::Tab);
-        let same = input.on_key(tab, &Mode::Normal, ContentKind::Text).unwrap();
-        assert_eq!(same.action, Action::Buffer(BufferCmd::Next), "Tab is the same key");
-
-        let prev = input.on_key(ctrl('o'), &Mode::Normal, ContentKind::Text).unwrap();
-        assert_eq!(prev.action, Action::Buffer(BufferCmd::Prev));
+    fn ctrl_o_and_ctrl_i_walk_the_jump_list_and_tab_is_ctrl_i() {
+        assert_eq!(typed("<C-o>").action, Action::JumpBack { count: 1 });
+        assert_eq!(typed("<C-i>").action, Action::JumpForward { count: 1 });
+        assert_eq!(typed("<Tab>").action, Action::JumpForward { count: 1 });
+        assert_eq!(typed("3<C-o>").action, Action::JumpBack { count: 3 });
+        assert_eq!(typed("''").action, Action::JumpLast);
+        assert_eq!(typed("``").action, Action::JumpLast);
+        // Buffer-next has its own keys and no longer rides on Tab.
+        assert_ne!(typed("<Tab>").action, Action::Buffer(BufferCmd::Next));
+        // `'x` is not a mark yet: the pending clears and the key is a miss.
+        assert!(nothing("'x").is_none(), "'x is not a mark yet");
     }
 
-    /// They reach the buffer list from a tree pane too, which is a request to
-    /// show a buffer there — the same thing `:bn` means.
+    /// They reach the jump list from a tree pane too — a tree has no jumps
+    /// of its own, so `Editor::walk_jumps` no-ops with a status rather than
+    /// this ever panicking. See `docs/specs/jumplist.md`.
     #[test]
-    fn the_buffer_keys_work_from_a_tree_as_well() {
+    fn the_jump_keys_work_from_a_tree_as_well() {
         let mut input = Input::default();
-        let next = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree).unwrap();
-        assert_eq!(next.action, Action::Buffer(BufferCmd::Next));
+        let forward = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree).unwrap();
+        assert_eq!(forward.action, Action::JumpForward { count: 1 });
     }
 
     /// The keys under the `g` prefix that go somewhere rather than move
@@ -2583,15 +2622,19 @@ leader = \" \"
         assert_eq!(cmd.action, Action::Buffer(BufferCmd::Alternate));
     }
 
-    /// Feeds `keys` and returns the one command they produce, asserting that
-    /// every key before the last resolved to nothing.
+    /// Feeds `keys` — a config-style spelling, so `<C-o>` and `<Tab>` work
+    /// beside plain characters — and returns the one command they produce,
+    /// asserting that every key before the last resolved to nothing.
     fn typed(keys: &str) -> Command {
         let mut input = Input::default();
+        let parsed = crate::config::parse_keys(keys, None)
+            .unwrap_or_else(|e| panic!("{keys:?} is not a key sequence: {e}"));
         let mut last = None;
-        for (i, c) in keys.chars().enumerate() {
-            let out = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
-            if i + 1 < keys.chars().count() {
-                assert!(out.is_none(), "{c:?} resolved early in {keys:?}");
+        let count = parsed.len();
+        for (i, k) in parsed.into_iter().enumerate() {
+            let out = input.on_key(k, &Mode::Normal, ContentKind::Text);
+            if i + 1 < count {
+                assert!(out.is_none(), "{k:?} resolved early in {keys:?}");
             }
             last = out;
         }
