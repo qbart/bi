@@ -56,6 +56,9 @@ Jumps {
 Jump { buffer: BufferId, at: usize /* char offset */ }
 ```
 
+`Jumps::entries()` hands the list back oldest-first, read-only, for anything
+that wants to look without walking — a `:jumps` listing, and the tests.
+
 **Before** a jump, the position being left is pushed. Pushing a position that
 equals the entry already on top is a no-op, so `n n n` over one hit records
 once. Pushing while walking (`at < len`) truncates the forward half first —
@@ -150,3 +153,11 @@ jump), which is what keeps the list stable while you flip through it.
    reserved for them, as decision 3 above says; today a stray letter after
    `'` or `` ` `` is swallowed rather than doing anything, because there are
    no marks yet to look up.
+4. **A window that goes text → tree → *another* file starts a fresh list.**
+   The list lives on [`window::Text`], and a window showing a tree has parked
+   its one `Text` in the single `alt` slot; coming back to a different file
+   builds a new `Text` and the parked one goes, jump list and all. The common
+   tree-toggle-back keeps everything, because that *is* the parked `Text`
+   returning. Living on `Text` is the design (§"The list"): a second slot to
+   carry a list across a buffer the window never showed would be a
+   window-level history by another name.

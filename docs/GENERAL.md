@@ -229,7 +229,7 @@ goes with it: the pattern is still remembered for `n`, but bi has stopped
 counting at you.
 
 **The jump list** — `Ctrl-O`/`Ctrl-I` retrace where a jump motion (`G`, `gg`,
-`:{n}`, `/`, `?`, `n`, `N`, `*`, `#`, `%`, `(` `)` `{` `}`, `gd`/`gr`, a
+`:{n}`, `/`, `?`, `n`, `N`, `*`, `#`, `%`, `{` `}`, `gd`/`gr`, a
 picker, `:e`, `:b`, `Ctrl-^`, a results row, a tree entry, a debugger frame)
 last took you, back and forward, across files. `''` and ``` `` ``` toggle back
 to the position before the latest jump. `Tab` is `Ctrl-I` byte for byte in a
