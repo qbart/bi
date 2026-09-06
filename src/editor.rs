@@ -10994,10 +10994,18 @@ impl View<'_> {
                     Selection::collapsed(ed.buffer.moved(sel.head, Motion::Right, true))
                 });
             }
+            // `I` is `^i`, not `0i`: the insert opens before the first
+            // non-blank, which on an indented line is where the text is. A
+            // line that is all whitespace has no such char and `^` would sit
+            // on its last space; there the insert goes to the line's end, so
+            // what you type follows the indent instead of splitting it.
             Action::EnterInsertLineStart => {
                 self.session.mode = Mode::Insert;
                 self.for_each_selection(|ed, sel| {
-                    Selection::collapsed(ed.buffer.moved(sel.head, Motion::LineStart, true))
+                    let at = ed.buffer.moved(sel.head, Motion::FirstNonBlank, true);
+                    let blank = ed.buffer.rope().char(at.at).is_whitespace();
+                    let at = if blank { ed.buffer.moved(at, Motion::LineEnd, true) } else { at };
+                    Selection::collapsed(at)
                 });
             }
             Action::EnterInsertLineEnd => {
@@ -18931,6 +18939,43 @@ mod tests {
 
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "    alpha\nbeta\n");
         assert_eq!(ed.cursor_col(), Some(4));
+    }
+
+    /// `I` is `^i`, not `0i`: vim inserts before the first non-blank, which
+    /// on an indented line is where the text starts and where you meant.
+    #[test]
+    fn capital_i_inserts_at_the_first_non_blank_not_column_zero() {
+        let mut ed = editor("    alpha\nbeta\n");
+        ed.apply(cmd(Action::Move(Motion::LineEnd)));
+
+        ed.apply(cmd(Action::EnterInsertLineStart));
+
+        assert_eq!(ed.session.mode, Mode::Insert);
+        assert_eq!(ed.cursor_col(), Some(4));
+    }
+
+    /// A line that is nothing but whitespace has no non-blank; `^` lands on
+    /// its last char, but `I` must open the insert at the line's *end* so the
+    /// typed text follows the indent rather than splitting it.
+    #[test]
+    fn capital_i_on_a_blank_line_inserts_after_the_indent() {
+        let mut ed = editor("    \nbeta\n");
+
+        ed.apply(cmd(Action::EnterInsertLineStart));
+
+        assert_eq!(ed.cursor_col(), Some(4));
+    }
+
+    /// The degenerate blank line: no indent to follow, and the newline is
+    /// not a place to insert. Column 0, and the buffer untouched by the move.
+    #[test]
+    fn capital_i_on_an_empty_line_stays_at_column_zero() {
+        let mut ed = editor("\nbeta\n");
+
+        ed.apply(cmd(Action::EnterInsertLineStart));
+
+        assert_eq!(ed.cursor_col(), Some(0));
+        assert_eq!(ed.buffer().unwrap().rope().to_string(), "\nbeta\n");
     }
 
     #[test]
