@@ -421,6 +421,20 @@ pub enum Action {
     CommandExecute,
     CommandCancel,
 
+    /// `Ctrl-O` — walk `count` entries back through the focused window's jump
+    /// list. Moves without recording: the walk itself is not a jump. See
+    /// `docs/specs/jumplist.md`.
+    JumpBack {
+        count: usize,
+    },
+    /// `Ctrl-I` / `Tab` — walk `count` entries forward.
+    JumpForward {
+        count: usize,
+    },
+    /// `''` / `` ` ` `` — back to the position before the latest jump; a
+    /// second press toggles back.
+    JumpLast,
+
     /// Changes which buffer the focused window shows, or the list itself.
     ///
     /// Handled by `Editor` before a `View` is built, because a view borrows
@@ -534,6 +548,10 @@ impl Action {
             | Action::Resurround { .. }
             | Action::SurroundSelection { .. }
             | Action::EnterReplace => true,
+            // Everything else, `Action::JumpBack`/`JumpForward`/`JumpLast`
+            // included: the walk moves the cursor (and, across files, the
+            // window's buffer) but edits nothing, so `.` has no reason to
+            // replay it.
             _ => false,
         }
     }
@@ -586,6 +604,9 @@ impl Action {
             | Action::OpenLineAbove
             | Action::BlockInsert { .. }
             | Action::EnterReplace => true,
+            // Everything else, `Action::JumpBack`/`JumpForward`/`JumpLast`
+            // included: the walk moves the cursor without editing, so it
+            // opens no session for `.` to close.
             _ => false,
         }
     }
@@ -2953,6 +2974,16 @@ fn variables_select_parent(vars: &mut DapVariables) {
     }
 }
 
+/// Which way [`Editor::walk_jumps`] steps the focused window's jump list —
+/// `Action::JumpBack`/`JumpForward`/`JumpLast` in one shape, since all three
+/// share everything but which of [`crate::jumps::Jumps`]'s three methods to
+/// call and which status to give up on `None`.
+enum Walk {
+    Back(usize),
+    Forward(usize),
+    Last,
+}
+
 impl Editor {
     pub fn empty() -> Self {
         Self::with_buffer(Buffer::empty())
@@ -4087,9 +4118,58 @@ impl Editor {
         self.record_jump_in(self.focus);
     }
 
+    /// `Ctrl-O`, `Ctrl-I` and `''`/`` ` ` ``: step the focused window's jump
+    /// list without recording anything — the walk itself is not a jump. See
+    /// `docs/specs/jumplist.md` §"Where it hooks in".
+    fn walk_jumps(&mut self, which: Walk) {
+        let focus = self.focus;
+        let ids = self.buffer_ids();
+        let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) else {
+            self.session.status = "no buffer in this window".into();
+            return;
+        };
+        // A buffer closed since the last walk is dropped here — the one
+        // place every walk passes through, jump list or not.
+        text.jumps.prune(|b| ids.contains(&b));
+        let from = Jump { buffer: text.buffer, at: text.selections.primary().head.at };
+        let target = match which {
+            Walk::Back(count) => text.jumps.back(from, count),
+            Walk::Forward(count) => text.jumps.forward(count),
+            Walk::Last => text.jumps.last(from),
+        };
+        let Some(target) = target else {
+            self.session.status = match which {
+                Walk::Forward(_) => "no later jump",
+                Walk::Back(_) | Walk::Last => "no earlier jump",
+            }
+            .into();
+            return;
+        };
+
+        // A target in another buffer means switching what the window shows
+        // — through `show`, but never recording: the walk must not add a
+        // fresh entry to the very list it is moving through.
+        if target.buffer != from.buffer {
+            self.show(focus, target.buffer, false);
+        }
+        // Clamped: another window may have edited that buffer since this
+        // walk's entry was last touched, past where `drain_edits` could
+        // have shifted it for a window not looking at it yet.
+        let len = self.entry(target.buffer).buffer.rope().len_chars();
+        let at = target.at.min(len);
+        if let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) {
+            text.selections = Selections::from_pairs(vec![(at, at)]);
+        }
+    }
+
     /// Points a window at another buffer, saving where it was and restoring
     /// where it last was in the one it is entering.
-    fn show(&mut self, window: WindowId, to: BufferId) {
+    ///
+    /// `record` is false only for the `Ctrl-O`/`Ctrl-I` walk (`walk_jumps`):
+    /// every other caller is switching what the window shows because of an
+    /// actual jump, and wants it in the list; the walk itself must not add
+    /// to the very list it is moving through.
+    fn show(&mut self, window: WindowId, to: BufferId, record: bool) {
         let Some(current) = self.window_of(window) else { return };
         let from = current.buffer();
         if from == Some(to) {
@@ -4098,7 +4178,9 @@ impl Editor {
         // Every switch of what a window shows is a jump — `docs/specs/jumplist.md`
         // §"Where it hooks in" — recorded before `touch`/`show` replace the
         // window's `Text` with one pointed at `to`.
-        self.record_jump_in(window);
+        if record {
+            self.record_jump_in(window);
+        }
         self.touch(to);
         let Some(current) = self.window_of(window) else { return };
 
@@ -4268,7 +4350,7 @@ impl Editor {
         };
 
         if let Some(target) = target {
-            self.show(focus, target);
+            self.show(focus, target, true);
             self.session.status = self.name_of(target);
         }
     }
@@ -4319,7 +4401,7 @@ impl Editor {
         if let Some(w) = orphan {
             let heir =
                 if ids.len() == 1 { self.fresh_scratch() } else { ids[(at + 1) % ids.len()] };
-            self.show(w, heir);
+            self.show(w, heir, true);
         }
 
         // A stable id that resolves to nothing is the one way it is worse than
@@ -5271,7 +5353,7 @@ impl Editor {
         match self.open_path(&path.to_string_lossy()) {
             Ok(id) => {
                 let Some(target) = target(self) else { return };
-                self.show(target, id);
+                self.show(target, id, true);
                 self.set_focus(target);
                 self.session.status = self.name_of(id);
             }
@@ -5534,7 +5616,7 @@ impl Editor {
                 // Through `show`, so the new window records where the
                 // duplicated one was before it moves off that buffer.
                 if let Some(id) = buffer {
-                    self.show(new, id);
+                    self.show(new, id, true);
                 }
             }
 
@@ -5551,7 +5633,7 @@ impl Editor {
                     None => focus,
                 };
                 let id = self.fresh_scratch();
-                self.show(target, id);
+                self.show(target, id, true);
             }
 
             WindowCmd::Pick => self.pick_window(),
@@ -6166,7 +6248,7 @@ impl Editor {
         };
         match self.open_path(path) {
             Ok(id) => {
-                self.show(target, id);
+                self.show(target, id, true);
                 self.set_focus(target);
                 self.session.status = match fallback {
                     Some(why) => format!("\"{}\" opened as text — {why}", self.name_of(id)),
@@ -6247,7 +6329,7 @@ impl Editor {
             return;
         }
         if let Some(&id) = self.mru_ids().first() {
-            self.show(window, id);
+            self.show(window, id, true);
             // `show` parked the image as the alternate; delete discards.
             if let Some(w) = self.window_mut_of(window) {
                 w.alt = None;
@@ -7250,6 +7332,12 @@ impl Editor {
             Action::Results(results_cmd) => {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
             }
+            // Handled here rather than in `View`, beside `Action::Buffer`
+            // and for the same reason: a cross-file walk needs `show`,
+            // which needs the buffer list a view borrows from.
+            Action::JumpBack { count } => self.walk_jumps(Walk::Back(count)),
+            Action::JumpForward { count } => self.walk_jumps(Walk::Forward(count)),
+            Action::JumpLast => self.walk_jumps(Walk::Last),
             _ => {
                 // A picture reads a handful of these as pixels and swallows
                 // the mode-entering ones; the rest of what is left needs the
@@ -7386,14 +7474,22 @@ impl Editor {
             // Text windows only: a tree pane shows no rope and has nothing in
             // it that an edit could move.
             for window in self.windows.iter_mut() {
+                let id = window.id;
+                let Some(text) = window.text_mut() else { continue };
+                if text.buffer != entry.id {
+                    continue;
+                }
+
+                // Every window on this buffer follows the edit through its
+                // jump list, focused window included: nothing else moves its
+                // entries the way the selection remap below moves its
+                // cursor. See `docs/specs/jumplist.md` §"Where it hooks in".
+                text.jumps.remap(entry.id, &edits);
+
                 // The window that made the edit already has the right cursor:
                 // the command that moved the text moved it too. Mapping it
                 // again would double-count.
-                if window.id == focus {
-                    continue;
-                }
-                let Some(text) = window.text_mut() else { continue };
-                if text.buffer != entry.id {
+                if id == focus {
                     continue;
                 }
 
@@ -7964,11 +8060,16 @@ impl Editor {
         match self.open_path(path) {
             Ok(id) => {
                 // Recorded only once the open has succeeded, so a bad path
-                // never records a jump nothing actually made. If this also
-                // switches buffers, `show` records the identical position
-                // right after and dedupes against it — see `Jumps::push`.
-                self.record_jump_in(window);
-                self.show(window, id);
+                // never records a jump nothing actually made. A stop back in
+                // the buffer already shown is a jump `show` will not see — it
+                // no-ops when the buffer does not change — so it is recorded
+                // here instead; a stop into a different buffer is `show`'s to
+                // record, the same guard `Editor::apply_goto` uses, so a
+                // cross-buffer debugger jump records once rather than twice.
+                if self.window_of(window).and_then(Window::buffer) == Some(id) {
+                    self.record_jump_in(window);
+                }
+                self.show(window, id, true);
                 // Column 0: DAP's `column` is in units the adapter never
                 // names (bi's LSP side only gets this right by carrying an
                 // explicit encoding across the wire — see `lsp::pos`) and the
@@ -9142,7 +9243,7 @@ impl Editor {
         if self.window_of(window).and_then(Window::buffer) == Some(id) {
             self.record_jump_in(window);
         }
-        self.show(window, id);
+        self.show(window, id, true);
         let at = lsp::pos::char_of(self.entry(id).buffer.rope(), range.start, encoding);
         if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
             text.selections = Selections::from_pairs(vec![(at, at)]);
@@ -10927,6 +11028,10 @@ impl View<'_> {
             // Always intercepted by `Editor::apply` before a view exists —
             // the menu is session state, and a view holds none.
             Action::CompleteNext | Action::CompletePrev => {}
+            // Also always intercepted by `Editor::apply`, beside
+            // `Action::Buffer` — the walk needs `Editor::show`, which a view
+            // cannot reach.
+            Action::JumpBack { .. } | Action::JumpForward { .. } | Action::JumpLast => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // A far motion is a jump — `docs/specs/jumplist.md` §"What a
@@ -18937,6 +19042,116 @@ mod tests {
             ed.window().text().unwrap().jumps.len(),
             1,
             "n n n over the one hit dedupes against the top entry each time"
+        );
+    }
+
+    // ---- jump walk ----------------------------------------------------------
+
+    #[test]
+    fn ctrl_o_returns_to_where_g_left_and_ctrl_i_goes_back_again() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.apply(cmd(Action::Move(Motion::Down))); // row 1
+        ed.apply(cmd(Action::Move(Motion::LastLine))); // row 3, recorded row 1
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+        assert_eq!(ed.cursor_row().unwrap(), 1);
+        ed.apply(cmd(Action::JumpForward { count: 1 }));
+        assert_eq!(ed.cursor_row().unwrap(), 3, "Ctrl-O then Ctrl-I is a no-op pair");
+    }
+
+    #[test]
+    fn ctrl_o_crosses_files_and_the_walk_records_nothing() {
+        let d = ScratchDir::new("jump-walk-crossfile")
+            .written("a.rs", "1\n2\n3\n")
+            .written("b.rs", "x\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let a = ed.window().buffer().unwrap();
+        ed.apply(cmd(Action::Move(Motion::Line(2)))); // row 1, recorded row 0
+        ex(&mut ed, &format!("e {}/b.rs", d.path())); // switch recorded row 1 in a.rs
+        assert_eq!(
+            ed.window().text().unwrap().jumps.len(),
+            2,
+            "the move and the file switch each recorded one"
+        );
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert_eq!(ed.window().buffer(), Some(a), "back in a.rs");
+        assert_eq!(ed.cursor_row().unwrap(), 1, "the row `:e` left");
+        assert_eq!(
+            ed.window().text().unwrap().jumps.len(),
+            3,
+            "unchanged by the walk except the end-of-list push that lets Ctrl-I return"
+        );
+    }
+
+    #[test]
+    fn a_jump_from_the_middle_drops_the_forward_half() {
+        let mut ed = editor("1\n2\n3\n4\n5\n6\n");
+        for _ in 0..3 {
+            ed.apply(cmd(Action::Move(Motion::LastLine)));
+            ed.apply(cmd(Action::Move(Motion::FirstLine)));
+        }
+        ed.apply(cmd(Action::JumpBack { count: 2 }));
+        let before = ed.cursor_row().unwrap();
+        ed.apply(cmd(Action::Move(Motion::Line(4)))); // fresh jump
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+        assert_eq!(ed.cursor_row().unwrap(), before);
+        ed.apply(cmd(Action::JumpForward { count: 1 }));
+        assert_eq!(ed.cursor_row().unwrap(), 3, "forward is the new place, not the old");
+    }
+
+    #[test]
+    fn quote_quote_toggles() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.apply(cmd(Action::Move(Motion::LastLine)));
+        ed.apply(cmd(Action::JumpLast));
+        assert_eq!(ed.cursor_row().unwrap(), 0);
+        ed.apply(cmd(Action::JumpLast));
+        assert_eq!(ed.cursor_row().unwrap(), 2);
+    }
+
+    #[test]
+    fn two_windows_on_one_buffer_keep_separate_lists() {
+        let mut ed = two_windows("one\ntwo\nthree\nfour\nfive\n");
+        ed.apply(cmd(Action::Move(Motion::LastLine)));
+        let second = other(&ed);
+        ed.set_focus(second);
+        let row_before = ed.cursor_row().unwrap();
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert!(
+            ed.session.status.contains("no earlier jump"),
+            "status was {:?}",
+            ed.session.status
+        );
+        assert_eq!(ed.cursor_row().unwrap(), row_before, "this window's own list is empty");
+    }
+
+    #[test]
+    fn a_jump_above_a_deleted_block_still_lands_on_the_same_text() {
+        let mut ed = editor("keep\nx\ny\nz\ntarget\n");
+        // The fixture's own construction leaves an edit pending — the same
+        // reason `split` settles before its own action (see its comment);
+        // without this, the settle below would remap the jump entry through
+        // that setup edit too.
+        ed.settle();
+        ed.apply(cmd(Action::Move(Motion::LastLine))); // recorded row 0 (offset 0)
+        ed.apply(cmd(Action::Move(Motion::Line(2)))); // recorded row 4 (offset of "target")
+        ed.apply(operate(Operator::Delete, Motion::CurrentLine, 3)); // takes "x\ny\nz\n"
+        ed.settle();
+        // `dd` lands the cursor at the start of the deleted range — here,
+        // after the remap, the exact offset the "target" entry now holds
+        // too, since the block removed sat entirely between them. A near
+        // motion up to "keep" is what a real session would do before
+        // reaching for `Ctrl-O`, and it is what makes the assertion below
+        // depend on the walk actually running rather than on the cursor
+        // already sitting on "target" from the delete.
+        ed.apply(cmd(Action::Move(Motion::Up)));
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+        assert_eq!(
+            ed.buffer().unwrap().rope().line(ed.cursor_row().unwrap()).to_string().trim(),
+            "target"
         );
     }
 
