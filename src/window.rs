@@ -258,6 +258,11 @@ pub struct Text {
     /// of `scroll`. In display columns rather than chars, because tabs and
     /// wide chars make the two disagree and the screen is ruled in columns.
     pub left: usize,
+    /// `Ctrl-O`/`Ctrl-I`'s history of jumps made in this window. View state
+    /// like `selections`/`scroll`, not the buffer's: two windows on one
+    /// buffer are two trains of thought, and one's `Ctrl-O` must not replay
+    /// the other's. See `docs/specs/jumplist.md`.
+    pub jumps: crate::jumps::Jumps,
 }
 
 /// One view onto one buffer, or onto one directory.
@@ -364,7 +369,13 @@ impl Window {
 
 impl Text {
     pub fn new(buffer: BufferId) -> Self {
-        Self { buffer, selections: Selections::default(), scroll: 0, left: 0 }
+        Self {
+            buffer,
+            selections: Selections::default(),
+            scroll: 0,
+            left: 0,
+            jumps: crate::jumps::Jumps::default(),
+        }
     }
 }
 

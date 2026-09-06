@@ -209,4 +209,69 @@ impl Motion {
         // `Found` names a destination outright, so a count must not repeat it.
         matches!(self, Motion::FirstLine | Motion::LastLine | Motion::Line(_) | Motion::Found(_))
     }
+
+    /// Whether this motion can move far enough that you cannot see where you
+    /// came from — vim's `:help jump-motions` list, which `docs/specs/jumplist.md`
+    /// §"What a jump is" adopts whole. A jump gets recorded on
+    /// [`crate::window::Text::jumps`] before it runs; a near motion, one you
+    /// can watch happen, does not, or `Ctrl-O` would drown the one jump you
+    /// want under fifty `h`/`j`/`w` steps.
+    ///
+    /// Written as an exhaustive match with no `_` arm, so a new variant has
+    /// to decide which side of the line it is on the day it is added.
+    pub fn is_jump(self) -> bool {
+        match self {
+            Motion::FirstLine
+            | Motion::LastLine
+            | Motion::Line(_)
+            | Motion::Search { .. }
+            | Motion::Found(_)
+            | Motion::MatchingBracket
+            | Motion::Paragraph { .. } => true,
+            Motion::Left
+            | Motion::Right
+            | Motion::Up
+            | Motion::Down
+            | Motion::Word { .. }
+            | Motion::LineStart
+            | Motion::FirstNonBlank
+            | Motion::LastNonBlank
+            | Motion::LineEnd
+            | Motion::CurrentLine
+            | Motion::FindChar { .. }
+            | Motion::RepeatFind { .. } => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn far_motions_are_jumps_and_near_ones_are_not() {
+        for far in [
+            Motion::FirstLine,
+            Motion::LastLine,
+            Motion::Line(3),
+            Motion::MatchingBracket,
+            Motion::Search { reverse: false },
+            Motion::Found(7),
+            Motion::Paragraph { forward: true },
+        ] {
+            assert!(far.is_jump(), "{far:?}");
+        }
+        for near in [
+            Motion::Left,
+            Motion::Right,
+            Motion::Up,
+            Motion::Down,
+            Motion::LineStart,
+            Motion::FirstNonBlank,
+            Motion::LineEnd,
+            Motion::CurrentLine,
+        ] {
+            assert!(!near.is_jump(), "{near:?}");
+        }
+    }
 }
