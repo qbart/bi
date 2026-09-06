@@ -281,7 +281,7 @@ Ctrl-W …        every window key, unchanged
 Ctrl-W e        a tree beside this one, in a pane of its own
 :               the command line
 Ctrl-^          the alternate content, tree or file
-Tab Ctrl-I / Ctrl-O   the next / previous buffer, shown from here
+Tab Ctrl-I / Ctrl-O   the jump list, forward / back (docs/specs/jumplist.md)
 Ctrl-P          the file picker
 gf              find any path under the root by name, and go to it
 /               the same, over the rows on screen

@@ -48,11 +48,15 @@ That leaves the register ring as the only kind that previews.
 and `Ctrl-I` are the same byte in a terminal, and a terminal that does not
 implement the kitty keyboard protocol cannot tell `Ctrl-Tab` from `Tab`.
 
-That costs nothing here. Where the modifier arrives, `Ctrl-Tab` opens the
-switcher; where it does not, the key that arrives is a plain `Tab`, which is
-buffer-next, which is exactly what it did before. Nothing is taken away and no
-key had to be given up — which is the reason the *window* picker went to
-`Ctrl-W f` instead of `Tab`: that one would have had to take `Ctrl-I` with it.
+Where the modifier arrives, `Ctrl-Tab` opens the switcher. Where it does not,
+the key that arrives is a plain `Tab`, which is jump-forward
+(`docs/specs/jumplist.md`) — not buffer-next; `Tab` never had a name of its
+own to lose, `Ctrl-I` and `Tab` were simply the same hardcoded key. Buffer-next
+is reached instead by `:bn`, `gb` and `Ctrl-^`, and by `Ctrl-Tab` itself where
+the terminal sends the modifier. Nothing here is taken away by the jump
+list's claim on `Tab`/`Ctrl-I` — which is also the reason the *window* picker
+went to `Ctrl-W f` instead of `Tab`: that one would have had to take `Ctrl-I`
+with it.
 
 `:ls` opens the same list, always, in every terminal.
 

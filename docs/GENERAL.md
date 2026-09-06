@@ -228,6 +228,24 @@ A search stays live while the keys are still the search — `n`, `N`, another
 goes with it: the pattern is still remembered for `n`, but bi has stopped
 counting at you.
 
+**The jump list** — `Ctrl-O`/`Ctrl-I` retrace where a jump motion (`G`, `gg`,
+`:{n}`, `/`, `?`, `n`, `N`, `*`, `#`, `%`, `(` `)` `{` `}`, `gd`/`gr`, a
+picker, `:e`, `:b`, `Ctrl-^`, a results row, a tree entry, a debugger frame)
+last took you, back and forward, across files. `''` and ``` `` ``` toggle back
+to the position before the latest jump. `Tab` is `Ctrl-I` byte for byte in a
+terminal, so it is jump-forward too, and buffer-next gave the key up — reach
+buffer-next with `:bn`, `gb` or `Ctrl-^` instead, and with `Ctrl-Tab` where the
+terminal can send the modifier (see *Windows and buffers*, below).
+
+| Key | Does |
+|---|---|
+| `Ctrl-O` | back to before the last jump — `jump_back` |
+| `Ctrl-I`, `Tab` | forward again — `jump_forward` |
+| `''`, ``` `` ``` | toggle to the position before the latest jump — `jump_last` |
+
+`[keys.normal]` rebinds all three by name. See
+[docs/specs/jumplist.md](specs/jumplist.md).
+
 **Scrolling**
 
 | Key | Does |
@@ -496,9 +514,11 @@ worked. bi's walk is checked against git's own in
 The buffer list is ordered by when each buffer was last *shown* and opens on
 the second row — the one you were in before this one — so `Ctrl-Tab` `Enter`
 switches back and doing it twice returns you. Where a terminal cannot tell
-`Ctrl-Tab` from `Tab` you simply get buffer-next, which is what that key always
-did — and `gb` opens the switcher on every terminal, beside `ga` for the
-alternate file and `gf` for the file picker. See [docs/specs/buffers.md](specs/buffers.md).
+`Ctrl-Tab` from `Tab` you get a plain `Tab`, which is jump-forward, not
+buffer-next — `gb` opens the switcher on every terminal instead, beside `ga`
+for the alternate file and `gf` for the file picker. See
+[docs/specs/buffers.md](specs/buffers.md) and
+[docs/specs/jumplist.md](specs/jumplist.md).
 
 Only the register pickers get a preview pane — the ring's, and the named
 space's, where the row is the name and the entry rides underneath. A file
@@ -662,8 +682,13 @@ See [docs/specs/windows.md](specs/windows.md).
 | `Ctrl-W + -` `Ctrl-W < >` | taller / shorter, wider / narrower |
 | `Ctrl-W =` | equalise every pane |
 | `Ctrl-^` | switch to the alternate buffer (`:b#` where the terminal does not send it) |
-| `Ctrl-I` `Ctrl-O` | cycle the buffer list forwards / backwards. `Ctrl-I` is `Tab`, byte for byte |
 | `Ctrl-Tab` `gb` | the buffer switcher: newest first, opening on the one you were in before |
+| `:bn` `:bp` | next / previous buffer in open order |
+
+`Ctrl-I`/`Ctrl-O`/`Tab` no longer cycle buffers — they are the jump list's
+keys now, described under *Normal mode* above. Where a terminal cannot tell
+`Ctrl-Tab` from a plain `Tab`, the plain `Tab` that arrives is jump-forward,
+not buffer-next.
 
 Two windows may show one buffer, with their own cursor and their own scroll.
 An edit in one moves the other's cursor *with the text* rather than clamping it
@@ -726,7 +751,7 @@ single character in a corner: it names a whole pane, and on a screen of four
 panes of code one more character is a thing you have to hunt for. It is the first client
 of bi's label machinery, which `s` and `S` will reuse; see
 [docs/specs/labels.md](specs/labels.md). Not `<Tab>`, which is `Ctrl-I`
-byte for byte in a terminal and would have taken buffer-next with it.
+byte for byte in a terminal and would have taken the jump list with it.
 
 `Ctrl-W e` is the shortcut for that layout: it opens the tree beside the file
 you are reading, rooted at its directory with the file already selected, and

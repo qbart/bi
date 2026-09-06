@@ -91,10 +91,11 @@ goes to the one you press.
 
 **Not `<Tab>`**, which TODO.md asked for. `Tab` and `Ctrl-I` are the same byte
 in a terminal, so `<Tab>` for window picking would silently take `Ctrl-I` —
-buffer-next — with it. The window prefix is where every other window command
-lives, and `Ctrl-W f` is one keystroke more than a bare `Tab` in exchange for
-nothing being taken away. A `[keys.normal]` binding can spell it as anything,
-`<leader>w` included.
+jump-forward, in the jump list (`docs/specs/jumplist.md`) — with it. The
+window prefix is where every other window command lives, and `Ctrl-W f` is
+one keystroke more than a bare `Tab` in exchange for nothing being taken
+away. A `[keys.normal]` binding can spell it as anything, `<leader>w`
+included.
 
 Every window gets a letter, the focused one included: jumping to where you
 already are is a no-op, and leaving it out would mean the letters move around

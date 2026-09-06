@@ -473,10 +473,11 @@ buffer is there to keep the list non-empty.
 This is the rule that stops `bi .` leaving a `[No Name]` in the cycle forever.
 `Editor::open` on a directory builds an empty session and then replaces the
 window's content with the tree, which orphans the buffer it just made; nothing
-ever showed it again, and `Ctrl-I` and `Ctrl-O` cycled between the file you
-opened and a blank that was never asked for. The same wart appeared from
-plain `bi` followed by `:e file`, where the initial blank stayed in the list
-behind the file — vim reuses that one, and this is how bi reuses it.
+ever showed it again, and the buffer switcher (`gb`, `Ctrl-Tab`, `:bn`) cycled
+between the file you opened and a blank that was never asked for. The same
+wart appeared from plain `bi` followed by `:e file`, where the initial blank
+stayed in the list behind the file — vim reuses that one, and this is how bi
+reuses it.
 
 The three conditions are each doing work. **Unnamed**, or `:w` would have
 somewhere to write and the buffer is a file you have not saved yet.

@@ -6,7 +6,7 @@ fingers already reach for.
 
 ## Status
 
-**Approved for build.** Decisions are resolved at the end.
+**Built.** Decisions are resolved at the end.
 
 ## Why
 
@@ -92,8 +92,11 @@ selections and diagnostics.
   you left, so `''` `''` toggles. Cheap once the list exists; the natural home
   of `'` and `` ` `` when marks arrive.
 
-`[keys.normal]` rebinds all of them; `Tab`'s entry in the names table moves
-from `buffer_next` to `jump_forward`.
+`[keys.normal]` rebinds all of them: `jump_back` (`Ctrl-O`), `jump_forward`
+(`Ctrl-I`, which is what `Tab` sends), `jump_last` (`''`). These are three new
+rows — buffer-next never had a name of its own; `Ctrl-I`/`Ctrl-O`/`Tab` were
+hardcoded and unrebindable before this. Buffer-next keeps `:bn`, `gb`,
+`Ctrl-^` and `Ctrl-Tab` (`docs/specs/buffers.md`).
 
 ## Where it hooks in
 
@@ -132,5 +135,18 @@ jump), which is what keeps the list stable while you flip through it.
 3. **`''` and ``` `` ``` ship now** — one entry of the same list. When marks
    arrive, `'` and `` ` `` become their prefix and these remain the `'`-`'`
    special case, as in vim.
-4. **Deviation from vim:** `:s` and `:g` do not record a jump. In bi they are
-   range commands that leave the cursor where the range ends, not moves.
+
+## Deviations from the design
+
+1. **`:s` and `:g` do not record a jump.** In bi they are range commands that
+   leave the cursor where the range ends, not moves.
+2. **A delete whose end coincides exactly with a recorded jump remaps that
+   entry onto the cursor's own position.** `Ctrl-O` then steps *past* it,
+   because `Jumps::back` dedupes an entry equal to the position it is walking
+   from — the same rule that makes `n n n` over one hit record once. This is
+   intended, not a gap: the entry did not vanish, it collapsed into the
+   position it now shares with the cursor.
+3. **`'x` and `` `x`` (marks) are not bound.** The `'`/`` ` `` prefix is
+   reserved for them, as decision 3 above says; today a stray letter after
+   `'` or `` ` `` is swallowed rather than doing anything, because there are
+   no marks yet to look up.
