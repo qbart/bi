@@ -19051,12 +19051,10 @@ mod tests {
 
         assert_ne!(ed.window().buffer(), Some(first), "the window now shows b.rs");
         let jumps = &ed.window().text().unwrap().jumps;
-        assert_eq!(jumps.len(), 1, "the switch recorded one jump");
-        let mut probe = jumps.clone();
-        // Not walking, so `back` pushes a throwaway "now" and returns the
-        // entry before it — the one the switch recorded.
-        let recorded = probe.back(Jump { buffer: BufferId(u32::MAX), at: 0 }, 1);
-        assert_eq!(recorded, Some(Jump { buffer: first, at: left }));
+        // Read, not walked: `entries` is the listing view, so the assertion
+        // says what was recorded without a throwaway `back` (and its
+        // synthetic "now") standing in for a look.
+        assert_eq!(jumps.entries(), [Jump { buffer: first, at: left }], "the switch recorded it");
     }
 
     /// `n` `n` `n` over one hit records once: the first search is the jump,
@@ -19186,6 +19184,198 @@ mod tests {
             ed.buffer().unwrap().rope().line(ed.cursor_row().unwrap()).to_string().trim(),
             "target"
         );
+    }
+
+    /// The remap is per *entry*, not per window: a window sitting in `a.rs`
+    /// holds entries pointing into `b.rs`, and nothing else in the editor will
+    /// ever shift those. A drain that only offered each window the edits to
+    /// the buffer it happens to be showing left them stale, which is exactly
+    /// the "lands in the middle of the wrong function" the spec's §"The list"
+    /// warns about.
+    #[test]
+    fn a_jump_in_another_file_follows_that_files_edits() {
+        let d = ScratchDir::new("jump-other-file")
+            .written("a.rs", "one\ntwo\n")
+            .written("b.rs", "aaaa\nbbbb\ncccc\ndddd\ntarget\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let home = ed.focus();
+
+        // Record an entry on "target" in b.rs, then come back to a.rs: this
+        // window's list now names a file it is not showing.
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+        ed.apply(cmd(Action::Move(Motion::Line(5)))); // the "target" row
+        ex(&mut ed, &format!("e {}/a.rs", d.path()));
+
+        // A second window does the editing, above the recorded row.
+        split(&mut ed, Dir::Vertical);
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+        ed.apply(cmd(Action::Move(Motion::Line(2))));
+        ed.apply(operate(Operator::Delete, Motion::CurrentLine, 3)); // bbbb/cccc/dddd
+        ed.settle();
+
+        ed.set_focus(home);
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().line(ed.cursor_row().unwrap()).to_string().trim(),
+            "target",
+            "the entry followed the other window's delete"
+        );
+    }
+
+    /// One goto answer, without a server: `apply_goto` is what every `gd`,
+    /// `:def`, `:decl` and `:impl` funnels into once the reply lands, and it
+    /// is the seam where the same-buffer and cross-buffer cases record the
+    /// jump differently. A synthetic answer reaches it directly, so the two
+    /// halves of that `if` are covered by something other than a full LSP
+    /// handshake.
+    fn goto(ed: &mut Editor, path: &str, line: u32, character: u32) {
+        let position = crate::lsp::types::Position { line, character };
+        let range = crate::lsp::types::Range { start: position, end: position };
+        let window = ed.focus();
+        ed.apply_goto(
+            lsp::Goto::Definition,
+            window,
+            vec![(PathBuf::from(path), range)],
+            crate::lsp::pos::Encoding::Utf8,
+        );
+    }
+
+    /// `gd` onto a name in the file already on screen: `show` no-ops on a
+    /// buffer that is not changing, so the guard in `apply_goto` is what
+    /// records the call site — exactly once.
+    #[test]
+    fn gd_within_one_file_records_the_call_once() {
+        let d = ScratchDir::new("goto-here").written("a.rs", "call()\nfn here() {}\n");
+        let a = format!("{}/a.rs", d.path());
+        let mut ed = Editor::open(a.clone()).unwrap();
+
+        goto(&mut ed, &a, 1, 3);
+
+        assert_eq!(ed.cursor_row().unwrap(), 1, "went to the definition");
+        assert_eq!(ed.window().text().unwrap().jumps.len(), 1, "the call site, once");
+    }
+
+    /// The spec's own bullet: "`gd` into another file, `Ctrl-O`, is back in
+    /// the first file at the call". The cross-buffer half of the guard —
+    /// `show` records this one, and `apply_goto` must not record it a second
+    /// time, or `Ctrl-O` would spend a press going nowhere.
+    #[test]
+    fn gd_into_another_file_records_once_and_ctrl_o_is_back_at_the_call() {
+        let d = ScratchDir::new("goto-cross")
+            .written("a.rs", "one\ncall()\n")
+            .written("b.rs", "fn here() {}\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let a = ed.window().buffer().unwrap();
+        ed.apply(cmd(Action::Move(Motion::Line(2)))); // the call, row 1
+        let call = ed.cursor().unwrap().at;
+        let recorded = ed.window().text().unwrap().jumps.len();
+
+        goto(&mut ed, &format!("{}/b.rs", d.path()), 0, 3);
+
+        assert_ne!(ed.window().buffer(), Some(a), "b.rs is on screen");
+        assert_eq!(
+            ed.window().text().unwrap().jumps.len(),
+            recorded + 1,
+            "the file switch recorded the call site, and only `show` recorded it"
+        );
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+        assert_eq!(ed.window().buffer(), Some(a), "back in a.rs");
+        assert_eq!(ed.cursor().unwrap().at, call, "at the call");
+    }
+
+    /// A tree pane has no rope and no jump list; `Ctrl-O` there says so
+    /// rather than reaching for a `Text` that is not in the window.
+    #[test]
+    fn a_walk_in_a_tree_window_says_there_is_no_buffer() {
+        let d = ScratchDir::new("jump-tree").written("a.rs", "one\ntwo\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        sized(&mut ed);
+        ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+        assert!(ed.window().tree().is_some(), "the tree pane has focus");
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert!(
+            ed.session.status.contains("no buffer in this window"),
+            "status was {:?}",
+            ed.session.status
+        );
+    }
+
+    /// `''` is one entry of the same list, so it crosses files like the walk
+    /// does — and toggles, because each press records the place it left.
+    #[test]
+    fn quote_quote_toggles_across_files() {
+        let d =
+            ScratchDir::new("jump-last-cross").written("a.rs", "one\n").written("b.rs", "two\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let a = ed.window().buffer().unwrap();
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+        let b = ed.window().buffer().unwrap();
+
+        ed.apply(cmd(Action::JumpLast));
+        assert_eq!(ed.window().buffer(), Some(a), "back in a.rs");
+        ed.apply(cmd(Action::JumpLast));
+        assert_eq!(ed.window().buffer(), Some(b), "and b.rs again");
+    }
+
+    /// The cap is the window's, not the value type's alone: a hundred and
+    /// five jumps through the real dispatch leave a hundred entries.
+    #[test]
+    fn the_windows_list_stops_at_a_hundred() {
+        let text: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        let mut ed = editor(&text);
+        for row in 1..=(crate::jumps::CAP + 5) {
+            ed.apply(cmd(Action::Move(Motion::Line(row))));
+        }
+        assert_eq!(ed.window().text().unwrap().jumps.entries().len(), crate::jumps::CAP);
+    }
+
+    /// Pins `docs/specs/jumplist.md` §"Deviations from the design" #2, which
+    /// is intended behaviour and not a bug to be helpfully fixed: a delete
+    /// whose end coincides with a recorded entry remaps that entry onto the
+    /// cursor's own position, and `Ctrl-O` pressed right there steps *past*
+    /// it — the same top-dedupe that makes `n n n` record once. The entry did
+    /// not vanish; it collapsed into the position the cursor already holds.
+    /// (`a_jump_above_a_deleted_block_still_lands_on_the_same_text` is the
+    /// same setup with one near motion in between, which is why that one
+    /// lands on "target" and this one does not.)
+    #[test]
+    fn deleting_the_recorded_line_steps_past_it() {
+        let mut ed = editor("keep\nx\ny\nz\ntarget\n");
+        ed.settle(); // the fixture's own construction edit, drained before the jump
+        ed.apply(cmd(Action::Move(Motion::LastLine))); // records row 0
+        ed.apply(cmd(Action::Move(Motion::Line(2)))); // records row 4, "target"
+        ed.apply(operate(Operator::Delete, Motion::CurrentLine, 3)); // takes "x\ny\nz\n"
+        ed.settle();
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert_eq!(
+            ed.buffer().unwrap().rope().line(ed.cursor_row().unwrap()).to_string().trim(),
+            "keep",
+            "the entry the cursor is already on is stepped past, not returned to"
+        );
+    }
+
+    /// A walk out of Visual mode leaves Visual, exactly as `Esc` would: the
+    /// walk plants one collapsed cursor, possibly in another file, and a
+    /// selection anchored where you no longer are is not one anybody asked
+    /// for. (Visual falls through to normal's keymap for `Ctrl-O`, so this is
+    /// reachable from the keyboard.)
+    #[test]
+    fn a_walk_out_of_visual_mode_leaves_visual_first() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.apply(cmd(Action::Move(Motion::LastLine))); // records row 0
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+
+        assert_eq!(ed.session.mode, Mode::Normal, "back in normal mode");
+        assert_eq!(ed.cursor_row().unwrap(), 0, "and the walk still moved");
+        assert_eq!(ed.selections().unwrap().primary().range().0, ed.cursor().unwrap().at);
     }
 
     // ---- scrolling ---------------------------------------------------------
