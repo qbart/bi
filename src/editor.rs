@@ -17,6 +17,7 @@ use crate::dap;
 use crate::encoding::{FileFormat, OpenHow};
 use crate::history::Cursors;
 use crate::img::Img;
+use crate::jumps::Jump;
 use crate::lsp;
 use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::{Item, Picker, PickerKind, REGISTER_MIN_LEN};
@@ -2821,6 +2822,8 @@ pub struct View<'a> {
     pub height: &'a mut usize,
     pub width: usize,
     pub session: &'a mut Session,
+    /// This window's `Ctrl-O`/`Ctrl-I` history, for [`View::record_jump`].
+    pub jumps: &'a mut crate::jumps::Jumps,
 }
 
 /// Picks a grammar from the file's name. An unknown one yields `None`, which
@@ -4005,6 +4008,7 @@ impl Editor {
             height,
             width,
             session: &mut self.session,
+            jumps: &mut text.jumps,
         })
     }
 
@@ -4064,6 +4068,25 @@ impl Editor {
         Ok(id)
     }
 
+    /// Records the place `window`'s cursor is at right now, before whatever
+    /// call site moves it — a jump is the position being LEFT, not the one
+    /// arrived at, so every caller sits before its move rather than after.
+    /// See `docs/specs/jumplist.md` §"What a jump is". A window showing
+    /// anything other than text (a tree, Results, an image) has no jump list
+    /// of its own and this is a no-op.
+    fn record_jump_in(&mut self, window: WindowId) {
+        if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
+            let jump = Jump { buffer: text.buffer, at: text.selections.primary().head.at };
+            text.jumps.push(jump);
+        }
+    }
+
+    /// [`Editor::record_jump_in`] for the focused window — the common case,
+    /// since most jumps happen wherever the cursor already is.
+    fn record_jump(&mut self) {
+        self.record_jump_in(self.focus);
+    }
+
     /// Points a window at another buffer, saving where it was and restoring
     /// where it last was in the one it is entering.
     fn show(&mut self, window: WindowId, to: BufferId) {
@@ -4072,11 +4095,18 @@ impl Editor {
         if from == Some(to) {
             return;
         }
+        // Every switch of what a window shows is a jump — `docs/specs/jumplist.md`
+        // §"Where it hooks in" — recorded before `touch`/`show` replace the
+        // window's `Text` with one pointed at `to`.
+        self.record_jump_in(window);
         self.touch(to);
         let Some(current) = self.window_of(window) else { return };
 
         // Leaving a buffer writes where this window was into the entry, whether
-        // what replaces it is another buffer or a tree.
+        // what replaces it is another buffer or a tree. The jump list comes
+        // along too: it is the window's history, not this buffer's, and must
+        // survive the switch to answer a `Ctrl-O` made after several more.
+        let jumps = current.text().map(|text| text.jumps.clone()).unwrap_or_default();
         if let Some(from) = from {
             let leaving = current.text().map(|text| text.selections.as_pairs()).unwrap_or_default();
             self.entry_mut(from).last = leaving;
@@ -4094,6 +4124,7 @@ impl Editor {
             .collect();
 
         let mut text = Text::new(to);
+        text.jumps = jumps;
         if !last.is_empty() {
             text.selections = Selections::from_pairs(last);
         }
@@ -6721,6 +6752,10 @@ impl Editor {
                 }
             }
             ExLine::Goto(address) => {
+                // `View::goto_row` has no way back to the window's `Text`
+                // (see its own doc comment), so `:{n}` records here instead —
+                // its one call site.
+                self.record_jump();
                 self.in_view(|view| view.goto(address));
             }
             ExLine::WriteQuit { path, force } => {
@@ -7928,6 +7963,11 @@ impl Editor {
         let window = self.debug_source_window();
         match self.open_path(path) {
             Ok(id) => {
+                // Recorded only once the open has succeeded, so a bad path
+                // never records a jump nothing actually made. If this also
+                // switches buffers, `show` records the identical position
+                // right after and dedupes against it — see `Jumps::push`.
+                self.record_jump_in(window);
                 self.show(window, id);
                 // Column 0: DAP's `column` is in units the adapter never
                 // names (bi's LSP side only gets this right by carrying an
@@ -9096,6 +9136,12 @@ impl Editor {
                 return;
             }
         };
+        // A goto that lands back in the buffer already shown is a jump
+        // `show` will not see: it no-ops when the buffer does not change.
+        // A goto into a different buffer is `show`'s to record instead.
+        if self.window_of(window).and_then(Window::buffer) == Some(id) {
+            self.record_jump_in(window);
+        }
         self.show(window, id);
         let at = lsp::pos::char_of(self.entry(id).buffer.rope(), range.start, encoding);
         if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
@@ -10355,6 +10401,15 @@ impl View<'_> {
         *self.options = resolve_options(self.session, *self.filetype, self.buffer.path.as_deref());
     }
 
+    /// Records where the cursor is right now, before a far motion carries it
+    /// somewhere `Ctrl-O` could not otherwise find its way back from. See
+    /// `docs/specs/jumplist.md` §"What a jump is" — a jump is the place being
+    /// LEFT, so this always runs before the move it guards, never after.
+    fn record_jump(&mut self) {
+        let jump = Jump { buffer: self.id, at: self.selections.primary().head.at };
+        self.jumps.push(jump);
+    }
+
     /// Everything that needs the rope. What does not — the window tree, the
     /// buffer list, the command line, the picker — was handled by `Editor`
     /// before this view existed.
@@ -10874,6 +10929,13 @@ impl View<'_> {
             Action::CompleteNext | Action::CompletePrev => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
+                // A far motion is a jump — `docs/specs/jumplist.md` §"What a
+                // jump is" — recorded before `for_each_selection` moves the
+                // head. An operator over the same motion (`d/foo`) dispatches
+                // through `Action::Operate` instead, so it never reaches here.
+                if m.is_jump() {
+                    self.record_jump();
+                }
                 // `$` in a block is a ragged right edge rather than a column,
                 // and any other motion gives the edge back to the head.
                 if self.session.mode.visual() == Some(Shape::Block) {
@@ -12166,6 +12228,12 @@ impl View<'_> {
     }
 
     /// Puts the cursor on a one-based row.
+    ///
+    /// `:{n}` is a jump (`docs/specs/jumplist.md`), but the recording happens
+    /// at this method's one call site (`ExLine::Goto` in the ex dispatcher)
+    /// rather than here: a `View` borrows the selections and buffer out of a
+    /// window without the window itself, so it has no way to reach that
+    /// window's `Text::jumps`.
     fn goto_row(&mut self, row: usize) {
         let cursor = self.buffer.at_row(row.saturating_sub(1), false);
         *self.selections = Selections::single(cursor);
@@ -18803,6 +18871,73 @@ mod tests {
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "XbXc");
         ed.apply(cmd(Action::RepeatChange { count: None }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "Xc");
+    }
+
+    // ---- jump list ----------------------------------------------------------
+    //
+    // `docs/specs/jumplist.md`'s "Where it hooks in": the walk (`Ctrl-O`) is a
+    // later task; these only cover recording, at the three seams.
+
+    /// A jump records where it left, and nothing else does.
+    #[test]
+    fn far_motions_record_a_jump_and_near_ones_do_not() {
+        let mut ed = editor("a\nb\nc\nd\n");
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        assert!(ed.window().text().unwrap().jumps.is_empty(), "j is not a jump");
+        ed.apply(cmd(Action::Move(Motion::LastLine)));
+        let jumps = &ed.window().text().unwrap().jumps;
+        assert_eq!(jumps.len(), 1);
+        assert_eq!(ed.cursor_row().unwrap(), 3);
+    }
+
+    /// A motion under an operator is a range, not a move — `d/foo` never
+    /// reaches `Action::Move` at all.
+    #[test]
+    fn an_operator_over_a_far_motion_records_nothing() {
+        let mut ed = editor("a\nb\nc\n");
+        ed.apply(operate(Operator::Delete, Motion::LastLine, 1));
+        assert!(ed.window().text().unwrap().jumps.is_empty());
+    }
+
+    /// Every switch of what a window shows is a jump, and the list survives
+    /// the switch — it is the window's history, not the buffer's.
+    #[test]
+    fn switching_buffers_records_the_place_left() {
+        let d = ScratchDir::new("jump-switch").written("a.rs", "a\nb\nc\n").written("b.rs", "x\n");
+        let mut ed = Editor::open(format!("{}/a.rs", d.path())).unwrap();
+        let first = ed.window().buffer().unwrap();
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        let left = ed.cursor().unwrap().at;
+
+        ex(&mut ed, &format!("e {}/b.rs", d.path()));
+
+        assert_ne!(ed.window().buffer(), Some(first), "the window now shows b.rs");
+        let jumps = &ed.window().text().unwrap().jumps;
+        assert_eq!(jumps.len(), 1, "the switch recorded one jump");
+        let mut probe = jumps.clone();
+        // Not walking, so `back` pushes a throwaway "now" and returns the
+        // entry before it — the one the switch recorded.
+        let recorded = probe.back(Jump { buffer: BufferId(u32::MAX), at: 0 }, 1);
+        assert_eq!(recorded, Some(Jump { buffer: first, at: left }));
+    }
+
+    /// `n` `n` `n` over one hit records once: the first search is the jump,
+    /// and every repeat leaves the cursor exactly where the last one put it,
+    /// so each records the same "place left" as the entry already on top.
+    #[test]
+    fn repeating_a_search_over_one_hit_records_once() {
+        let mut ed = editor("foo\nbar\n");
+        search_for(&mut ed, "foo", true);
+        assert_eq!(ed.window().text().unwrap().jumps.len(), 1, "the search itself is a jump");
+
+        for _ in 0..3 {
+            ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
+        }
+        assert_eq!(
+            ed.window().text().unwrap().jumps.len(),
+            1,
+            "n n n over the one hit dedupes against the top entry each time"
+        );
     }
 
     // ---- scrolling ---------------------------------------------------------
