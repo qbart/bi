@@ -40,6 +40,7 @@ pub mod history;
 pub mod img;
 pub mod indent;
 pub mod input;
+pub mod jumps;
 pub mod key;
 pub mod label;
 pub mod lsp;

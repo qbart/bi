@@ -188,6 +188,7 @@ const LIB_MODULES: &[&str] = &[
     "img.rs",
     "indent.rs",
     "input.rs",
+    "jumps.rs",
     "key.rs",
     "label.rs",
     "lsp/client.rs",
