@@ -4162,9 +4162,10 @@ impl Editor {
         if target.buffer != from.buffer {
             self.show_without_recording(focus, target.buffer);
         }
-        // Clamped: another window may have edited that buffer since this
-        // walk's entry was last touched, past where `drain_edits` could
-        // have shifted it for a window not looking at it yet.
+        // Clamped as a backstop. `drain_edits` shifts every window's entries
+        // through every buffer's edits, so a stale offset should not happen;
+        // but a buffer reverted or reloaded from disk is not an edit, and an
+        // entry past the end must land on the end rather than panic.
         let len = self.entry(target.buffer).buffer.rope().len_chars();
         let at = target.at.min(len);
         if let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) {

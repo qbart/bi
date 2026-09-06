@@ -28,7 +28,8 @@ whole:
 - `G`, `gg`, `:{n}` — [`Motion::FirstLine`], [`LastLine`], [`Line`]
 - `/`, `?`, `n`, `N`, `*`, `#` — [`Motion::Search`], [`Found`]
 - `%` — [`Motion::MatchingBracket`]
-- `(`, `)`, `{`, `}` — [`Motion::Paragraph`] (and sentences, when bi has them)
+- `{`, `}` — [`Motion::Paragraph`] (`(`, `)` join them the day bi has
+  sentence motions; it has none today)
 - any switch of what a window shows: `gd`/`gr`/`:def`/`:decl`/`:impl`, the
   file and buffer pickers, `:e`, `:b`, `Ctrl-^`, a Results row, a tree entry,
   a debugger frame, `:find` hits
