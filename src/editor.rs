@@ -4122,6 +4122,16 @@ impl Editor {
     /// list without recording anything — the walk itself is not a jump. See
     /// `docs/specs/jumplist.md` §"Where it hooks in".
     fn walk_jumps(&mut self, which: Walk) {
+        // A walk out of Visual mode leaves Visual first, exactly as `Esc`
+        // would. The walk ends by planting one collapsed cursor somewhere
+        // else — possibly in another file — and a selection whose anchor
+        // stayed behind is not a selection anyone asked for; staying in the
+        // mode would leave the status line claiming VISUAL over a range that
+        // no longer exists. `Action::EnterNormal` rather than a mode
+        // assignment, so this is the same exit `Esc` performs, forever.
+        if self.session.mode.visual().is_some() {
+            self.apply(cmd_of(Action::EnterNormal));
+        }
         let focus = self.focus;
         let ids = self.buffer_ids();
         let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) else {
@@ -4146,11 +4156,11 @@ impl Editor {
             return;
         };
 
-        // A target in another buffer means switching what the window shows
-        // — through `show`, but never recording: the walk must not add a
-        // fresh entry to the very list it is moving through.
+        // A target in another buffer means switching what the window shows —
+        // through the one spelling of `show` that records nothing: the walk
+        // must not add a fresh entry to the list it is moving through.
         if target.buffer != from.buffer {
-            self.show(focus, target.buffer, false);
+            self.show_without_recording(focus, target.buffer);
         }
         // Clamped: another window may have edited that buffer since this
         // walk's entry was last touched, past where `drain_edits` could
@@ -4163,13 +4173,29 @@ impl Editor {
     }
 
     /// Points a window at another buffer, saving where it was and restoring
-    /// where it last was in the one it is entering.
+    /// where it last was in the one it is entering, and recording the place
+    /// left in the window's jump list.
     ///
-    /// `record` is false only for the `Ctrl-O`/`Ctrl-I` walk (`walk_jumps`):
-    /// every other caller is switching what the window shows because of an
-    /// actual jump, and wants it in the list; the walk itself must not add
-    /// to the very list it is moving through.
-    fn show(&mut self, window: WindowId, to: BufferId, record: bool) {
+    /// Recording is not optional here, and that is the point: every switch of
+    /// what a window shows is a jump (`docs/specs/jumplist.md` §"Where it
+    /// hooks in"), so the default has no business being spellable at a call
+    /// site. The single exception has its own name —
+    /// [`Editor::show_without_recording`].
+    fn show(&mut self, window: WindowId, to: BufferId) {
+        self.switch(window, to, true);
+    }
+
+    /// [`Editor::show`] for the one caller that must not record: the
+    /// `Ctrl-O`/`Ctrl-I` walk, which would otherwise add a fresh entry to the
+    /// very list it is moving through — and the walk is not a jump.
+    fn show_without_recording(&mut self, window: WindowId, to: BufferId) {
+        self.switch(window, to, false);
+    }
+
+    /// The shared body of the two above. Private, and reached only through
+    /// them, so `record` is a fact about which of the two was called rather
+    /// than a flag anyone can get backwards.
+    fn switch(&mut self, window: WindowId, to: BufferId, record: bool) {
         let Some(current) = self.window_of(window) else { return };
         let from = current.buffer();
         if from == Some(to) {
@@ -4350,7 +4376,7 @@ impl Editor {
         };
 
         if let Some(target) = target {
-            self.show(focus, target, true);
+            self.show(focus, target);
             self.session.status = self.name_of(target);
         }
     }
@@ -4401,7 +4427,7 @@ impl Editor {
         if let Some(w) = orphan {
             let heir =
                 if ids.len() == 1 { self.fresh_scratch() } else { ids[(at + 1) % ids.len()] };
-            self.show(w, heir, true);
+            self.show(w, heir);
         }
 
         // A stable id that resolves to nothing is the one way it is worse than
@@ -5353,7 +5379,7 @@ impl Editor {
         match self.open_path(&path.to_string_lossy()) {
             Ok(id) => {
                 let Some(target) = target(self) else { return };
-                self.show(target, id, true);
+                self.show(target, id);
                 self.set_focus(target);
                 self.session.status = self.name_of(id);
             }
@@ -5616,7 +5642,7 @@ impl Editor {
                 // Through `show`, so the new window records where the
                 // duplicated one was before it moves off that buffer.
                 if let Some(id) = buffer {
-                    self.show(new, id, true);
+                    self.show(new, id);
                 }
             }
 
@@ -5633,7 +5659,7 @@ impl Editor {
                     None => focus,
                 };
                 let id = self.fresh_scratch();
-                self.show(target, id, true);
+                self.show(target, id);
             }
 
             WindowCmd::Pick => self.pick_window(),
@@ -6248,7 +6274,7 @@ impl Editor {
         };
         match self.open_path(path) {
             Ok(id) => {
-                self.show(target, id, true);
+                self.show(target, id);
                 self.set_focus(target);
                 self.session.status = match fallback {
                     Some(why) => format!("\"{}\" opened as text — {why}", self.name_of(id)),
@@ -6329,7 +6355,7 @@ impl Editor {
             return;
         }
         if let Some(&id) = self.mru_ids().first() {
-            self.show(window, id, true);
+            self.show(window, id);
             // `show` parked the image as the alternate; delete discards.
             if let Some(w) = self.window_mut_of(window) {
                 w.alt = None;
@@ -7476,15 +7502,22 @@ impl Editor {
             for window in self.windows.iter_mut() {
                 let id = window.id;
                 let Some(text) = window.text_mut() else { continue };
+
+                // Above the "does this window show the edited buffer" guard,
+                // and deliberately: a jump list is the *window's* history and
+                // holds entries in files this window is not looking at right
+                // now, which nothing else would ever shift. Skipping those
+                // windows is how a `Ctrl-O` into another file lands in the
+                // middle of the wrong function. `Jumps::remap` does its own
+                // per-entry filtering by buffer, so every list can be offered
+                // every buffer's edits. Focused window included: nothing else
+                // moves its entries the way the selection remap below moves
+                // its cursor. See `docs/specs/jumplist.md` §"Where it hooks in".
+                text.jumps.remap(entry.id, &edits);
+
                 if text.buffer != entry.id {
                     continue;
                 }
-
-                // Every window on this buffer follows the edit through its
-                // jump list, focused window included: nothing else moves its
-                // entries the way the selection remap below moves its
-                // cursor. See `docs/specs/jumplist.md` §"Where it hooks in".
-                text.jumps.remap(entry.id, &edits);
 
                 // The window that made the edit already has the right cursor:
                 // the command that moved the text moved it too. Mapping it
@@ -8069,7 +8102,7 @@ impl Editor {
                 if self.window_of(window).and_then(Window::buffer) == Some(id) {
                     self.record_jump_in(window);
                 }
-                self.show(window, id, true);
+                self.show(window, id);
                 // Column 0: DAP's `column` is in units the adapter never
                 // names (bi's LSP side only gets this right by carrying an
                 // explicit encoding across the wire — see `lsp::pos`) and the
@@ -9243,7 +9276,7 @@ impl Editor {
         if self.window_of(window).and_then(Window::buffer) == Some(id) {
             self.record_jump_in(window);
         }
-        self.show(window, id, true);
+        self.show(window, id);
         let at = lsp::pos::char_of(self.entry(id).buffer.rope(), range.start, encoding);
         if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
             text.selections = Selections::from_pairs(vec![(at, at)]);
