@@ -1707,7 +1707,12 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         // cursor position to report either.
         Some(Pane::DapStack { stack, .. }) => ("Stack".into(), format!("{} frames", stack.frames.len())),
         Some(Pane::DapConsole { console, .. }) => {
-            ("Console".into(), format!("{} lines", console.lines.len()))
+            // `! <cmd>` while a `:!` job runs, `! <cmd> — exited <n>` /
+            // `— killed` / `— signal` after — see `Editor::shell_title` and
+            // `docs/specs/shell.md`. Plain "Console" before any `:!` has run,
+            // or while it is showing debuggee output instead.
+            let name = ed.shell_title().unwrap_or_else(|| "Console".into());
+            (name, format!("{} lines", console.lines.len()))
         }
         Some(Pane::DapVariables { vars, .. }) => {
             ("Variables".into(), format!("{} rows", vars.visible().len()))

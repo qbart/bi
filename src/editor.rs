@@ -5,6 +5,7 @@
 //! produces actions too and nothing here changes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -25,6 +26,7 @@ use crate::range::{Address, Scope, Where};
 use crate::region::{Region, Shape};
 use crate::registers::{Entry, Registers, Sink};
 use crate::selection::{Selection, Selections};
+use crate::shell;
 use crate::syntax::Syntax;
 use crate::theme::Theme;
 use crate::tree::{ClipMode, Clipboard, Kind, Mark, Tree, copy_into, move_into};
@@ -450,6 +452,9 @@ pub enum Action {
     /// session, or the ex surface that starts, stops or attaches one. See
     /// `docs/specs/debug.md`.
     Debug(DebugCmd),
+    /// A key in the Console pane, or the ex surface that starts or stops a
+    /// job. See `docs/specs/shell.md`.
+    Shell(ShellCmd),
 }
 
 impl Action {
@@ -1783,6 +1788,9 @@ enum ExLine {
     /// `:debug`, `:debug stop`, `:debug attach`, `:break` — see
     /// `docs/specs/debug.md`.
     Debug(DebugCmd),
+    /// `:!cmd`, `:!!`, `:stop`, and the filter/read/write spellings. See
+    /// `docs/specs/shell.md`.
+    Shell(ShellCmd),
     /// `:definition` — `gd`. See `docs/specs/lsp-requests.md`.
     Definition,
     /// `:decl` — the declaration: the header's side of the question, where
@@ -2008,6 +2016,25 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // split-and-rejoin below.
     if let Some(parsed) = parse_global(line, scope) {
         return Some(parsed);
+    }
+
+    // `:!cmd` and `:!!`, off the whole line for the same reason `:g`'s
+    // pattern is: the command may itself contain anything, including
+    // whitespace, and must not go through the name/argument split below. A
+    // scope in front (`:%!sort`) is a filter, not a job — Task 3's, so it
+    // falls through unhandled here and lands wherever the table below sends
+    // a command line named `!...` today (its "takes no range" check, since
+    // no such name is on the range whitelist).
+    if scope.is_none()
+        && let Some(rest) = line.strip_prefix('!')
+    {
+        return Some(if rest == "!" {
+            ExLine::Shell(ShellCmd::Repeat)
+        } else if rest.trim().is_empty() {
+            ExLine::Error("run what?".into())
+        } else {
+            ExLine::Shell(ShellCmd::Run(rest.trim().to_string()))
+        });
     }
 
     let (cmd, arg) = match line.split_once(char::is_whitespace) {
@@ -2281,6 +2308,8 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         }
         "wq" | "x" => ExLine::WriteQuit { path: arg.into(), force },
         "reload" => ExLine::ReloadConfig,
+        // `:stop` — ends the live `:!` job. See `docs/specs/shell.md`.
+        "stop" => ExLine::Shell(ShellCmd::Stop),
         // A bare line number never reaches here: it is a range with no
         // command, and was handled before the table.
         _ => ExLine::Unknown(name.into()),
@@ -2416,6 +2445,40 @@ pub enum DebugPane {
     Console,
     Variables,
     Watches,
+}
+
+/// `:!cmd`, `:!!`, `:stop` and the filter/read/write spellings — see
+/// `docs/specs/shell.md`. `Run`/`Repeat`/`Stop` are Task 2's, dispatched in
+/// `Editor::run_shell_cmd`; `Filter`/`Read`/`Write` are parsed here (Task 3
+/// claims their scope, so the ex parser learns the whole family in one
+/// enum) but dispatch to explicit no-ops until Task 3 wires them up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellCmd {
+    /// `:!cmd` — a background job. `%`/`#` are expanded before it runs.
+    Run(String),
+    /// `:!!` — the last `Run`, again.
+    Repeat,
+    /// `:stop` — ends the live job, if there is one.
+    Stop,
+    /// `:{range}!cmd` — replaces the range's lines with the command's
+    /// stdout, as one edit. `scope` is `None` for the current line, as in
+    /// vim. Task 3.
+    Filter {
+        scope: Option<Scope>,
+        cmd: String,
+    },
+    /// `:[range]r !cmd` — inserts stdout below the cursor line or the
+    /// range's last line. Task 3.
+    Read {
+        scope: Option<Scope>,
+        cmd: String,
+    },
+    /// `:[range]w !cmd` — feeds the lines (default: the whole buffer) to
+    /// the command's stdin and shows its output in the Console. Task 3.
+    Write {
+        scope: Option<Scope>,
+        cmd: String,
+    },
 }
 
 /// `DebugCmd::AttachPid` and `DebugCmd::AttachTo`'s shared resolution —
@@ -2765,6 +2828,30 @@ pub struct Editor {
     /// An install begun and not yet reported: the server's name, and the slot
     /// its thread fills. One at a time — the slot is the whole queue.
     pending_install: Option<(String, InstallSlot)>,
+    /// The live `:!` job, if there is one. One at a time — see
+    /// `docs/specs/shell.md` §Jobs. Drained by `pump_shell` in `settle`, and
+    /// dropped (never killed by the drop itself) once its exit is reported.
+    shell: Option<shell::Job>,
+    /// The last `:!cmd` typed, for `:!!` to repeat. Never the expanded
+    /// form — `%`/`#` expand fresh against whatever the focused buffer and
+    /// its alternate are *this* time.
+    last_bang: Option<String>,
+    /// How a job comes to exist — a test's fake, or an embedding host with
+    /// no processes to spawn. `None` is the frontend that supplies none:
+    /// `:!` then says so rather than silently doing nothing. See
+    /// `docs/specs/shell.md` and `Editor::set_shell_spawner`.
+    shell_spawner: Option<Box<dyn shell::Spawn>>,
+    /// Registered by `Editor::set_shell_waker`; rung by the job's reader and
+    /// waiter threads. A no-op until a frontend supplies one, so a headless
+    /// embedder that never registers a waker just never gets rung.
+    shell_waker: Arc<dyn Fn() + Send + Sync>,
+    /// What the Console pane's title shows in place of "Console" — `!
+    /// <cmd>` while a job runs, `! <cmd> — exited <n>` / `— killed` /
+    /// `— signal` after. Set at spawn and at exit; outlives the `Job` itself
+    /// (which `pump_shell` drops once its exit is reported), so the last
+    /// run's verdict stays on the title until the next one overwrites it.
+    /// Read through `Editor::shell_title`.
+    shell_title: Option<String>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -3312,6 +3399,11 @@ impl Editor {
             fmt_runner: None,
             installer: None,
             pending_install: None,
+            shell: None,
+            last_bang: None,
+            shell_spawner: None,
+            shell_waker: Arc::new(|| {}),
+            shell_title: None,
         };
         // The session's root, resolved once and stored — the single fact the
         // tree, the pickers and `:find` all read. Only `bi <dir>` / `:e
@@ -6833,6 +6925,7 @@ impl Editor {
             ExLine::Themes => self.open_theme_picker(),
             ExLine::Lsp(cmd) => self.run_lsp(cmd),
             ExLine::Debug(cmd) => self.debug_command(cmd),
+            ExLine::Shell(cmd) => self.run_shell_cmd(cmd),
             ExLine::Definition => self.lsp_goto(lsp::Goto::Definition),
             ExLine::Declaration => self.lsp_goto(lsp::Goto::Declaration),
             ExLine::Implementation => self.lsp_goto(lsp::Goto::Implementation),
@@ -7364,6 +7457,7 @@ impl Editor {
             Action::Window(window_cmd) => self.run_window_cmd(window_cmd),
             Action::Tree(tree_cmd) => self.run_tree_cmd(tree_cmd),
             Action::Debug(debug_cmd) => self.debug_command(debug_cmd),
+            Action::Shell(shell_cmd) => self.run_shell_cmd(shell_cmd),
             Action::Results(results_cmd) => {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
             }
@@ -7463,6 +7557,7 @@ impl Editor {
         self.flush_saves();
         self.pump_lsp();
         self.pump_dap();
+        self.pump_shell();
         // The pump can itself edit — a `:format` answer — so the drain runs
         // once more: the parse tree and the servers see those edits before
         // the frame that shows them, not one keystroke later.
@@ -8290,11 +8385,15 @@ impl Editor {
     /// `Effect::Scopes` only reaches panes that were already open when it
     /// arrived.
     fn open_debug_pane(&mut self, pane: DebugPane) {
+        if pane == DebugPane::Console {
+            self.console_window();
+            return;
+        }
         let kind = match pane {
             DebugPane::Stack => ContentKind::DapStack,
-            DebugPane::Console => ContentKind::DapConsole,
             DebugPane::Variables => ContentKind::DapVariables,
             DebugPane::Watches => ContentKind::DapWatches,
+            DebugPane::Console => unreachable!("handled above"),
         };
         if let Some(id) = self.windows.iter().find(|w| w.content.kind() == kind).map(|w| w.id) {
             self.set_focus(id);
@@ -8303,11 +8402,9 @@ impl Editor {
         let Some(new) = self.split_focus(Dir::Horizontal) else { return };
         let content = match pane {
             DebugPane::Stack => Content::DapStack(DapStack { frames: Vec::new(), selected: 0 }),
-            DebugPane::Console => {
-                Content::DapConsole(Box::new(DapConsole { lines: Vec::new(), scroll: 0 }))
-            }
             DebugPane::Variables => Content::DapVariables(Box::default()),
             DebugPane::Watches => Content::DapWatches(DapWatches::default()),
+            DebugPane::Console => unreachable!("handled above"),
         };
         if let Some(window) = self.window_mut_of(new) {
             window.show(content);
@@ -8321,6 +8418,140 @@ impl Editor {
                 serde_json::json!({ "frameId": frame }),
                 dap::client::Intent::Scopes { frame },
             );
+        }
+    }
+
+    /// The "focus an existing Console window, else split and open one"
+    /// mechanics behind both `:debug console` and `:!` — factored out so a
+    /// job has somewhere to put its output without duplicating
+    /// `open_debug_pane`'s find-or-split dance. `None` means there was no
+    /// room to split; `split_focus` has already said so on the status line.
+    fn console_window(&mut self) -> Option<WindowId> {
+        if let Some(id) =
+            self.windows.iter().find(|w| w.content.kind() == ContentKind::DapConsole).map(|w| w.id)
+        {
+            self.set_focus(id);
+            return Some(id);
+        }
+        let new = self.split_focus(Dir::Horizontal)?;
+        if let Some(window) = self.window_mut_of(new) {
+            window.show(Content::DapConsole(Box::new(DapConsole { lines: Vec::new(), scroll: 0 })));
+        }
+        Some(new)
+    }
+
+    /// `ShellCmd::Run`/`Repeat`/`Stop` — everything else in the enum is
+    /// Task 3's, dispatched as an explicit no-op until then.
+    fn run_shell_cmd(&mut self, cmd: ShellCmd) {
+        match cmd {
+            ShellCmd::Run(cmd) => self.run_bang(cmd),
+            ShellCmd::Repeat => match self.last_bang.clone() {
+                Some(cmd) => self.run_bang(cmd),
+                None => self.session.status = "no previous !".into(),
+            },
+            ShellCmd::Stop => self.stop_shell(),
+            // Task 3: filters run synchronously through the fmt runner's
+            // process guard, not the job machinery above.
+            ShellCmd::Filter { .. } => {}
+            ShellCmd::Read { .. } => {}
+            ShellCmd::Write { .. } => {}
+        }
+    }
+
+    /// `:!cmd` and what `:!!` repeats. Refuses while a job is already live;
+    /// otherwise expands `%`/`#` against the focused buffer and its
+    /// alternate, opens or reuses the Console, delimits the run with `$
+    /// <cmd>`, and spawns. See `docs/specs/shell.md` §Jobs.
+    fn run_bang(&mut self, cmd: String) {
+        if self.shell_spawner.is_none() {
+            self.session.status = "! : this frontend supplies no runner".into();
+            return;
+        }
+        if let Some(job) = &mut self.shell
+            && job.handle.is_running()
+        {
+            self.session.status = format!("! is running {} — :stop it first", job.cmd);
+            return;
+        }
+        let current = self.window().buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        let alternate =
+            self.window().alt_buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        let current = current.map(|p| p.display().to_string());
+        let alternate = alternate.map(|p| p.display().to_string());
+        let expanded = match shell::expand(&cmd, current.as_deref(), alternate.as_deref()) {
+            Ok(expanded) => expanded,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        if self.console_window().is_none() {
+            return;
+        }
+        self.push_console_lines(&[format!("$ {expanded}")]);
+        let slot = shell::Slot::default();
+        let cwd = self.session_root();
+        let wake = self.shell_waker.clone();
+        let spawner = self.shell_spawner.as_ref().expect("checked is_none above");
+        match spawner.spawn(&expanded, &cwd, slot.clone(), wake) {
+            Ok(handle) => {
+                self.session.status = format!("! {expanded}");
+                self.shell_title = Some(format!("! {expanded}"));
+                self.shell = Some(shell::Job { cmd: expanded, slot, handle, exit: None });
+                self.last_bang = Some(cmd);
+            }
+            Err(message) => self.session.status = format!("! {message}"),
+        }
+    }
+
+    /// `:stop` — SIGTERM then SIGKILL, in `Handle::kill`'s order. Pins
+    /// `Exit::Killed`; the trailer and the status land on the next
+    /// `pump_shell`, same as a natural exit.
+    fn stop_shell(&mut self) {
+        if let Some(job) = &mut self.shell
+            && job.handle.is_running()
+        {
+            job.handle.kill();
+        } else {
+            self.session.status = "no job running".into();
+        }
+    }
+
+    /// Drains the live job's slot into the Console, every wake this reaches
+    /// through `settle`. `Line::Err` gets the `"! "` prefix `pump_dap`'s
+    /// stderr already wears; an exit appends its trailer line, sets the
+    /// status and the title, and drops the `Job` — its `Handle`'s `Drop`
+    /// does nothing to an already-finished process (see `shell::Handle`),
+    /// so this never kills a job that already ended on its own.
+    fn pump_shell(&mut self) {
+        let Some(job) = &mut self.shell else { return };
+        let (lines, exit) = job.slot.drain();
+        let cmd = job.cmd.clone();
+        if let Some(exit) = exit {
+            job.exit = Some(exit);
+        }
+        let mut out: Vec<String> = lines
+            .into_iter()
+            .map(|line| match line {
+                shell::Line::Out(text) => text,
+                shell::Line::Err(text) => format!("! {text}"),
+            })
+            .collect();
+        let trailer = exit.map(|exit| match exit {
+            shell::Exit::Code(n) => format!("exited {n}"),
+            shell::Exit::Signal => "signal".to_string(),
+            shell::Exit::Killed => "killed".to_string(),
+        });
+        if let Some(trailer) = &trailer {
+            out.push(trailer.clone());
+        }
+        if !out.is_empty() {
+            self.push_console_lines(&out);
+        }
+        if let Some(trailer) = trailer {
+            self.session.status = format!("! {trailer}");
+            self.shell_title = Some(format!("! {cmd} — {trailer}"));
+            self.shell = None;
         }
     }
 
@@ -10170,6 +10401,22 @@ impl Editor {
         self.dap.set_spawner(spawner);
     }
 
+    /// Registers how a `:!` job's reader and waiter threads wake the
+    /// frontend's event loop — the same handshake as [`Editor::set_dap_waker`].
+    /// Passed straight into `shell::Spawn::spawn` as the `wake` argument, so
+    /// it is what `pump_shell` in `settle` is rung by.
+    pub fn set_shell_waker(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.shell_waker = Arc::new(wake);
+    }
+
+    /// Replaces how `:!` jobs come to exist — a test's fake, or an embedding
+    /// host that has no processes to spawn. The lib boundary holds here
+    /// exactly as it does for LSP and DAP: the editor never spawns. See
+    /// `docs/specs/shell.md`.
+    pub fn set_shell_spawner(&mut self, spawner: impl shell::Spawn + 'static) {
+        self.shell_spawner = Some(Box::new(spawner));
+    }
+
     /// The debug registry — sessions and the editor-owned breakpoint store.
     pub fn dap(&self) -> &dap::Registry {
         &self.dap
@@ -10206,6 +10453,26 @@ impl Editor {
     /// left running behind it, which is a stopped process nobody owns.
     pub fn shutdown_dap(&mut self) {
         self.dap.shutdown_all(std::time::Duration::from_millis(200));
+    }
+
+    /// The same for a `:!` job: quitting with one running kills it on the
+    /// way out, so nothing is orphaned. Called once beside
+    /// [`Editor::shutdown_dap`]. The same `Handle::kill` `:stop` uses — its
+    /// exit never reaches the console because nothing pumps it again after
+    /// this, but nothing needs it to: the process is asked to end and
+    /// `Editor` is about to go away regardless.
+    pub fn shutdown_shell(&mut self) {
+        if let Some(job) = &mut self.shell
+            && job.handle.is_running()
+        {
+            job.handle.kill();
+        }
+    }
+
+    /// What the Console pane's title shows in place of "Console" — `None`
+    /// before any `:!` has run. See the `shell_title` field doc.
+    pub fn shell_title(&self) -> Option<String> {
+        self.shell_title.clone()
     }
 
     /// Installs how git baselines are fetched — [`crate::git::baseline`] from
@@ -11769,6 +12036,7 @@ impl View<'_> {
             | Action::Window(_)
             | Action::Tree(_)
             | Action::Debug(_)
+            | Action::Shell(_)
             | Action::Results(_) => {}
         }
     }
@@ -26184,6 +26452,179 @@ int main(void) {
 
             let hover = ed.session.hover.as_ref().expect("a float");
             assert_eq!(hover.lines, vec![HoverLine::Text("fn = 42".into())]);
+        }
+    }
+
+    /// `:!`, `:!!`, `:stop`, `pump_shell`, Console reuse, the lib-boundary
+    /// seam, and kill-on-quit — Task 2 of `docs/specs/shell.md`. Filters
+    /// (`:{range}!`, `:r !`, `:w !`) are Task 3's and untested here.
+    mod shell_integration {
+        use super::*;
+        use crate::shell::fake::FakeSpawn;
+        use crate::shell::{Exit, Line, Slot};
+
+        /// A project on disk, an editor opened on its main file, and a fake
+        /// behind the shell spawner — sized, so `console_window`'s split has
+        /// room. The same shape as `dap_integration::project`.
+        fn project(name: &str) -> (ScratchDir, Editor, FakeSpawn) {
+            let dir = ScratchDir::new(&format!("shell-{name}"))
+                .written("src/main.rs", "fn main() {}\n")
+                .written("src/alt.rs", "fn alt() {}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            sized(&mut ed);
+            let fake = FakeSpawn::default();
+            ed.set_shell_spawner(fake.clone());
+            (dir, ed, fake)
+        }
+
+        fn console_window(ed: &Editor) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&id| ed.content_kind_of(id) == Some(ContentKind::DapConsole))
+                .unwrap_or_else(|| panic!("no Console pane open"))
+        }
+
+        fn console_lines(ed: &Editor, id: WindowId) -> Vec<String> {
+            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
+                panic!("not a console pane")
+            };
+            console.lines.clone()
+        }
+
+        /// The most recently spawned command and the slot the editor is
+        /// draining — a test's hand on the job's output and exit.
+        fn last_spawned(fake: &FakeSpawn) -> (String, Slot) {
+            fake.spawned.lock().unwrap().last().cloned().expect("something was spawned")
+        }
+
+        #[test]
+        fn bang_runs_a_job_and_streams_into_the_console() {
+            let (_dir, mut ed, fake) = project("run");
+
+            ex(&mut ed, "!echo hi");
+
+            let spawned = fake.spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].0, "echo hi");
+            drop(spawned);
+            let id = console_window(&ed);
+            assert_eq!(console_lines(&ed, id), vec!["$ echo hi".to_string()]);
+
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("hi".into()));
+            slot.finish(Exit::Code(0));
+            ed.settle();
+
+            assert_eq!(
+                console_lines(&ed, id),
+                vec!["$ echo hi".to_string(), "hi".to_string(), "exited 0".to_string()]
+            );
+            assert_eq!(ed.session.status, "! exited 0");
+        }
+
+        #[test]
+        fn a_second_bang_while_running_is_refused() {
+            let (_dir, mut ed, fake) = project("second-bang");
+            ex(&mut ed, "!sleep 1");
+
+            ex(&mut ed, "!echo again");
+
+            assert!(ed.session.status.contains(":stop it first"), "{}", ed.session.status);
+            assert_eq!(fake.spawned.lock().unwrap().len(), 1, "the second bang never spawned");
+        }
+
+        #[test]
+        fn bang_bang_repeats_the_last_job() {
+            let (_dir, mut ed, fake) = project("repeat");
+            ex(&mut ed, "!echo hi");
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+            ed.settle();
+
+            ex(&mut ed, "!!");
+
+            let spawned = fake.spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 2);
+            assert_eq!(spawned[1].0, "echo hi");
+        }
+
+        #[test]
+        fn bang_bang_with_no_previous_job_says_so() {
+            let (_dir, mut ed, fake) = project("repeat-none");
+
+            ex(&mut ed, "!!");
+
+            assert!(ed.session.status.contains("no previous !"), "{}", ed.session.status);
+            assert!(fake.spawned.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn stop_kills_the_job() {
+            let (_dir, mut ed, fake) = project("stop");
+            ex(&mut ed, "!sleep 30");
+            let id = console_window(&ed);
+
+            ex(&mut ed, "stop");
+
+            assert_eq!(*fake.killed.lock().unwrap(), 1);
+            ed.settle();
+            assert_eq!(console_lines(&ed, id).last(), Some(&"killed".to_string()));
+            assert_eq!(ed.session.status, "! killed");
+        }
+
+        #[test]
+        fn stop_with_no_job_says_so() {
+            let (_dir, mut ed, _fake) = project("stop-none");
+
+            ex(&mut ed, "stop");
+
+            assert_eq!(ed.session.status, "no job running");
+        }
+
+        #[test]
+        fn quit_kills_a_running_job() {
+            let (_dir, mut ed, fake) = project("quit");
+            ex(&mut ed, "!sleep 30");
+
+            ed.shutdown_shell();
+
+            assert_eq!(*fake.killed.lock().unwrap(), 1);
+        }
+
+        #[test]
+        fn percent_expands_to_the_buffer_path() {
+            let (dir, mut ed, fake) = project("percent");
+            let path = format!("{}/src/main.rs", dir.path());
+
+            ex(&mut ed, "!echo %");
+
+            assert_eq!(fake.spawned.lock().unwrap()[0].0, format!("echo {path}"));
+        }
+
+        #[test]
+        fn stderr_lines_are_prefixed() {
+            let (_dir, mut ed, fake) = project("stderr");
+            ex(&mut ed, "!cmd");
+            let id = console_window(&ed);
+            let (_, slot) = last_spawned(&fake);
+
+            slot.push(Line::Err("oops".into()));
+            slot.finish(Exit::Code(1));
+            ed.settle();
+
+            assert!(console_lines(&ed, id).contains(&"! oops".to_string()));
+            assert_eq!(ed.session.status, "! exited 1");
+        }
+
+        #[test]
+        fn bang_on_a_headless_editor_says_no_runner() {
+            let dir = ScratchDir::new("shell-no-runner").written("src/main.rs", "fn main() {}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", dir.path())).unwrap();
+            sized(&mut ed);
+
+            ex(&mut ed, "!echo hi");
+
+            assert_eq!(ed.session.status, "! : this frontend supplies no runner");
         }
     }
 

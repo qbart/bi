@@ -381,20 +381,26 @@ pub mod fake {
             slot: Slot,
             _wake: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Box<dyn Handle>, String> {
-            self.spawned.lock().expect("spawned list poisoned").push((cmd.to_string(), slot));
-            Ok(Box::new(FakeHandle { killed: self.killed.clone(), running: true }))
+            self.spawned.lock().expect("spawned list poisoned").push((cmd.to_string(), slot.clone()));
+            Ok(Box::new(FakeHandle { killed: self.killed.clone(), running: true, slot }))
         }
     }
 
     pub struct FakeHandle {
         killed: Arc<Mutex<usize>>,
         running: bool,
+        /// The same slot the editor holds. `kill` files [`Exit::Killed`]
+        /// into it, matching [`Handle::kill`]'s documented contract — a
+        /// caller that only checked `is_running` and never drained the slot
+        /// would otherwise see a job that stays "running" forever.
+        slot: Slot,
     }
 
     impl Handle for FakeHandle {
         fn kill(&mut self) {
             *self.killed.lock().expect("killed count poisoned") += 1;
             self.running = false;
+            self.slot.finish(Exit::Killed);
         }
 
         fn is_running(&mut self) -> bool {

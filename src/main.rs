@@ -84,6 +84,9 @@ fn main() -> Result<()> {
     // like a language server, and spawning one is the host's business too.
     // See docs/specs/debug.md.
     editor.set_dap_spawner(bi::dap::transport::ProcessSpawn);
+    // `:!` jobs too — a shell command is another child process, and the
+    // library never spawns one itself. See docs/specs/shell.md.
+    editor.set_shell_spawner(bi::shell::ProcessSpawn);
     // External formatters too — `:fmt` through a tool is a child process,
     // and processes are the host's business. See docs/specs/fmt.md.
     editor.set_fmt_runner(bi::fmt::ProcessRun::default());
@@ -111,6 +114,8 @@ fn main() -> Result<()> {
     // And the debug adapters, for the stronger version of the same reason:
     // an adapter outliving bi keeps a *stopped debuggee* alive behind it.
     editor.shutdown_dap();
+    // And a running `:!` job — quitting on top of it must not orphan it.
+    editor.shutdown_shell();
     // Also before `restore`, for the same reason: leaving the alternate
     // screen does not take a kitty placement with it, and an editor that
     // quits leaving a photograph floating over the shell has not quit.
@@ -442,6 +447,7 @@ enum Wake {
     Term(Event),
     Lsp,
     Dap,
+    Shell,
 }
 
 fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> Result<()> {
@@ -465,11 +471,17 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
         }
     });
     let dap_tx = tx.clone();
+    let shell_tx = tx.clone();
     ed.set_lsp_waker(move || {
         let _ = tx.send(Wake::Lsp);
     });
     ed.set_dap_waker(move || {
         let _ = dap_tx.send(Wake::Dap);
+    });
+    // The `:!` job's reader and waiter threads wake the loop the same way.
+    // See docs/specs/shell.md.
+    ed.set_shell_waker(move || {
+        let _ = shell_tx.send(Wake::Shell);
     });
 
     let mut input = Input::default();
@@ -544,6 +556,9 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
                 Wake::Lsp => {}
                 // Same story for DAP — the settle below pumps its inbox too.
                 Wake::Dap => {}
+                // Same story for a `:!` job — the settle below pumps its
+                // slot too.
+                Wake::Shell => {}
             }
             // Feed the parse tree and the language servers — both hang off
             // this one drain.
