@@ -544,9 +544,13 @@ pub fn render(
 
     match &ed.session.mode {
         // Where the `:` line says its cursor is, not the end of it — the line
-        // has one now. The `1` is the colon the status row draws.
+        // has one now. A character column, widened through the text before
+        // it the way `status_spans` draws that text (a pasted `^[` is two
+        // cells, a tab up to eight), so the cursor sits on the cell typing
+        // goes to. The `1` is the colon the status row draws.
         Mode::Command(line) => {
-            frame.set_cursor_position((footer.x + 1 + line.cursor() as u16, footer.y));
+            let col = 1 + display_col(&line.to_string(), line.cursor(), 8);
+            frame.set_cursor_position((footer.x + col as u16, footer.y));
         }
         // Only the focused window gets it: there is one cursor, and it goes
         // where typing goes.
@@ -2982,6 +2986,29 @@ int main(void) {
             (0..24).map(|x| terminal.backend().buffer()[(x, 3)].symbol().to_string()).collect();
         assert!(footer.contains("! ^[[31mx"), "drawn as a glyph: {footer:?}");
         assert!(!footer.contains('\x1b'), "no raw ESC in any cell");
+    }
+
+    /// The `:` line's cursor is a character column; the text it sits in is
+    /// drawn through `cells`, so a pasted `^[` before it widens the column
+    /// by one — and the cursor must widen with it or it points at the `[`.
+    #[test]
+    fn the_command_line_cursor_sits_past_a_widened_glyph() {
+        use ratatui::Terminal;
+        use ratatui::backend::{Backend, TestBackend};
+
+        let mut ed = Editor::empty();
+        let mut line = bi::cmdline::CmdLine::default();
+        for c in "\x1bab".chars() {
+            line.insert(c);
+        }
+        line.left();
+        ed.session.mode = Mode::Command(line);
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+        let at = terminal.backend_mut().get_cursor_position().unwrap();
+        // `:` then `^[` then `a`: the cursor, one left of the end, is on `b`.
+        assert_eq!((at.x, at.y), (4, 3));
     }
 
     #[test]

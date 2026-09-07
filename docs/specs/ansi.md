@@ -60,11 +60,13 @@ terminal's cursor, change its colours, or erase a line.
 Width and glyph come from one place so the cursor and the text agree:
 `indent::char_width` answers `2` for a control character (it answered `0`,
 which is why a cursor over one already sat in the wrong column), and a
-sibling `indent::glyph(ch) -> Option<[u8; 2]>`-shaped helper names the two
+sibling `indent::glyph(ch) -> Option<[char; 2]>` helper names the two
 characters to draw. `display_col` and `width_of` follow from `char_width`
 without a change of their own.
 
-Four drawing paths use it: the buffer view's `styled_line` for a highlighted
+Every path that draws text bi did not write itself uses it (Deviation 8
+lists them); the four the design started from are the buffer view's
+`styled_line` for a highlighted
 line and `render_window`'s plain branch for one with no grammar attached, the
 debugger's Console lines, and the results pane — whose `terminal_safe` today
 *drops* control characters, and after this shows them, the same as everywhere
