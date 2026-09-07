@@ -54,6 +54,12 @@ terminal is for.
 `! ` the way debuggee stderr already is — a build's errors belong beside its
 progress, not in a second buffer.
 
+**Escape sequences and other control characters are stripped before a line
+reaches the buffer**, and a carriage return rewinds it — the same rule as
+any job's output (`docs/specs/ansi.md`) — so a coloured build log reads as
+plain text and a progress bar that redraws itself keeps only its final
+state.
+
 **Exit:** the status line says `! exited 0` (or `1`, or `killed`), and the
 trailer line lands in the buffer. Non-UTF-8 output is decoded lossily.
 
@@ -142,6 +148,8 @@ result inside the command, like `:format`.
 - `%` and `#` expand; `\%` does not; `:!!` repeats.
 - A prompting command (`read x`) exits on EOF rather than hanging.
 - With a fake spawner nothing is spawned and the whole flow still works.
+- A job that prints colours shows plain text; `:r !` keeps the escapes
+  verbatim.
 
 ## Resolved decisions
 

@@ -727,14 +727,20 @@ on screen is what you did not delete. The window you are in is the one that
 survives if they all showed it; there is always a window, and it falls through
 to the next buffer.
 
+A control character in any buffer is shown as `^X` (`^[` for escape), two
+cells wide, in the text's own colour — never sent to the terminal to
+interpret. See [docs/specs/ansi.md](specs/ansi.md).
+
 **Transient buffers.** A `:!` job's output, and nothing else, lives in one —
 shown as `[!cmd]` in `:ls`, the status line and the switcher, otherwise a
 buffer like any other: Normal, Insert and Visual modes, motions, registers,
-search, undo, splits, `gb`, `Ctrl-^`. Four things it does not do: it does not
-save (`:w` is refused with a copy hint, `:wa` skips it); it does not nag
-(`:bd`/`:q`/`:qa` never ask about it); it does not attach (no LSP, no git
-signs, no trim-on-write, no `.editorconfig` lookup); and it does not grow
-without bound (capped at 10,000 lines, oldest dropped first). See
+search, undo, splits, `gb`, `Ctrl-^`. Colours and other control sequences the
+job printed are already stripped by the time they land, the same as any
+job's output. Four things it does not do: it does not save (`:w` is refused
+with a copy hint, `:wa` skips it); it does not nag (`:bd`/`:q`/`:qa` never
+ask about it); it does not attach (no LSP, no git signs, no trim-on-write, no
+`.editorconfig` lookup); and it does not grow without bound (capped at
+10,000 lines, oldest dropped first). See
 [docs/specs/transient.md](specs/transient.md).
 
 ### The file tree

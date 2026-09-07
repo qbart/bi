@@ -6,7 +6,7 @@ never executes a control character it was handed as text.
 
 ## Status
 
-**Design.** Asked for by the user on 2026-09-08 after a coloured build log
+**Built.** Asked for by the user on 2026-09-08 after a coloured build log
 left glyphs behind in the neighbouring pane.
 
 ## The bug
@@ -64,10 +64,11 @@ sibling `indent::glyph(ch) -> Option<[u8; 2]>`-shaped helper names the two
 characters to draw. `display_col` and `width_of` follow from `char_width`
 without a change of their own.
 
-Three drawing paths use it: the buffer view (`styled_line`), the debugger's
-Console lines, and the results pane — whose `terminal_safe` today *drops*
-control characters, and after this shows them, the same as everywhere else.
-The Console's own text is otherwise untouched; only the cells it paints
+Four drawing paths use it: the buffer view's `styled_line` for a highlighted
+line and `render_window`'s plain branch for one with no grammar attached, the
+debugger's Console lines, and the results pane — whose `terminal_safe` today
+*drops* control characters, and after this shows them, the same as everywhere
+else. The Console's own text is otherwise untouched; only the cells it paints
 change.
 
 ## Where it lives
@@ -76,7 +77,7 @@ change.
 src/shell.rs         sanitize()                                        (core)
 src/indent.rs        char_width() = 2 for controls; the glyph helper   (core)
 src/editor.rs        pump_shell / run_write call sanitize              (core)
-src/tui/render.rs    styled_line, console lines, terminal_safe draw ^X (tui)
+src/tui/render.rs    cells(): styled_line, the plain branch, console, results (tui)
 ```
 
 A frontend that is not a terminal draws `^[` too, or draws what it likes:
@@ -92,8 +93,34 @@ the glyph helper is advice from the core, not a screen contract.
   transient buffer; a stderr line the same way, still prefixed `! `.
 - `:r !` with the same fake output inserts the escapes verbatim.
 - `char_width('\x1b') == 2`; `display_col` on `\x1b[1mx` puts `x` at
-  column 6 (`^[` `[` `1` `m`).
+  column 5 (`^[` `[` `1` `m`).
 - `styled_line` on a line holding `ESC` yields `^[` in the cell text and no
   raw control byte in any span; the Console and results paths likewise.
 - Render a line of text with `ESC` in it, then remove it: the diff repaints
   the cells (no stale glyph) — asserted on the rendered frame.
+
+## Deviations from the design
+
+Five places where the build corrected or completed what this spec's text
+said, each recorded here so nobody re-derives it from scratch:
+
+1. **An `ESC` followed by an intermediate byte is consumed through to its
+   final byte, not just the next one.** The spec's "every other two-byte
+   `ESC x`" undercounted a whole class: `ESC` followed by a byte in
+   `0x20-0x2F` — the charset designation `ESC ( B` and its kin — is a
+   sequence that only ends at the first byte outside that range, `0x30-0x7E`,
+   which can be several bytes further on, not the very next one.
+2. **The buffer view has a fourth cell path.** `render_window` draws an
+   unhighlighted line — no grammar attached — through its own branch beside
+   `styled_line`, and that branch needs the glyph helper too; the spec's
+   count of drawing paths left it out.
+3. **The Console draws its lines against a tab width of 8.** It is not a
+   buffer and has no `tab_width` of its own to consult, so its lines use the
+   one width nothing else in the editor has to ask for.
+4. **`terminal_safe` was renamed `cells` and generalised to every path.** The
+   results pane's helper used to drop control characters for one view only;
+   the build turned it into the shared function all four paths call, and the
+   old, narrower name went with the old, narrower job.
+5. **`display_col` on `\x1b[1mx` puts `x` at column 5, not 6.** `^[` costs 2
+   cells, and `[`, `1`, `m` cost one each — 2+1+1+1 — the spec's Tests
+   section had the arithmetic one column high.
