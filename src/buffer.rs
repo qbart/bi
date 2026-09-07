@@ -17,7 +17,7 @@ use ropey::Rope;
 use crate::encoding::{self, FileFormat, OpenHow, Storage};
 use crate::history::{Change, Cursors, History};
 use crate::indent::{self, Indent};
-use crate::motion::{Kind, Motion, Operator, Target, TextObject};
+use crate::motion::{Kind as MotionKind, Motion, Operator, Target, TextObject};
 use crate::registers::{Entry, Shape};
 use crate::trim::Trim;
 
@@ -147,9 +147,24 @@ pub enum DiskCheck {
     Deleted,
 }
 
+/// What a buffer's text is backed by.
+///
+/// `File` is a real path — what `:w` writes to, what LSP/git/editorconfig
+/// key off of. `Transient` is vim's `buftype=nofile`: a real buffer, but one
+/// with no path that never adopts one. See `docs/specs/transient.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Transient { name: String },
+}
+
 pub struct Buffer {
     rope: Rope,
     pub path: Option<PathBuf>,
+    /// `File` for every buffer `empty()` or `open()` builds; `Transient` only
+    /// for `Buffer::transient`. Lives beside `path` because save/save_as are
+    /// `Buffer`'s own business — the line cap is a property of the text.
+    pub kind: Kind,
     /// Drained by `Editor::settle` — for tree-sitter and LSP `didChange` both.
     pub pending_edits: Vec<Edit>,
     history: History,
@@ -178,6 +193,7 @@ impl Buffer {
         Self {
             rope: Rope::new(),
             path: None,
+            kind: Kind::File,
             pending_edits: Vec::new(),
             history: History::default(),
             edits: 0,
@@ -214,6 +230,38 @@ impl Buffer {
         }
         buf.path = Some(path);
         Ok(buf)
+    }
+
+    /// A transient buffer named `name` — vim's `buftype=nofile`. No path, and
+    /// it never gets one; see `docs/specs/transient.md`.
+    pub fn transient(name: &str) -> Self {
+        let mut buf = Self::empty();
+        buf.kind = Kind::Transient { name: name.to_string() };
+        buf
+    }
+
+    /// Whether this buffer is transient — no path, no save, no attach.
+    pub fn is_transient(&self) -> bool {
+        matches!(self.kind, Kind::Transient { .. })
+    }
+
+    /// The transient's display name — `[!make]` and the like. `None` for a
+    /// `File` buffer.
+    pub fn transient_name(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Transient { name } => Some(name),
+            Kind::File => None,
+        }
+    }
+
+    /// Renames a transient buffer — `:!` renaming `[!<old cmd>]` to
+    /// `[!<new cmd>]` on every run. A no-op on a `File` buffer, which has no
+    /// name of this kind to set.
+    pub fn set_transient_name(&mut self, name: &str) {
+        if let Kind::Transient { name: current } = &mut self.kind {
+            current.clear();
+            current.push_str(name);
+        }
     }
 
     /// Compares the disk against the snapshot taken at the last read or write.
@@ -280,28 +328,10 @@ impl Buffer {
         }
     }
 
-    /// Takes the selections because a write closes the open undo group, and a
-    /// group needs somewhere to put you when you undo back through it.
-    ///
-    /// `force` is the `!`: without it, a file that moved on disk since the
-    /// last read refuses the write with the disk untouched — the floor under
-    /// everything checktime does. A file that is merely *gone* writes without
-    /// complaint; recreating it is the fix, not a conflict.
-    pub fn save(&mut self, before: Cursors, after: Cursors, force: bool) -> Result<()> {
-        let path = self.path.clone().context("no file name (use `:w <path>`)")?;
-        if !force
-            && let Some(snap) = self.disk
-            && let Some(now) = disk_state(&path)
-            && snap != now
-        {
-            anyhow::bail!(
-                "\"{}\" changed on disk since last read (`:e` loads it, `:w!` overwrites)",
-                path.display()
-            );
-        }
-        // What lands on disk has to be a revision, or nothing can be marked as
-        // saved and the buffer stays "modified" straight after a good write.
-        self.commit_undo(before, after);
+    /// Encodes the rope per `self.storage` and writes it to `path`. Pure I/O —
+    /// no undo, no path/disk bookkeeping; `save` and the transient copy in
+    /// `save_as` each do their own bookkeeping around this.
+    fn write_text(&self, path: &Path) -> Result<()> {
         // The bytes are worked out *before* the file is truncated: a `€` that
         // latin1 cannot spell must fail the save with the disk untouched.
         let bytes = match self.storage.is_default() {
@@ -319,7 +349,7 @@ impl Buffer {
                 },
             )?),
         };
-        let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         match bytes {
             // Plain UTF-8/unix streams straight from the rope, as it always has.
             None => self
@@ -330,6 +360,39 @@ impl Buffer {
                 .write_all(&bytes)
                 .with_context(|| format!("writing {}", path.display()))?,
         }
+        Ok(())
+    }
+
+    /// Takes the selections because a write closes the open undo group, and a
+    /// group needs somewhere to put you when you undo back through it.
+    ///
+    /// `force` is the `!`: without it, a file that moved on disk since the
+    /// last read refuses the write with the disk untouched — the floor under
+    /// everything checktime does. A file that is merely *gone* writes without
+    /// complaint; recreating it is the fix, not a conflict.
+    ///
+    /// A transient buffer has no file to write to at all: it refuses outright,
+    /// pointing at `:w <path>` (`save_as`) instead — see
+    /// `docs/specs/transient.md`.
+    pub fn save(&mut self, before: Cursors, after: Cursors, force: bool) -> Result<()> {
+        if self.is_transient() {
+            anyhow::bail!("transient — :w <path> saves a copy");
+        }
+        let path = self.path.clone().context("no file name (use `:w <path>`)")?;
+        if !force
+            && let Some(snap) = self.disk
+            && let Some(now) = disk_state(&path)
+            && snap != now
+        {
+            anyhow::bail!(
+                "\"{}\" changed on disk since last read (`:e` loads it, `:w!` overwrites)",
+                path.display()
+            );
+        }
+        // What lands on disk has to be a revision, or nothing can be marked as
+        // saved and the buffer stays "modified" straight after a good write.
+        self.commit_undo(before, after);
+        self.write_text(&path)?;
         self.history.mark_saved();
         self.storage_dirty = false;
         // What was just written *is* the disk now; the next check has nothing
@@ -339,12 +402,24 @@ impl Buffer {
         Ok(())
     }
 
+    /// `:w <path>`. For a `File` buffer this adopts `path` — same as `save`
+    /// from then on. For a transient buffer it copies the text out: the write
+    /// happens, but `path`/`kind` and the modified state are untouched — the
+    /// log was copied, not adopted, so the buffer is exactly as transient and
+    /// exactly as "modified" after this as it was before it.
     pub fn save_as(
         &mut self,
         before: Cursors,
         after: Cursors,
         path: impl AsRef<Path>,
     ) -> Result<()> {
+        if self.is_transient() {
+            // Still closes the open undo group — a write is a write — but
+            // nothing else about the buffer moves: no path, no disk snapshot,
+            // no `mark_saved`.
+            self.commit_undo(before, after);
+            return self.write_text(path.as_ref());
+        }
         self.path = Some(path.as_ref().to_path_buf());
         // The snapshot belonged to the old path; guarding the new one against
         // it would refuse writes for no reason.
@@ -682,6 +757,70 @@ impl Buffer {
     /// own about where the cursor lands.
     pub fn replace_range(&mut self, start: usize, end: usize, text: &str) {
         self.apply_edit(start, end, text);
+    }
+
+    // ---- transient buffers --------------------------------------------------
+
+    /// A runaway `make` must not eat the session: a transient buffer keeps at
+    /// most this many lines, and [`Buffer::append_lines`] drops the oldest
+    /// once it's over. See `docs/specs/transient.md`.
+    pub const TRANSIENT_MAX_LINES: usize = 10_000;
+
+    /// Appends `lines` at the end of the buffer and caps growth at
+    /// [`Buffer::TRANSIENT_MAX_LINES`] — what `:!` output calls after every
+    /// batch of a job's lines. See [`Buffer::append_lines_capped`] for the
+    /// mechanics.
+    pub fn append_lines(&mut self, lines: &[String]) -> Option<usize> {
+        self.append_lines_capped(lines, Self::TRANSIENT_MAX_LINES)
+    }
+
+    /// The guts of [`Buffer::append_lines`], with the cap as a parameter so
+    /// tests don't need ten thousand lines to see it trim.
+    ///
+    /// Appends `line + "\n"` for each of `lines` at the end of the rope, as
+    /// ONE edit through the normal path (`apply_edit`), so `pending_edits`
+    /// carries it to windows and tree-sitter/LSP exactly as typing would,
+    /// and a single `undo` reverses it. If the buffer is non-empty and
+    /// doesn't already end in `\n`, a `\n` is inserted first so the new
+    /// lines start on a fresh row rather than running into whatever was on
+    /// the last one.
+    ///
+    /// Then, while the line count is over `cap`, the oldest lines are
+    /// dropped — also through `apply_edit`, so windows' cursors shift
+    /// correctly when `pending_edits` is drained. The trim is a second edit,
+    /// but nothing commits until the very end, so it lands in the same undo
+    /// step as the append: one `undo` reverses both together.
+    ///
+    /// Returns the row of the first appended line, after any trim. `None`
+    /// when `lines` is empty — no edit, nothing to report.
+    pub fn append_lines_capped(&mut self, lines: &[String], cap: usize) -> Option<usize> {
+        if lines.is_empty() {
+            return None;
+        }
+        let end = self.rope.len_chars();
+        let needs_nl = end > 0 && self.rope.char(end - 1) != '\n';
+        let mut first_row = self.rope.char_to_line(end) + usize::from(needs_nl);
+
+        let mut text = String::new();
+        if needs_nl {
+            text.push('\n');
+        }
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        self.apply_edit(end, end, &text);
+
+        let count = self.line_count();
+        if count > cap {
+            let dropped = count - cap;
+            let cut = self.rope.line_to_char(dropped);
+            self.apply_edit(0, cut, "");
+            first_row = first_row.saturating_sub(dropped);
+        }
+
+        self.commit_undo(Vec::new(), Vec::new());
+        Some(first_row)
     }
 
     // ---- surroundings ------------------------------------------------------
@@ -1611,7 +1750,7 @@ impl Buffer {
                 // A linewise object has to take its terminator too, or `dip`
                 // leaves the empty line behind. `cip` keeps it, for the same
                 // reason `cc` does: insert mode needs a line to sit on.
-                let end = if target.kind() == Kind::Linewise
+                let end = if target.kind() == MotionKind::Linewise
                     && op != Operator::Change
                     && end < len
                     && self.rope.char(end) == '\n'
@@ -1624,7 +1763,7 @@ impl Buffer {
             }
         };
 
-        if motion.kind() == Kind::Linewise {
+        if motion.kind() == MotionKind::Linewise {
             let (first, last) = self.linewise_rows(at, motion, count);
             let content_start = self.rope.line_to_char(first);
             // `cc` empties the lines but leaves them, so insert mode has a line
@@ -1670,7 +1809,7 @@ impl Buffer {
 
         let target = self.motion_target(motion, count, at).at;
         let (lo, mut hi) = (at.at.min(target), at.at.max(target));
-        if motion.kind() == Kind::Inclusive {
+        if motion.kind() == MotionKind::Inclusive {
             hi = (hi + 1).min(len);
         }
         // Vim quirk: an exclusive motion that leaves the line stops at the end
@@ -1704,7 +1843,7 @@ impl Buffer {
         count: usize,
     ) -> Option<(Entry, Cursor, std::ops::Range<usize>)> {
         let (start, end) = self.operator_range(at, op, target, count)?;
-        let linewise = target.kind() == Kind::Linewise;
+        let linewise = target.kind() == MotionKind::Linewise;
 
         // A linewise entry is always whole lines ending in a newline, even when
         // it came from a final line that had none — otherwise pasting it could
@@ -3527,6 +3666,78 @@ mod tests {
         assert!(!b.is_modified(), "the buffer is what's on disk");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello!");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- transient buffers --------------------------------------------------
+
+    #[test]
+    fn a_transient_buffer_refuses_a_bare_save() {
+        let mut b = Buffer::transient("make");
+        let err = b.save(vec![], vec![], false).unwrap_err();
+        assert_eq!(err.to_string(), "transient — :w <path> saves a copy");
+    }
+
+    #[test]
+    fn save_as_writes_a_copy_and_stays_transient() {
+        let path =
+            std::env::temp_dir().join(format!("bi-transient-copy-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut b = Buffer::transient("make");
+        b.insert_str(Cursor::at(0), "log line\n");
+        assert!(b.is_modified());
+
+        b.save_as(vec![], vec![], &path).expect("write failed");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "log line\n");
+        assert!(b.is_transient(), "still transient");
+        assert_eq!(b.path, None, "never adopts the path");
+        assert!(b.is_modified(), "the log was copied, not adopted");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_lines_adds_at_the_end_as_one_undo() {
+        let mut b = Buffer::transient("make");
+        b.insert_str(Cursor::at(0), "start\n");
+        b.commit_undo(vec![], vec![]);
+
+        let lines = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let first_row = b.append_lines(&lines).expect("lines were appended");
+        assert_eq!(first_row, 1);
+        assert_eq!(b.rope().to_string(), "start\none\ntwo\nthree\n");
+
+        b.undo(vec![], vec![]).expect("one undo restores it");
+        assert_eq!(b.rope().to_string(), "start\n", "one undo reverses the whole append");
+    }
+
+    #[test]
+    fn appending_past_the_cap_drops_from_the_top() {
+        let mut b = Buffer::empty();
+        let initial: Vec<String> = (0..5).map(|i| format!("line{i}")).collect();
+        b.append_lines_capped(&initial, 5);
+        assert_eq!(b.line_count(), 5);
+
+        let more: Vec<String> = (5..10).map(|i| format!("line{i}")).collect();
+        let first_row = b.append_lines_capped(&more, 5).expect("lines were appended");
+
+        assert_eq!(b.line_count(), 5, "capped at 5");
+        assert_eq!(
+            b.rope().to_string(),
+            "line5\nline6\nline7\nline8\nline9\n",
+            "the oldest 5 are gone"
+        );
+        assert_eq!(first_row, 0, "the first appended line is now the first line");
+    }
+
+    #[test]
+    fn transient_name_renames() {
+        let mut b = Buffer::transient("echo hi");
+        assert_eq!(b.transient_name(), Some("echo hi"));
+
+        b.set_transient_name("ls -la");
+        assert_eq!(b.transient_name(), Some("ls -la"));
     }
 
     // ---- storage: encoding, BOM, line endings ------------------------------
