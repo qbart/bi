@@ -68,13 +68,35 @@ impl Indent {
     }
 }
 
+/// The two characters a control character is drawn as — `^[` for `ESC`,
+/// `^A` for `0x01`, `^?` for `DEL` — or `None` when `ch` is ordinary text
+/// (or a tab, which is elastic and the caller's business).
+///
+/// Advice from the core, not a screen contract: the terminal draws these so
+/// that no byte in a buffer can ever move its cursor or change its colours
+/// (`docs/specs/ansi.md` §"Rule 2"); another frontend may draw what it
+/// likes, but it gets the width from the same place, so cursor and text
+/// agree wherever it is drawn.
+pub fn glyph(ch: char) -> Option<[char; 2]> {
+    match ch {
+        '\t' => None,
+        '\x7f' => Some(['^', '?']),
+        c if (c as u32) < 0x20 => Some(['^', char::from(c as u8 + 0x40)]),
+        _ => None,
+    }
+}
+
 /// How many cells one character occupies.
 ///
 /// Unicode's answer, not `1`: a CJK character takes two cells, a combining
 /// mark takes none — it lands on its base's cells — and a control character
-/// paints nothing. Tabs are elastic and are the caller's business.
+/// is drawn as `^X` and takes two. Tabs are elastic and are the caller's
+/// business.
 pub fn char_width(ch: char) -> usize {
     use unicode_width::UnicodeWidthChar;
+    if glyph(ch).is_some() {
+        return 2;
+    }
     ch.width().unwrap_or(0)
 }
 
@@ -309,6 +331,20 @@ mod tests {
         assert_eq!(display_col("e\u{301}x", 2, 4), 1);
         assert_eq!(width_of("漢\tx", 4), 5, "a tab after a wide char reaches the next stop");
         assert_eq!(expand_tabs("漢\tx", 4), "漢  x");
+    }
+
+    /// A control character paints two cells, `^X`, the way vim shows it —
+    /// and the width says so, or the cursor sits in the wrong column over it.
+    #[test]
+    fn a_control_character_is_two_cells_wide_and_has_a_glyph() {
+        assert_eq!(glyph('\x1b'), Some(['^', '[']));
+        assert_eq!(glyph('\x01'), Some(['^', 'A']));
+        assert_eq!(glyph('\x7f'), Some(['^', '?']));
+        assert_eq!(glyph('\t'), None, "tabs are elastic, the caller's business");
+        assert_eq!(glyph('a'), None);
+        assert_eq!(char_width('\x1b'), 2);
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(display_col("\x1b[1mx", 4, 4), 5, "^[ then [ 1 m");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use bi::config::Options;
 use bi::dap::Watch;
 use bi::decoration::{Decoration, Layer};
 use bi::editor::{Editor, Mode, Pane};
-use bi::indent::{char_width, display_col, expand_tabs};
+use bi::indent::{char_width, display_col, expand_tabs, glyph};
 use bi::picker::{Picker, PickerKind};
 use bi::region::Shape;
 use bi::selection::Selections;
@@ -386,18 +386,7 @@ fn styled_line(
         if text.is_empty() {
             return;
         }
-        let mut expanded = String::with_capacity(text.len());
-        for ch in text.chars() {
-            if ch == '\t' {
-                let n = tab_width - (*col % tab_width);
-                expanded.extend(std::iter::repeat_n(' ', n));
-                *col += n;
-            } else {
-                expanded.push(ch);
-                *col += char_width(ch);
-            }
-        }
-        out.push(Span::styled(expanded, style));
+        out.push(Span::styled(cells(text, col, tab_width), style));
     };
 
     for span in spans {
@@ -645,19 +634,14 @@ fn render_tree(
     cursor_at
 }
 
-/// What a search found: a heading per file, its matching lines under it.
-///
-/// The same shape as [`render_tree`] and for the same reason — a list pane is
-/// a list of rows with one selected, and the selection is drawn in every such
-/// pane rather than only the focused one, because it is where the next Enter
-/// goes rather than where a text cursor is.
-/// A matched line arrives exactly as the file spelled it, tabs and control
-/// characters included — and a `\t` written into a cell is how the diff and
-/// the real terminal come to disagree, which reads as stale glyphs left
-/// behind after the pane closes. Tabs expand to the option's stops, other
-/// control characters are dropped; `col` runs across a row's segments so the
-/// stops land where the buffer view would put them.
-fn terminal_safe(text: &str, col: &mut usize, tab: usize) -> String {
+/// `text` as cells: tabs to the option's stops, every other control
+/// character as its `^X` glyph, so nothing a buffer holds can reach the
+/// terminal as a byte it would execute (`docs/specs/ansi.md` §"Rule 2") —
+/// a control byte written into a cell is how the diff and the real terminal
+/// come to disagree, which reads as stale glyphs left behind after a pane
+/// closes. `col` runs across a row's segments so the stops land where the
+/// buffer view would put them.
+fn cells(text: &str, col: &mut usize, tab: usize) -> String {
     let tab = tab.max(1);
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -665,7 +649,11 @@ fn terminal_safe(text: &str, col: &mut usize, tab: usize) -> String {
             let n = tab - (*col % tab);
             out.extend(std::iter::repeat_n(' ', n));
             *col += n;
-        } else if !ch.is_control() {
+        } else if let Some([a, b]) = glyph(ch) {
+            out.push(a);
+            out.push(b);
+            *col += 2;
+        } else {
             out.push(ch);
             *col += char_width(ch);
         }
@@ -673,6 +661,12 @@ fn terminal_safe(text: &str, col: &mut usize, tab: usize) -> String {
     out
 }
 
+/// What a search found: a heading per file, its matching lines under it.
+///
+/// The same shape as [`render_tree`] and for the same reason — a list pane is
+/// a list of rows with one selected, and the selection is drawn in every such
+/// pane rather than only the focused one, because it is where the next Enter
+/// goes rather than where a text cursor is.
 fn render_results(
     frame: &mut Frame,
     results: &bi::results::Results,
@@ -733,19 +727,19 @@ fn render_results(
                                 for (from, to) in rewrite.spans {
                                     let (from, to) = (from.min(text.len()), to.min(text.len()));
                                     let before = text[at..from].iter().collect::<String>();
-                                    out.push(Span::raw(terminal_safe(&before, &mut col, tab)));
+                                    out.push(Span::raw(cells(&before, &mut col, tab)));
                                     let hit = text[from..to].iter().collect::<String>();
                                     out.push(Span::styled(
-                                        terminal_safe(&hit, &mut col, tab),
+                                        cells(&hit, &mut col, tab),
                                         tui(ui.search),
                                     ));
                                     at = to;
                                 }
                                 let after = text[at..].iter().collect::<String>();
-                                out.push(Span::raw(terminal_safe(&after, &mut col, tab)));
+                                out.push(Span::raw(cells(&after, &mut col, tab)));
                             }
                             None => {
-                                out.push(Span::raw(terminal_safe(&m.text, &mut col, tab)));
+                                out.push(Span::raw(cells(&m.text, &mut col, tab)));
                             }
                         }
                         out
@@ -761,11 +755,11 @@ fn render_results(
                         let (from, to) = (m.col.min(text.len()), (m.col + m.len).min(text.len()));
                         let mut col = 0;
                         let before = text[..from].iter().collect::<String>();
-                        out.push(Span::raw(terminal_safe(&before, &mut col, tab)));
+                        out.push(Span::raw(cells(&before, &mut col, tab)));
                         let hit = text[from..to].iter().collect::<String>();
-                        out.push(Span::styled(terminal_safe(&hit, &mut col, tab), tui(ui.search)));
+                        out.push(Span::styled(cells(&hit, &mut col, tab), tui(ui.search)));
                         let after = text[to..].iter().collect::<String>();
-                        out.push(Span::raw(terminal_safe(&after, &mut col, tab)));
+                        out.push(Span::raw(cells(&after, &mut col, tab)));
                         out
                     }
                 }
@@ -843,8 +837,12 @@ fn render_console(frame: &mut Frame, console: &DapConsole, area: Rect) -> Option
     }
     let last = console.scroll.min(console.lines.len() - 1);
     let first = (last + 1).saturating_sub(height);
-    let lines: Vec<Line> =
-        console.lines[first..=last].iter().map(|line| Line::from(Span::raw(line.clone()))).collect();
+    // The Console has no tab option of its own, so the terminal's own default
+    // of 8 is what its stops are worked out against.
+    let lines: Vec<Line> = console.lines[first..=last]
+        .iter()
+        .map(|line| Line::from(Span::raw(cells(line, &mut 0, 8))))
+        .collect();
     frame.render_widget(Paragraph::new(lines), area);
     None
 }
@@ -1118,7 +1116,7 @@ fn render_window(
                     .collect();
                 spans.extend(styled_line(raw, line_start, &mine, syntax, ed.theme(), tab));
             }
-            None => spans.push(Span::raw(expand_tabs(raw, tab))),
+            None => spans.push(Span::raw(cells(raw, &mut 0, tab))),
         }
         // Under the selection: a guide or a swatch has to let a selected line
         // still look selected.
@@ -1983,21 +1981,22 @@ mod tests {
     /// A `\t` written into a cell desyncs the diff from the real terminal,
     /// which reads as stale glyphs after the pane closes. Expanded to the
     /// stops instead, with the column running across segments; other control
-    /// characters are dropped.
+    /// characters are drawn as `^X`.
     #[test]
     fn a_results_row_reaches_the_terminal_with_no_control_characters() {
         let mut col = 0;
-        assert_eq!(terminal_safe("\tfn main()", &mut col, 4), "    fn main()");
+        assert_eq!(cells("\tfn main()", &mut col, 4), "    fn main()");
         assert_eq!(col, 13);
 
         // The second segment's tab knows where the first one ended.
         let mut col = 0;
-        let head = terminal_safe("ab", &mut col, 4);
-        let tail = terminal_safe("\tc", &mut col, 4);
+        let head = cells("ab", &mut col, 4);
+        let tail = cells("\tc", &mut col, 4);
         assert_eq!(format!("{head}{tail}"), "ab  c", "two columns to the next stop");
 
         let mut col = 0;
-        assert_eq!(terminal_safe("a\u{7}b\u{1b}c", &mut col, 4), "abc", "control bytes dropped");
+        assert_eq!(cells("a\u{7}b\u{1b}c", &mut col, 4), "a^Gb^[c", "controls drawn, not sent");
+        assert_eq!(col, 7);
     }
 
     /// Any background will do for the padding tests below — they are about
@@ -2223,6 +2222,57 @@ mod tests {
         // is here to catch.
         // One leading cell everywhere: the sign column, reserved and empty.
         assert_eq!(rows, [" 1 fn main() {", " 2 │   let x = 1;", " 3 │   │   deep();", " 4 }",]);
+    }
+
+    /// The screen never executes text: an `ESC` in a buffer is drawn as
+    /// `^[`, two cells, and once the line is gone the cells are repainted —
+    /// the diff and the terminal agree, so nothing stays behind.
+    #[test]
+    fn a_control_character_reaches_the_screen_as_a_glyph_and_leaves_no_trace() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "a\x1b[32mb\n");
+        ed.set_cursor(Cursor::at(0));
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+        let row = |terminal: &Terminal<TestBackend>, y: u16| -> String {
+            (0..24).map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string()).collect()
+        };
+        let first = row(&terminal, 0);
+        assert!(first.contains("a^[[32mb"), "drawn as a glyph: {first:?}");
+        assert!(!first.contains('\x1b'), "no raw ESC in any cell");
+
+        // Replace the line with plain text; every cell the glyph used is
+        // repainted, because the diff wrote glyphs, not control bytes.
+        let len = ed.buffer().unwrap().rope().len_chars();
+        ed.buffer_mut().unwrap().replace_range(0, len, "ab\n");
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+        let first = row(&terminal, 0);
+        assert!(first.contains(" ab "), "repainted: {first:?}");
+        assert!(!first.contains('^'), "and nothing of the glyph is left: {first:?}");
+    }
+
+    /// The Console paints a debuggee's stdout, which is as free to hold an
+    /// `ESC` as any other log — and it goes to cells through the same helper.
+    #[test]
+    fn a_console_line_draws_its_escapes_rather_than_sending_them() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut console = DapConsole { lines: Vec::new(), scroll: 0 };
+        console.push("\x1b[31mx".into());
+        let mut terminal = Terminal::new(TestBackend::new(24, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_console(frame, &console, frame.area());
+            })
+            .unwrap();
+        let row: String =
+            (0..24).map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string()).collect();
+        assert!(row.contains("^[[31mx"), "drawn as a glyph: {row:?}");
+        assert!(!row.contains('\x1b'), "no raw ESC in any cell");
     }
 
     /// The reserved column, on a real frame: nothing draws a sign yet, so the
