@@ -552,6 +552,17 @@ impl Buffer {
     /// deferred into one revision. `:g` and `:normal` run sub-commands that
     /// commit at their own boundaries, and this is what makes the batch one
     /// `u` anyway. Nests; the outermost pair wins.
+    /// Throws the undo history away — the text stays exactly as it is, but
+    /// `u` can no longer reach anything before this call.
+    ///
+    /// Only [`Buffer::append_lines_capped`] calls it, and only when the cap
+    /// has fired. `History::default()` is saved at its root, so a buffer
+    /// that forgets stays unmodified — which is what a transient buffer is
+    /// anyway. See `docs/specs/transient.md`.
+    pub fn forget_history(&mut self) {
+        self.history = History::default();
+    }
+
     pub fn begin_undo_group(&mut self, before: Cursors) {
         self.history.begin_group(before);
     }
@@ -787,9 +798,13 @@ impl Buffer {
     ///
     /// Then, while the line count is over `cap`, the oldest lines are
     /// dropped — also through `apply_edit`, so windows' cursors shift
-    /// correctly when `pending_edits` is drained. The trim is a second edit,
-    /// but nothing commits until the very end, so it lands in the same undo
-    /// step as the append: one `undo` reverses both together.
+    /// correctly when `pending_edits` is drained.
+    ///
+    /// Until the cap is reached the batch commits as one undo step, so a
+    /// single `undo` reverses the whole append. Once a trim fires the
+    /// history is thrown away instead ([`Buffer::forget_history`]): the cap
+    /// is there to bound the session, and an append-only history holding
+    /// every line the trim dropped would not bound anything.
     ///
     /// Returns the row of the first appended line, after any trim. `None`
     /// when `lines` is empty — no edit, nothing to report.
@@ -817,9 +832,12 @@ impl Buffer {
             let cut = self.rope.line_to_char(dropped);
             self.apply_edit(0, cut, "");
             first_row = first_row.saturating_sub(dropped);
+            // Not `commit_undo`: see the doc above. Memory stays bounded at
+            // roughly twice the cap — the rope, and the batch in flight.
+            self.forget_history();
+        } else {
+            self.commit_undo(Vec::new(), Vec::new());
         }
-
-        self.commit_undo(Vec::new(), Vec::new());
         Some(first_row)
     }
 
@@ -3729,6 +3747,32 @@ mod tests {
             "the oldest 5 are gone"
         );
         assert_eq!(first_row, 0, "the first appended line is now the first line");
+    }
+
+    /// The cap has to bound memory, not just the line count: history is
+    /// append-only, so a trim that left its `Change` behind would keep every
+    /// dropped line for the rest of the session. A trim throws the history
+    /// away instead — `u` reaches nothing past it, and the buffer is still
+    /// not modified, because a transient buffer never is.
+    #[test]
+    fn a_trim_takes_the_undo_history_with_it() {
+        let mut b = Buffer::transient("make");
+        let initial: Vec<String> = (0..5).map(|i| format!("line{i}")).collect();
+        b.append_lines_capped(&initial, 5);
+        assert!(b.undo(vec![], vec![]).is_some(), "the untrimmed batch is one undo");
+        b.redo(vec![], vec![]).expect("and back");
+
+        let more: Vec<String> = (5..10).map(|i| format!("line{i}")).collect();
+        b.append_lines_capped(&more, 5);
+
+        assert_eq!(b.line_count(), 5, "capped");
+        assert_eq!(b.undo(vec![], vec![]), None, "nothing to walk back to");
+        assert_eq!(
+            b.rope().to_string(),
+            "line5\nline6\nline7\nline8\nline9\n",
+            "and the trimmed lines did not come back"
+        );
+        assert!(!b.is_modified(), "a transient buffer is never dirty");
     }
 
     #[test]

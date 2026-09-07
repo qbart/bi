@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::buffer::{Buffer, BufferId, Cursor};
+use crate::buffer::{Buffer, BufferId, Cursor, Edit};
 use crate::clipboard::SystemClipboard;
 use crate::cmd_history::History;
 use crate::cmdline::CmdLine;
@@ -2870,6 +2870,11 @@ pub struct Editor {
     /// Kept on the `Editor` rather than on `shell::Job` itself: `shell::Job`
     /// is the core's, and a `BufferId` is the editor's alone. See
     /// `docs/specs/transient.md` §"`:!` in a transient buffer".
+    ///
+    /// Not cleared when a job ends: the buffer outlives it, and `:!!` wants
+    /// to find it. So this is never the answer to "is a job running" —
+    /// that is `shell.is_some() && handle.is_running()`, which is what
+    /// `a_job_is_in_the_way` asks.
     job_buffer: Option<BufferId>,
     /// The last `:!cmd` typed, for `:!!` to repeat. Never the expanded
     /// form — `%`/`#` expand fresh against whatever the focused buffer and
@@ -2985,6 +2990,14 @@ fn syntax_for(buffer: &Buffer, options: &Options) -> Option<Syntax> {
 /// `:set syntax` wins over the name, which is the whole of what it is for: a
 /// file with no extension, or one whose extension lies.
 fn wanted_syntax(buffer: &Buffer, options: &Options) -> Option<&'static str> {
+    // A transient buffer is a log, not a file in a language: `:set syntax`
+    // is a session-wide option and would otherwise paint every `:!` run
+    // through whatever grammar the last real buffer wanted. It is also the
+    // only way a path-less buffer could get a grammar at all, so the answer
+    // is `None` before anything else is asked. `docs/specs/transient.md`.
+    if buffer.is_transient() {
+        return None;
+    }
     if let Some(named) = crate::syntax::canonical(&options.syntax) {
         return Some(named);
     }
@@ -4225,13 +4238,16 @@ impl Editor {
     /// `[!make]` becomes `[!ls]` in place and its previous run's tail is
     /// still above the new `$ ls` header. See `docs/specs/transient.md`.
     ///
-    /// The entry is built by hand rather than through `BufferEntry::new`
-    /// and `resolve_options`/`refresh_git`: a transient buffer has no path,
-    /// so `filetype_of`/`syntax_for` would already land on `None`/plain
-    /// text and `refresh_git` on no baseline — but a session-wide `:set
-    /// syntax` or a git loader that ignores the path could still reach in
-    /// and give it one. Stated outright instead, so nothing here is an
-    /// accident of what a path-less buffer happens to resolve to today.
+    /// The entry's syntax, filetype and git are cleared by hand rather than
+    /// left to `BufferEntry::new`: a transient buffer has no path, so
+    /// `filetype_of`/`syntax_for` would already land on `None`/plain text
+    /// and `refresh_git` on no baseline — but a git loader that ignores the
+    /// path could still reach in and give it one. Stated outright instead,
+    /// so nothing here is an accident of what a path-less buffer happens to
+    /// resolve to today. The `resolve_options` below re-asks the syntax
+    /// question for every buffer, which is why the transient answer lives
+    /// in `wanted_syntax` rather than in the clearing here — clearing alone
+    /// would last exactly two lines.
     pub fn transient_buffer(&mut self, name: &str) -> BufferId {
         if let Some(entry) = self.buffers.iter_mut().find(|b| b.buffer.is_transient()) {
             entry.buffer.set_transient_name(name);
@@ -5760,6 +5776,17 @@ impl Editor {
         let previous = self.previous;
         let Some(new) = self.split_focus(Dir::Horizontal) else { return false };
         self.show(new, id);
+        // A window opened on a log starts at the tail, whatever the buffer
+        // entry remembers about where the last window on it was reading:
+        // this one was opened to watch a job, and `append_to_transient`
+        // only follows the tail for windows already on it — so a log split
+        // closed with `Ctrl-W c` and re-opened by the next `:!` would
+        // otherwise sit on an old line and never move again.
+        let last = self.entry(id).buffer.line_count().saturating_sub(1);
+        let cursor = self.entry(id).buffer.at_row(last, false);
+        if let Some(text) = self.window_mut_of(new).and_then(Window::text_mut) {
+            text.selections = Selections::single(cursor);
+        }
         self.set_focus(focus);
         self.previous = previous;
         true
@@ -5782,6 +5809,14 @@ impl Editor {
     /// last row. Doing that before the drain would shift those same cursors
     /// a second time.
     ///
+    /// A focused window reading the log *above* the tail is the other half
+    /// of that same skip: nothing walks it to the tail, and nothing in the
+    /// drain moved it either, so it is mapped here by hand through the
+    /// edits the append just made — otherwise the trim would slide the text
+    /// out from under a cursor that stayed on its old char index and the
+    /// line being read would change under the eye. Same arithmetic as the
+    /// drain's, via `Editor::remapped`.
+    ///
     fn append_to_transient(&mut self, id: BufferId, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -5800,7 +5835,20 @@ impl Editor {
             .collect();
 
         self.entry_mut(id).buffer.append_lines(lines);
+        // Cloned before the drain takes them: `drain_edits` consumes
+        // `pending_edits`, and the focused window's remap below needs the
+        // same list it just fed everyone else.
+        let edits = self.entry(id).buffer.pending_edits.clone();
         self.drain_edits();
+
+        let focus = self.focus;
+        if !at_tail.contains(&focus)
+            && let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut)
+            && text.buffer == id
+        {
+            let mapped = Self::remapped(&text.selections, &edits);
+            text.selections.set(mapped);
+        }
 
         let last_after = self.entry(id).buffer.line_count().saturating_sub(1);
         let cursor = self.entry(id).buffer.at_row(last_after, false);
@@ -7756,6 +7804,24 @@ impl Editor {
         self.open_lsp_docs();
     }
 
+    /// Carries `selections` across `edits` — every endpoint through every
+    /// edit, in order.
+    ///
+    /// One place rather than two: the drain below maps the windows that did
+    /// not make the edit, and `append_to_transient` maps the focused one by
+    /// hand when a job made it, and both must agree about where a cursor
+    /// ends up or a trim would move the two halves of a split apart.
+    fn remapped(selections: &Selections, edits: &[Edit]) -> Vec<Selection> {
+        selections
+            .all()
+            .iter()
+            .map(|s| Selection {
+                anchor: Cursor::at(edits.iter().fold(s.anchor.at, |at, e| e.map(at))),
+                head: Cursor::at(edits.iter().fold(s.head.at, |at, e| e.map(at))),
+            })
+            .collect()
+    }
+
     /// The drain itself: every buffer's `pending_edits`, fed to tree-sitter,
     /// to LSP `didChange`, to the stored diagnostics, and to the selections
     /// of every window not responsible for them.
@@ -7819,15 +7885,7 @@ impl Editor {
                     continue;
                 }
 
-                let mapped: Vec<Selection> = text
-                    .selections
-                    .all()
-                    .iter()
-                    .map(|s| Selection {
-                        anchor: Cursor::at(edits.iter().fold(s.anchor.at, |at, e| e.map(at))),
-                        head: Cursor::at(edits.iter().fold(s.head.at, |at, e| e.map(at))),
-                    })
-                    .collect();
+                let mapped = Self::remapped(&text.selections, &edits);
                 text.selections.set(mapped);
 
                 // The scroll row follows the text above it, so a line inserted
@@ -8668,27 +8726,42 @@ impl Editor {
         shell::expand(cmd, current.as_deref(), alternate.as_deref())
     }
 
+    /// Whether a `:!` job is still running — and if it is, says so, in the
+    /// words the refusal is spoken in.
+    ///
+    /// Pumps first: a job that ended between the last frame and this command
+    /// still has its tail lines and its trailer sitting in the slot, and the
+    /// refusal would otherwise be spoken by a job that is already over.
+    /// Draining reports that exit and drops the `Job`, so what refuses here
+    /// is only ever a job genuinely still running.
+    ///
+    /// Shared by `:!` and `:w !cmd`, which are the two commands that write
+    /// into the transient buffer under a `$ <cmd>` header of their own: one
+    /// job, one buffer — renaming a live job's buffer and interleaving a
+    /// filter's output into its stream is the surprising half.
+    /// `docs/specs/transient.md`.
+    fn a_job_is_in_the_way(&mut self) -> bool {
+        self.pump_shell();
+        if let Some(job) = &mut self.shell
+            && job.handle.is_running()
+        {
+            self.session.status = format!("! is running {} — :stop it first", job.cmd);
+            return true;
+        }
+        false
+    }
+
     /// `:!cmd` and what `:!!` repeats. Refuses while a job is already live;
     /// otherwise expands `%`/`#` against the focused buffer and its
     /// alternate, finds or creates the one transient buffer, delimits the
     /// run with `$ <cmd>`, shows it, and spawns. See
     /// `docs/specs/transient.md` §"`:!` in a transient buffer".
     fn run_bang(&mut self, cmd: String) {
-        // Before anything reads `self.shell`: a job that ended between the
-        // last frame and this command still has its tail lines and its
-        // trailer sitting in the slot, and the refusal below would otherwise
-        // be spoken by a job that is already over. Draining first reports
-        // that exit and drops the `Job`, so what refuses a `:!` here is only
-        // ever a job that is genuinely still running.
-        self.pump_shell();
         if self.shell_spawner.is_none() {
             self.session.status = "! : this frontend supplies no runner".into();
             return;
         }
-        if let Some(job) = &mut self.shell
-            && job.handle.is_running()
-        {
-            self.session.status = format!("! is running {} — :stop it first", job.cmd);
+        if self.a_job_is_in_the_way() {
             return;
         }
         let expanded = match self.expand_shell(&cmd) {
@@ -8896,6 +8969,9 @@ impl Editor {
     /// the buffer's modified flag is untouched, because nothing here saves
     /// anything. See `docs/specs/transient.md`.
     fn run_write(&mut self, scope: Option<Scope>, cmd: String) {
+        if self.a_job_is_in_the_way() {
+            return;
+        }
         let expanded = match self.expand_shell(&cmd) {
             Ok(expanded) => expanded,
             Err(message) => {
@@ -27567,6 +27643,79 @@ int main(void) {
             assert_eq!(ed.session.status, "! killed", "the verdict still lands");
         }
 
+        /// A log window closed with `Ctrl-W c` and re-opened by the next
+        /// `:!` starts at the tail — otherwise it would sit wherever the
+        /// buffer entry remembers the last window was reading, and
+        /// `append_to_transient` only follows the tail for windows already
+        /// on it: the new window would never move again.
+        #[test]
+        fn a_reopened_log_window_starts_at_the_tail() {
+            let (_dir, mut ed, fake) = project("reopen");
+            ex(&mut ed, "!echo a");
+            let id = transient_id(&ed);
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("a".into()));
+            slot.finish(Exit::Code(0));
+            ed.settle();
+            let shown = transient_window(&ed, id);
+            ed.close_window(shown);
+            assert!(ed.buffer_ids().contains(&id), "the window went, the buffer stayed");
+
+            ex(&mut ed, "!echo b");
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("b".into()));
+            slot.finish(Exit::Code(0));
+            ed.settle();
+
+            let shown = transient_window(&ed, id);
+            let cursor = ed.window_of(shown).and_then(Window::text).unwrap().selections.cursor();
+            let last = ed.entry(id).buffer.line_count() - 1;
+            assert_eq!(ed.entry(id).buffer.row_at(cursor), last, "on the tail, and following it");
+            assert_eq!(ed.entry(id).buffer.line(last), "exited 0");
+        }
+
+        /// `:qa` does not nag about the job's buffer — a transient buffer has
+        /// no file to be behind — and the job dies with the editor: the kill
+        /// is `shutdown_shell`'s, which the frontend runs on its way out
+        /// (`src/main.rs`). `docs/specs/transient.md`.
+        #[test]
+        fn qa_with_a_job_running_quits_and_the_job_dies_with_it() {
+            let (_dir, mut ed, fake) = project("qa-running");
+            ex(&mut ed, "!sleep 30");
+
+            ex(&mut ed, "qa");
+
+            assert!(ed.session.quit, "quit, no nag: {}", ed.session.status);
+            assert!(!ed.session.status.contains("unsaved"), "{}", ed.session.status);
+
+            ed.shutdown_shell();
+            assert_eq!(*fake.killed.lock().unwrap(), 1);
+        }
+
+        /// `:bd` on a finished job's buffer takes the buffer away, and
+        /// `job_buffer` with it. The next `:!!` must build a fresh one rather
+        /// than append into an id that no longer resolves.
+        #[test]
+        fn bang_bang_after_the_log_was_closed_opens_a_fresh_buffer() {
+            let (_dir, mut ed, fake) = project("bang-bang-after-bd");
+            ex(&mut ed, "!echo hi");
+            let first = transient_id(&ed);
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+            ed.settle();
+            let shown = transient_window(&ed, first);
+            ed.set_focus(shown);
+            ex(&mut ed, "bd");
+            assert!(!ed.buffer_ids().contains(&first));
+
+            ex(&mut ed, "!!");
+
+            let id = transient_id(&ed);
+            assert_ne!(id, first, "a fresh buffer, not the closed one");
+            assert_eq!(fake.spawned.lock().unwrap().len(), 2);
+            assert_eq!(transient_lines(&ed, id), vec!["$ echo hi".to_string()]);
+        }
+
         #[test]
         fn shutting_down_with_no_job_is_a_no_op() {
             let (_dir, mut ed, fake) = project("shutdown-none");
@@ -27778,6 +27927,40 @@ int main(void) {
                 "one\ntwo\n",
                 "one `u` reaches past the empty read to the edit before it"
             );
+        }
+
+        /// One job, one buffer: `:w !cmd` writes into the same transient
+        /// buffer under a `$ <cmd>` header of its own, so while a job is
+        /// filling that buffer it is refused in the same words a second
+        /// `:!` is. `docs/specs/transient.md`.
+        #[test]
+        fn write_bang_while_a_job_runs_is_refused() {
+            let (_dir, mut ed, fake_run) = filter_project("write-running", "one\n", Ok("one\n"));
+            let fake_spawn = crate::shell::fake::FakeSpawn::default();
+            ed.set_shell_spawner(fake_spawn.clone());
+            ex(&mut ed, "!sleep 30");
+
+            ex(&mut ed, "w !cat");
+
+            assert!(ed.session.status.contains(":stop it first"), "{}", ed.session.status);
+            assert!(ed.session.status.contains("sleep 30"), "names it: {}", ed.session.status);
+            assert!(fake_run.calls.lock().unwrap().is_empty(), "the filter never ran");
+        }
+
+        /// The log is a buffer, and everything a buffer does works in it —
+        /// a range filter included. `docs/specs/transient.md`.
+        #[test]
+        fn a_range_filter_works_in_the_transient_buffer() {
+            let (_dir, mut ed, fake) = filter_project("sort-transient", "x\n", Ok("a\nb\n"));
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["b".to_string(), "a".to_string()]);
+            let focus = ed.focus();
+            ed.show(focus, id);
+
+            ex(&mut ed, "%!sort");
+
+            assert_eq!(transient_lines(&ed, id), vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(fake.calls.lock().unwrap()[0].2, "b\na\n", "the log's own lines, on stdin");
         }
 
         /// A transient buffer holds its text whether or not a window can
@@ -28110,6 +28293,52 @@ int main(void) {
             assert_eq!(reader_cursor, top, "the reader stayed put");
         }
 
+        /// The drain skips the focused window on the assumption that whatever
+        /// made the edit moved that cursor too — which a job writing into a
+        /// buffer someone is reading breaks. Park focus above the tail, let
+        /// the cap trim the top, and the line under the cursor must still be
+        /// the line under the cursor.
+        #[test]
+        fn a_trim_carries_the_focused_readers_cursor_with_it() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let id = ed.transient_buffer("job");
+            ed.show_transient(id);
+            let watcher = ed
+                .window_ids()
+                .into_iter()
+                .find(|&w| ed.window_of(w).and_then(Window::buffer) == Some(id))
+                .unwrap();
+            ed.set_focus(watcher);
+            ed.apply(cmd(Action::Window(WindowCmd::Split { dir: Dir::Horizontal, path: None })));
+            let reader = ed.focus();
+            assert_ne!(reader, watcher, "two windows on the log");
+
+            // A hundred lines, then the reader parked in the middle of them
+            // — column 2 of `line90`, which the trim below will not eat.
+            let first: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
+            ed.append_to_transient(id, &first);
+            let at = ed.entry(id).buffer.at_row(90, false);
+            ed.window_mut_of(reader).and_then(Window::text_mut).unwrap().selections =
+                Selections::single(Cursor::at(at.at + 2));
+
+            // Five past the cap: the oldest five lines go.
+            let more: Vec<String> =
+                (0..Buffer::TRANSIENT_MAX_LINES - 95).map(|i| format!("more{i}")).collect();
+            ed.append_to_transient(id, &more);
+
+            assert_eq!(ed.entry(id).buffer.line_count(), Buffer::TRANSIENT_MAX_LINES, "capped");
+            let cursor = ed.window_of(reader).and_then(Window::text).unwrap().selections.cursor();
+            assert_eq!(ed.entry(id).buffer.row_at(cursor), 85, "up by the five that went");
+            assert_eq!(ed.entry(id).buffer.col_at(cursor), 2, "and in the same column");
+            assert_eq!(ed.entry(id).buffer.line(85), "line90", "still the line it was reading");
+
+            let last = ed.entry(id).buffer.line_count() - 1;
+            let watching =
+                ed.window_of(watcher).and_then(Window::text).unwrap().selections.cursor();
+            assert_eq!(ed.entry(id).buffer.row_at(watching), last, "the tail-watcher still is");
+        }
+
         #[test]
         fn bare_w_is_refused_with_the_copy_hint() {
             let mut ed = editor("hello");
@@ -28215,6 +28444,24 @@ int main(void) {
             ex(&mut ed, "enew");
 
             assert!(ed.buffer_ids().contains(&id), "the sweep left it alone");
+        }
+
+        /// `:set syntax` is session-wide, and a log is not a file in a
+        /// language: a transient buffer answers `None` however the option is
+        /// set, or every `:!` run would be painted through whatever grammar
+        /// the last real buffer wanted. `docs/specs/transient.md`.
+        #[test]
+        fn set_syntax_never_reaches_a_transient_buffer() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+
+            ex(&mut ed, "set syntax rust");
+            let id = ed.transient_buffer("!echo x");
+            ed.append_to_transient(id, &["$ echo x".to_string()]);
+            ed.settle();
+
+            assert!(ed.entry(id).syntax.is_none(), "no grammar for a log");
+            assert!(ed.entry(id).filetype.is_none(), "and no filetype either");
         }
 
         #[test]
