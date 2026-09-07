@@ -73,10 +73,16 @@ impl Slot {
     }
 
     /// Called from the waiter thread (or `Handle::kill`): files the exit.
-    /// A later call overwrites an earlier one — `kill`'s `Killed` is meant
-    /// to win over a waiter thread's `Signal` for the same death.
+    /// Delivered once: `Killed` is sticky, so any call after it is dropped.
+    /// `kill()` pins `Killed` before it forces the kill, so its verdict
+    /// always outranks the waiter thread's for the same death — the editor
+    /// asked for it, so its account of the death wins.
     pub fn finish(&self, exit: Exit) {
-        self.0.lock().expect("shell slot poisoned").exit = Some(exit);
+        let mut inner = self.0.lock().expect("shell slot poisoned");
+        if inner.exit == Some(Exit::Killed) {
+            return;
+        }
+        inner.exit = Some(exit);
     }
 
     /// Everything seen so far, and the exit if one has landed. Empties both
@@ -237,8 +243,11 @@ impl Handle for ProcessHandle {
             return;
         }
 
-        // Fire-and-forget: this waits only for the `kill` binary itself to
-        // exit (near-instant), not for the target process.
+        // `spawn()`, not `status()`: fire-and-forget per the controller
+        // ruling (no libc/nix dependency added), so this waits only for the
+        // `kill` binary itself to exit (near-instant), not for the target
+        // process — the `kill` process becomes a short-lived zombie until
+        // reaped, by design.
         let _ = Command::new("kill").arg("-TERM").arg(self.pid.to_string()).spawn();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -246,13 +255,20 @@ impl Handle for ProcessHandle {
             thread::sleep(Duration::from_millis(10));
         }
 
+        // Pin the verdict before forcing the kill: once this lands, `finish`
+        // is sticky on `Killed`, so the waiter thread — which may be
+        // blocked on the child mutex below and wakes the instant it's
+        // dropped — can never overwrite it with `Signal`/`Code`, regardless
+        // of scheduling. We asked for this death, so our verdict wins even
+        // if the process happened to exit cleanly on the SIGTERM above.
+        self.slot.finish(Exit::Killed);
+
         if self.is_running() {
             let mut child = self.child.lock().expect("child mutex poisoned");
             let _ = child.kill();
             let _ = child.wait();
         }
 
-        self.slot.finish(Exit::Killed);
         (self.wake)();
     }
 
@@ -420,7 +436,34 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
 
         let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
-        assert!(matches!(exit, Exit::Killed | Exit::Signal), "{exit:?}");
+        assert_eq!(exit, Exit::Killed, "kill's verdict must win the race with the waiter thread");
         assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
+        assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn kill_still_reports_killed_when_the_job_honours_sigterm() {
+        let slot = Slot::default();
+        let (wake, rx) = waker();
+        let mut handle = ProcessSpawn
+            .spawn(
+                "trap 'exit 0' TERM; while :; do sleep 0.1; done",
+                Path::new("."),
+                slot.clone(),
+                wake,
+            )
+            .expect("sh exists everywhere this builds");
+
+        let start = Instant::now();
+        handle.kill();
+        assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
+
+        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
+        assert_eq!(
+            exit,
+            Exit::Killed,
+            "we asked for this death, so our verdict wins even though the job exited cleanly"
+        );
+        assert!(!handle.is_running());
     }
 }
