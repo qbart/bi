@@ -5737,7 +5737,11 @@ impl Editor {
 
     /// Shows a transient buffer, the way `:!` and `:results` both want: reuse
     /// a window already looking at it, otherwise open one in a split below
-    /// the focused window — and leave focus exactly where it was.
+    /// the focused window — and leave focus exactly where it was. Returns
+    /// whether some window now shows `id` — `false` only when there was no
+    /// room to split (`split_focus` has already put that on the status
+    /// line), so a caller whose own status would otherwise overwrite that
+    /// message knows to fold the "no room" fact into its own instead.
     ///
     /// Mirrors `WindowCmd::New { dir: Some(Horizontal) }`'s mechanics
     /// (`split_focus` then `show`), with one difference on purpose: that
@@ -5745,19 +5749,20 @@ impl Editor {
     /// window to work in, and this one restores focus because you asked
     /// for a buffer to watch, not to leave what you were doing.
     /// `docs/specs/transient.md` §"Where it shows".
-    fn show_transient(&mut self, id: BufferId) {
+    fn show_transient(&mut self, id: BufferId) -> bool {
         if self.windows.iter().any(|w| w.buffer() == Some(id)) {
-            return;
+            return true;
         }
         let focus = self.focus;
         // `previous` means "where focus was before the last deliberate
         // jump" — a round trip through the split this makes is not one, and
         // must not be what a later `Ctrl-W p` answers with.
         let previous = self.previous;
-        let Some(new) = self.split_focus(Dir::Horizontal) else { return };
+        let Some(new) = self.split_focus(Dir::Horizontal) else { return false };
         self.show(new, id);
         self.set_focus(focus);
         self.previous = previous;
+        true
     }
 
     /// Appends `lines` to a transient buffer and moves the cursor of every
@@ -8699,14 +8704,26 @@ impl Editor {
         // and `docs/specs/transient.md` already requires.
         let id = self.transient_buffer(&format!("!{expanded}"));
         self.append_to_transient(id, &[format!("$ {expanded}")]);
-        self.show_transient(id);
+        let shown = self.show_transient(id);
         let slot = shell::Slot::default();
         let cwd = self.session_root();
         let wake = self.shell_waker.clone();
         let spawner = self.shell_spawner.as_ref().expect("checked is_none above");
         match spawner.spawn(&expanded, &cwd, slot.clone(), wake) {
             Ok(handle) => {
-                self.session.status = format!("! {expanded}");
+                // `show_transient` already put "not enough room to split" on
+                // the status line when `shown` is false — folding the job
+                // into that instead of overwriting it, so the status still
+                // says a job ran, but also where to go find it (`:b`, since
+                // there is no window open on it to switch to instead).
+                self.session.status = if shown {
+                    format!("! {expanded}")
+                } else {
+                    format!(
+                        "! {expanded} — output in {} (no room to split; :b to see it)",
+                        self.name_of(id)
+                    )
+                };
                 self.shell = Some(shell::Job { cmd: expanded, slot, handle });
                 self.job_buffer = Some(id);
                 self.last_bang = Some(cmd);
@@ -8921,9 +8938,21 @@ impl Editor {
         let mut lines = vec![format!("$ {expanded}")];
         lines.extend(output.lines().map(str::to_string));
         self.append_to_transient(id, &lines);
-        self.show_transient(id);
+        let shown = self.show_transient(id);
         let rows = last - first + 1;
-        self.session.status = format!("wrote {rows} line{}", if rows == 1 { "" } else { "s" });
+        let plural = if rows == 1 { "" } else { "s" };
+        // As in `run_bang`: fold `show_transient`'s "not enough room to
+        // split" into the write's own status rather than silently
+        // overwriting it — the output still landed in the buffer, just
+        // with nowhere open to show it.
+        self.session.status = if shown {
+            format!("wrote {rows} line{plural}")
+        } else {
+            format!(
+                "wrote {rows} line{plural} to {} (no room to split; :b to see it)",
+                self.name_of(id)
+            )
+        };
     }
 
     /// Drains the live job's slot into its transient buffer, every wake this
@@ -27259,6 +27288,24 @@ int main(void) {
             assert_eq!(ed.session.status, "! exited 0");
         }
 
+        /// `show_transient` puts "not enough room to split" on the status
+        /// line when it can't open a window — and `run_bang` must not
+        /// silently overwrite that with its own `! <cmd>`, or the user has
+        /// no way to learn the output is sitting unseen in `[!echo hi]`.
+        #[test]
+        fn bang_with_no_room_to_split_says_where_the_output_went() {
+            let (_dir, mut ed, fake) = project("no-room");
+            // A terminal with no room to split.
+            ed.layout(Rect::new(0, 0, 80, 2), TEST_CHROME);
+
+            ex(&mut ed, "!echo hi");
+
+            let id = transient_id(&ed);
+            assert_eq!(fake.spawned.lock().unwrap().len(), 1, "the job still spawned");
+            assert!(ed.session.status.contains("no room"), "{}", ed.session.status);
+            assert!(ed.session.status.contains(&ed.name_of(id)), "{}", ed.session.status);
+        }
+
         #[test]
         fn a_second_bang_appends_under_a_new_header_and_renames() {
             let (_dir, mut ed, fake) = project("rename");
@@ -27749,6 +27796,10 @@ int main(void) {
             assert_eq!(fake.calls.lock().unwrap().len(), 1, "the command still ran");
             let id = transient_id(&ed);
             assert!(transient_lines(&ed, id).contains(&"one".to_string()));
+            // The output landed nowhere visible — the status has to say so,
+            // or the user has no way to learn it is sitting in `[!cat]`.
+            assert!(ed.session.status.contains("no room"), "{}", ed.session.status);
+            assert!(ed.session.status.contains(&ed.name_of(id)), "{}", ed.session.status);
         }
 
         #[test]
