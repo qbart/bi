@@ -14,7 +14,7 @@ use bi::config::Options;
 use bi::dap::Watch;
 use bi::decoration::{Decoration, Layer};
 use bi::editor::{Editor, Mode, Pane};
-use bi::indent::{char_width, display_col, expand_tabs, glyph};
+use bi::indent::{char_width, display_col, glyph};
 use bi::picker::{Picker, PickerKind};
 use bi::region::Shape;
 use bi::selection::Selections;
@@ -205,6 +205,12 @@ fn split_at_col(spans: Vec<Span<'static>>, col: usize) -> (Vec<Span<'static>>, V
 
 /// How many cells a span's text occupies. Tabs are already expanded by the
 /// time text is a span, so every char answers for itself.
+///
+/// This sums [`char_width`], which agrees with [`cells`] and `display_col` —
+/// *not* with the `str` width ratatui measures a span by, which counts a
+/// control character as one cell. That is not a disagreement to "fix" here:
+/// every span that could carry a control has been through [`cells`] already,
+/// so by this point there are none left to measure.
 fn span_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
@@ -219,9 +225,13 @@ fn overlay(
     text: &str,
     style: ThemeStyle,
 ) -> Vec<Span<'static>> {
+    // The context header's text is a line of the file (`editor.rs`,
+    // `context_header`), so it is as foreign as the row underneath it; the
+    // guides and whitespace marks are single glyphs this leaves alone.
+    let text = cells_at(text, 8);
     let (mut out, rest) = split_at_col(spans, col);
-    let (_replaced, right) = split_at_col(rest, span_width(text));
-    out.push(Span::styled(text.to_string(), tui(style)));
+    let (_replaced, right) = split_at_col(rest, span_width(&text));
+    out.push(Span::styled(text, tui(style)));
     out.extend(right);
     out
 }
@@ -306,7 +316,7 @@ fn decorate(
                 spans = overlay(spans, col + gutter, text, *style);
             }
             Decoration::Eol { row: at, text, style } if *at == row => {
-                spans.push(Span::styled(text.clone(), tui(*style)));
+                spans.push(Span::styled(cells_at(text, tab), tui(*style)));
             }
             Decoration::Repaint { range, style, .. } => {
                 let chars = raw.chars().count();
@@ -610,7 +620,8 @@ fn render_tree(
             None => Style::default(),
         };
 
-        let spans = vec![Span::styled(indent.clone(), mark_style), Span::styled(name, style)];
+        let spans =
+            vec![Span::styled(indent.clone(), mark_style), Span::styled(cells_at(&name, 8), style)];
         if index != tree.selected() {
             lines.push(Line::from(spans));
             continue;
@@ -653,12 +664,25 @@ fn cells(text: &str, col: &mut usize, tab: usize) -> String {
             out.push(a);
             out.push(b);
             *col += 2;
+        } else if ch.is_control() {
+            // A C1 control (`0x80-0x9f`): no `^X` name to draw it as, no
+            // width — `char_width` agrees, it answers 0 — and never sent, the
+            // one thing that matters. The old results-pane helper dropped
+            // every control this way; only the C0 ones grew a glyph.
         } else {
             out.push(ch);
             *col += char_width(ch);
         }
     }
     out
+}
+
+/// [`cells`] from column zero: the entry point for any text bi did not write
+/// itself — a file's lines, a name off the filesystem, a string an LSP or DAP
+/// server sent, a register's contents. Anything with no column to carry across
+/// segments, which is everything outside the buffer view and the results pane.
+fn cells_at(text: &str, tab: usize) -> String {
+    cells(text, &mut 0, tab)
 }
 
 /// What a search found: a heading per file, its matching lines under it.
@@ -696,7 +720,7 @@ fn render_results(
             // it is the same idea — a name with things under it.
             Row::File { path, matches } => vec![
                 Span::styled(
-                    path.display().to_string(),
+                    cells_at(&path.display().to_string(), tab),
                     tui(ui.tree_dir).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  {matches}"), tui(ui.status_muted)),
@@ -808,7 +832,9 @@ fn render_stack(
             Some(path) => format!("  {path}:{}", f.line),
             None => String::new(),
         };
-        let spans = vec![Span::raw(format!("#{index} {}{at}", f.name))];
+        // Tab 8, as in `render_console`: a debug pane has no `tab_width` of
+        // its own, so its stops are the terminal's own default.
+        let spans = vec![Span::raw(cells_at(&format!("#{index} {}{at}", f.name), 8))];
 
         if index != stack.selected {
             lines.push(Line::from(spans));
@@ -876,10 +902,12 @@ fn render_variables(
             (false, _) => ' ',
         };
         let indent = "  ".repeat(depth);
-        let mut spans =
-            vec![Span::raw(format!("{indent}{marker} {} = {}", node.name, node.value))];
+        // Tab 8, as in `render_console`: a debug pane has no `tab_width` of
+        // its own, so its stops are the terminal's own default.
+        let row = format!("{indent}{marker} {} = {}", node.name, node.value);
+        let mut spans = vec![Span::raw(cells_at(&row, 8))];
         if let Some(ty) = &node.ty {
-            spans.push(Span::styled(format!(": {ty}"), tui(ui.status_muted)));
+            spans.push(Span::styled(cells_at(&format!(": {ty}"), 8), tui(ui.status_muted)));
         }
 
         if index != vars.selected {
@@ -920,7 +948,10 @@ fn render_watches(
 
     for (index, watch) in list.iter().enumerate().take(last).skip(first) {
         let value = watch.value.as_deref().unwrap_or("…");
-        let spans = vec![Span::raw(format!("{}. {} = {value}", index + 1, watch.expr))];
+        // Tab 8, as in `render_console`: a debug pane has no `tab_width` of
+        // its own, so its stops are the terminal's own default.
+        let row = format!("{}. {} = {value}", index + 1, watch.expr);
+        let spans = vec![Span::raw(cells_at(&row, 8))];
 
         if index != watches.selected {
             lines.push(Line::from(spans));
@@ -987,7 +1018,7 @@ fn render_image(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| img.path.display().to_string());
-            let label = format!("{name} — {}×{}", img.width, img.height);
+            let label = cells_at(&format!("{name} — {}×{}", img.width, img.height), 8);
             let middle = Rect { y: area.y + area.height / 2, height: 1.min(area.height), ..area };
             let line = Line::from(Span::styled(label, tui(ui.status_muted)));
             frame.render_widget(
@@ -1406,7 +1437,7 @@ fn render_hover(
             HoverLine::Code(code) => block.push(code),
             HoverLine::Text(text) => {
                 flush(&mut block, &mut lines);
-                lines.push(Line::raw(format!(" {text} ")));
+                lines.push(Line::raw(format!(" {} ", cells_at(text, tab))));
             }
             HoverLine::Rule => {
                 flush(&mut block, &mut lines);
@@ -1444,7 +1475,7 @@ fn highlight_block<'a>(
     let text = block.join("\n");
     let rope = ropey::Rope::from_str(&text);
     let Some(syntax) = language.and_then(|name| Syntax::for_filetype(name, &rope)) else {
-        return block.iter().map(|line| Line::raw(format!(" {line} "))).collect();
+        return block.iter().map(|line| Line::raw(format!(" {} ", cells_at(line, tab)))).collect();
     };
     let spans = syntax.highlights(&rope, 0..text.len());
     let mut out = Vec::new();
@@ -1489,7 +1520,8 @@ fn render_menu(
     if total == 0 {
         return;
     }
-    let label_width = menu.matches().take(100).map(|i| span_width(&i.label)).max().unwrap_or(0);
+    let label_width =
+        menu.matches().take(100).map(|i| span_width(&cells_at(&i.label, tab))).max().unwrap_or(0);
     let width = (label_width + 4).clamp(8, area.width as usize) as u16;
     let height = total.min(8) as u16;
     let Some(rect) = float_rect(anchor, (width, height), area, false) else { return };
@@ -1508,7 +1540,7 @@ fn render_menu(
             let badge = item.kind.map(kind_char).unwrap_or(' ');
             let text = format!(
                 " {:<w$} {badge} ",
-                truncate(&item.label, width as usize - 4),
+                truncate(&cells_at(&item.label, tab), width as usize - 4),
                 w = width as usize - 4
             );
             match i == menu.selected() {
@@ -1544,8 +1576,12 @@ fn render_signature(
     };
     let data = &sig.data;
 
-    let take = |from: usize, to: usize| -> String {
-        data.label.chars().skip(from).take(to.saturating_sub(from)).collect()
+    // One column runs across the three slices, so the server's own text is
+    // drawn as cells with its stops where they would be anywhere else.
+    let mut col = 0;
+    let mut take = |from: usize, to: usize| -> String {
+        let slice: String = data.label.chars().skip(from).take(to.saturating_sub(from)).collect();
+        cells(&slice, &mut col, tab)
     };
     let total = data.label.chars().count();
     let mut spans = vec![Span::raw(" ")];
@@ -1558,7 +1594,7 @@ fn render_signature(
             ));
             spans.push(Span::raw(take(range.end, total)));
         }
-        None => spans.push(Span::raw(data.label.clone())),
+        None => spans.push(Span::raw(take(0, total))),
     }
     if data.total > 1 {
         spans.push(Span::styled(format!(" (1/{})", data.total), tui(ui.status_muted)));
@@ -1635,7 +1671,9 @@ fn mode_style(mode: &Mode, ui: &Ui) -> Style {
 fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Span<'static>> {
     let row =
         if focused { tui(ed.theme().ui.statusline) } else { tui(ed.theme().ui.status_inactive) };
-    let left = window_status_text(ed, id, focused);
+    // The name comes off the filesystem, so the row it leads goes to cells
+    // like any other foreign text.
+    let left = cells_at(&window_status_text(ed, id, focused), 8);
     // An image pane has no mode segment: modes do not exist there, and the
     // row should not claim otherwise. See docs/specs/images.md.
     let image = matches!(ed.pane(id), Some(Pane::Image { .. }));
@@ -1754,7 +1792,7 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
 /// The entry's first line, tab-expanded and elided to fit one row.
 fn row_label(text: &str, width: usize, tab_width: usize) -> String {
     let first = text.lines().next().unwrap_or("");
-    let expanded = expand_tabs(first, tab_width);
+    let expanded = cells_at(first, tab_width);
     if span_width(&expanded) <= width {
         return expanded;
     }
@@ -1835,7 +1873,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("> ", tui(ui.picker_prompt)),
-            Span::raw(picker.query().to_string()),
+            Span::raw(cells_at(picker.query(), tab_width)),
         ])),
         query_area,
     );
@@ -1883,7 +1921,7 @@ fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect, ui: &Ui, ta
             .preview()
             .lines()
             .take(preview_inner.height as usize)
-            .map(|l| Line::from(expand_tabs(l, tab_width)))
+            .map(|l| Line::from(cells_at(l, tab_width)))
             .collect();
         frame.render_widget(Paragraph::new(body).style(tui(ui.picker_preview)), preview_inner);
     }
@@ -1928,18 +1966,21 @@ fn status_spans(
     matches: Option<(usize, usize)>,
     width: u16,
 ) -> Vec<Span<'static>> {
+    // Everything on this row can carry text bi did not write — a pasted `:`
+    // line, a search pattern, a status naming a file or a shell command — so
+    // all of it goes to cells. Tab 8: the footer belongs to no buffer.
     if let Mode::Command(line) = &ed.session.mode {
-        return vec![Span::raw(format!(":{line}"))];
+        return vec![Span::raw(cells_at(&format!(":{line}"), 8))];
     }
     if let Mode::Search { query, forward } = &ed.session.mode {
         let prefix = if *forward { '/' } else { '?' };
-        return vec![Span::raw(format!("{prefix}{query}"))];
+        return vec![Span::raw(cells_at(&format!("{prefix}{query}"), 8))];
     }
     // The search keeps the line after `<CR>` too, for as long as the keys are
     // still the search. The pattern reads the same as it did while it was
     // being typed, which is the point: nothing else moves in or out around it.
     if ed.session.search_focus {
-        let left = Span::raw(ed.session.status.clone());
+        let left = Span::raw(cells_at(&ed.session.status, 8));
         let right = match matches {
             Some((at, total)) => format!("[{at}/{total}] "),
             None => String::new(),
@@ -1952,8 +1993,10 @@ fn status_spans(
         ];
     }
 
-    let mut spans =
-        vec![Span::raw(" "), Span::styled(ed.session.status.clone(), tui(ed.theme().ui.status))];
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(cells_at(&ed.session.status, 8), tui(ed.theme().ui.status)),
+    ];
 
     // Several cursors is a state you cannot otherwise tell from the mode: the
     // label still says NORMAL, and the only other sign is coloured cells that
@@ -1976,7 +2019,10 @@ fn status_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `cells_at` is what the drawing paths use now; the raw expansion is
+    // still the plainest way to build a line for a test about columns.
     use bi::editor::LineNumbers;
+    use bi::indent::expand_tabs;
 
     /// A `\t` written into a cell desyncs the diff from the real terminal,
     /// which reads as stale glyphs after the pane closes. Expanded to the
@@ -1997,6 +2043,12 @@ mod tests {
         let mut col = 0;
         assert_eq!(cells("a\u{7}b\u{1b}c", &mut col, 4), "a^Gb^[c", "controls drawn, not sent");
         assert_eq!(col, 7);
+
+        // A C1 control has no `^X` name and no width; it is dropped outright
+        // rather than pushed through as the byte a terminal would execute.
+        let mut col = 0;
+        assert_eq!(cells("a\u{9b}b", &mut col, 4), "ab", "C1 is dropped, never sent");
+        assert_eq!(col, 2);
     }
 
     /// Any background will do for the padding tests below — they are about
@@ -2254,6 +2306,68 @@ mod tests {
         assert!(!first.contains('^'), "and nothing of the glyph is left: {first:?}");
     }
 
+    /// The highlighted branch of the buffer view, on its own: a captured
+    /// span and the text either side of it both go to cells, so a themed
+    /// line is no more able to reach the terminal than an unthemed one.
+    /// The frame tests above run through `Editor::empty()`, which has no
+    /// grammar and so never reaches here.
+    #[test]
+    fn a_styled_line_draws_its_escapes_rather_than_sending_them() {
+        const SOURCE: &str = "let a = \"x\x1b[31my\";";
+        let rope = ropey::Rope::from_str(SOURCE);
+        let syntax = Syntax::for_filetype("rust", &rope).expect("rust is a shipped grammar");
+        let theme = Theme::default();
+        // The string literal, capture and all — the span either side of it is
+        // the other half of what `styled_line` pushes.
+        let start = SOURCE.find('"').expect("a literal");
+        let hl = [HlSpan { start_byte: start, end_byte: SOURCE.len() - 1, capture: 0 }];
+
+        let spans = styled_line(SOURCE, 0, &hl, &syntax, &theme, 4);
+
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "let a = \"x^[[31my\";");
+        assert!(!spans.iter().any(|s| s.content.contains('\x1b')), "no raw ESC in any span");
+    }
+
+    /// An LSP server's strings are as foreign as a file's bytes: a hover
+    /// body, and the fenced block under it that no grammar claims, both reach
+    /// the screen as glyphs. See `docs/specs/ansi.md` §"Rule 2".
+    #[test]
+    fn a_hover_draws_a_servers_escapes_rather_than_sending_them() {
+        use bi::editor::{Hover, HoverLine};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "code\n");
+        ed.set_cursor(Cursor::at(0));
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        // Once first, so the window knows how tall it is: a float is placed
+        // against a viewport, and one of nought rows has nowhere to go.
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+
+        ed.session.hover = Some(Hover {
+            window: ed.focus(),
+            anchor: 0,
+            // No language, so the fenced block takes the fallback branch —
+            // the other path this covers.
+            language: None,
+            lines: vec![
+                HoverLine::Text("t\x1b[31mx".into()),
+                HoverLine::Code("c\x1b[31my".into()),
+            ],
+        });
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+
+        let screen: String = (0..8)
+            .flat_map(|y| (0..30).map(move |x| (x, y)))
+            .map(|(x, y)| terminal.backend().buffer()[(x, y)].symbol().to_string())
+            .collect();
+        assert!(screen.contains("t^[[31mx"), "the text line, drawn: {screen:?}");
+        assert!(screen.contains("c^[[31my"), "and the fenced one: {screen:?}");
+        assert!(!screen.contains('\x1b'), "no raw ESC in any cell");
+    }
+
     /// The Console paints a debuggee's stdout, which is as free to hold an
     /// `ESC` as any other log — and it goes to cells through the same helper.
     #[test]
@@ -2272,6 +2386,38 @@ mod tests {
         let row: String =
             (0..24).map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string()).collect();
         assert!(row.contains("^[[31mx"), "drawn as a glyph: {row:?}");
+        assert!(!row.contains('\x1b'), "no raw ESC in any cell");
+    }
+
+    /// A debug adapter's strings are foreign too: a variable's value, its
+    /// name and the type beside it all reach the screen as glyphs. The stack
+    /// and watches panes go the same way through the same helper.
+    #[test]
+    fn a_variable_row_draws_its_escapes_rather_than_sending_them() {
+        use bi::window::VarNode;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let node = VarNode {
+            name: "v".into(),
+            value: "\x1b[31mx".into(),
+            ty: None,
+            reference: 0,
+            expanded: false,
+            loaded: true,
+            children: Vec::new(),
+        };
+        let vars = DapVariables { roots: vec![node], selected: 0 };
+        let ui = Theme::default().ui;
+        let mut terminal = Terminal::new(TestBackend::new(24, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_variables(frame, &vars, frame.area(), true, &ui);
+            })
+            .unwrap();
+        let row: String =
+            (0..24).map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string()).collect();
+        assert!(row.contains("v = ^[[31mx"), "drawn as a glyph: {row:?}");
         assert!(!row.contains('\x1b'), "no raw ESC in any cell");
     }
 
@@ -2610,6 +2756,22 @@ int main(void) {
         assert_eq!(line_of(&out), "code  ← here");
     }
 
+    /// An `Eol` carries a diagnostic message, which is a server's text — so
+    /// it goes to cells like every other foreign string.
+    #[test]
+    fn an_eol_decoration_draws_its_escapes_rather_than_sending_them() {
+        let line = Row { row: 0, raw: "code", start: 0, gutter: 0, tab: 4 };
+        let decorations = [Decoration::Eol {
+            row: 0,
+            text: "  \x1b[31mbad".to_string(),
+            style: ThemeStyle::default(),
+        }];
+
+        let out = decorate(vec![Span::raw("code".to_string())], &line, &decorations, Layer::Over);
+
+        assert_eq!(line_of(&out), "code  ^[[31mbad");
+    }
+
     /// The whole point of `Inline`: the character the label points at is still
     /// on the screen, one cell further along.
     #[test]
@@ -2766,6 +2928,60 @@ int main(void) {
     fn a_tab_is_as_wide_as_the_options_say() {
         assert_eq!(row_label("a\tb", 20, 4), "a   b");
         assert_eq!(row_label("a\tb", 20, 8), "a       b");
+
+        // And a control character is two cells the tab after it counts, so
+        // the stop is still the option's.
+        assert_eq!(row_label("\x1b\tb", 20, 4), "^[  b");
+        assert_eq!(cells_at("a\tb", 4), "a   b");
+    }
+
+    /// A picker row is a register's text, a file's name, a command someone
+    /// typed — none of it bi's own, all of it through `cells`. The query line
+    /// above the list is the same: a pasted `ESC` is a character, not a
+    /// command to the terminal.
+    #[test]
+    fn a_picker_row_and_its_query_draw_their_escapes() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        let mut picker = Picker::new(
+            PickerKind::Register { before: false },
+            vec![bi::picker::Item { text: "r\x1b[31mx".into(), badge: None }],
+            0,
+        );
+        picker.push_char('\x1b');
+        ed.session.picker = Some(picker);
+        ed.session.mode = Mode::Pick;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+
+        let screen: String = (0..12)
+            .flat_map(|y| (0..40).map(move |x| (x, y)))
+            .map(|(x, y)| terminal.backend().buffer()[(x, y)].symbol().to_string())
+            .collect();
+        assert!(screen.contains("r^[[31mx"), "the row, drawn: {screen:?}");
+        assert!(screen.contains("> ^["), "and the query: {screen:?}");
+        assert!(!screen.contains('\x1b'), "no raw ESC in any cell");
+    }
+
+    /// The footer carries whatever a command left there — a shell command
+    /// line among them, which is as free to hold an `ESC` as any file is.
+    #[test]
+    fn the_footer_draws_its_escapes_rather_than_sending_them() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.session.status = "! \x1b[31mx".into();
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+
+        let footer: String =
+            (0..24).map(|x| terminal.backend().buffer()[(x, 3)].symbol().to_string()).collect();
+        assert!(footer.contains("! ^[[31mx"), "drawn as a glyph: {footer:?}");
+        assert!(!footer.contains('\x1b'), "no raw ESC in any cell");
     }
 
     #[test]

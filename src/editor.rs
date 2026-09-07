@@ -1433,7 +1433,9 @@ fn whitespace(
             }
             col += match ch {
                 '\t' => tab_width - (col % tab_width),
-                _ => 1,
+                // Not one per character: a control is drawn `^X` and costs
+                // two cells, a CJK character two, a combining mark none.
+                _ => crate::indent::char_width(ch),
             };
         }
         // Only where there is one. The last row of a file that does not end in
@@ -8784,12 +8786,17 @@ impl Editor {
                 return;
             }
         };
+        // What the job is told is `expanded` as written; what bi *shows* of
+        // it is sanitized, because `%` and `#` expand to names off the
+        // filesystem and a file name may hold a control byte.
+        // `docs/specs/ansi.md` §"Rule 1".
+        let shown_cmd = shell::sanitize(&expanded);
         // `show_transient` restores focus and `previous` itself, so there is
         // nothing here to save and put back — the cursor never leaves the
         // buffer the command was run from, the way vim leaves you in place
         // and `docs/specs/transient.md` already requires.
-        let id = self.transient_buffer(&format!("!{expanded}"));
-        self.append_to_transient(id, &[format!("$ {expanded}")]);
+        let id = self.transient_buffer(&format!("!{shown_cmd}"));
+        self.append_to_transient(id, &[format!("$ {shown_cmd}")]);
         let shown = self.show_transient(id);
         let slot = shell::Slot::default();
         let cwd = self.session_root();
@@ -8803,14 +8810,16 @@ impl Editor {
                 // says a job ran, but also where to go find it (`:b`, since
                 // there is no window open on it to switch to instead).
                 self.session.status = if shown {
-                    format!("! {expanded}")
+                    format!("! {shown_cmd}")
                 } else {
                     format!(
-                        "! {expanded} — output in {} (no room to split; :b to see it)",
+                        "! {shown_cmd} — output in {} (no room to split; :b to see it)",
                         self.name_of(id)
                     )
                 };
-                self.shell = Some(shell::Job { cmd: expanded, slot, handle });
+                // The job's own `cmd` is what the refusal names, and that is
+                // shown too, so it is the sanitized one; nothing re-runs it.
+                self.shell = Some(shell::Job { cmd: shown_cmd, slot, handle });
                 self.job_buffer = Some(id);
                 self.last_bang = Some(cmd);
             }
@@ -9023,8 +9032,12 @@ impl Editor {
                 return;
             }
         };
-        let id = self.transient_buffer(&format!("!{expanded}"));
-        let mut lines = vec![format!("$ {expanded}")];
+        // Sanitized for the same reason as `run_bang`'s header: `%` expands
+        // to a name off the filesystem. The argv the runner was handed above
+        // is the unsanitized one.
+        let shown_cmd = shell::sanitize(&expanded);
+        let id = self.transient_buffer(&format!("!{shown_cmd}"));
+        let mut lines = vec![format!("$ {shown_cmd}")];
         lines.extend(output.lines().map(shell::sanitize));
         self.append_to_transient(id, &lines);
         let shown = self.show_transient(id);
@@ -22574,6 +22587,20 @@ mod tests {
         );
     }
 
+    /// A control character is two cells on the screen (`^[`), so the space
+    /// after one is at column 2 — the walk counts columns, and a column is
+    /// what `indent::char_width` answers, not one per character.
+    #[test]
+    fn a_mark_past_a_control_character_lands_where_the_glyph_ends() {
+        let ed = shown("\x1b x\n");
+
+        assert_eq!(
+            marks(&ed),
+            [(0, Some(2), WS_SPACE.into()), (0, None, WS_EOL.into())],
+            "past the two cells `^[` occupies"
+        );
+    }
+
     #[test]
     fn a_tab_is_marked_at_the_column_it_starts_in() {
         let mut ed = editor("\tx\ty\n");
@@ -27350,6 +27377,31 @@ int main(void) {
         /// draining — a test's hand on the job's output and exit.
         fn last_spawned(fake: &FakeSpawn) -> (String, Slot) {
             fake.spawned.lock().unwrap().last().cloned().expect("something was spawned")
+        }
+
+        /// `%` expands to a path off the filesystem, and a file name is free
+        /// to hold a control byte. What the job is *told* is the name as it
+        /// is; what the header, the buffer's name and the status say is the
+        /// name sanitized, because those three are text bi shows.
+        /// `docs/specs/ansi.md` §"Rule 1".
+        #[test]
+        fn a_control_byte_in_an_expanded_name_never_reaches_the_header_or_status() {
+            let dir = ScratchDir::new("shell-bel").written("be\x07l.rs", "x\n");
+            let mut ed = Editor::open(format!("{}/be\x07l.rs", dir.path())).unwrap();
+            sized(&mut ed);
+            let fake = FakeSpawn::default();
+            ed.set_shell_spawner(fake.clone());
+
+            ex(&mut ed, "!echo %");
+
+            let (spawned, _) = last_spawned(&fake);
+            assert!(spawned.contains('\x07'), "the job runs the command as written");
+            let id = transient_id(&ed);
+            let header = transient_lines(&ed, id).remove(0);
+            assert!(!header.contains('\x07'), "no BEL in the header: {header:?}");
+            assert!(header.starts_with("$ echo "), "{header:?}");
+            assert!(!ed.session.status.contains('\x07'), "nor the status: {}", ed.session.status);
+            assert!(!ed.name_of(id).contains('\x07'), "nor the name: {}", ed.name_of(id));
         }
 
         #[test]
