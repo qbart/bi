@@ -10670,15 +10670,19 @@ impl Editor {
 
     /// The same for a `:!` job: quitting with one running kills it on the
     /// way out, so nothing is orphaned. Called once beside
-    /// [`Editor::shutdown_dap`]. The same `Handle::kill` `:stop` uses — its
-    /// exit never reaches the console because nothing pumps it again after
-    /// this, but nothing needs it to: the process is asked to end and
-    /// `Editor` is about to go away regardless.
+    /// [`Editor::shutdown_dap`]. `kill_blocking`, not the `kill` `:stop`
+    /// uses: `:stop` can afford to let the escalation finish on its own
+    /// thread because the editor is still there to be woken, and this cannot
+    /// — the frontend is tearing down behind us, and a detached thread would
+    /// be racing the exit of the process it is escalating in. The job's own
+    /// exit never reaches the console (nothing pumps again after this), and
+    /// nothing needs it to; what matters is that we do not return with the
+    /// child still alive. No job, or one that already ended, is a no-op.
     pub fn shutdown_shell(&mut self) {
         if let Some(job) = &mut self.shell
             && job.handle.is_running()
         {
-            job.handle.kill();
+            job.handle.kill_blocking();
         }
     }
 

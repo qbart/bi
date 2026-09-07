@@ -28,11 +28,25 @@
 //! process-less embedding) drive the whole flow without one.
 
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// How long a SIGTERM has to work before the job is killed outright — the
+/// same grace the debugger's `end_session` gives an adapter.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// How long the waiter gives the two reader threads to reach EOF once the
+/// job itself has been reaped. A grandchild that inherited stdout can hold
+/// the pipe open for as long as it likes (`sh -c '(sleep 300 &)'`), and the
+/// exit is a fact about the job, not about that fd: past this the waiter
+/// files the exit and lets the readers finish whenever they finish. Their
+/// pushes are still safe — the `Slot` mutex, not the join, is what makes
+/// them visible — they just arrive after the trailer instead of before it.
+const READER_GRACE: Duration = Duration::from_secs(1);
 
 /// One line of a job's output, tagged by which pipe it came from — arrival
 /// order across both pipes is what a console wants, not stdout-then-stderr.
@@ -58,6 +72,10 @@ pub enum Exit {
 struct SlotInner {
     lines: Vec<Line>,
     exit: Option<Exit>,
+    /// Set by [`Slot::mark_killed`] the moment bi asks the job to die, and
+    /// read by [`Slot::finish`]: whatever verdict the death then arrives
+    /// with, it is reported as [`Exit::Killed`].
+    killed: bool,
 }
 
 /// A handle to one job's output, shared between the threads that produce it
@@ -72,17 +90,33 @@ impl Slot {
         self.0.lock().expect("shell slot poisoned").lines.push(line);
     }
 
-    /// Called from the waiter thread (or `Handle::kill`): files the exit.
-    /// Delivered once: `Killed` is sticky, so any call after it is dropped.
-    /// `kill()` pins `Killed` before it forces the kill, so its verdict
-    /// always outranks the waiter thread's for the same death — the editor
-    /// asked for it, so its account of the death wins.
+    /// Called from the escalation or waiter thread: files the exit. First
+    /// one wins — whichever of them notices the death first is the one that
+    /// reports it, and the loser's call is dropped.
+    ///
+    /// A job bi asked to kill is reported as [`Exit::Killed`] whatever it
+    /// actually died of ([`Slot::mark_killed`]), including a clean `exit 0`
+    /// out of its own SIGTERM handler: we asked for this death, so our
+    /// account of it wins over the exit code it happened to wear.
+    ///
+    /// **The exit is the editor's signal that the job is over**, and
+    /// `pump_shell` drops the `Job` — and with it `shutdown_shell`'s grip on
+    /// the process — as soon as it sees one. So nothing files an exit until
+    /// the process is confirmed gone: `kill` marks and signals, and leaves
+    /// the filing to whichever thread watches the death happen.
     pub fn finish(&self, exit: Exit) {
         let mut inner = self.0.lock().expect("shell slot poisoned");
-        if inner.exit == Some(Exit::Killed) {
+        if inner.exit.is_some() {
             return;
         }
-        inner.exit = Some(exit);
+        inner.exit = Some(if inner.killed { Exit::Killed } else { exit });
+    }
+
+    /// Called from `Handle::kill` before it signals anything: the death that
+    /// follows is one bi asked for, so [`Slot::finish`] should report it as
+    /// [`Exit::Killed`] regardless of what the process exits with.
+    pub fn mark_killed(&self) {
+        self.0.lock().expect("shell slot poisoned").killed = true;
     }
 
     /// Everything seen so far, and the exit if one has landed. Empties both
@@ -95,18 +129,35 @@ impl Slot {
 
 /// A running (or just-finished) job, from the editor's side.
 pub trait Handle: Send {
-    /// Ends the process: SIGTERM, ~2 s grace, SIGKILL, reaped. Files
-    /// [`Exit::Killed`] into the job's [`Slot`] once the process is
-    /// confirmed gone, so the editor can tell "we killed it" from "it
-    /// died" on its own.
+    /// Ends the process, **without blocking the caller**: files
+    /// [`Exit::Killed`] into the job's [`Slot`] (so the editor can tell "we
+    /// killed it" from "it died" on its own), sends SIGTERM, and returns.
+    /// The escalation — ~2 s of grace, then SIGKILL, then the reap — happens
+    /// behind it; the waker rings when the process is actually gone.
+    ///
+    /// It has to be that way round: `:stop` runs on the editor thread, and a
+    /// job that ignores SIGTERM would otherwise freeze the whole editor for
+    /// the length of the grace period. [`Handle::kill_blocking`] is the
+    /// variant for the one caller that needs the opposite.
     ///
     /// No `libc`/`nix` dependency exists in this crate and this method adds
-    /// none: the SIGTERM is sent by shelling out to the `kill` binary
-    /// (`kill -TERM <pid>`) rather than calling `libc::kill` directly. The
-    /// final SIGKILL uses `std::process::Child::kill`, which needs no such
-    /// dependency because the standard library already knows how to send
-    /// that one signal.
+    /// none: the signals are sent by shelling out to the `kill` binary
+    /// rather than calling `libc::kill` directly, and the last-resort
+    /// SIGKILL of the leader uses `std::process::Child::kill`, which the
+    /// standard library already knows how to send.
     fn kill(&mut self);
+
+    /// [`Handle::kill`] that returns only once the process is gone — for
+    /// `Editor::shutdown_shell`, which runs as the frontend tears itself
+    /// down: there is no event loop left to wake, so a detached escalation
+    /// thread would be racing the exit of the process it is escalating in.
+    ///
+    /// The default is right for any handle whose `kill` is already
+    /// synchronous (every fake, and any embedding that has no real process
+    /// to outlive it); [`ProcessSpawn`]'s handle overrides it.
+    fn kill_blocking(&mut self) {
+        self.kill();
+    }
 
     /// Whether the process is still alive, checked without blocking.
     fn is_running(&mut self) -> bool;
@@ -142,6 +193,16 @@ impl Spawn for ProcessSpawn {
             .arg("-c")
             .arg(cmd)
             .current_dir(cwd)
+            // Its own process group, with the shell as leader, so its pgid
+            // is its pid. `sh -c` execs only a *simple* command: for
+            // anything with a `;`, a `&` or a pipe in it the shell stays
+            // alive as a parent, and signalling the leader alone would kill
+            // the `sh` and orphan the `cargo build` underneath it. The group
+            // is the unit a job actually is, so it is the unit `kill` aims
+            // at (see `signal_group`). `process_group` is `std`'s own — it
+            // adds no `libc`/`nix` dependency, which is the whole reason the
+            // signals below go through the `kill` binary.
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -152,8 +213,9 @@ impl Spawn for ProcessSpawn {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
-        let stdout_reader = spawn_reader(stdout, slot.clone(), wake.clone(), Line::Out)?;
-        let stderr_reader = spawn_reader(stderr, slot.clone(), wake.clone(), Line::Err)?;
+        let readers = Readers::default();
+        spawn_reader(stdout, slot.clone(), wake.clone(), Line::Out, readers.clone())?;
+        spawn_reader(stderr, slot.clone(), wake.clone(), Line::Err, readers.clone())?;
 
         // The `Child` moves behind a mutex rather than into the waiter
         // thread outright: `Handle::kill` needs to reach it too (for the
@@ -166,6 +228,7 @@ impl Spawn for ProcessSpawn {
         let waiter_child = child.clone();
         let waiter_slot = slot.clone();
         let waiter_wake = wake.clone();
+        let waiter_readers = readers.clone();
         thread::Builder::new()
             .name("shell-wait".into())
             .spawn(move || {
@@ -173,51 +236,36 @@ impl Spawn for ProcessSpawn {
                     let status = waiter_child.lock().expect("child mutex poisoned").try_wait();
                     match status {
                         Ok(Some(status)) => {
-                            // Join the readers before filing the exit: a
+                            // Wait for the readers before filing the exit: a
                             // child can be reaped while its last lines still
-                            // sit in the pipe buffer, unread. `join` gives
-                            // the happens-before edge that `push`ing a line
-                            // and storing the exit otherwise lack — every
-                            // push the readers will ever make is visible
-                            // here before `finish` runs, so "exit delivered"
-                            // implies "all output delivered", and a drain
-                            // that sees the exit never misses a line that
-                            // preceded it.
+                            // sit in the pipe buffer, unread, and "exit
+                            // delivered" should imply "all output
+                            // delivered" — a drain that sees the exit must
+                            // not be missing a line that preceded it.
+                            //
+                            // Bounded, though (`READER_GRACE`): a grandchild
+                            // holding the fd open would otherwise hold the
+                            // trailer and the status line hostage for as
+                            // long as it lives. Completeness is what the
+                            // wait buys, not correctness — the `Slot` mutex
+                            // is what makes a reader's pushes visible here,
+                            // so the only cost of giving up is a late line
+                            // landing under the trailer instead of above it.
                             //
                             // This arm is also reached on the kill race:
                             // `std::process::Child` caches its reaped
-                            // status, so if `Handle::kill`'s forced path
-                            // reaps the child first, our `try_wait` above
-                            // does NOT error — it returns that same cached
-                            // `Ok(Some(status))`, and we join the readers
-                            // and compute an `exit` here same as any other
-                            // exit. That's harmless, not because we skip
-                            // this branch (we don't), but because the
-                            // readers see EOF once the child is gone (the
-                            // joins complete either way) and because
-                            // `Slot::finish` is sticky on `Killed`: by the
-                            // time we call it below, `kill()` has already
-                            // pinned `Exit::Killed`, so our `finish(exit)`
-                            // here is silently discarded. The stickiness in
-                            // `finish`, not the `Err(_)` arm below, is what
-                            // guards this race.
-                            //
-                            // Caveat, on both the natural-exit and kill
-                            // paths alike: a grandchild that inherits and
-                            // holds the stdout/stderr fds open past this
-                            // child's own exit keeps the corresponding
-                            // reader blocked on EOF, and now delays `finish`
-                            // (and thus the editor's status line) along with
-                            // it. Nothing new hangs that wasn't already
-                            // hanging — that reader was already stuck
-                            // waiting on the same fd before this join
-                            // existed — and it never blocks `kill()` or the
-                            // editor thread: `kill()` calls `finish(Killed)`
-                            // directly, without ever joining this waiter,
-                            // and the `Child` mutex is not held across
-                            // either join.
-                            let _ = stdout_reader.join();
-                            let _ = stderr_reader.join();
+                            // status, so if the escalation thread reaps the
+                            // child first, our `try_wait` above does NOT
+                            // error — it returns that same cached
+                            // `Ok(Some(status))`, and we compute an `exit`
+                            // here same as any other exit. Which of the two
+                            // threads files it does not matter: `finish`
+                            // takes the first and drops the second, and a
+                            // job that was killed is reported as `Killed`
+                            // either way (`Slot::mark_killed`). That, not
+                            // the `Err(_)` arm below, is what guards this
+                            // race.
+                            waiter_readers.wait_for_eof(READER_GRACE);
                             let exit = match status.code() {
                                 Some(code) => Exit::Code(code),
                                 None => Exit::Signal,
@@ -229,10 +277,22 @@ impl Spawn for ProcessSpawn {
                         Ok(None) => thread::sleep(Duration::from_millis(15)),
                         // A genuine wait error — e.g. the pid vanished from
                         // under us — not the kill race: a `Child` that has
-                        // already been reaped (by `kill()`'s forced path or
+                        // already been reaped (by the escalation thread or
                         // otherwise) yields the cached `Ok(Some(status))`
                         // above on every subsequent `try_wait`, never `Err`.
-                        Err(_) => return,
+                        //
+                        // Returning silently would leave a phantom job: no
+                        // exit is ever filed, so the editor keeps a `Job`
+                        // that pumps nothing, refuses the next `:!`, and
+                        // titles the pane `! <cmd>` forever. `Signal` is the
+                        // honest verdict — the process is gone and we cannot
+                        // say with what code — and it ends the job.
+                        Err(_) => {
+                            waiter_readers.wait_for_eof(READER_GRACE);
+                            waiter_slot.finish(Exit::Signal);
+                            waiter_wake();
+                            return;
+                        }
                     }
                 }
             })
@@ -242,22 +302,45 @@ impl Spawn for ProcessSpawn {
     }
 }
 
+/// The two reader threads' finish line — see [`READER_GRACE`]: a count under
+/// a mutex, notified on a condvar, because that is a wait a deadline can be
+/// put on and a `JoinHandle::join` is not. Cloned into each reader, which
+/// bumps the count as its very last act, and into the waiter.
+#[derive(Clone, Default)]
+struct Readers(Arc<(Mutex<usize>, Condvar)>);
+
+impl Readers {
+    /// Called by a reader thread as it ends, however it ends.
+    fn done(&self) {
+        let (count, ready) = &*self.0;
+        *count.lock().expect("reader tally poisoned") += 1;
+        ready.notify_all();
+    }
+
+    /// Blocks until both readers have hit EOF, or `patience` runs out.
+    fn wait_for_eof(&self, patience: Duration) {
+        let (count, ready) = &*self.0;
+        let done = count.lock().expect("reader tally poisoned");
+        let _ = ready.wait_timeout_while(done, patience, |count| *count < 2);
+    }
+}
+
 /// Reads `pipe` line by line (lossily — a job's output is not guaranteed
 /// UTF-8) and pushes each as a `Line` into `slot`, waking after each.
 /// `read_until` rather than `BufRead::lines`: `lines` errors out on invalid
 /// UTF-8 and drops the rest of the stream, which a build's stray byte
 /// should not be able to do.
 ///
-/// Returns the thread's `JoinHandle` rather than discarding it: the waiter
-/// thread joins both readers before filing the exit, so a `drain()` that
-/// sees the exit can never be missing lines that were still sitting in the
-/// pipe when the child was reaped.
+/// The thread is detached — it reports its own end through `readers`
+/// instead, so the waiter can stop waiting on a reader that a grandchild is
+/// keeping alive (see [`READER_GRACE`]).
 fn spawn_reader(
     pipe: impl Read + Send + 'static,
     slot: Slot,
     wake: Arc<dyn Fn() + Send + Sync>,
     make: fn(String) -> Line,
-) -> Result<thread::JoinHandle<()>, String> {
+    readers: Readers,
+) -> Result<(), String> {
     thread::Builder::new()
         .name("shell-read".into())
         .spawn(move || {
@@ -266,7 +349,7 @@ fn spawn_reader(
             loop {
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => return,
+                    Ok(0) | Err(_) => break,
                     Ok(_) => {
                         if buf.last() == Some(&b'\n') {
                             buf.pop();
@@ -274,11 +357,71 @@ fn spawn_reader(
                         slot.push(make(String::from_utf8_lossy(&buf).into_owned()));
                         wake();
                     }
-                    Err(_) => return,
                 }
             }
+            readers.done();
         })
+        .map(|_| ())
         .map_err(|e| format!("spawning reader thread: {e}"))
+}
+
+/// `kill -<signal> -- -<pid>`: the leading `-` on the pid makes it a
+/// *process group* id, and the job's group is its own (see the
+/// `process_group(0)` in [`ProcessSpawn::spawn`]), so this reaches the whole
+/// pipeline rather than only the `sh` at its head. `--` keeps `kill` from
+/// reading `-1234` as an option.
+///
+/// `status()`, not `spawn()`: waiting for the `kill` binary itself is
+/// near-instant and leaves no zombie behind, where fire-and-forget would
+/// leave one unreaped for the life of the editor. Output is discarded — a
+/// group that has already exited is not news, and the status line is not the
+/// place for `kill`'s complaint about it.
+fn signal_group(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Whether the child is still alive, reaping it if it is not.
+fn running(child: &Mutex<Child>) -> bool {
+    !matches!(child.lock().expect("child mutex poisoned").try_wait(), Ok(Some(_)))
+}
+
+/// SIGTERM has already been sent: give it [`GRACE`] to work, then take the
+/// group out with SIGKILL and reap the leader — and only once the process is
+/// actually gone, file the exit and wake the editor. Shared by the detached
+/// thread [`Handle::kill`] leaves behind and by [`Handle::kill_blocking`];
+/// the only difference between the two is which thread runs this.
+///
+/// The filing comes last on purpose. The exit is what tells `pump_shell` the
+/// job is over, and it drops the `Job` when it sees one — so filing early
+/// would hand the editor a "killed" for a process still in its grace period,
+/// with nothing left holding the handle that `shutdown_shell` would need on
+/// the way out. (The waiter thread may beat us to the filing; that is fine,
+/// it only ever files a death it has already observed.)
+fn escalate(pid: u32, child: &Mutex<Child>, slot: &Slot, wake: &(dyn Fn() + Send + Sync)) {
+    let deadline = Instant::now() + GRACE;
+    while Instant::now() < deadline && running(child) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if running(child) {
+        signal_group(pid, "KILL");
+        // And the leader by hand as well: SIGKILL to the group is
+        // best-effort (the `kill` binary may not be there, the group may
+        // have changed under a job that called `setsid` itself), and
+        // `Child::kill` is the one signal `std` sends without help. The
+        // `wait` is the reap that stops it becoming a zombie.
+        let mut child = child.lock().expect("child mutex poisoned");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    slot.finish(Exit::Killed);
+    wake();
 }
 
 /// The real [`Handle`]: a live `sh -c` child.
@@ -289,44 +432,55 @@ struct ProcessHandle {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
+impl ProcessHandle {
+    /// The half `kill` and `kill_blocking` share: nothing to do if the
+    /// process is already gone, otherwise pin the verdict and send SIGTERM.
+    ///
+    /// The mark comes *before* the signal, and that ordering is the whole
+    /// point: whichever thread ends up filing the death that follows, it
+    /// files it as `Killed`. What it deliberately does *not* do is file an
+    /// exit here — see [`escalate`], which files one only once the process
+    /// is confirmed gone.
+    fn begin_kill(&mut self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        self.slot.mark_killed();
+        signal_group(self.pid, "TERM");
+        true
+    }
+}
+
 impl Handle for ProcessHandle {
     fn kill(&mut self) {
-        if !self.is_running() {
+        if !self.begin_kill() {
             return;
         }
+        // The escalation runs on its own thread so `:stop` costs the editor
+        // thread one SIGTERM and nothing else. Detached on purpose: it owns
+        // a clone of the `Arc<Mutex<Child>>`, so the child stays reapable
+        // whatever happens to this handle. Nothing is filed or woken here —
+        // the exit lands from `escalate`, once the process is really gone,
+        // so the `Job` (and with it `shutdown_shell`'s grip on the process)
+        // outlives the request to end it right up until it is honoured.
+        let pid = self.pid;
+        let child = self.child.clone();
+        let slot = self.slot.clone();
+        let wake = self.wake.clone();
+        let _ = thread::Builder::new().name("shell-kill".into()).spawn(move || {
+            escalate(pid, &child, &slot, &*wake);
+        });
+    }
 
-        // `spawn()`, not `status()`: fire-and-forget per the controller
-        // ruling (no libc/nix dependency added), so this waits only for the
-        // `kill` binary itself to exit (near-instant), not for the target
-        // process — the `kill` process becomes a short-lived zombie until
-        // reaped, by design.
-        let _ = Command::new("kill").arg("-TERM").arg(self.pid.to_string()).spawn();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && self.is_running() {
-            thread::sleep(Duration::from_millis(10));
+    fn kill_blocking(&mut self) {
+        if !self.begin_kill() {
+            return;
         }
-
-        // Pin the verdict before forcing the kill: once this lands, `finish`
-        // is sticky on `Killed`, so the waiter thread — which may be
-        // blocked on the child mutex below and wakes the instant it's
-        // dropped — can never overwrite it with `Signal`/`Code`, regardless
-        // of scheduling. We asked for this death, so our verdict wins even
-        // if the process happened to exit cleanly on the SIGTERM above.
-        self.slot.finish(Exit::Killed);
-
-        if self.is_running() {
-            let mut child = self.child.lock().expect("child mutex poisoned");
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        (self.wake)();
+        escalate(self.pid, &self.child, &self.slot, &*self.wake);
     }
 
     fn is_running(&mut self) -> bool {
-        let mut child = self.child.lock().expect("child mutex poisoned");
-        !matches!(child.try_wait(), Ok(Some(_)))
+        running(&self.child)
     }
 }
 
@@ -500,7 +654,7 @@ mod tests {
         handle.kill();
         assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
 
-        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
+        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(5));
         assert_eq!(exit, Exit::Killed, "kill's verdict must win the race with the waiter thread");
         assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
         assert!(!handle.is_running());
@@ -523,12 +677,92 @@ mod tests {
         handle.kill();
         assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
 
-        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
+        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(5));
         assert_eq!(
             exit,
             Exit::Killed,
             "we asked for this death, so our verdict wins even though the job exited cleanly"
         );
         assert!(!handle.is_running());
+    }
+
+    /// A job that ignores SIGTERM is what tells the two apart: with the
+    /// escalation inline, `kill` would sit here for the whole 2 s grace
+    /// period with the editor thread inside it.
+    #[test]
+    fn kill_returns_at_once_and_the_escalation_lands_behind_it() {
+        let slot = Slot::default();
+        let (wake, rx) = waker();
+        let mut handle = ProcessSpawn
+            .spawn("trap '' TERM; while :; do sleep 0.1; done", Path::new("."), slot.clone(), wake)
+            .expect("sh exists everywhere this builds");
+
+        let start = Instant::now();
+        handle.kill();
+        assert!(start.elapsed() < Duration::from_millis(50), "kill blocked for {:?}", start.elapsed());
+
+        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(5));
+        assert_eq!(exit, Exit::Killed);
+        assert!(!handle.is_running());
+    }
+
+    /// What `shutdown_shell` needs on the way out: no detached thread racing
+    /// the process's exit, because there is no editor left to wake.
+    #[test]
+    fn kill_blocking_returns_with_the_child_gone() {
+        let slot = Slot::default();
+        let (wake, _rx) = waker();
+        let mut handle = ProcessSpawn
+            .spawn("trap '' TERM; while :; do sleep 0.1; done", Path::new("."), slot.clone(), wake)
+            .expect("sh exists everywhere this builds");
+
+        handle.kill_blocking();
+
+        assert!(!handle.is_running(), "kill_blocking must not return with the child alive");
+        assert_eq!(slot.drain().1, Some(Exit::Killed));
+    }
+
+    /// `sh -c` only execs a *simple* command; `sleep 30 & wait` leaves the
+    /// sleep a separate process in the job's group. Signalling the group,
+    /// not the leader, is what stops it being orphaned — the marker file is
+    /// the grandchild's proof of life.
+    #[test]
+    fn kill_reaches_the_whole_process_group() {
+        let marker =
+            std::env::temp_dir().join(format!("bi-shell-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let cmd = format!("(sleep 1; echo alive > {}) & wait", marker.display());
+
+        let slot = Slot::default();
+        let (wake, rx) = waker();
+        let mut handle = ProcessSpawn
+            .spawn(&cmd, Path::new("."), slot.clone(), wake)
+            .expect("sh exists everywhere this builds");
+        handle.kill();
+
+        let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(5));
+        assert_eq!(exit, Exit::Killed);
+        thread::sleep(Duration::from_millis(1600));
+        assert!(!marker.exists(), "the grandchild outlived the group kill");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A grandchild that inherits stdout keeps the reader blocked long after
+    /// the job itself is gone. The waiter gives the readers a bounded grace
+    /// and then files the exit anyway: the editor learns the job ended when
+    /// it ended, not when the last fd copy is closed.
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_hold_up_the_exit() {
+        let slot = Slot::default();
+        let (wake, rx) = waker();
+        let start = Instant::now();
+        let _handle = ProcessSpawn
+            .spawn("(sleep 5 &); echo started", Path::new("."), slot.clone(), wake)
+            .expect("sh exists everywhere this builds");
+
+        let (lines, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
+        assert_eq!(exit, Exit::Code(0));
+        assert!(lines.contains(&Line::Out("started".to_string())), "{lines:?}");
+        assert!(start.elapsed() < Duration::from_secs(4), "waited on the grandchild: {:?}", start.elapsed());
     }
 }
