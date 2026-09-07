@@ -182,12 +182,40 @@ impl Spawn for ProcessSpawn {
                             // here before `finish` runs, so "exit delivered"
                             // implies "all output delivered", and a drain
                             // that sees the exit never misses a line that
-                            // preceded it. (`kill()`'s own `finish(Killed)`
-                            // doesn't go through here: it's called directly
-                            // from `Handle::kill`, and if it wins the race
-                            // to reap the child first, this waiter's next
-                            // `try_wait` hits the `Err(_)` arm below and
-                            // returns before ever reaching this join.)
+                            // preceded it.
+                            //
+                            // This arm is also reached on the kill race:
+                            // `std::process::Child` caches its reaped
+                            // status, so if `Handle::kill`'s forced path
+                            // reaps the child first, our `try_wait` above
+                            // does NOT error — it returns that same cached
+                            // `Ok(Some(status))`, and we join the readers
+                            // and compute an `exit` here same as any other
+                            // exit. That's harmless, not because we skip
+                            // this branch (we don't), but because the
+                            // readers see EOF once the child is gone (the
+                            // joins complete either way) and because
+                            // `Slot::finish` is sticky on `Killed`: by the
+                            // time we call it below, `kill()` has already
+                            // pinned `Exit::Killed`, so our `finish(exit)`
+                            // here is silently discarded. The stickiness in
+                            // `finish`, not the `Err(_)` arm below, is what
+                            // guards this race.
+                            //
+                            // Caveat, on both the natural-exit and kill
+                            // paths alike: a grandchild that inherits and
+                            // holds the stdout/stderr fds open past this
+                            // child's own exit keeps the corresponding
+                            // reader blocked on EOF, and now delays `finish`
+                            // (and thus the editor's status line) along with
+                            // it. Nothing new hangs that wasn't already
+                            // hanging — that reader was already stuck
+                            // waiting on the same fd before this join
+                            // existed — and it never blocks `kill()` or the
+                            // editor thread: `kill()` calls `finish(Killed)`
+                            // directly, without ever joining this waiter,
+                            // and the `Child` mutex is not held across
+                            // either join.
                             let _ = stdout_reader.join();
                             let _ = stderr_reader.join();
                             let exit = match status.code() {
@@ -199,8 +227,11 @@ impl Spawn for ProcessSpawn {
                             return;
                         }
                         Ok(None) => thread::sleep(Duration::from_millis(15)),
-                        // Already reaped elsewhere — `Handle::kill`'s forced
-                        // path won the race and filed its own exit.
+                        // A genuine wait error — e.g. the pid vanished from
+                        // under us — not the kill race: a `Child` that has
+                        // already been reaped (by `kill()`'s forced path or
+                        // otherwise) yields the cached `Ok(Some(status))`
+                        // above on every subsequent `try_wait`, never `Err`.
                         Err(_) => return,
                     }
                 }
