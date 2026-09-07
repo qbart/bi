@@ -4190,13 +4190,17 @@ impl Editor {
     }
 
     /// A buffer's name for the status line and the picker.
+    ///
+    /// A transient buffer shows its bracketed name (`[!make]`) rather than a
+    /// path — it never has one. See `docs/specs/transient.md`.
     pub fn name_of(&self, id: BufferId) -> String {
-        self.buffers
-            .iter()
-            .find(|b| b.id == id)
-            .and_then(|b| b.buffer.path.as_ref())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[No Name]".into())
+        let Some(entry) = self.buffers.iter().find(|b| b.id == id) else {
+            return "[No Name]".into();
+        };
+        if let Some(name) = entry.buffer.transient_name() {
+            return format!("[{name}]");
+        }
+        entry.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".into())
     }
 
     pub fn is_modified(&self, id: BufferId) -> bool {
@@ -4206,6 +4210,36 @@ impl Editor {
     fn fresh_buffer_id(&mut self) -> BufferId {
         let id = BufferId(self.next_buffer);
         self.next_buffer += 1;
+        id
+    }
+
+    /// Finds or creates the one transient buffer, and gives it `name`.
+    ///
+    /// One at a time is the rule `:!` relies on: a second `:!cmd` renames the
+    /// buffer that is already there rather than opening a second one, so
+    /// `[!make]` becomes `[!ls]` in place and its previous run's tail is
+    /// still above the new `$ ls` header. See `docs/specs/transient.md`.
+    ///
+    /// The entry is built by hand rather than through `BufferEntry::new`
+    /// and `resolve_options`/`refresh_git`: a transient buffer has no path,
+    /// so `filetype_of`/`syntax_for` would already land on `None`/plain
+    /// text and `refresh_git` on no baseline — but a session-wide `:set
+    /// syntax` or a git loader that ignores the path could still reach in
+    /// and give it one. Stated outright instead, so nothing here is an
+    /// accident of what a path-less buffer happens to resolve to today.
+    pub fn transient_buffer(&mut self, name: &str) -> BufferId {
+        if let Some(entry) = self.buffers.iter_mut().find(|b| b.buffer.is_transient()) {
+            entry.buffer.set_transient_name(name);
+            return entry.id;
+        }
+        let id = self.fresh_buffer_id();
+        let mut entry = BufferEntry::new(id, Buffer::transient(name));
+        entry.syntax = None;
+        entry.filetype = None;
+        entry.git = None;
+        entry.lsp = lsp::Attach::No { epoch: self.config_epoch, reason: "transient buffer".into() };
+        self.buffers.push(entry);
+        self.resolve_options();
         id
     }
 
@@ -4526,7 +4560,10 @@ impl Editor {
     /// to, since the last window cannot close, and leaving it where the user is
     /// already looking means focus never moves.
     fn delete_buffer(&mut self, id: BufferId, force: bool) {
-        if self.is_modified(id) && !force {
+        // A transient buffer has no file to be behind, so there is nothing
+        // to lose in closing it — `docs/specs/transient.md` §"What a
+        // transient buffer is".
+        if self.is_modified(id) && !force && !self.entry(id).buffer.is_transient() {
             self.session.status = "unsaved changes (use `:bd!` to discard)".into();
             return;
         }
@@ -5660,6 +5697,78 @@ impl Editor {
         id
     }
 
+    /// Shows a transient buffer, the way `:!` and `:results` both want: reuse
+    /// a window already looking at it, otherwise open one in a split below
+    /// the focused window — and leave focus exactly where it was.
+    ///
+    /// Mirrors `WindowCmd::New { dir: Some(Horizontal) }`'s mechanics
+    /// (`split_focus` then `show`), with one difference on purpose: that
+    /// command moves focus into the new window because you asked for a
+    /// window to work in, and this one restores focus because you asked
+    /// for a buffer to watch, not to leave what you were doing.
+    /// `docs/specs/transient.md` §"Where it shows".
+    ///
+    /// Not called yet outside tests — `:!` starts calling it in the next
+    /// commit, which is what wires the Console's replacement in.
+    #[allow(dead_code)]
+    fn show_transient(&mut self, id: BufferId) {
+        if self.windows.iter().any(|w| w.buffer() == Some(id)) {
+            return;
+        }
+        let focus = self.focus;
+        let Some(new) = self.split_focus(Dir::Horizontal) else { return };
+        self.show(new, id);
+        self.set_focus(focus);
+    }
+
+    /// Appends `lines` to a transient buffer and moves the cursor of every
+    /// window that was watching the tail so it still is.
+    ///
+    /// The order here is the whole trick (`docs/specs/transient.md` §"The
+    /// cursor follows the tail only if it was at the tail"): which windows
+    /// were at the tail is recorded *before* the append, because the append
+    /// is what moves the last row out from under them; `drain_edits` is
+    /// called explicitly, right after, so every *unfocused* window's
+    /// selection is remapped through the new text exactly as it would be at
+    /// the next `settle` — calling it again there is harmless, since it has
+    /// nothing left to drain. Only once that remap has happened are the
+    /// tail-watching windows — the focused one included, since the drain
+    /// skips that one on the assumption it moved itself, and appending
+    /// through the buffer directly means it did not — walked to the new
+    /// last row. Doing that before the drain would shift those same cursors
+    /// a second time.
+    ///
+    /// Not called yet outside tests — see `show_transient`.
+    #[allow(dead_code)]
+    fn append_to_transient(&mut self, id: BufferId, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let last_before = self.entry(id).buffer.line_count().saturating_sub(1);
+        let at_tail: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|w| w.buffer() == Some(id))
+            .filter(|w| {
+                w.text().is_some_and(|text| {
+                    self.entry(id).buffer.row_at(text.selections.cursor()) == last_before
+                })
+            })
+            .map(|w| w.id)
+            .collect();
+
+        self.entry_mut(id).buffer.append_lines(lines);
+        self.drain_edits();
+
+        let last_after = self.entry(id).buffer.line_count().saturating_sub(1);
+        let cursor = self.entry(id).buffer.at_row(last_after, false);
+        for window in at_tail {
+            if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
+                text.selections = Selections::single(cursor);
+            }
+        }
+    }
+
     /// Splits the focused window, moves focus into the new one, and hands back
     /// its id. `None` means there was no room, and it has already said so.
     ///
@@ -6304,16 +6413,19 @@ impl Editor {
     fn quit(&mut self, force: bool) {
         if self.windows.len() > 1 {
             self.close_window(self.focus);
-        } else if self.buffer().is_some_and(Buffer::is_modified) && !force {
+        } else if self.buffer().is_some_and(|b| b.is_modified() && !b.is_transient()) && !force {
             self.session.status = "unsaved changes (use `:q!` to discard)".into();
         } else {
             self.session.quit = true;
         }
     }
 
-    /// Every buffer has to agree, not just the focused one.
+    /// Every buffer has to agree, not just the focused one — except a
+    /// transient one, which has no file to be behind and so nothing to
+    /// nag about (`docs/specs/transient.md`).
     fn quit_all(&mut self, force: bool) {
-        let unsaved = self.buffers.iter().find(|b| b.buffer.is_modified()).map(|b| b.id);
+        let unsaved =
+            self.buffers.iter().find(|b| b.buffer.is_modified() && !b.buffer.is_transient()).map(|b| b.id);
         match unsaved {
             Some(id) if !force => {
                 self.session.status =
@@ -7704,6 +7816,11 @@ impl Editor {
             let no = |reason: &str| lsp::Attach::No { epoch, reason: reason.into() };
             let resolved = if !self.config.lsp.enabled {
                 no("off (`enabled = false` in [lsp])")
+            } else if entry.buffer.is_transient() {
+                // Stated outright rather than left to fall out of "no
+                // path": a transient buffer never attaches, full stop. See
+                // `docs/specs/transient.md`.
+                no("transient buffer")
             } else if let Some(path) = entry.buffer.path.clone() {
                 match entry.filetype {
                     Some(filetype) => {
@@ -10772,6 +10889,9 @@ impl Editor {
     fn refresh_git(&mut self, id: BufferId) {
         let Some(loader) = &self.git_baseline else { return };
         let Some(entry) = self.buffers.iter_mut().find(|b| b.id == id) else { return };
+        // A transient buffer has no path, and this is where that already
+        // means "no baseline" — same branch a `[No Name]` buffer takes.
+        // See `docs/specs/transient.md`.
         let Some(path) = &entry.buffer.path else {
             entry.git = None;
             return;
@@ -13027,6 +13147,14 @@ impl View<'_> {
         };
         match result {
             Ok(()) => {
+                if self.buffer.is_transient() {
+                    // `save` never returns `Ok` for a transient buffer, so
+                    // getting here means `save_as`: the text was copied to
+                    // `path`, and the buffer — no path, no language change —
+                    // is untouched. See `docs/specs/transient.md`.
+                    self.session.status = format!("wrote {path} (copy)");
+                    return true;
+                }
                 // `:w other.rs` can change the language under us.
                 if !path.is_empty() {
                     self.reload_syntax();
@@ -13040,7 +13168,13 @@ impl View<'_> {
                 true
             }
             Err(e) => {
-                self.session.status = format!("error: {e:#}");
+                // A transient's bare `:w` fails on purpose — `save`'s
+                // message *is* the answer, not a bug report about one.
+                self.session.status = if path.is_empty() && self.buffer.is_transient() {
+                    format!("{e:#}")
+                } else {
+                    format!("error: {e:#}")
+                };
                 false
             }
         }
@@ -13269,7 +13403,11 @@ impl View<'_> {
     ///
     /// See `docs/specs/trim.md`.
     fn trim_for_write(&mut self) {
-        if !self.options.trim.does_anything() {
+        // `:w <path>` on a transient buffer copies the text out as-is — the
+        // log was copied, not adopted, and a copy that silently lost its
+        // trailing whitespace would not be the log any more. See
+        // `docs/specs/transient.md`.
+        if self.buffer.is_transient() || !self.options.trim.does_anything() {
             return;
         }
         let edits = self.buffer.trim(&self.options.trim);
@@ -27696,5 +27834,224 @@ int main(void) {
         ed.apply(cmd(Action::EnterCommandMode));
 
         assert!(matches!(ed.session.mode, Mode::Command(_)));
+    }
+
+    /// The editor surface over `buffer::Kind::Transient` — finding/creating
+    /// the one transient buffer, showing it, appending with follow, and the
+    /// places a transient buffer must be treated differently from a file
+    /// one: no nags, no save, no attach. `:!` itself is untouched here — see
+    /// `shell_integration` — this is only what a transient buffer does once
+    /// something has put one in front of it. `docs/specs/transient.md`.
+    mod transient {
+        use super::*;
+
+        #[test]
+        fn a_transient_buffer_shows_in_a_split_below_and_keeps_focus() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let before = ed.focus();
+            let before_rect = ed.layout.rect_of(before, ed.area, &ed.chrome).unwrap();
+
+            let id = ed.transient_buffer("!make");
+            ed.show_transient(id);
+
+            assert_eq!(ed.focus(), before, "focus never moved");
+            assert_eq!(ed.window_ids().len(), 2, "a split");
+
+            let shown =
+                ed.window_ids().into_iter().find(|&w| w != before).expect("a second window");
+            assert_eq!(ed.window_of(shown).and_then(Window::buffer), Some(id));
+
+            let rect = ed.layout.rect_of(shown, ed.area, &ed.chrome).unwrap();
+            assert!(rect.y > before_rect.y, "below, not above");
+
+            // A second call with a window already showing it does nothing.
+            ed.show_transient(id);
+            assert_eq!(ed.window_ids().len(), 2, "no second split");
+            assert_eq!(ed.focus(), before);
+        }
+
+        #[test]
+        fn append_follows_a_cursor_on_the_last_line_and_leaves_one_that_moved_up() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            // Empty and shown before anything is in it — same order `:!`
+            // uses: the split opens on nothing, then output arrives.
+            let id = ed.transient_buffer("job");
+            ed.show_transient(id);
+            let watcher = ed
+                .window_ids()
+                .into_iter()
+                .find(|&w| ed.window_of(w).and_then(Window::buffer) == Some(id))
+                .unwrap();
+            ed.set_focus(watcher);
+            // A clone of `watcher`, cursor and all — both are on the tail of
+            // an empty buffer right now.
+            ed.apply(cmd(Action::Window(WindowCmd::Split { dir: Dir::Horizontal, path: None })));
+            let reader = ed.focus();
+            assert_ne!(reader, watcher, "a second window on the same buffer");
+
+            // Both were at the tail (there is only one row), so the first
+            // batch moves both of them to the new last line.
+            ed.append_to_transient(
+                id,
+                &["one".to_string(), "two".to_string(), "three".to_string()],
+            );
+            let after_first = ed.entry(id).buffer.at_row(2, false);
+            assert_eq!(
+                ed.window_of(watcher).and_then(Window::text).unwrap().selections.cursor(),
+                after_first
+            );
+            assert_eq!(
+                ed.window_of(reader).and_then(Window::text).unwrap().selections.cursor(),
+                after_first
+            );
+
+            // `reader` reads back to the top; `watcher` is left alone, still
+            // on the tail.
+            let top = ed.entry(id).buffer.at_row(0, false);
+            ed.window_mut_of(reader).and_then(Window::text_mut).unwrap().selections =
+                Selections::single(top);
+
+            ed.append_to_transient(id, &["four".to_string(), "five".to_string()]);
+
+            let last = ed.entry(id).buffer.line_count() - 1;
+            assert_eq!(last, 4, "five lines, rows 0..=4");
+            let last_cursor = ed.entry(id).buffer.at_row(last, false);
+
+            let watcher_cursor =
+                ed.window_of(watcher).and_then(Window::text).unwrap().selections.cursor();
+            assert_eq!(watcher_cursor, last_cursor, "the tail-watcher followed");
+
+            let reader_cursor =
+                ed.window_of(reader).and_then(Window::text).unwrap().selections.cursor();
+            assert_eq!(reader_cursor, top, "the reader stayed put");
+        }
+
+        #[test]
+        fn bare_w_is_refused_with_the_copy_hint() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["x".to_string()]);
+            let focus = ed.focus();
+            ed.show(focus, id);
+
+            ex(&mut ed, "w");
+
+            assert_eq!(ed.session.status, "transient — :w <path> saves a copy");
+            assert!(ed.entry(id).buffer.is_transient());
+        }
+
+        #[test]
+        fn w_path_writes_a_copy_and_the_buffer_stays_transient() {
+            let d = ScratchDir::new("transient-w-path");
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["log line".to_string()]);
+            let focus = ed.focus();
+            ed.show(focus, id);
+
+            let path = format!("{}/copy.txt", d.path());
+            ex(&mut ed, &format!("w {path}"));
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(written, ed.entry(id).buffer.rope().to_string());
+            assert!(ed.entry(id).buffer.path.is_none(), "no path adopted");
+            assert!(ed.entry(id).buffer.is_transient(), "still transient");
+            assert!(ed.entry(id).buffer.is_modified(), "copied, not saved");
+            assert_eq!(ed.session.status, format!("wrote {path} (copy)"));
+        }
+
+        #[test]
+        fn bd_and_q_do_not_nag_about_a_transient_buffer() {
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["line".to_string()]);
+            let focus = ed.focus();
+            ed.show(focus, id);
+            assert!(ed.entry(id).buffer.is_modified(), "set up dirty");
+
+            ex(&mut ed, "bd");
+
+            assert!(!ed.buffer_ids().contains(&id), "closed without `:bd!`");
+            assert!(!ed.session.status.contains("unsaved"), "{}", ed.session.status);
+
+            let mut ed = editor("hello");
+            sized(&mut ed);
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["line".to_string()]);
+            let focus = ed.focus();
+            ed.show(focus, id);
+
+            ex(&mut ed, "q");
+
+            assert!(ed.session.quit, "quit without `:q!`");
+            assert!(!ed.session.status.contains("unsaved"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn wa_skips_it() {
+            let d = ScratchDir::new("transient-wa").written("main.rs", "old\n");
+            let mut ed = Editor::open(format!("{}/main.rs", d.path())).unwrap();
+            sized(&mut ed);
+            ed.apply(cmd(Action::InsertChar('!')));
+            assert!(ed.buffer().unwrap().is_modified(), "set up dirty");
+
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["log".to_string()]);
+
+            ex(&mut ed, "wa");
+
+            assert_eq!(ed.session.status, "1 written");
+            assert!(ed.entry(id).buffer.is_modified(), "the transient buffer was left alone");
+            let saved = std::fs::read_to_string(format!("{}/main.rs", d.path())).unwrap();
+            assert!(saved.contains('!'), "the file buffer was written");
+        }
+
+        #[test]
+        fn ls_shows_the_bracketed_name() {
+            let mut ed = editor("hello");
+            let id = ed.transient_buffer("!make");
+
+            assert_eq!(ed.name_of(id), "[!make]");
+        }
+
+        #[test]
+        fn no_lsp_git_or_trim_for_a_transient() {
+            use crate::lsp::transport::fake::FakeSpawn;
+
+            let d = ScratchDir::new("transient-no-attach")
+                .written("Cargo.toml", "[package]\n")
+                .written("src/main.rs", "fn main() {}\n");
+            let mut ed = Editor::open(format!("{}/src/main.rs", d.path())).unwrap();
+            sized(&mut ed);
+            let main_id = ed.buffer_ids()[0];
+            let fake = FakeSpawn::default();
+            ed.set_lsp_spawner(fake.clone());
+
+            let id = ed.transient_buffer("job");
+            ed.append_to_transient(id, &["a  ".to_string()]);
+            ed.set_git_baseline(|_| Some("baseline\n".into()));
+
+            ed.settle();
+
+            assert_eq!(
+                fake.spawned.lock().unwrap().len(),
+                1,
+                "only the real file attached, not the transient buffer"
+            );
+            assert!(ed.entry(main_id).git.is_some(), "the real file got a baseline");
+            assert!(ed.entry(id).git.is_none(), "the transient buffer got none");
+
+            let focus = ed.focus();
+            ed.show(focus, id);
+            let path = format!("{}/copy.txt", d.path());
+            ex(&mut ed, &format!("w {path}"));
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(written, "a  \n", "the copy is untrimmed");
+        }
     }
 }
