@@ -317,6 +317,14 @@ directional keys are more thought than they are worth.
 An edit in one window moves text under every other window showing that buffer.
 Their cursors and scroll rows have to move with it.
 
+Visual mode, on the other hand, belongs to the *focused* window alone. `V` in
+one pane paints that pane's line; the other pane's collapsed cursor stays a
+cursor and its cursor line stays a cursor line — the mode is the session's,
+but a selection is a window's, and painting the other pane's plain cursor as
+a line about to go was a bug, not a feature. A real, non-collapsed range in an
+unfocused pane is still painted, charwise, whatever mode the focused pane is
+in.
+
 `edit_raw` already knows the char range it replaced and the length of what
 replaced it, but `Edit` only records bytes, because tree-sitter asked in bytes.
 It gains the char triple beside them:

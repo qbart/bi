@@ -1151,12 +1151,17 @@ fn render_window(
         // inside a cursor-line bar is not a sentence anyone can read — the two
         // colours are a shade apart in most themes, which is right for a bar
         // under the cursor and wrong for the thing you are about to delete.
+        // Visual mode is the session's, but a selection is this window's.
+        // The shape only applies to the pane that pressed `v`/`V`/`Ctrl-V`;
+        // in any other pane a collapsed cursor is a cursor, and a real range
+        // is painted charwise, whatever mode the focused pane is in.
+        let shape = if focused { ed.visual() } else { None };
         let mut linewise = false;
         for selection in selections.all() {
             // A collapsed selection still covers something in visual mode — one
             // character for `v`, the whole line for `V` — so only skip it
             // outside visual, where it is a plain cursor.
-            if selection.is_collapsed() && ed.visual().is_none() {
+            if selection.is_collapsed() && shape.is_none() {
                 continue;
             }
             let (lo, hi) = selection.range();
@@ -1164,7 +1169,7 @@ fn render_window(
             if row < first || row > last {
                 continue;
             }
-            let cols = match ed.visual() {
+            let cols = match shape {
                 Some(Shape::Lines) => {
                     linewise = true;
                     0..display_col(raw, raw.chars().count(), tab).max(1)
@@ -2345,6 +2350,63 @@ mod tests {
         assert_eq!(bg(19, 0), selection, "and all the way to the edge");
         assert_eq!(bg(0, 0), cursorline, "but not the gutter, which is not selected");
         assert_ne!(bg(3, 1), selection, "and the row below is not in it");
+    }
+
+    /// Where each pane landed on a `width`×`height` terminal — the same
+    /// layout `render` computes, with the one-row footer taken off the bottom.
+    fn window_rects(
+        ed: &mut Editor,
+        width: u16,
+        height: u16,
+    ) -> std::collections::HashMap<WindowId, Rect> {
+        let body = Rect { x: 0, y: 0, width, height: height - 1 };
+        ed.layout(to_core(body), CHROME).into_iter().map(|(id, r)| (id, to_tui(r))).collect()
+    }
+
+    /// Visual mode is the *session's*, but a selection is a *window's*: `V`
+    /// in one pane must not paint the other pane's plain cursor as a whole
+    /// selected line. The other pane shows its cursor line and nothing more.
+    #[test]
+    fn a_selection_in_one_pane_does_not_bleed_into_the_other() {
+        use bi::editor::{Action, Command, WindowCmd};
+        use bi::region::Shape;
+        use bi::window::Dir;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.buffer_mut().unwrap().insert_str(Cursor::at(0), "alpha\nbeta\n");
+        ed.set_cursor(Cursor::at(0));
+        // A split needs a window that has been given a size, and a settle so
+        // the setup's insert is not replayed onto the pane that did not make
+        // it — the same two steps the editor's own split tests take.
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+        ed.settle();
+        // Two panes on the buffer, side by side; focus lands on the new one.
+        ed.apply(Command {
+            count: 1,
+            action: Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }),
+        });
+        let focused = ed.focus();
+        let other = ed.window_ids().into_iter().find(|&w| w != focused).expect("two panes");
+
+        ed.apply(Command { count: 1, action: Action::EnterVisual(Shape::Lines) });
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
+
+        let rects = window_rects(&mut ed, 40, 5);
+        let focused_rect = rects[&focused];
+        let other_rect = rects[&other];
+        let bg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].style().bg;
+        let selection = Some(color(ed.theme().ui.selection.bg.unwrap()));
+
+        // The pane that pressed `V` paints its whole line...
+        assert_eq!(bg(focused_rect.x + 3, focused_rect.y), selection, "the focused pane is selected");
+        // ...and the other pane, whose cursor is collapsed, paints nothing as
+        // selected — a cursor there is a cursor, not a line about to go.
+        for x in other_rect.x..other_rect.x + other_rect.width {
+            assert_ne!(bg(x, other_rect.y), selection, "col {x} of the unfocused pane is selected");
+        }
     }
 
     /// The same pipeline for `Eol`, which needs a file on disk rather than a
