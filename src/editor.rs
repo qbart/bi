@@ -11711,10 +11711,25 @@ impl View<'_> {
                     return;
                 };
                 let indent = self.options.indent();
+                // Two cursors whose motions cover the same row(s) must not
+                // toggle that row twice: `comment_rows` re-reads the row from
+                // the rope on every call, so a second pass on a row the first
+                // pass just commented would silently uncomment it again (and
+                // a second pass sharing only part of the range, as `gcj` from
+                // adjacent rows does, would double that row's marker). Track
+                // which ranges have already been claimed and skip anything
+                // that overlaps one. Row indices stay valid to compare against
+                // across every pass because `comment_rows` only rewrites the
+                // text of existing rows — it never changes the line count.
+                let mut done: Vec<(usize, usize)> = Vec::new();
                 self.for_each_selection(|ed, sel| {
                     let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
                         return sel;
                     };
+                    if done.iter().any(|&(a, b)| first <= b && a <= last) {
+                        return sel;
+                    }
+                    done.push((first, last));
                     match ed.buffer.comment_rows(first, last, marker, &indent) {
                         Some(landed) => Selection::collapsed(landed),
                         None => sel,
@@ -12004,6 +12019,13 @@ impl View<'_> {
             // Unlike `>`, a toggle does not accumulate, so it consumes the
             // selection exactly as `gq`/`=` do: back to Normal, cursor on
             // the first row's first non-blank. See `docs/specs/comment.md`.
+            //
+            // The `None`-marker `return`s above are deliberate about the
+            // opposite: they leave `self.session.mode` untouched, so a `gc`
+            // that refuses (no filetype, or a language with no line-comment
+            // form) leaves Visual mode active. Nothing changed, so nothing
+            // was consumed — only a `gc` that actually toggles something
+            // drops back to Normal, at the bottom of this arm.
             Action::OperateSelection { op: Operator::Comment, .. } => {
                 let Some(filetype) = *self.filetype else {
                     self.session.status = "no filetype".into();
@@ -12014,10 +12036,20 @@ impl View<'_> {
                     return;
                 };
                 let indent = self.options.indent();
+                // Mirrors the dedupe in the `Operate` arm above: if two
+                // selections can ever overlap here, a second pass over rows
+                // the first pass already toggled must be skipped rather than
+                // re-toggling them. See the comment there for why row indices
+                // stay comparable across passes.
+                let mut done: Vec<(usize, usize)> = Vec::new();
                 self.for_each_selection(|ed, sel| {
                     let (lo, hi) = sel.range();
                     let first = ed.buffer.row_at(Cursor::at(lo));
                     let last = ed.buffer.row_at(Cursor::at(hi));
+                    if done.iter().any(|&(a, b)| first <= b && a <= last) {
+                        return Selection::collapsed(sel.head);
+                    }
+                    done.push((first, last));
                     match ed.buffer.comment_rows(first, last, marker, &indent) {
                         Some(landed) => Selection::collapsed(landed),
                         None => Selection::collapsed(sel.head),
@@ -24027,6 +24059,102 @@ int main(void) {
             ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
             assert_eq!(rope_of(&ed), "aaa\nbbb\n", "gc gc is a no-op");
             assert_eq!(ed.session.mode, Mode::Normal);
+        }
+
+        #[test]
+        fn gcap_toggles_the_paragraphs_rows() {
+            let (_d, mut ed) = on("comment-gcap", "a.rs", "a();\nb();\n\nc();\n");
+
+            ed.apply(cmd(Action::Operate {
+                op: Operator::Comment,
+                target: Target::Object { object: TextObject::Paragraph, around: true },
+                count: 1,
+                sink: Sink::Ring,
+            }));
+
+            assert_eq!(
+                rope_of(&ed),
+                "// a();\n// b();\n\nc();\n",
+                "the paragraph's two rows toggle; the line beyond it does not"
+            );
+        }
+
+        /// JSON has no line-comment form — only CSS is covered above, so
+        /// this locks in the same refusal for the markup/data family.
+        #[test]
+        fn json_refuses_and_leaves_the_line_alone() {
+            let (_d, mut ed) = on("comment-json", "a.json", "{}\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "{}\n");
+            assert!(ed.session.status.contains("no line comment"), "{}", ed.session.status);
+        }
+
+        /// `.` after a visual `gc` replays as a visual command over the same
+        /// extent from the new cursor (`repeat_over`), not as a plain
+        /// `gcc`-style repeat — so it re-toggles the two rows *there* and
+        /// still ends back in Normal.
+        #[test]
+        fn dot_repeats_a_visual_gc_from_the_new_cursor() {
+            let (_d, mut ed) = on("comment-dot-visual", "a.rs", "aaa\nbbb\nccc\nddd\n");
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
+            ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
+            assert_eq!(rope_of(&ed), "// aaa\n// bbb\nccc\nddd\n");
+            assert_eq!(ed.session.mode, Mode::Normal);
+
+            let at = rope_of(&ed).find("ccc").unwrap();
+            ed.set_cursor(Cursor::at(at));
+            ed.apply(cmd(Action::RepeatChange { count: None }));
+
+            assert_eq!(
+                rope_of(&ed),
+                "// aaa\n// bbb\n// ccc\n// ddd\n",
+                "the same two-row extent, replayed from the new cursor"
+            );
+            assert_eq!(ed.session.mode, Mode::Normal, "the replayed visual gc consumes too");
+        }
+
+        /// Two collapsed cursors on the same row must not toggle it twice —
+        /// `comment_rows` re-reads the row from the rope on every pass, so a
+        /// second pass on an already-commented row would silently uncomment
+        /// it again.
+        #[test]
+        fn two_cursors_on_one_row_toggle_it_once() {
+            let (_d, mut ed) = on("comment-dedupe-row", "a.rs", "y();\n");
+            ed.window_mut().text_mut().unwrap().selections.set(vec![
+                Selection::at(0),
+                Selection::at(1),
+            ]);
+
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "// y();\n", "commented once, not toggled back off");
+
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(rope_of(&ed), "y();\n", "one u undoes the one toggle");
+        }
+
+        /// Two cursors on adjacent rows under a motion that reaches onto the
+        /// same shared row: `gcj` from row 0 and from row 1 both cover row
+        /// 1, and must not double its marker. `for_each_selection` runs
+        /// highest position first, so the row-1 cursor's range (rows 1-2)
+        /// is claimed first and the row-0 cursor's range (rows 0-1), which
+        /// overlaps it on row 1, is skipped whole rather than re-toggling
+        /// row 1.
+        #[test]
+        fn cursors_on_adjacent_rows_do_not_double_a_shared_row() {
+            let (_d, mut ed) = on("comment-dedupe-adjacent", "a.rs", "a();\nb();\nc();\n");
+            ed.window_mut().text_mut().unwrap().selections.set(vec![
+                Selection::at(0),
+                Selection::at(5),
+            ]);
+
+            ed.apply(operate(Operator::Comment, Motion::Down, 1));
+
+            assert_eq!(
+                rope_of(&ed),
+                "a();\n// b();\n// c();\n",
+                "row 1 is shared by both `gcj` ranges and gets one marker, not two"
+            );
         }
     }
 

@@ -2904,6 +2904,21 @@ mod tests {
         assert_eq!(shown(&buffer), "\t// \tfoo\n        // bar\n");
     }
 
+    /// When the minimum column falls inside a tab, the marker goes after the
+    /// whole tab rather than splitting it — so a tab-indented row's marker
+    /// does not line up with a space-indented row's, unlike every other case
+    /// in this file. Tab width 4: row 0's indent is column 2, row 1's tab
+    /// reaches column 4, so the range's minimum column is 2 — which lands
+    /// inside row 1's tab.
+    #[test]
+    fn a_minimum_column_inside_a_tab_lands_the_marker_after_it() {
+        let mut buffer = rows("  a\n\tb\n");
+
+        buffer.comment_rows(0, 1, "//", &Indent { tab_width: 4, ..spaces() }).expect("commented");
+
+        assert_eq!(shown(&buffer), "  // a\n\t// b\n", "the markers do not line up on row 1");
+    }
+
     #[test]
     fn an_all_blank_range_changes_nothing() {
         let mut buffer = rows("   \n\t\n");
@@ -2913,6 +2928,20 @@ mod tests {
 
         assert_eq!(shown(&buffer), "   \n\t\n");
         assert_eq!(buffer.edits(), before);
+    }
+
+    /// The rope only ever sees a bare `\n` for a file loaded through
+    /// `open` — CRLF is stripped and restored on write — but a buffer built
+    /// directly (as `rows` does, bypassing that translation) can carry a
+    /// literal `\r` as the last character of a line's text. The marker goes
+    /// in before it, at the front of the line, so it survives untouched.
+    #[test]
+    fn a_literal_carriage_return_survives_the_toggle() {
+        let mut buffer = rows("a\r\nb\r\n");
+
+        buffer.comment_rows(0, 0, "//", &spaces()).expect("commented");
+
+        assert_eq!(shown(&buffer), "// a\r\nb\r\n");
     }
 
     #[test]
