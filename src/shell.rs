@@ -514,6 +514,66 @@ pub fn expand(cmd: &str, current: Option<&str>, alternate: Option<&str>) -> Resu
     Ok(out)
 }
 
+/// A job's line as a terminal would have *shown* it, minus the colours.
+///
+/// `:!` has no pty, so a program that prints escape sequences is printing
+/// for a terminal that is not there — and the buffer the line lands in is
+/// text, which must never carry an `ESC` a screen could execute
+/// (`docs/specs/ansi.md` §"Rule 1"). CSI and OSC sequences and every other
+/// `ESC x` pair go; a carriage return rewinds the line, so a progress bar
+/// that redrew itself keeps its final state; the other C0 controls are
+/// dropped, except the tab, which is text.
+pub fn sanitize(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    // CSI: parameter and intermediate bytes, then one final
+                    // byte in 0x40..=0x7E.
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: up to BEL or ESC \ (ST).
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // An intermediate byte introduces a longer sequence — a
+                // charset designation like `ESC ( B` — which runs on to its
+                // final byte.
+                Some(c) if ('\x20'..='\x2f').contains(&c) => {
+                    for c in chars.by_ref() {
+                        if ('\x30'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // Any other two-byte sequence, or a lone trailing ESC.
+                _ => {}
+            },
+            '\r' => out.clear(),
+            '\t' => out.push('\t'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A spawner and handle that record instead of running a process, for
 /// tests anywhere in the crate — the same shape as `lsp::transport::fake`
 /// and `dap::transport::fake`.
@@ -599,6 +659,30 @@ mod tests {
         assert_eq!(expand(r"echo \% \#", None, None).unwrap(), "echo % #");
         assert!(expand("cat %", None, None).unwrap_err().contains("no file name"));
         assert_eq!(expand("grep '!' %", Some("x"), None).unwrap(), "grep '!' x", "! is literal");
+    }
+
+    #[test]
+    fn sanitize_strips_colours_and_keeps_the_text() {
+        assert_eq!(sanitize("\x1b[32mok\x1b[0m done"), "ok done");
+        assert_eq!(sanitize("\x1b[1;31merror\x1b[m: x"), "error: x");
+    }
+
+    #[test]
+    fn sanitize_strips_cursor_moves_titles_and_bare_escapes() {
+        assert_eq!(sanitize("a\x1b[2Kb"), "ab", "erase-line CSI");
+        assert_eq!(sanitize("\x1b]0;title\x07text"), "text", "OSC ended by BEL");
+        assert_eq!(sanitize("\x1b]0;title\x1b\\text"), "text", "OSC ended by ST");
+        assert_eq!(sanitize("\x1b(Bplain"), "plain", "two-byte ESC sequence");
+        assert_eq!(sanitize("tail\x1b"), "tail", "lone trailing ESC");
+    }
+
+    #[test]
+    fn sanitize_rewinds_on_carriage_return_and_drops_other_controls() {
+        assert_eq!(sanitize("10%\r50%\r100%"), "100%", "a progress bar ends where it ended");
+        assert_eq!(sanitize("done\r"), "", "a trailing CR leaves the empty rewind");
+        assert_eq!(sanitize("a\x07b\x08c"), "abc", "BEL and BS dropped");
+        assert_eq!(sanitize("\tindented"), "\tindented", "tab is text");
+        assert_eq!(sanitize("plain line"), "plain line");
     }
 
     #[test]

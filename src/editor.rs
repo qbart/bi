@@ -9025,7 +9025,7 @@ impl Editor {
         };
         let id = self.transient_buffer(&format!("!{expanded}"));
         let mut lines = vec![format!("$ {expanded}")];
-        lines.extend(output.lines().map(str::to_string));
+        lines.extend(output.lines().map(shell::sanitize));
         self.append_to_transient(id, &lines);
         let shown = self.show_transient(id);
         let rows = last - first + 1;
@@ -9061,8 +9061,8 @@ impl Editor {
         let mut out: Vec<String> = lines
             .into_iter()
             .map(|line| match line {
-                shell::Line::Out(text) => text,
-                shell::Line::Err(text) => format!("! {text}"),
+                shell::Line::Out(text) => shell::sanitize(&text),
+                shell::Line::Err(text) => format!("! {}", shell::sanitize(&text)),
             })
             .collect();
         let trailer = exit.map(|exit| match exit {
@@ -27382,6 +27382,29 @@ int main(void) {
             assert_eq!(ed.session.status, "! exited 0");
         }
 
+        /// A coloured build log arrives as text: the job's escape sequences
+        /// are stripped before the line reaches the buffer, stderr's `! `
+        /// prefix included. `docs/specs/ansi.md` §"Rule 1".
+        #[test]
+        fn a_jobs_escape_sequences_are_stripped_before_the_buffer_sees_them() {
+            let (_dir, mut ed, fake) = project("run");
+            ex(&mut ed, "!make");
+            let id = transient_id(&ed);
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("\x1b[32mok\x1b[0m".into()));
+            slot.push(Line::Err("\x1b[1;31merror\x1b[m: x".into()));
+            slot.push(Line::Out("10%\r100%".into()));
+            slot.finish(Exit::Code(0));
+            ed.settle();
+            assert_eq!(
+                transient_lines(&ed, id),
+                vec!["$ make", "ok", "! error: x", "100%", "exited 0"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+
         /// `show_transient` puts "not enough room to split" on the status
         /// line when it can't open a window — and `run_bang` must not
         /// silently overwrite that with its own `! <cmd>`, or the user has
@@ -27837,6 +27860,23 @@ int main(void) {
 
             assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nx\ntwo\n");
             assert!(ed.session.status.contains("read 1 line"), "{}", ed.session.status);
+        }
+
+        /// `:r !` puts the output *in your buffer*, so it lands verbatim —
+        /// vim inserts what the command printed, escapes and all, and the
+        /// screen's own drawing keeps them harmless. `docs/specs/ansi.md`
+        /// §"Rule 1".
+        #[test]
+        fn read_bang_keeps_escape_sequences_verbatim() {
+            let (_dir, mut ed, _fake) =
+                filter_project("read-ansi", "one\n", Ok("\x1b[32mx\x1b[0m\n"));
+
+            ex(&mut ed, "r !echo x");
+
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "one\n\x1b[32mx\x1b[0m\n"
+            );
         }
 
         #[test]
