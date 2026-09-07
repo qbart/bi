@@ -11,8 +11,7 @@
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{
-    Action, BufferCmd, CmdMove, Command, DebugCmd, FileOp, Mode, ResultsCmd, ShellCmd, TreeCmd,
-    WindowCmd,
+    Action, BufferCmd, CmdMove, Command, DebugCmd, FileOp, Mode, ResultsCmd, TreeCmd, WindowCmd,
 };
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -786,25 +785,6 @@ impl Input {
         let ctrl = key.mods.ctrl;
         let count = self.count.unwrap_or(1).max(1);
         let g = std::mem::take(&mut self.g_pending);
-
-        // The Console's stop keys. `x` means cut in every other tree pane
-        // (see `tree`'s `TreeCmd::Mark(Cut)`), but the Console has nothing to
-        // cut and a job to stop, so it wins here ahead of the shared grammar.
-        // `Ctrl-C` is bound only in this pane — Normal mode's `Ctrl-C` keeps
-        // meaning what it means (`Action::CollapseCursors`).
-        //
-        // Above the tree grammar, but below the user's own `[keys]`: `remap`
-        // has already run by the time `dispatch` reaches here, so a config
-        // that rebinds `x` (in `[keys.tree]`, which the debug panes borrow,
-        // or in `[keys]` behind it) has rebound it in the Console as well.
-        // That is the right way round — this arm is what `x` means when
-        // nobody has said otherwise, not a key withheld from the config.
-        if content == ContentKind::DapConsole
-            && (key.code == KeyCode::Char('x') || (ctrl && key.code == KeyCode::Char('c')))
-        {
-            self.reset();
-            return Some(Command { count: 1, action: Action::Shell(ShellCmd::Stop) });
-        }
 
         let cmd = match key.code {
             KeyCode::Char('g') if g => TreeCmd::First,
@@ -1810,6 +1790,7 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::ShellCmd;
     use crate::picker::PickerKind;
     use crate::registers::Sink;
 
@@ -2477,25 +2458,9 @@ leader = \" \"
         assert_eq!(debug_action("c"), Action::Debug(DebugCmd::Continue));
     }
 
-    /// The Console's stop keys: `Ctrl-C` and `x` both send `ShellCmd::Stop`,
-    /// in either mode a Console-focused window can be in — `dap_pane` routes
-    /// both `Mode::Normal` and `Mode::Debug`.
-    #[test]
-    fn ctrl_c_and_x_in_the_console_stop_the_job() {
-        let mut input = Input::default();
-        for mode in [Mode::Normal, Mode::Debug] {
-            let stop =
-                input.on_key(ctrl('c'), &mode, ContentKind::DapConsole).expect("resolved");
-            assert_eq!(stop.action, Action::Shell(ShellCmd::Stop), "{mode:?} ctrl-c");
-
-            let stop = input.on_key(key('x'), &mode, ContentKind::DapConsole).expect("resolved");
-            assert_eq!(stop.action, Action::Shell(ShellCmd::Stop), "{mode:?} x");
-        }
-    }
-
-    /// `Ctrl-C` is bound only in the Console pane. In a text window, Normal
-    /// mode's `Ctrl-C` keeps meaning what it means today — collapse extra
-    /// cursors — not stop a job.
+    /// `ShellCmd::Stop` is reachable only through `:stop` now — no key sends
+    /// it. In a text window, Normal mode's `Ctrl-C` keeps meaning what it
+    /// means today — collapse extra cursors.
     #[test]
     fn ctrl_c_in_a_text_window_is_unchanged() {
         let mut input = Input::default();
@@ -2504,32 +2469,9 @@ leader = \" \"
         assert_ne!(cmd.action, Action::Shell(ShellCmd::Stop));
     }
 
-    /// Where the Console's `x` sits in the order: above the tree grammar it
-    /// shares a keymap with, below the user's own `[keys]`. `remap` runs
-    /// before `dispatch`, so someone who rebinds `x` has rebound it here
-    /// too — the built-in override is what `x` means when nothing else has
-    /// claimed it, not a key held back from the config.
-    #[test]
-    fn a_rebound_x_is_rebound_in_the_console_too() {
-        let src = "[keys.tree]\n\"x\" = \"tree_collapse\"\n";
-        let (config, problems) =
-            crate::config::parse(src, crate::config::Config::default()).expect("parses");
-        assert!(problems.is_empty(), "{problems:?}");
-        let mut input = Input::default();
-        input.set_keys(config.keys);
-
-        let cmd = input.on_key(key('x'), &Mode::Normal, ContentKind::DapConsole);
-
-        assert_ne!(
-            cmd.map(|c| c.action),
-            Some(Action::Shell(ShellCmd::Stop)),
-            "the config had the key first"
-        );
-    }
-
-    /// `x` is the Console's stop key, but everywhere else in the tree
-    /// grammar it is still cut — the Console arm must not leak into other
-    /// panes.
+    /// `x` is cut everywhere in the tree grammar, the Console pane included
+    /// now that its stop keys are gone — a `:!` job lives in a transient
+    /// buffer, and `x` there deletes a character like anywhere else.
     #[test]
     fn x_in_a_tree_pane_still_cuts() {
         assert_eq!(tree_action("x"), Action::Tree(TreeCmd::Mark(ClipMode::Cut)));

@@ -1707,14 +1707,7 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         // cursor position to report either.
         Some(Pane::DapStack { stack, .. }) => ("Stack".into(), format!("{} frames", stack.frames.len())),
         Some(Pane::DapConsole { console, .. }) => {
-            // `! <cmd>` while a `:!` job runs, `! <cmd> — exited <n>` /
-            // `— killed` / `— signal` after — see `Editor::shell_title` and
-            // `docs/specs/shell.md`. The verdict outlives the job on purpose,
-            // so the last run stays readable; plain "Console" before any `:!`
-            // has run, and again once the editor gives the pane back to the
-            // debugger (a session starting, or `:debug console` with no job).
-            let name = ed.shell_title().unwrap_or_else(|| "Console".into());
-            (name, format!("{} lines", console.lines.len()))
+            ("Console".into(), format!("{} lines", console.lines.len()))
         }
         Some(Pane::DapVariables { vars, .. }) => {
             ("Variables".into(), format!("{} rows", vars.visible().len()))
@@ -2104,61 +2097,6 @@ mod tests {
         let line = window_status(&ed, ed.focus(), false, 40);
         let text: String = line.iter().map(|s| s.content.to_string()).collect();
         assert!(!text.contains("NORMAL"), "{text:?}");
-    }
-
-    /// The Console pane's row carries the job rather than the word
-    /// "Console": `! <cmd>` while it runs, and the verdict after it. A real
-    /// process, not the library's fake spawner — that seam is `#[cfg(test)]`
-    /// inside `bi`, so it does not exist from out here in the frontend.
-    #[test]
-    fn the_console_row_names_the_job_and_then_how_it_ended() {
-        use std::time::{Duration, Instant};
-
-        use bi::editor::{Action, Command, ShellCmd};
-        use bi::shell::ProcessSpawn;
-
-        let mut ed = Editor::empty();
-        ed.layout(to_core(Rect { x: 0, y: 0, width: 80, height: 23 }), CHROME);
-        ed.settle();
-        ed.set_shell_spawner(ProcessSpawn);
-
-        let run = |ed: &mut Editor, cmd: &str| {
-            ed.apply(Command { count: 1, action: Action::Shell(ShellCmd::Run(cmd.to_string())) });
-        };
-        // Settles until `pump_shell` has filed the job's exit, or gives up —
-        // this is a real process, so the wait is for it, not for a fake.
-        let settle_until = |ed: &mut Editor, ending: &str| {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                ed.settle();
-                if ed.shell_title().is_some_and(|t| t.ends_with(ending)) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            panic!("the job never ended: {:?}", ed.shell_title());
-        };
-
-        run(&mut ed, "sleep 30");
-        let console = ed
-            .window_ids()
-            .into_iter()
-            .find(|&id| ed.content_kind_of(id) == Some(ContentKind::DapConsole))
-            .expect("`:!` opened a Console pane");
-        let row = window_status_text(&ed, console, false);
-        assert!(row.contains("! sleep 30"), "the job, while it runs: {row:?}");
-        assert!(!row.contains('—'), "and no verdict yet: {row:?}");
-
-        ed.apply(Command { count: 1, action: Action::Shell(ShellCmd::Stop) });
-        settle_until(&mut ed, "killed");
-        let row = window_status_text(&ed, console, false);
-        assert!(row.contains("! sleep 30 — killed"), "{row:?}");
-
-        run(&mut ed, "true");
-        settle_until(&mut ed, "exited 0");
-        let row = window_status_text(&ed, console, false);
-        assert!(row.contains("! true — exited 0"), "{row:?}");
-        assert!(row.contains("lines"), "and still says how much it holds: {row:?}");
     }
 
     /// The mark column is one character wide whether anything is marked or

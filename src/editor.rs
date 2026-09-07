@@ -452,8 +452,8 @@ pub enum Action {
     /// session, or the ex surface that starts, stops or attaches one. See
     /// `docs/specs/debug.md`.
     Debug(DebugCmd),
-    /// A key in the Console pane, or the ex surface that starts or stops a
-    /// job. See `docs/specs/shell.md`.
+    /// The ex surface that starts or stops a `:!` job — no key sends this
+    /// directly. See `docs/specs/shell.md` and `docs/specs/transient.md`.
     Shell(ShellCmd),
 }
 
@@ -2503,7 +2503,8 @@ pub enum ShellCmd {
         cmd: String,
     },
     /// `:[range]w !cmd` — feeds the lines (default: the whole buffer) to
-    /// the command's stdin and shows its output in the Console.
+    /// the command's stdin and shows its output in the same transient
+    /// buffer as a job's.
     Write {
         scope: Option<Scope>,
         cmd: String,
@@ -2861,6 +2862,15 @@ pub struct Editor {
     /// `docs/specs/shell.md` §Jobs. Drained by `pump_shell` in `settle`, and
     /// dropped (never killed by the drop itself) once its exit is reported.
     shell: Option<shell::Job>,
+    /// The transient buffer the current or most recent job writes into —
+    /// `run_bang` sets it once its job spawns, `pump_shell` appends to it,
+    /// and `delete_buffer` clears it when that buffer closes. `run_write`
+    /// writes into the same transient buffer but is synchronous and never
+    /// touches this field — there is no job for `:bd` to stop behind it.
+    /// Kept on the `Editor` rather than on `shell::Job` itself: `shell::Job`
+    /// is the core's, and a `BufferId` is the editor's alone. See
+    /// `docs/specs/transient.md` §"`:!` in a transient buffer".
+    job_buffer: Option<BufferId>,
     /// The last `:!cmd` typed, for `:!!` to repeat. Never the expanded
     /// form — `%`/`#` expand fresh against whatever the focused buffer and
     /// its alternate are *this* time.
@@ -2874,16 +2884,6 @@ pub struct Editor {
     /// waiter threads. A no-op until a frontend supplies one, so a headless
     /// embedder that never registers a waker just never gets rung.
     shell_waker: Arc<dyn Fn() + Send + Sync>,
-    /// What the Console pane's title shows in place of "Console" — `!
-    /// <cmd>` while a job runs, `! <cmd> — exited <n>` / `— killed` /
-    /// `— signal` after. Set at spawn and at exit; outlives the `Job` itself
-    /// (which `pump_shell` drops once its exit is reported), so the last
-    /// run's verdict stays on the title until the next one overwrites it —
-    /// or until the pane goes back to being the debugger's, which clears it:
-    /// a session starting (`debug_start`, `debug_attach_to`) or a jobless
-    /// `:debug console`. `None` is the plain "Console".
-    /// Read through `Editor::shell_title`.
-    shell_title: Option<String>,
 }
 
 /// One window and what it shows, borrowed to be drawn.
@@ -3432,10 +3432,10 @@ impl Editor {
             installer: None,
             pending_install: None,
             shell: None,
+            job_buffer: None,
             last_bang: None,
             shell_spawner: None,
             shell_waker: Arc::new(|| {}),
-            shell_title: None,
         };
         // The session's root, resolved once and stored — the single fact the
         // tree, the pickers and `:find` all read. Only `bi <dir>` / `:e
@@ -4593,6 +4593,16 @@ impl Editor {
             return;
         }
 
+        // Closing the buffer you are watching a job in means you are done
+        // with it, the way closing a terminal tab does: stop the job first,
+        // so `:bd` never leaves an orphaned process behind.
+        // `docs/specs/transient.md` §"Stopping".
+        let watching_a_running_job = Some(id) == self.job_buffer
+            && self.shell.as_mut().is_some_and(|job| job.handle.is_running());
+        if watching_a_running_job {
+            self.stop_shell();
+        }
+
         // The server hears first: a `didClose` after the list forgot the
         // entry would have nothing left to say.
         if let Some(entry) = self.buffers.iter().find(|b| b.id == id)
@@ -4634,6 +4644,9 @@ impl Editor {
         }
 
         self.buffers.retain(|b| b.id != id);
+        if self.job_buffer == Some(id) {
+            self.job_buffer = None;
+        }
         // The list is never empty, so no path has to handle a session with
         // nothing open — and closing the last window that showed the last
         // buffer is the other way it could have become so. (A window may still
@@ -5732,10 +5745,6 @@ impl Editor {
     /// window to work in, and this one restores focus because you asked
     /// for a buffer to watch, not to leave what you were doing.
     /// `docs/specs/transient.md` §"Where it shows".
-    ///
-    /// Not called yet outside tests — `:!` starts calling it in the next
-    /// commit, which is what wires the Console's replacement in.
-    #[allow(dead_code)]
     fn show_transient(&mut self, id: BufferId) {
         if self.windows.iter().any(|w| w.buffer() == Some(id)) {
             return;
@@ -5768,8 +5777,6 @@ impl Editor {
     /// last row. Doing that before the drain would shift those same cursors
     /// a second time.
     ///
-    /// Not called yet outside tests — see `show_transient`.
-    #[allow(dead_code)]
     fn append_to_transient(&mut self, id: BufferId, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -8138,11 +8145,7 @@ impl Editor {
         let request = launch.request.clone();
         let body = launch.body.clone();
         match self.dap.launch(&launch_name, &command, &root, &request, body) {
-            // The Console is the debuggee's from here: a `! make — exited 0`
-            // left on its title would be describing output it no longer
-            // holds. Same at `open_debug_pane`.
             Ok(_) => {
-                self.shell_title = None;
                 self.session.mode = Mode::Debug;
             }
             Err(reason) => self.session.status = format!("debug: {reason}"),
@@ -8221,9 +8224,7 @@ impl Editor {
         let root = self.session_root();
         let command = adapter.command.clone();
         match self.dap.launch(&launch_name, &command, &root, "attach", body) {
-            // As in `debug_start`: the Console belongs to the session now.
             Ok(_) => {
-                self.shell_title = None;
                 self.session.mode = Mode::Debug;
             }
             Err(reason) => self.session.status = format!("debug: {reason}"),
@@ -8578,13 +8579,6 @@ impl Editor {
     /// arrived.
     fn open_debug_pane(&mut self, pane: DebugPane) {
         if pane == DebugPane::Console {
-            // Asked for as the debugger's pane, with no job to name: the
-            // last run's verdict has outstayed its welcome, and leaving it
-            // up would label the debuggee's output with a shell command that
-            // ended ten minutes ago. See the `shell_title` field doc.
-            if self.shell.is_none() {
-                self.shell_title = None;
-            }
             self.console_window();
             return;
         }
@@ -8621,10 +8615,10 @@ impl Editor {
     }
 
     /// The "focus an existing Console window, else split and open one"
-    /// mechanics behind both `:debug console` and `:!` — factored out so a
-    /// job has somewhere to put its output without duplicating
-    /// `open_debug_pane`'s find-or-split dance. `None` means there was no
-    /// room to split; `split_focus` has already said so on the status line.
+    /// mechanics behind `:debug console` — the debugger's own pane; `:!`
+    /// puts its output in a transient buffer instead (`show_transient`).
+    /// `None` means there was no room to split; `split_focus` has already
+    /// said so on the status line.
     fn console_window(&mut self) -> Option<WindowId> {
         if let Some(id) =
             self.windows.iter().find(|w| w.content.kind() == ContentKind::DapConsole).map(|w| w.id)
@@ -8671,8 +8665,9 @@ impl Editor {
 
     /// `:!cmd` and what `:!!` repeats. Refuses while a job is already live;
     /// otherwise expands `%`/`#` against the focused buffer and its
-    /// alternate, opens or reuses the Console, delimits the run with `$
-    /// <cmd>`, and spawns. See `docs/specs/shell.md` §Jobs.
+    /// alternate, finds or creates the one transient buffer, delimits the
+    /// run with `$ <cmd>`, shows it, and spawns. See
+    /// `docs/specs/transient.md` §"`:!` in a transient buffer".
     fn run_bang(&mut self, cmd: String) {
         // Before anything reads `self.shell`: a job that ended between the
         // last frame and this command still has its tail lines and its
@@ -8698,18 +8693,13 @@ impl Editor {
                 return;
             }
         };
-        // The Console gets the output, not the cursor. vim leaves you in the
-        // buffer you ran the command from, and bi has a second reason to:
-        // the editor stays live while a job runs, and the Console pane has
-        // no buffer behind it — parking the cursor there would quietly
-        // repoint `%` at nothing and `#` at the file it displaced, so
-        // `:!echo %` followed by `:!!` would fail "no file name for %".
-        let focus = self.focus;
-        if self.console_window().is_none() {
-            return;
-        }
-        self.set_focus(focus);
-        self.push_console_lines(&[format!("$ {expanded}")]);
+        // `show_transient` restores focus and `previous` itself, so there is
+        // nothing here to save and put back — the cursor never leaves the
+        // buffer the command was run from, the way vim leaves you in place
+        // and `docs/specs/transient.md` already requires.
+        let id = self.transient_buffer(&format!("!{expanded}"));
+        self.append_to_transient(id, &[format!("$ {expanded}")]);
+        self.show_transient(id);
         let slot = shell::Slot::default();
         let cwd = self.session_root();
         let wake = self.shell_waker.clone();
@@ -8717,8 +8707,8 @@ impl Editor {
         match spawner.spawn(&expanded, &cwd, slot.clone(), wake) {
             Ok(handle) => {
                 self.session.status = format!("! {expanded}");
-                self.shell_title = Some(format!("! {expanded}"));
                 self.shell = Some(shell::Job { cmd: expanded, slot, handle });
+                self.job_buffer = Some(id);
                 self.last_bang = Some(cmd);
             }
             Err(message) => self.session.status = format!("! {message}"),
@@ -8884,10 +8874,10 @@ impl Editor {
     }
 
     /// `:[range]w !cmd` — feeds the range's lines (default: the whole
-    /// buffer) to the command's stdin and shows its output in the Console
-    /// under `$ <cmd>`, like a job's — but synchronously, and the buffer's
-    /// modified flag is untouched, because nothing here saves anything. See
-    /// `docs/specs/shell.md` §Filters.
+    /// buffer) to the command's stdin and shows its output in the same
+    /// transient buffer as a job's, under `$ <cmd>` — but synchronously, and
+    /// the buffer's modified flag is untouched, because nothing here saves
+    /// anything. See `docs/specs/transient.md`.
     fn run_write(&mut self, scope: Option<Scope>, cmd: String) {
         let expanded = match self.expand_shell(&cmd) {
             Ok(expanded) => expanded,
@@ -8913,22 +8903,12 @@ impl Editor {
             self.session.status = "! : this frontend supplies no runner".into();
             return;
         }
-        let Some(id) = self.window().buffer() else { return };
+        let Some(source) = self.window().buffer() else { return };
         let lines: Vec<String> =
-            (first..=last).map(|row| self.entry(id).buffer.line(row)).collect();
+            (first..=last).map(|row| self.entry(source).buffer.line(row)).collect();
         let input = format!("{}\n", lines.join("\n"));
         let cwd = self.session_root();
         let argv = Self::filter_argv(&expanded);
-        // The Console before the command, not after: opening it can fail for
-        // want of room to split, and a failure on that side of the run would
-        // throw away output the command has already produced — with no
-        // running it again to get it back, for a command with side effects.
-        // The focus goes straight back to the buffer, as `run_bang`'s does.
-        let focus = self.focus;
-        if self.console_window().is_none() {
-            return;
-        }
-        self.set_focus(focus);
         let runner = self.fmt_runner.as_ref().expect("checked is_none above");
         let output = match runner.run(&argv, &cwd, &input) {
             Ok(output) => output,
@@ -8937,23 +8917,29 @@ impl Editor {
                 return;
             }
         };
-        let mut console_lines = vec![format!("$ {expanded}")];
-        console_lines.extend(output.lines().map(str::to_string));
-        self.push_console_lines(&console_lines);
+        let id = self.transient_buffer(&format!("!{expanded}"));
+        let mut lines = vec![format!("$ {expanded}")];
+        lines.extend(output.lines().map(str::to_string));
+        self.append_to_transient(id, &lines);
+        self.show_transient(id);
         let rows = last - first + 1;
         self.session.status = format!("wrote {rows} line{}", if rows == 1 { "" } else { "s" });
     }
 
-    /// Drains the live job's slot into the Console, every wake this reaches
-    /// through `settle`. `Line::Err` gets the `"! "` prefix `pump_dap`'s
-    /// stderr already wears; an exit appends its trailer line, sets the
-    /// status and the title, and drops the `Job` — its `Handle`'s `Drop`
-    /// does nothing to an already-finished process (see `shell::Handle`),
-    /// so this never kills a job that already ended on its own.
+    /// Drains the live job's slot into its transient buffer, every wake this
+    /// reaches through `settle`. `Line::Err` gets the `"! "` prefix
+    /// `pump_dap`'s stderr already wears; an exit appends its trailer line,
+    /// sets the status, and drops the `Job` — its `Handle`'s `Drop` does
+    /// nothing to an already-finished process (see `shell::Handle`), so this
+    /// never kills a job that already ended on its own.
+    ///
+    /// If `job_buffer` was `:bd`-closed mid-run, the lines are dropped —
+    /// there is nowhere left to put them — but the status still lands, so
+    /// `! exited n` reaches the status line even for a job nobody is
+    /// watching any more. See `docs/specs/transient.md`.
     fn pump_shell(&mut self) {
         let Some(job) = &mut self.shell else { return };
         let (lines, exit) = job.slot.drain();
-        let cmd = job.cmd.clone();
         let mut out: Vec<String> = lines
             .into_iter()
             .map(|line| match line {
@@ -8969,12 +8955,14 @@ impl Editor {
         if let Some(trailer) = &trailer {
             out.push(trailer.clone());
         }
-        if !out.is_empty() {
-            self.push_console_lines(&out);
+        if !out.is_empty()
+            && let Some(id) = self.job_buffer
+            && self.buffers.iter().any(|b| b.id == id)
+        {
+            self.append_to_transient(id, &out);
         }
         if let Some(trailer) = trailer {
             self.session.status = format!("! {trailer}");
-            self.shell_title = Some(format!("! {cmd} — {trailer}"));
             self.shell = None;
         }
     }
@@ -10895,12 +10883,6 @@ impl Editor {
         {
             job.handle.kill_blocking();
         }
-    }
-
-    /// What the Console pane's title shows in place of "Console" — `None`
-    /// before any `:!` has run. See the `shell_title` field doc.
-    pub fn shell_title(&self) -> Option<String> {
-        self.shell_title.clone()
     }
 
     /// Installs how git baselines are fetched — [`crate::git::baseline`] from
@@ -27196,16 +27178,17 @@ int main(void) {
         }
     }
 
-    /// `:!`, `:!!`, `:stop`, `pump_shell`, Console reuse, the lib-boundary
-    /// seam, and kill-on-quit — Task 2 of `docs/specs/shell.md`. Filters
-    /// (`:{range}!`, `:r !`, `:w !`) are Task 3's and untested here.
+    /// `:!`, `:!!`, `:stop`, `pump_shell`, the transient buffer it writes
+    /// into, the lib-boundary seam, and kill-on-quit. See
+    /// `docs/specs/transient.md` §"`:!` in a transient buffer". Filters
+    /// (`:{range}!`, `:r !`, `:w !`) are `shell_filters`'s, below.
     mod shell_integration {
         use super::*;
         use crate::shell::fake::FakeSpawn;
         use crate::shell::{Exit, Line, Slot};
 
         /// A project on disk, an editor opened on its main file, and a fake
-        /// behind the shell spawner — sized, so `console_window`'s split has
+        /// behind the shell spawner — sized, so `show_transient`'s split has
         /// room. The same shape as `dap_integration::project`.
         fn project(name: &str) -> (ScratchDir, Editor, FakeSpawn) {
             let dir = ScratchDir::new(&format!("shell-{name}"))
@@ -27218,18 +27201,26 @@ int main(void) {
             (dir, ed, fake)
         }
 
-        fn console_window(ed: &Editor) -> WindowId {
-            ed.window_ids()
+        /// The one transient buffer `:!` writes into — there is at most one
+        /// at a time. `docs/specs/transient.md`.
+        fn transient_id(ed: &Editor) -> BufferId {
+            ed.buffer_ids()
                 .into_iter()
-                .find(|&id| ed.content_kind_of(id) == Some(ContentKind::DapConsole))
-                .unwrap_or_else(|| panic!("no Console pane open"))
+                .find(|&id| ed.entry(id).buffer.is_transient())
+                .unwrap_or_else(|| panic!("no transient buffer"))
         }
 
-        fn console_lines(ed: &Editor, id: WindowId) -> Vec<String> {
-            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
-                panic!("not a console pane")
-            };
-            console.lines.clone()
+        /// The window showing `id` — `show_transient`'s split, in every test
+        /// here since nothing closes it first.
+        fn transient_window(ed: &Editor, id: BufferId) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&w| ed.window_of(w).and_then(Window::buffer) == Some(id))
+                .unwrap_or_else(|| panic!("no window showing the transient buffer"))
+        }
+
+        fn transient_lines(ed: &Editor, id: BufferId) -> Vec<String> {
+            ed.entry(id).buffer.rope().to_string().lines().map(str::to_string).collect()
         }
 
         /// The most recently spawned command and the slot the editor is
@@ -27239,8 +27230,9 @@ int main(void) {
         }
 
         #[test]
-        fn bang_runs_a_job_and_streams_into_the_console() {
+        fn bang_runs_a_job_into_a_transient_buffer() {
             let (_dir, mut ed, fake) = project("run");
+            let before = ed.focus();
 
             ex(&mut ed, "!echo hi");
 
@@ -27248,8 +27240,12 @@ int main(void) {
             assert_eq!(spawned.len(), 1);
             assert_eq!(spawned[0].0, "echo hi");
             drop(spawned);
-            let id = console_window(&ed);
-            assert_eq!(console_lines(&ed, id), vec!["$ echo hi".to_string()]);
+            assert_eq!(ed.focus(), before, "focus stayed in the buffer");
+            let id = transient_id(&ed);
+            assert_eq!(ed.name_of(id), "[!echo hi]");
+            let shown = transient_window(&ed, id);
+            assert_ne!(shown, before, "shown in a split, not the focused window");
+            assert_eq!(transient_lines(&ed, id), vec!["$ echo hi".to_string()]);
 
             let (_, slot) = last_spawned(&fake);
             slot.push(Line::Out("hi".into()));
@@ -27257,10 +27253,27 @@ int main(void) {
             ed.settle();
 
             assert_eq!(
-                console_lines(&ed, id),
+                transient_lines(&ed, id),
                 vec!["$ echo hi".to_string(), "hi".to_string(), "exited 0".to_string()]
             );
             assert_eq!(ed.session.status, "! exited 0");
+        }
+
+        #[test]
+        fn a_second_bang_appends_under_a_new_header_and_renames() {
+            let (_dir, mut ed, fake) = project("rename");
+            ex(&mut ed, "!a");
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+            ed.settle();
+            let id = transient_id(&ed);
+
+            ex(&mut ed, "!b");
+
+            assert_eq!(ed.name_of(id), "[!b]", "renamed to the latest command");
+            let lines = transient_lines(&ed, id);
+            assert!(lines.contains(&"$ a".to_string()), "{lines:?}");
+            assert!(lines.contains(&"$ b".to_string()), "{lines:?}");
         }
 
         #[test]
@@ -27305,16 +27318,16 @@ int main(void) {
         }
 
         #[test]
-        fn stop_kills_the_job() {
+        fn stop_is_unchanged() {
             let (_dir, mut ed, fake) = project("stop");
             ex(&mut ed, "!sleep 30");
-            let id = console_window(&ed);
+            let id = transient_id(&ed);
 
             ex(&mut ed, "stop");
 
             assert_eq!(*fake.killed.lock().unwrap(), 1);
             ed.settle();
-            assert_eq!(console_lines(&ed, id).last(), Some(&"killed".to_string()));
+            assert_eq!(transient_lines(&ed, id).last(), Some(&"killed".to_string()));
             assert_eq!(ed.session.status, "! killed");
         }
 
@@ -27351,23 +27364,24 @@ int main(void) {
         fn stderr_lines_are_prefixed() {
             let (_dir, mut ed, fake) = project("stderr");
             ex(&mut ed, "!cmd");
-            let id = console_window(&ed);
+            let id = transient_id(&ed);
             let (_, slot) = last_spawned(&fake);
 
             slot.push(Line::Err("oops".into()));
             slot.finish(Exit::Code(1));
             ed.settle();
 
-            assert!(console_lines(&ed, id).contains(&"! oops".to_string()));
+            assert!(transient_lines(&ed, id).contains(&"! oops".to_string()));
             assert_eq!(ed.session.status, "! exited 1");
         }
 
         /// vim leaves you in the buffer you ran the command from, and bi has
-        /// a second reason to: the Console pane has no buffer, so a `:!`
-        /// that parked the cursor there would make the next `%` fail with
-        /// "no file name" and the next `#` mean the file it displaced.
+        /// a second reason to: the transient buffer's window is a split off
+        /// to the side, not the window you were editing, so a `:!` that
+        /// parked the cursor there would make the next `%` fail with "no
+        /// file name" and the next `#` mean the file it displaced.
         #[test]
-        fn a_job_takes_the_console_but_not_the_focus() {
+        fn a_job_takes_the_split_but_not_the_focus() {
             let (dir, mut ed, fake) = project("focus");
             let before = ed.focus();
 
@@ -27401,13 +27415,13 @@ int main(void) {
 
         /// A job that ended between two frames has its last lines and its
         /// trailer still in the slot. The next `:!` drains them first, so the
-        /// console reads as it happened rather than losing the tail of one
+        /// buffer reads as it happened rather than losing the tail of one
         /// run to the start of the next.
         #[test]
         fn a_new_job_flushes_the_finished_one_first() {
             let (_dir, mut ed, fake) = project("pump-first");
             ex(&mut ed, "!first");
-            let id = console_window(&ed);
+            let id = transient_id(&ed);
             let (_, slot) = last_spawned(&fake);
             slot.push(Line::Out("last".into()));
             slot.finish(Exit::Code(0));
@@ -27416,7 +27430,7 @@ int main(void) {
             ex(&mut ed, "!next");
 
             assert_eq!(
-                console_lines(&ed, id),
+                transient_lines(&ed, id),
                 vec![
                     "$ first".to_string(),
                     "last".to_string(),
@@ -27443,23 +27457,67 @@ int main(void) {
             assert_eq!(*fake.killed.lock().unwrap(), 0, "nothing left to kill");
         }
 
-        /// The title outlives the job so the last run's verdict stays
-        /// readable — but not past the point where the pane goes back to
-        /// being the debugger's, or it would label debuggee output with a
-        /// shell command that ended ten minutes ago.
+        /// `:bd` means "take this away", the same as any other buffer — but
+        /// the job it is watching is still live, so closing it stops the
+        /// job first: the way closing a terminal tab does, leaving no
+        /// orphaned process. `docs/specs/transient.md` §"Stopping".
         #[test]
-        fn reopening_the_console_for_the_debugger_clears_the_job_title() {
-            let (_dir, mut ed, fake) = project("title");
+        fn bd_on_the_running_jobs_buffer_stops_it_and_closes() {
+            let (_dir, mut ed, fake) = project("bd-running");
+            ex(&mut ed, "!sleep 30");
+            let id = transient_id(&ed);
+            let shown = transient_window(&ed, id);
+            ed.set_focus(shown);
+
+            ex(&mut ed, "bd");
+
+            assert_eq!(*fake.killed.lock().unwrap(), 1, "the job was killed");
+            assert!(!ed.buffer_ids().contains(&id), "the buffer is gone");
+            assert_eq!(ed.job_buffer, None);
+        }
+
+        /// The job is already over, so there is nothing to kill — `:bd`
+        /// just closes it, same as any finished buffer.
+        #[test]
+        fn bd_on_a_finished_job_buffer_just_closes() {
+            let (_dir, mut ed, fake) = project("bd-finished");
             ex(&mut ed, "!echo hi");
-            assert_eq!(ed.shell_title().as_deref(), Some("! echo hi"));
+            let id = transient_id(&ed);
             let (_, slot) = last_spawned(&fake);
             slot.finish(Exit::Code(0));
             ed.settle();
-            assert_eq!(ed.shell_title().as_deref(), Some("! echo hi — exited 0"));
+            let shown = transient_window(&ed, id);
+            ed.set_focus(shown);
 
-            ex(&mut ed, "debug console");
+            ex(&mut ed, "bd");
 
-            assert_eq!(ed.shell_title(), None, "the pane is Console again");
+            assert_eq!(*fake.killed.lock().unwrap(), 0, "nothing left to kill");
+            assert!(!ed.buffer_ids().contains(&id));
+        }
+
+        /// Once the buffer that would have shown it is gone, there is
+        /// nowhere left to put the job's output — but the verdict the kill
+        /// provokes still reaches the status line, the way `:stop` on an
+        /// unpumped job already does.
+        #[test]
+        fn output_after_the_buffer_was_closed_is_dropped_but_the_status_lands() {
+            let (_dir, mut ed, fake) = project("bd-mid-run");
+            ex(&mut ed, "!sleep 30");
+            let id = transient_id(&ed);
+            let shown = transient_window(&ed, id);
+            ed.set_focus(shown);
+
+            ex(&mut ed, "bd");
+            assert!(!ed.buffer_ids().contains(&id), "the buffer is gone");
+
+            // More output lands on the slot after the buffer that would
+            // have shown it no longer exists — dropped rather than panicking
+            // on a buffer id that resolves to nothing.
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("late".into()));
+            ed.settle();
+
+            assert_eq!(ed.session.status, "! killed", "the verdict still lands");
         }
 
         #[test]
@@ -27493,7 +27551,7 @@ int main(void) {
 
         /// A file on disk holding `content`, and an editor opened on it with
         /// a fake fmt runner answering every call with `answer` — sized, so
-        /// `console_window`'s split has room for `:w !cmd`.
+        /// `show_transient`'s split has room for `:w !cmd`.
         fn filter_project(
             name: &str,
             content: &str,
@@ -27507,18 +27565,16 @@ int main(void) {
             (dir, ed, fake)
         }
 
-        fn console_window(ed: &Editor) -> WindowId {
-            ed.window_ids()
+        /// The one transient buffer `:w !cmd` writes into.
+        fn transient_id(ed: &Editor) -> BufferId {
+            ed.buffer_ids()
                 .into_iter()
-                .find(|&id| ed.content_kind_of(id) == Some(ContentKind::DapConsole))
-                .unwrap_or_else(|| panic!("no Console pane open"))
+                .find(|&id| ed.entry(id).buffer.is_transient())
+                .unwrap_or_else(|| panic!("no transient buffer"))
         }
 
-        fn console_lines(ed: &Editor, id: WindowId) -> Vec<String> {
-            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
-                panic!("not a console pane")
-            };
-            console.lines.clone()
+        fn transient_lines(ed: &Editor, id: BufferId) -> Vec<String> {
+            ed.entry(id).buffer.rope().to_string().lines().map(str::to_string).collect()
         }
 
         #[test]
@@ -27579,12 +27635,36 @@ int main(void) {
 
             ex(&mut ed, "w !cat");
 
-            let id = console_window(&ed);
+            let id = transient_id(&ed);
             assert_eq!(
-                console_lines(&ed, id),
+                transient_lines(&ed, id),
                 vec!["$ cat".to_string(), "one".to_string(), "two".to_string()]
             );
             assert!(ed.entry(buf).buffer.is_modified(), "a filter write is not a save");
+        }
+
+        /// The same transient buffer a running `:!` job writes into — `:w
+        /// !cmd`'s output lands under its own `$ cmd` header, in the buffer
+        /// the job already renamed, not a second one.
+        /// `docs/specs/transient.md`.
+        #[test]
+        fn write_bang_goes_to_the_same_buffer() {
+            let (_dir, mut ed, _fake_run) = filter_project("write-same", "one\n", Ok("one\n"));
+            let fake_spawn = crate::shell::fake::FakeSpawn::default();
+            ed.set_shell_spawner(fake_spawn.clone());
+            ex(&mut ed, "!echo hi");
+            let id = transient_id(&ed);
+            let (_, slot) = fake_spawn.spawned.lock().unwrap().last().cloned().unwrap();
+            slot.finish(crate::shell::Exit::Code(0));
+            ed.settle();
+
+            ex(&mut ed, "w !cat");
+
+            assert_eq!(transient_id(&ed), id, "the same buffer, not a second one");
+            let lines = transient_lines(&ed, id);
+            assert!(lines.contains(&"$ echo hi".to_string()), "{lines:?}");
+            assert!(lines.contains(&"$ cat".to_string()), "{lines:?}");
+            assert!(lines.contains(&"one".to_string()), "{lines:?}");
         }
 
         #[test]
@@ -27653,20 +27733,22 @@ int main(void) {
             );
         }
 
-        /// The Console is opened before the command runs, not after: the
-        /// split can fail for want of room, and output already produced —
-        /// by a command that may not be safe to run twice — must not be
-        /// thrown away because there was nowhere to put it.
+        /// A transient buffer holds its text whether or not a window can
+        /// show it — unlike the Console pane it replaced, there is nothing
+        /// to lose by running before there is room to split: `:w !cmd`
+        /// still runs, and its output still lands in the buffer, even with
+        /// nowhere to show it. `docs/specs/transient.md`.
         #[test]
-        fn write_bang_opens_the_console_before_it_runs_the_command() {
+        fn write_bang_runs_even_with_no_room_to_split() {
             let (_dir, mut ed, fake) = filter_project("write-order", "one\n", Ok("one\n"));
-            // A terminal with no room to split: the write is refused, and it
-            // is refused without having run anything.
+            // A terminal with no room to split.
             ed.layout(Rect::new(0, 0, 80, 2), TEST_CHROME);
 
             ex(&mut ed, "w !cat");
 
-            assert!(fake.calls.lock().unwrap().is_empty(), "nothing ran");
+            assert_eq!(fake.calls.lock().unwrap().len(), 1, "the command still ran");
+            let id = transient_id(&ed);
+            assert!(transient_lines(&ed, id).contains(&"one".to_string()));
         }
 
         #[test]
