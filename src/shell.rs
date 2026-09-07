@@ -490,7 +490,6 @@ pub struct Job {
     pub cmd: String,
     pub slot: Slot,
     pub handle: Box<dyn Handle>,
-    pub exit: Option<Exit>,
 }
 
 /// `%` expands to `current`, `#` to `alternate`; `\%` and `\#` are the

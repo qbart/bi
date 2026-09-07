@@ -2878,7 +2878,10 @@ pub struct Editor {
     /// <cmd>` while a job runs, `! <cmd> — exited <n>` / `— killed` /
     /// `— signal` after. Set at spawn and at exit; outlives the `Job` itself
     /// (which `pump_shell` drops once its exit is reported), so the last
-    /// run's verdict stays on the title until the next one overwrites it.
+    /// run's verdict stays on the title until the next one overwrites it —
+    /// or until the pane goes back to being the debugger's, which clears it:
+    /// a session starting (`debug_start`, `debug_attach_to`) or a jobless
+    /// `:debug console`. `None` is the plain "Console".
     /// Read through `Editor::shell_title`.
     shell_title: Option<String>,
 }
@@ -7985,7 +7988,13 @@ impl Editor {
         let request = launch.request.clone();
         let body = launch.body.clone();
         match self.dap.launch(&launch_name, &command, &root, &request, body) {
-            Ok(_) => self.session.mode = Mode::Debug,
+            // The Console is the debuggee's from here: a `! make — exited 0`
+            // left on its title would be describing output it no longer
+            // holds. Same at `open_debug_pane`.
+            Ok(_) => {
+                self.shell_title = None;
+                self.session.mode = Mode::Debug;
+            }
             Err(reason) => self.session.status = format!("debug: {reason}"),
         }
     }
@@ -8062,7 +8071,11 @@ impl Editor {
         let root = self.session_root();
         let command = adapter.command.clone();
         match self.dap.launch(&launch_name, &command, &root, "attach", body) {
-            Ok(_) => self.session.mode = Mode::Debug,
+            // As in `debug_start`: the Console belongs to the session now.
+            Ok(_) => {
+                self.shell_title = None;
+                self.session.mode = Mode::Debug;
+            }
             Err(reason) => self.session.status = format!("debug: {reason}"),
         }
     }
@@ -8415,6 +8428,13 @@ impl Editor {
     /// arrived.
     fn open_debug_pane(&mut self, pane: DebugPane) {
         if pane == DebugPane::Console {
+            // Asked for as the debugger's pane, with no job to name: the
+            // last run's verdict has outstayed its welcome, and leaving it
+            // up would label the debuggee's output with a shell command that
+            // ended ten minutes ago. See the `shell_title` field doc.
+            if self.shell.is_none() {
+                self.shell_title = None;
+            }
             self.console_window();
             return;
         }
@@ -8504,6 +8524,13 @@ impl Editor {
     /// alternate, opens or reuses the Console, delimits the run with `$
     /// <cmd>`, and spawns. See `docs/specs/shell.md` §Jobs.
     fn run_bang(&mut self, cmd: String) {
+        // Before anything reads `self.shell`: a job that ended between the
+        // last frame and this command still has its tail lines and its
+        // trailer sitting in the slot, and the refusal below would otherwise
+        // be spoken by a job that is already over. Draining first reports
+        // that exit and drops the `Job`, so what refuses a `:!` here is only
+        // ever a job that is genuinely still running.
+        self.pump_shell();
         if self.shell_spawner.is_none() {
             self.session.status = "! : this frontend supplies no runner".into();
             return;
@@ -8521,9 +8548,17 @@ impl Editor {
                 return;
             }
         };
+        // The Console gets the output, not the cursor. vim leaves you in the
+        // buffer you ran the command from, and bi has a second reason to:
+        // the editor stays live while a job runs, and the Console pane has
+        // no buffer behind it — parking the cursor there would quietly
+        // repoint `%` at nothing and `#` at the file it displaced, so
+        // `:!echo %` followed by `:!!` would fail "no file name for %".
+        let focus = self.focus;
         if self.console_window().is_none() {
             return;
         }
+        self.set_focus(focus);
         self.push_console_lines(&[format!("$ {expanded}")]);
         let slot = shell::Slot::default();
         let cwd = self.session_root();
@@ -8533,22 +8568,35 @@ impl Editor {
             Ok(handle) => {
                 self.session.status = format!("! {expanded}");
                 self.shell_title = Some(format!("! {expanded}"));
-                self.shell = Some(shell::Job { cmd: expanded, slot, handle, exit: None });
+                self.shell = Some(shell::Job { cmd: expanded, slot, handle });
                 self.last_bang = Some(cmd);
             }
             Err(message) => self.session.status = format!("! {message}"),
         }
     }
 
-    /// `:stop` — SIGTERM then SIGKILL, in `Handle::kill`'s order. Pins
-    /// `Exit::Killed`; the trailer and the status land on the next
-    /// `pump_shell`, same as a natural exit.
+    /// `:stop` — SIGTERM then SIGKILL, in `Handle::kill`'s order. `kill`
+    /// returns at once and the escalation runs behind it, so this never
+    /// blocks the editor; the trailer and the status land on the
+    /// `pump_shell` that follows the death, same as a natural exit.
     fn stop_shell(&mut self) {
-        if let Some(job) = &mut self.shell
-            && job.handle.is_running()
-        {
-            job.handle.kill();
-        } else {
+        // Same drain, and for the same reason, as `run_bang`: a job that has
+        // already exited is not "no job running", it is a job whose exit
+        // nobody has read yet. Pumping first reports that exit — and the
+        // status it sets is then the answer to the `:stop`.
+        let had_job = self.shell.is_some();
+        self.pump_shell();
+        if let Some(job) = &mut self.shell {
+            // A job still here after the pump has no exit filed yet — but
+            // its process may already be gone, in which case there is
+            // nothing to signal and the exit is one wake away.
+            if job.handle.is_running() {
+                job.handle.kill();
+            }
+        } else if !had_job {
+            // Only now: a job the pump above dropped has already had its
+            // exit put on the status line, and "no job running" over the top
+            // of that would be a lie about a job that just finished.
             self.session.status = "no job running".into();
         }
     }
@@ -8653,6 +8701,14 @@ impl Editor {
             }
         };
         let count = output.lines().count();
+        // Nothing read is nothing to undo. `commit_undo` files a revision
+        // for an edit that replaced nothing with nothing, and `u` would then
+        // spend a keystroke walking back over it to reach the edit the user
+        // actually made.
+        if output.is_empty() {
+            self.session.status = "read 0 lines".into();
+            return;
+        }
         self.in_view(|view| {
             let before = view.selections.as_pairs();
             let mut insertion = output.clone();
@@ -8703,16 +8759,27 @@ impl Editor {
             }
             Some(Ok(rows)) => rows,
         };
-        let Some(runner) = &self.fmt_runner else {
+        if self.fmt_runner.is_none() {
             self.session.status = "! : this frontend supplies no runner".into();
             return;
-        };
+        }
         let Some(id) = self.window().buffer() else { return };
         let lines: Vec<String> =
             (first..=last).map(|row| self.entry(id).buffer.line(row)).collect();
         let input = format!("{}\n", lines.join("\n"));
         let cwd = self.session_root();
         let argv = Self::filter_argv(&expanded);
+        // The Console before the command, not after: opening it can fail for
+        // want of room to split, and a failure on that side of the run would
+        // throw away output the command has already produced — with no
+        // running it again to get it back, for a command with side effects.
+        // The focus goes straight back to the buffer, as `run_bang`'s does.
+        let focus = self.focus;
+        if self.console_window().is_none() {
+            return;
+        }
+        self.set_focus(focus);
+        let runner = self.fmt_runner.as_ref().expect("checked is_none above");
         let output = match runner.run(&argv, &cwd, &input) {
             Ok(output) => output,
             Err(message) => {
@@ -8720,9 +8787,6 @@ impl Editor {
                 return;
             }
         };
-        if self.console_window().is_none() {
-            return;
-        }
         let mut console_lines = vec![format!("$ {expanded}")];
         console_lines.extend(output.lines().map(str::to_string));
         self.push_console_lines(&console_lines);
@@ -8740,9 +8804,6 @@ impl Editor {
         let Some(job) = &mut self.shell else { return };
         let (lines, exit) = job.slot.drain();
         let cmd = job.cmd.clone();
-        if let Some(exit) = exit {
-            job.exit = Some(exit);
-        }
         let mut out: Vec<String> = lines
             .into_iter()
             .map(|line| match line {
@@ -26747,6 +26808,11 @@ int main(void) {
             ex(&mut ed, "!echo again");
 
             assert!(ed.session.status.contains(":stop it first"), "{}", ed.session.status);
+            assert!(
+                ed.session.status.contains("sleep 1"),
+                "and names the job in the way: {}",
+                ed.session.status
+            );
             assert_eq!(fake.spawned.lock().unwrap().len(), 1, "the second bang never spawned");
         }
 
@@ -26831,6 +26897,116 @@ int main(void) {
 
             assert!(console_lines(&ed, id).contains(&"! oops".to_string()));
             assert_eq!(ed.session.status, "! exited 1");
+        }
+
+        /// vim leaves you in the buffer you ran the command from, and bi has
+        /// a second reason to: the Console pane has no buffer, so a `:!`
+        /// that parked the cursor there would make the next `%` fail with
+        /// "no file name" and the next `#` mean the file it displaced.
+        #[test]
+        fn a_job_takes_the_console_but_not_the_focus() {
+            let (dir, mut ed, fake) = project("focus");
+            let before = ed.focus();
+
+            ex(&mut ed, "!echo %");
+
+            assert_eq!(ed.focus(), before, "the cursor stayed in the buffer");
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+            ed.settle();
+
+            ex(&mut ed, "!!");
+
+            let path = format!("{}/src/main.rs", dir.path());
+            let spawned = fake.spawned.lock().unwrap();
+            assert_eq!(spawned[1].0, format!("echo {path}"), "% still means the file");
+        }
+
+        /// `#` is the alternate, `\%` is the character. Both resolved against
+        /// the focused window at the moment the job starts — `:!!` re-expands
+        /// rather than repeating the expansion.
+        #[test]
+        fn hash_is_the_alternate_and_a_backslash_keeps_the_sign_literal() {
+            let (dir, mut ed, fake) = project("hash");
+            ex(&mut ed, &format!("e {}/src/alt.rs", dir.path()));
+
+            ex(&mut ed, r"!echo # \%");
+
+            let path = format!("{}/src/main.rs", dir.path());
+            assert_eq!(fake.spawned.lock().unwrap()[0].0, format!("echo {path} %"));
+        }
+
+        /// A job that ended between two frames has its last lines and its
+        /// trailer still in the slot. The next `:!` drains them first, so the
+        /// console reads as it happened rather than losing the tail of one
+        /// run to the start of the next.
+        #[test]
+        fn a_new_job_flushes_the_finished_one_first() {
+            let (_dir, mut ed, fake) = project("pump-first");
+            ex(&mut ed, "!first");
+            let id = console_window(&ed);
+            let (_, slot) = last_spawned(&fake);
+            slot.push(Line::Out("last".into()));
+            slot.finish(Exit::Code(0));
+
+            // No settle: the job finished after the last frame was drawn.
+            ex(&mut ed, "!next");
+
+            assert_eq!(
+                console_lines(&ed, id),
+                vec![
+                    "$ first".to_string(),
+                    "last".to_string(),
+                    "exited 0".to_string(),
+                    "$ next".to_string(),
+                ]
+            );
+            assert_eq!(fake.spawned.lock().unwrap().len(), 2, "and it was not refused");
+        }
+
+        /// The same drain in front of `:stop`: a job that has already exited
+        /// is not "no job running", it is a job whose exit nobody has read
+        /// yet.
+        #[test]
+        fn stop_on_a_finished_but_unpumped_job_reports_its_exit() {
+            let (_dir, mut ed, fake) = project("stop-unpumped");
+            ex(&mut ed, "!echo hi");
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+
+            ex(&mut ed, "stop");
+
+            assert_eq!(ed.session.status, "! exited 0");
+            assert_eq!(*fake.killed.lock().unwrap(), 0, "nothing left to kill");
+        }
+
+        /// The title outlives the job so the last run's verdict stays
+        /// readable — but not past the point where the pane goes back to
+        /// being the debugger's, or it would label debuggee output with a
+        /// shell command that ended ten minutes ago.
+        #[test]
+        fn reopening_the_console_for_the_debugger_clears_the_job_title() {
+            let (_dir, mut ed, fake) = project("title");
+            ex(&mut ed, "!echo hi");
+            assert_eq!(ed.shell_title().as_deref(), Some("! echo hi"));
+            let (_, slot) = last_spawned(&fake);
+            slot.finish(Exit::Code(0));
+            ed.settle();
+            assert_eq!(ed.shell_title().as_deref(), Some("! echo hi — exited 0"));
+
+            ex(&mut ed, "debug console");
+
+            assert_eq!(ed.shell_title(), None, "the pane is Console again");
+        }
+
+        #[test]
+        fn shutting_down_with_no_job_is_a_no_op() {
+            let (_dir, mut ed, fake) = project("shutdown-none");
+
+            ed.shutdown_shell();
+
+            assert_eq!(*fake.killed.lock().unwrap(), 0);
+            assert!(ed.session.status.is_empty(), "and says nothing: {}", ed.session.status);
         }
 
         #[test]
@@ -26960,6 +27136,74 @@ int main(void) {
             assert_eq!(argv, &["sh", "-c", "sort"]);
             assert_eq!(cwd.to_str().unwrap(), dir.path());
             assert_eq!(stdin, "b\na\n");
+        }
+
+        /// The range's own trailing newline is put back by the untouched
+        /// suffix, so a command whose answer has none (`printf x`) must not
+        /// pull the next line up onto the replaced one.
+        #[test]
+        fn a_filter_answer_without_a_trailing_newline_keeps_the_next_line() {
+            let (_dir, mut ed, _fake) = filter_project("no-newline", "one\ntwo\n", Ok("x"));
+
+            ex(&mut ed, "1!printf x");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "x\ntwo\n");
+        }
+
+        /// The last line is the interesting one: there is no line below to
+        /// insert in front of, and a file with no trailing newline has to
+        /// grow one first.
+        #[test]
+        fn read_bang_below_the_last_line_appends_it() {
+            for (name, content) in [("read-last-nl", "one\ntwo\n"), ("read-last", "one\ntwo")] {
+                let (_dir, mut ed, _fake) = filter_project(name, content, Ok("x\n"));
+
+                ex(&mut ed, "2r !echo x");
+
+                assert_eq!(
+                    ed.buffer().unwrap().rope().to_string(),
+                    "one\ntwo\nx\n",
+                    "reading below the last line of {content:?}"
+                );
+            }
+        }
+
+        /// Nothing read is nothing to undo: an empty answer must not leave a
+        /// no-op revision for `u` to walk back through on its way to the
+        /// edit the user actually made.
+        #[test]
+        fn read_bang_with_no_output_leaves_no_undo_step() {
+            let (_dir, mut ed, _fake) = filter_project("read-empty", "one\ntwo\n", Ok(""));
+            ed.apply(cmd(Action::InsertChar('X')));
+            ed.apply(cmd(Action::EnterNormal));
+            let edited = ed.buffer().unwrap().rope().to_string();
+
+            ex(&mut ed, "r !true");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), edited, "nothing to insert");
+            assert!(ed.session.status.contains("read 0 lines"), "{}", ed.session.status);
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "one\ntwo\n",
+                "one `u` reaches past the empty read to the edit before it"
+            );
+        }
+
+        /// The Console is opened before the command runs, not after: the
+        /// split can fail for want of room, and output already produced —
+        /// by a command that may not be safe to run twice — must not be
+        /// thrown away because there was nowhere to put it.
+        #[test]
+        fn write_bang_opens_the_console_before_it_runs_the_command() {
+            let (_dir, mut ed, fake) = filter_project("write-order", "one\n", Ok("one\n"));
+            // A terminal with no room to split: the write is refused, and it
+            // is refused without having run anything.
+            ed.layout(Rect::new(0, 0, 80, 2), TEST_CHROME);
+
+            ex(&mut ed, "w !cat");
+
+            assert!(fake.calls.lock().unwrap().is_empty(), "nothing ran");
         }
 
         #[test]

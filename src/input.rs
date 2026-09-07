@@ -791,6 +791,13 @@ impl Input {
         // cut and a job to stop, so it wins here ahead of the shared grammar.
         // `Ctrl-C` is bound only in this pane — Normal mode's `Ctrl-C` keeps
         // meaning what it means (`Action::CollapseCursors`).
+        //
+        // Above the tree grammar, but below the user's own `[keys]`: `remap`
+        // has already run by the time `dispatch` reaches here, so a config
+        // that rebinds `x` (in `[keys.tree]`, which the debug panes borrow,
+        // or in `[keys]` behind it) has rebound it in the Console as well.
+        // That is the right way round — this arm is what `x` means when
+        // nobody has said otherwise, not a key withheld from the config.
         if content == ContentKind::DapConsole
             && (key.code == KeyCode::Char('x') || (ctrl && key.code == KeyCode::Char('c')))
         {
@@ -2470,6 +2477,29 @@ leader = \" \"
         let cmd = input.on_key(ctrl('c'), &Mode::Normal, ContentKind::Text).expect("resolved");
         assert_eq!(cmd.action, Action::CollapseCursors);
         assert_ne!(cmd.action, Action::Shell(ShellCmd::Stop));
+    }
+
+    /// Where the Console's `x` sits in the order: above the tree grammar it
+    /// shares a keymap with, below the user's own `[keys]`. `remap` runs
+    /// before `dispatch`, so someone who rebinds `x` has rebound it here
+    /// too — the built-in override is what `x` means when nothing else has
+    /// claimed it, not a key held back from the config.
+    #[test]
+    fn a_rebound_x_is_rebound_in_the_console_too() {
+        let src = "[keys.tree]\n\"x\" = \"tree_collapse\"\n";
+        let (config, problems) =
+            crate::config::parse(src, crate::config::Config::default()).expect("parses");
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut input = Input::default();
+        input.set_keys(config.keys);
+
+        let cmd = input.on_key(key('x'), &Mode::Normal, ContentKind::DapConsole);
+
+        assert_ne!(
+            cmd.map(|c| c.action),
+            Some(Action::Shell(ShellCmd::Stop)),
+            "the config had the key first"
+        );
     }
 
     /// `x` is the Console's stop key, but everywhere else in the tree
