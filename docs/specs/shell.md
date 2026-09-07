@@ -42,7 +42,10 @@ the same keys. `:!` opens it if no window shows one, exactly as
 `:debug console` does, and appends `$ <cmd>` as the first line so a run is
 delimited from the debuggee output or the previous run above it. The pane's
 title reads `! <cmd>` while the job runs, then `! <cmd> — exited <n>` or
-`! <cmd> — killed`.
+`! <cmd> — killed`. The verdict outlives the job so the last run stays
+readable, but not past the point where the pane goes back to being the
+debugger's: a session starting, or `:debug console` opened with no job,
+gives it the plain `Console` again.
 
 **stdin is closed at spawn.** A program that prompts gets EOF, not a hang.
 That is the honest answer without a pty: interactive programs are what the
@@ -57,7 +60,15 @@ trailer line lands in the console. Non-UTF-8 output is decoded lossily.
 
 **Stopping.** `:stop` — and `Ctrl-C` or `x` *in the Console pane* — sends
 SIGTERM, waits ~2 s, then SIGKILL, in the order the debugger's
-`end_session` already uses. `Ctrl-C` is bound only in the pane: in Normal
+`end_session` already uses. The waiting happens on a thread of its own:
+`:stop` returns to the editor the moment the SIGTERM is away, or a job that
+ignores it would freeze the session for the whole grace period. The signals
+go to the job's **process group**, not to the `sh` at its head — `sh -c`
+only execs a *simple* command, so `:!cargo build; ./run` leaves a shell
+with a child underneath it, and signalling the leader alone would kill the
+shell and orphan the build. The exit is filed only once the process is
+confirmed gone, so the job the editor still holds is a job that is still
+alive, and quitting can always take it with it. `Ctrl-C` is bound only in the pane: in Normal
 mode it keeps meaning what it means. `x` is the Console's own override too:
 every other tree-shaped pane binds `x` to `TreeCmd::Mark(Cut)`, but the
 Console has nothing to cut, so there `x` means stop, not cut. Quitting with
@@ -72,6 +83,11 @@ stdin is the lines, newline-terminated; on a non-zero exit the buffer is
 left alone and the status shows the first stderr line — the formatter's
 rule, for the formatter's reason: a filter that failed has nothing to say
 about your text.
+
+The runner drains the command's stdout and stderr while it waits, so an
+answer bigger than a pipe buffer (~64 KB) is fine: `:%!sort` on a file of
+any size is a filter, not a hang. `:r !cmd` with no output at all makes no
+edit, and so leaves no undo step.
 
 `:[range]r !cmd` inserts stdout below the cursor line (or below the range's
 last line). `:[range]w !cmd` feeds the lines (default: whole buffer) to the
@@ -136,7 +152,7 @@ result inside the command, like `:format`.
 
 ## Deviations from the design
 
-Three places where the build settled a question this spec's text left
+Five places where the build settled a question this spec's text left
 implicit, each recorded here so nobody re-derives it from scratch:
 
 1. **The grammar ruling: bare `:!cmd` is the job; the current-line filter is
@@ -148,7 +164,21 @@ implicit, each recorded here so nobody re-derives it from scratch:
 2. **`Read`/`Write` report `read N lines` / `wrote N lines`.** Wording
    chosen at build time to match the buffer's own "N lines" phrasing
    elsewhere in the status line; nothing in the spec's text mandated it.
-3. **One "no runner" status, shared by jobs and filters.** A headless
+3. **A job the editor kills reports `killed`; one that died of a signal
+   nobody asked for reports `signal`.** The spec's text names `exited <n>`
+   and `killed` only, but a job can also end on a SIGSEGV or a SIGHUP that
+   bi had nothing to do with, and there is no exit code to print for it.
+   `signal` is that third trailer — in the console line, in the status
+   (`! signal`) and in the pane title (`! <cmd> — signal`) alike. Which of
+   the two a death gets is a question of *who asked*, not of what the kernel
+   did: `:stop` marks the job before it signals it, so even a job that
+   handles SIGTERM and exits 0 is reported `killed`.
+4. **`:!` does not move the cursor.** The Console gets the output; the focus
+   stays in the buffer you ran the command from, as in vim. It has to: the
+   editor stays live while a job runs, and the Console pane has no buffer
+   behind it, so a `:!` that parked the cursor there would leave `%` with no
+   file to name and `#` meaning the file it had just displaced.
+5. **One "no runner" status, shared by jobs and filters.** A headless
    embedder that supplies no spawner (`set_shell_spawner`) sees the same
    `! : this frontend supplies no runner` whether `:!cmd`, `:{range}!cmd`,
    `:r !cmd` or `:w !cmd` triggered it — there was no reason for the two

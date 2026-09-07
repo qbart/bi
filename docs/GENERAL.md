@@ -488,6 +488,16 @@ output, and inside it `Ctrl-C` and `x` stop the running job rather than
 their usual meanings. See [docs/specs/debug.md](specs/debug.md) and
 [docs/specs/shell.md](specs/shell.md).
 
+### Shell
+
+In every `!` command line, `%` expands to the current file's path and `#` to
+the alternate's; `\%` and `\#` are the characters themselves, and a `!`
+inside the line is literal (`:!grep '!' %` means what it says) — `:!!` is how
+you repeat the last job. A **range is what makes a `!` a filter**: bare `:!cmd`
+is always the background job, so the current line alone is `:.!cmd`, as in
+vim. Filters are synchronous under a 5 s guard; a job has no timeout, it has
+`:stop`. See [docs/specs/shell.md](specs/shell.md).
+
 ### Picker
 
 One overlay over seven lists: the register ring (`"p` / `"P`), the named
@@ -619,7 +629,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:watch <expr>` `:unwatch <n>` | add / remove a Watches expression, 1-based |
 | `:!cmd` `:!!` | run a command as a background job in the Console; `!!` repeats the last one |
 | `:stop` | end the running job |
-| `:{range}!cmd` | filter the range's lines through a command, synchronously, as one undo step |
+| `:{range}!cmd` `:.!cmd` | filter the range's lines through a command, synchronously, as one undo step |
 | `:r !cmd` | insert a command's stdout below the cursor |
 | `:w !cmd` | feed the buffer to a command's stdin and show its output in the Console |
 | `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
