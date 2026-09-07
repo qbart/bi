@@ -11694,6 +11694,33 @@ impl View<'_> {
                     }
                 });
             }
+            // Beside `gq` and `>`: captures nothing, always linewise. The
+            // marker is the language's own — `None` means either no
+            // filetype or a language with no line-comment form, and either
+            // way `gc` says so and changes nothing. See
+            // `docs/specs/comment.md`.
+            Action::Operate { op: Operator::Comment, target, count, .. } => {
+                let Some(target) = self.resolve_find_target(*target) else { return };
+                let count = *count;
+                let Some(filetype) = *self.filetype else {
+                    self.session.status = "no filetype".into();
+                    return;
+                };
+                let Some(marker) = crate::syntax::line_comment(filetype) else {
+                    self.session.status = format!("no line comment for {filetype}");
+                    return;
+                };
+                let indent = self.options.indent();
+                self.for_each_selection(|ed, sel| {
+                    let Some((first, last)) = ed.buffer.target_rows(sel.head, target, count) else {
+                        return sel;
+                    };
+                    match ed.buffer.comment_rows(first, last, marker, &indent) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => sel,
+                    }
+                });
+            }
             Action::Operate { op, target, count, sink } => {
                 let Some(target) = self.resolve_find_target(*target) else { return };
                 let (op, count, sink) = (*op, *count, *sink);
@@ -11965,6 +11992,36 @@ impl View<'_> {
                     // The rows it touched, whole: the text moved out from under
                     // the old columns, so keeping them would slide the
                     // selection sideways under a repeated `>`.
+                    let backwards = sel.head.at < sel.anchor.at;
+                    let start = ed.buffer.at_row(first, false);
+                    let end = ed.buffer.line_end(ed.buffer.at_row(last, false), false);
+                    match backwards {
+                        true => Selection { anchor: end, head: start },
+                        false => Selection { anchor: start, head: end },
+                    }
+                });
+            }
+            // Beside `>`: the selection survives, reshaped to the rows the
+            // toggle touched. That is what lets a visual `gc` `gc` undo
+            // itself without reselecting — the no-op the spec calls for.
+            // See `docs/specs/comment.md`.
+            Action::OperateSelection { op: Operator::Comment, .. } => {
+                let Some(filetype) = *self.filetype else {
+                    self.session.status = "no filetype".into();
+                    return;
+                };
+                let Some(marker) = crate::syntax::line_comment(filetype) else {
+                    self.session.status = format!("no line comment for {filetype}");
+                    return;
+                };
+                let indent = self.options.indent();
+                self.for_each_selection(|ed, sel| {
+                    let (lo, hi) = sel.range();
+                    let first = ed.buffer.row_at(Cursor::at(lo));
+                    let last = ed.buffer.row_at(Cursor::at(hi));
+                    if ed.buffer.comment_rows(first, last, marker, &indent).is_none() {
+                        return sel;
+                    }
                     let backwards = sel.head.at < sel.anchor.at;
                     let start = ed.buffer.at_row(first, false);
                     let end = ed.buffer.line_end(ed.buffer.at_row(last, false), false);
@@ -23864,6 +23921,113 @@ int main(void) {
             ed.name_of(ed.window().buffer().unwrap()).ends_with("a.txt"),
             "`at` is a subsequence of a.txt and of nothing else here"
         );
+    }
+
+    /// `gc` — the comment-toggle operator: the marker per filetype, the
+    /// refusal where there is none, dot-repeat and the visual form. See
+    /// `docs/specs/comment.md`.
+    mod comment {
+        use super::*;
+
+        /// A file on disk with `text`, and an editor opened on it — the
+        /// path is what gives the buffer its filetype.
+        fn on(dir: &str, name: &str, text: &str) -> (ScratchDir, Editor) {
+            let d = ScratchDir::new(dir).written(name, text);
+            let ed = Editor::open(format!("{}/{name}", d.path())).unwrap();
+            (d, ed)
+        }
+
+        #[test]
+        fn gcc_comments_a_rust_line_and_the_second_gcc_uncomments_it() {
+            let (_d, mut ed) = on("comment-rust", "a.rs", "    y();\n");
+
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "    // y();\n");
+
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "    y();\n");
+        }
+
+        #[test]
+        fn python_comments_with_a_hash() {
+            let (_d, mut ed) = on("comment-py", "a.py", "y()\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "# y()\n");
+        }
+
+        #[test]
+        fn lua_comments_with_a_double_dash() {
+            let (_d, mut ed) = on("comment-lua", "a.lua", "y()\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "-- y()\n");
+        }
+
+        #[test]
+        fn ini_comments_with_a_semicolon() {
+            let (_d, mut ed) = on("comment-ini", "a.ini", "key = val\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "; key = val\n");
+        }
+
+        /// CSS has no line-comment form, only a bracketing one — lending it
+        /// `//` would read as a mistake in the file. `gc` says so and
+        /// changes nothing.
+        #[test]
+        fn css_refuses_and_leaves_the_line_alone() {
+            let (_d, mut ed) = on("comment-css", "a.css", "a { color: red; }\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "a { color: red; }\n");
+            assert!(ed.session.status.contains("no line comment"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn a_buffer_with_no_filetype_refuses_too() {
+            let mut ed = editor("y()\n");
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "y()\n");
+            assert!(ed.session.status.contains("no filetype"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn three_gcc_comments_three_lines_and_one_u_restores_them() {
+            let (_d, mut ed) = on("comment-undo", "a.rs", "a();\nb();\nc();\n");
+
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 3));
+            assert_eq!(rope_of(&ed), "// a();\n// b();\n// c();\n");
+
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(rope_of(&ed), "a();\nb();\nc();\n", "one `u` reaches all three lines");
+        }
+
+        #[test]
+        fn dot_repeats_gcc() {
+            let (_d, mut ed) = on("comment-dot", "a.rs", "aaa\nbbb\n");
+
+            ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
+            assert_eq!(rope_of(&ed), "// aaa\nbbb\n");
+
+            let at = rope_of(&ed).find("bbb").unwrap();
+            ed.set_cursor(Cursor::at(at));
+            ed.apply(cmd(Action::RepeatChange { count: None }));
+
+            assert_eq!(rope_of(&ed), "// aaa\n// bbb\n");
+        }
+
+        /// Beside `>`: the selection survives the toggle, which is what
+        /// lets a second visual `gc` undo the first without reselecting.
+        #[test]
+        fn visual_gc_toggles_the_selected_rows_and_keeps_the_selection() {
+            let (_d, mut ed) = on("comment-visual", "a.rs", "aaa\nbbb\n");
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
+
+            ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
+            assert_eq!(rope_of(&ed), "// aaa\n// bbb\n");
+            assert_eq!(ed.session.mode.visual(), Some(Shape::Lines), "the selection survives");
+
+            ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
+            assert_eq!(rope_of(&ed), "aaa\nbbb\n", "gc gc is a no-op");
+        }
     }
 
     /// `:fmt` through an external tool — the filter run, its application as

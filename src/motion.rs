@@ -148,6 +148,11 @@ pub enum Operator {
     /// depth. The third indent operator; captures nothing, always linewise.
     /// See `docs/specs/indent.md`.
     Reindent,
+    /// `gc` — toggle the language's line comment. Captures nothing and is
+    /// always linewise, beside [`Operator::Reflow`] and [`Operator::Indent`]
+    /// and for the same reasons: half a line cannot be commented out with a
+    /// line marker. See `docs/specs/comment.md`.
+    Comment,
 }
 
 /// How a motion's endpoints turn into a range.

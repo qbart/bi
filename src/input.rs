@@ -461,6 +461,7 @@ impl Input {
             Some(Operator::Indent { right }) => s.push(if right { '>' } else { '<' }),
             Some(Operator::Reflow) => s.push_str("gq"),
             Some(Operator::Reindent) => s.push('='),
+            Some(Operator::Comment) => s.push_str("gc"),
             None => {}
         }
         if let Some(n) = self.motion_count {
@@ -1230,6 +1231,14 @@ impl Input {
                     self.operator = Some(Operator::Reflow);
                     None
                 }
+                // `gc` — the comment-toggle operator, the same doubled shape
+                // as `gq`: `gcgc` covers the line the way `gcc` does. See
+                // `docs/specs/comment.md`.
+                'c' if self.operator == Some(Operator::Comment) => self.resolve(Motion::CurrentLine),
+                'c' if self.operator.is_none() => {
+                    self.operator = Some(Operator::Comment);
+                    None
+                }
                 _ => {
                     self.reset();
                     None
@@ -1263,6 +1272,8 @@ impl Input {
                     // `gqq`, and `gqgq` via the `g` block above.
                     | (Operator::Reflow, 'q')
                     | (Operator::Reindent, '=')
+                    // `gcc`, and `gcgc` via the `g` block above.
+                    | (Operator::Comment, 'c')
             );
             if doubled {
                 return self.resolve(Motion::CurrentLine);
@@ -1275,7 +1286,10 @@ impl Input {
                     Operator::Yank => Some(Surround::Add),
                     Operator::Delete => Some(Surround::Delete),
                     Operator::Change => Some(Surround::Change(None)),
-                    Operator::Indent { .. } | Operator::Reflow | Operator::Reindent => None,
+                    Operator::Indent { .. }
+                    | Operator::Reflow
+                    | Operator::Reindent
+                    | Operator::Comment => None,
                 };
                 if self.surround.is_some() {
                     // `ys` keeps the yank operator pending, because what
@@ -1583,6 +1597,17 @@ impl Input {
             return Some(Command {
                 count: 1,
                 action: Action::OperateSelection { op: Operator::Reflow, sink },
+            });
+        }
+
+        // `gc` beside `gq`: the comment toggle over the selection.
+        if self.g_pending && c == 'c' {
+            self.g_pending = false;
+            let sink = self.sink;
+            self.reset();
+            return Some(Command {
+                count: 1,
+                action: Action::OperateSelection { op: Operator::Comment, sink },
             });
         }
 
@@ -2824,6 +2849,60 @@ leader = \" \"
                 "{spelling}"
             );
         }
+    }
+
+    /// `gc` is an operator in the full sense too, the same doubled shape as
+    /// `gq`. See `docs/specs/comment.md`.
+    #[test]
+    fn gc_is_an_operator_and_doubles_both_ways() {
+        assert_eq!(
+            typed("gcj").action,
+            Action::Operate {
+                op: Operator::Comment,
+                target: Target::Motion(Motion::Down),
+                count: 1,
+                sink: Sink::Ring
+            }
+        );
+        for spelling in ["gcc", "gcgc"] {
+            assert_eq!(
+                typed(spelling).action,
+                Action::Operate {
+                    op: Operator::Comment,
+                    target: Target::Motion(Motion::CurrentLine),
+                    count: 1,
+                    sink: Sink::Ring
+                },
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_before_gcc_folds_into_the_motion() {
+        let cmd = typed("3gcc");
+        assert_eq!(
+            cmd.action,
+            Action::Operate {
+                op: Operator::Comment,
+                target: Target::Motion(Motion::CurrentLine),
+                count: 3,
+                sink: Sink::Ring
+            }
+        );
+    }
+
+    #[test]
+    fn visual_gc_takes_the_selection() {
+        let mut input = Input::default();
+        let mut last = None;
+        for c in "gc".chars() {
+            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+        }
+        assert_eq!(
+            last.expect("resolved").action,
+            Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }
+        );
     }
 
     #[test]
