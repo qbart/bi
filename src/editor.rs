@@ -2018,22 +2018,22 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         return Some(parsed);
     }
 
-    // `:!cmd` and `:!!`, off the whole line for the same reason `:g`'s
-    // pattern is: the command may itself contain anything, including
-    // whitespace, and must not go through the name/argument split below. A
-    // scope in front (`:%!sort`) is a filter, not a job — Task 3's, so it
-    // falls through unhandled here and lands wherever the table below sends
-    // a command line named `!...` today (its "takes no range" check, since
-    // no such name is on the range whitelist).
-    if scope.is_none()
-        && let Some(rest) = line.strip_prefix('!')
-    {
-        return Some(if rest == "!" {
-            ExLine::Shell(ShellCmd::Repeat)
-        } else if rest.trim().is_empty() {
-            ExLine::Error("run what?".into())
-        } else {
-            ExLine::Shell(ShellCmd::Run(rest.trim().to_string()))
+    // `:!cmd`, `:!!` and `:{range}!cmd`, off the whole line for the same
+    // reason `:g`'s pattern is: the command may itself contain anything,
+    // including whitespace, and must not go through the name/argument split
+    // below. Vim's real grammar: `:!` with no range is the shell form (a
+    // background job here — see `docs/specs/shell.md` §Jobs); a scope in
+    // front is the filter, so `:.!cmd` is "filter the current line" and bare
+    // `:!cmd` is never a filter, even for a scope-less current line.
+    if let Some(rest) = line.strip_prefix('!') {
+        return Some(match scope {
+            None if rest == "!" => ExLine::Shell(ShellCmd::Repeat),
+            None if rest.trim().is_empty() => ExLine::Error("run what?".into()),
+            None => ExLine::Shell(ShellCmd::Run(rest.trim().to_string())),
+            Some(_) if rest.trim().is_empty() => ExLine::Error("filter through what?".into()),
+            Some(scope) => {
+                ExLine::Shell(ShellCmd::Filter { scope: Some(scope), cmd: rest.trim().to_string() })
+            }
         });
     }
 
@@ -2061,6 +2061,31 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     let split = |dir| {
         ExLine::Window(WindowCmd::Split { dir, path: (!arg.is_empty()).then(|| arg.to_string()) })
     };
+
+    // `:[range]r !cmd` / `:[range]w !cmd` — Task 3's filters. The space
+    // before `!` is what keeps `:w !cmd` (this) apart from `:w!`'s
+    // force-write, which glues the `!` onto the name instead and never
+    // reaches here with an `arg` that starts with one. A scope is allowed on
+    // both even though neither name is on the no-range whitelist below,
+    // because these run a command rather than touch a path.
+    if let Some(rest) = arg.strip_prefix('!') {
+        let shell_cmd = rest.trim().to_string();
+        match name {
+            "r" | "read" => {
+                return Some(match shell_cmd.is_empty() {
+                    true => ExLine::Error("read what?".into()),
+                    false => ExLine::Shell(ShellCmd::Read { scope, cmd: shell_cmd }),
+                });
+            }
+            "w" | "write" => {
+                return Some(match shell_cmd.is_empty() {
+                    true => ExLine::Error("write through what?".into()),
+                    false => ExLine::Shell(ShellCmd::Write { scope, cmd: shell_cmd }),
+                });
+            }
+            _ => {}
+        }
+    }
 
     // A range handed to a command that has no use for one is an error rather
     // than a range quietly dropped: vim writes part of a file for `:1,5w` and
@@ -2448,10 +2473,12 @@ pub enum DebugPane {
 }
 
 /// `:!cmd`, `:!!`, `:stop` and the filter/read/write spellings — see
-/// `docs/specs/shell.md`. `Run`/`Repeat`/`Stop` are Task 2's, dispatched in
-/// `Editor::run_shell_cmd`; `Filter`/`Read`/`Write` are parsed here (Task 3
-/// claims their scope, so the ex parser learns the whole family in one
-/// enum) but dispatch to explicit no-ops until Task 3 wires them up.
+/// `docs/specs/shell.md`. `Run`/`Repeat`/`Stop` are jobs, background and
+/// asynchronous, dispatched in `Editor::run_shell_cmd` via `run_bang`.
+/// `Filter`/`Read`/`Write` are synchronous filters through the fmt runner,
+/// dispatched via `Editor::run_filter`/`run_read`/`run_write` — a scope in
+/// front of `!` is what tells a filter from a job: bare `:!cmd` is always
+/// `Run`, never `Filter`, even for a scope-less current line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCmd {
     /// `:!cmd` — a background job. `%`/`#` are expanded before it runs.
@@ -2462,19 +2489,21 @@ pub enum ShellCmd {
     Stop,
     /// `:{range}!cmd` — replaces the range's lines with the command's
     /// stdout, as one edit. `scope` is `None` for the current line, as in
-    /// vim. Task 3.
+    /// vim — though the parser never produces that for this variant, since
+    /// a scope-less `!` is always `Run`; only `:.!cmd` spells the current
+    /// line explicitly.
     Filter {
         scope: Option<Scope>,
         cmd: String,
     },
     /// `:[range]r !cmd` — inserts stdout below the cursor line or the
-    /// range's last line. Task 3.
+    /// range's last line.
     Read {
         scope: Option<Scope>,
         cmd: String,
     },
     /// `:[range]w !cmd` — feeds the lines (default: the whole buffer) to
-    /// the command's stdin and shows its output in the Console. Task 3.
+    /// the command's stdin and shows its output in the Console.
     Write {
         scope: Option<Scope>,
         cmd: String,
@@ -8440,8 +8469,10 @@ impl Editor {
         Some(new)
     }
 
-    /// `ShellCmd::Run`/`Repeat`/`Stop` — everything else in the enum is
-    /// Task 3's, dispatched as an explicit no-op until then.
+    /// `ShellCmd::Run`/`Repeat`/`Stop` are jobs, background and
+    /// asynchronous; `Filter`/`Read`/`Write` are synchronous filters through
+    /// the fmt runner's process guard, not the job machinery above. See
+    /// `docs/specs/shell.md`.
     fn run_shell_cmd(&mut self, cmd: ShellCmd) {
         match cmd {
             ShellCmd::Run(cmd) => self.run_bang(cmd),
@@ -8450,12 +8481,22 @@ impl Editor {
                 None => self.session.status = "no previous !".into(),
             },
             ShellCmd::Stop => self.stop_shell(),
-            // Task 3: filters run synchronously through the fmt runner's
-            // process guard, not the job machinery above.
-            ShellCmd::Filter { .. } => {}
-            ShellCmd::Read { .. } => {}
-            ShellCmd::Write { .. } => {}
+            ShellCmd::Filter { scope, cmd } => self.run_filter(scope, cmd),
+            ShellCmd::Read { scope, cmd } => self.run_read(scope, cmd),
+            ShellCmd::Write { scope, cmd } => self.run_write(scope, cmd),
         }
+    }
+
+    /// `%`/`#` expansion against the focused window's buffer and its
+    /// alternate — what `run_bang` and the filter family (`run_filter`,
+    /// `run_read`, `run_write`) all share. See `docs/specs/shell.md`.
+    fn expand_shell(&self, cmd: &str) -> Result<String, String> {
+        let current = self.window().buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        let alternate =
+            self.window().alt_buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        let current = current.map(|p| p.display().to_string());
+        let alternate = alternate.map(|p| p.display().to_string());
+        shell::expand(cmd, current.as_deref(), alternate.as_deref())
     }
 
     /// `:!cmd` and what `:!!` repeats. Refuses while a job is already live;
@@ -8473,12 +8514,7 @@ impl Editor {
             self.session.status = format!("! is running {} — :stop it first", job.cmd);
             return;
         }
-        let current = self.window().buffer().and_then(|id| self.entry(id).buffer.path.clone());
-        let alternate =
-            self.window().alt_buffer().and_then(|id| self.entry(id).buffer.path.clone());
-        let current = current.map(|p| p.display().to_string());
-        let alternate = alternate.map(|p| p.display().to_string());
-        let expanded = match shell::expand(&cmd, current.as_deref(), alternate.as_deref()) {
+        let expanded = match self.expand_shell(&cmd) {
             Ok(expanded) => expanded,
             Err(message) => {
                 self.session.status = message;
@@ -8515,6 +8551,183 @@ impl Editor {
         } else {
             self.session.status = "no job running".into();
         }
+    }
+
+    /// The argv every filter runs through: `["sh", "-c", cmd]`, the fmt
+    /// runner's own contract. See `docs/specs/shell.md` §Filters.
+    fn filter_argv(cmd: &str) -> [String; 3] {
+        ["sh".to_string(), "-c".to_string(), cmd.to_string()]
+    }
+
+    /// `:{range}!cmd` — replaces the range's lines with the command's
+    /// stdout, as one edit and one undo step. No scope reaches here from the
+    /// parser (a scope-less `!` is always a job), but `Fallback::CursorRow`
+    /// — `View::scope_rows`'s own default — keeps the type's `None` honest
+    /// with vim's rule anyway. A failing filter leaves the buffer alone and
+    /// reports the runner's `Err`, the formatter's rule for the formatter's
+    /// reason. See `docs/specs/shell.md` §Filters.
+    fn run_filter(&mut self, scope: Option<Scope>, cmd: String) {
+        let expanded = match self.expand_shell(&cmd) {
+            Ok(expanded) => expanded,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let (first, last) = match self.in_view(|view| view.scope_rows(scope, None)) {
+            None => return,
+            Some(Err(message)) => {
+                self.session.status = message;
+                return;
+            }
+            Some(Ok(rows)) => rows,
+        };
+        // Resolved after the rows, not before: `View::scope_rows` needs
+        // `&mut self` through `in_view`, and the runner reference below
+        // would otherwise still be borrowed across that call.
+        let Some(runner) = &self.fmt_runner else {
+            self.session.status = "! : this frontend supplies no runner".into();
+            return;
+        };
+        let Some(id) = self.window().buffer() else { return };
+        let lines: Vec<String> =
+            (first..=last).map(|row| self.entry(id).buffer.line(row)).collect();
+        let input = format!("{}\n", lines.join("\n"));
+        let cwd = self.session_root();
+        let argv = Self::filter_argv(&expanded);
+        let output = match runner.run(&argv, &cwd, &input) {
+            Ok(output) => output,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        // The trailing newline is the range's own, put back by the
+        // untouched suffix below — keeping it here would double it, the way
+        // `:sort` avoids doubling every line's by joining without one.
+        let replacement = output.strip_suffix('\n').unwrap_or(&output).to_string();
+        self.in_view(|view| {
+            let before = view.selections.as_pairs();
+            let start = view.buffer.rope().line_to_char(first);
+            let stop = view.buffer.rope().line_to_char(last) + view.buffer.line_len(last);
+            view.buffer.replace_range(start, stop, &replacement);
+            // The cursor lands on the first replaced row, same as `:sort`.
+            *view.selections = Selections::single(view.buffer.clamped(Cursor::at(start), false));
+            view.buffer.commit_undo(before, view.selections.as_pairs());
+        });
+        let rows = last - first + 1;
+        self.session.status = format!("filtered {rows} line{}", if rows == 1 { "" } else { "s" });
+    }
+
+    /// `:[range]r !cmd` — inserts the command's stdout below the cursor row,
+    /// or below the scope's last row. Nothing from the buffer feeds the
+    /// command's stdin — a read is not a filter. See `docs/specs/shell.md`
+    /// §Filters.
+    fn run_read(&mut self, scope: Option<Scope>, cmd: String) {
+        let expanded = match self.expand_shell(&cmd) {
+            Ok(expanded) => expanded,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let last = match self.in_view(|view| view.scope_rows(scope, None)) {
+            None => return,
+            Some(Err(message)) => {
+                self.session.status = message;
+                return;
+            }
+            Some(Ok((_, last))) => last,
+        };
+        let Some(runner) = &self.fmt_runner else {
+            self.session.status = "! : this frontend supplies no runner".into();
+            return;
+        };
+        let cwd = self.session_root();
+        let argv = Self::filter_argv(&expanded);
+        let output = match runner.run(&argv, &cwd, "") {
+            Ok(output) => output,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        let count = output.lines().count();
+        self.in_view(|view| {
+            let before = view.selections.as_pairs();
+            let mut insertion = output.clone();
+            if !insertion.is_empty() && !insertion.ends_with('\n') {
+                insertion.push('\n');
+            }
+            let insert_at = if last + 1 < view.buffer.rope().len_lines() {
+                view.buffer.rope().line_to_char(last + 1)
+            } else {
+                let len = view.buffer.rope().len_chars();
+                let ends_in_newline = len > 0 && view.buffer.rope().char(len - 1) == '\n';
+                if len > 0 && !ends_in_newline {
+                    insertion = format!("\n{insertion}");
+                }
+                len
+            };
+            view.buffer.replace_range(insert_at, insert_at, &insertion);
+            *view.selections =
+                Selections::single(view.buffer.clamped(Cursor::at(insert_at), false));
+            view.buffer.commit_undo(before, view.selections.as_pairs());
+        });
+        self.session.status = format!("read {count} line{}", if count == 1 { "" } else { "s" });
+    }
+
+    /// `:[range]w !cmd` — feeds the range's lines (default: the whole
+    /// buffer) to the command's stdin and shows its output in the Console
+    /// under `$ <cmd>`, like a job's — but synchronously, and the buffer's
+    /// modified flag is untouched, because nothing here saves anything. See
+    /// `docs/specs/shell.md` §Filters.
+    fn run_write(&mut self, scope: Option<Scope>, cmd: String) {
+        let expanded = match self.expand_shell(&cmd) {
+            Ok(expanded) => expanded,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        // The whole buffer by default, unlike `Filter`/`Read`'s current
+        // line — `:w` with no range already means "the whole file".
+        let (first, last) = match self.in_view(|view| {
+            let region = view.region(scope, None, Fallback::File)?;
+            view.whole_rows(region).ok_or_else(|| "nothing selected".into())
+        }) {
+            None => return,
+            Some(Err(message)) => {
+                self.session.status = message;
+                return;
+            }
+            Some(Ok(rows)) => rows,
+        };
+        let Some(runner) = &self.fmt_runner else {
+            self.session.status = "! : this frontend supplies no runner".into();
+            return;
+        };
+        let Some(id) = self.window().buffer() else { return };
+        let lines: Vec<String> =
+            (first..=last).map(|row| self.entry(id).buffer.line(row)).collect();
+        let input = format!("{}\n", lines.join("\n"));
+        let cwd = self.session_root();
+        let argv = Self::filter_argv(&expanded);
+        let output = match runner.run(&argv, &cwd, &input) {
+            Ok(output) => output,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        if self.console_window().is_none() {
+            return;
+        }
+        let mut console_lines = vec![format!("$ {expanded}")];
+        console_lines.extend(output.lines().map(str::to_string));
+        self.push_console_lines(&console_lines);
+        let rows = last - first + 1;
+        self.session.status = format!("wrote {rows} line{}", if rows == 1 { "" } else { "s" });
     }
 
     /// Drains the live job's slot into the Console, every wake this reaches
@@ -26625,6 +26838,136 @@ int main(void) {
             ex(&mut ed, "!echo hi");
 
             assert_eq!(ed.session.status, "! : this frontend supplies no runner");
+        }
+    }
+
+    /// `:{range}!cmd`, `:r !cmd`, `:w !cmd` — the synchronous filters, run
+    /// through a fake `fmt::Run` rather than the job spawner above. See
+    /// `docs/specs/shell.md` §Filters.
+    mod shell_filters {
+        use super::*;
+        use crate::fmt::fake::FakeRun;
+
+        /// A file on disk holding `content`, and an editor opened on it with
+        /// a fake fmt runner answering every call with `answer` — sized, so
+        /// `console_window`'s split has room for `:w !cmd`.
+        fn filter_project(
+            name: &str,
+            content: &str,
+            answer: Result<&str, &str>,
+        ) -> (ScratchDir, Editor, FakeRun) {
+            let dir = ScratchDir::new(&format!("shell-filter-{name}")).written("main.rs", content);
+            let mut ed = Editor::open(format!("{}/main.rs", dir.path())).unwrap();
+            sized(&mut ed);
+            let fake = FakeRun::answering(answer.map(str::to_string).map_err(str::to_string));
+            ed.set_fmt_runner(fake.clone());
+            (dir, ed, fake)
+        }
+
+        fn console_window(ed: &Editor) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&id| ed.content_kind_of(id) == Some(ContentKind::DapConsole))
+                .unwrap_or_else(|| panic!("no Console pane open"))
+        }
+
+        fn console_lines(ed: &Editor, id: WindowId) -> Vec<String> {
+            let Content::DapConsole(console) = &ed.window_of(id).unwrap().content else {
+                panic!("not a console pane")
+            };
+            console.lines.clone()
+        }
+
+        #[test]
+        fn a_range_filter_replaces_the_lines_as_one_undo() {
+            let (_dir, mut ed, _fake) = filter_project("sort", "b\na\n", Ok("a\nb\n"));
+
+            ex(&mut ed, "%!sort");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "a\nb\n");
+            assert!(ed.session.status.contains("filtered 2 lines"), "{}", ed.session.status);
+
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(
+                ed.buffer().unwrap().rope().to_string(),
+                "b\na\n",
+                "one `u` restores it all"
+            );
+        }
+
+        /// Vim's real grammar: `:!` alone is the job (Task 2's), never a
+        /// filter — the current line is filtered by naming it, `:.!cmd`.
+        #[test]
+        fn a_dot_range_filters_the_current_line() {
+            let (_dir, mut ed, _fake) = filter_project("dot", "hello\nworld\n", Ok("HELLO\n"));
+
+            ex(&mut ed, ".!tr a-z A-Z");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "HELLO\nworld\n");
+        }
+
+        #[test]
+        fn a_failing_filter_leaves_the_buffer_and_reports_stderr() {
+            let (_dir, mut ed, _fake) = filter_project("fail", "b\na\n", Err("sort: bad option"));
+
+            ex(&mut ed, "%!sort --nope");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\na\n", "untouched");
+            assert_eq!(ed.session.status, "sort: bad option");
+        }
+
+        #[test]
+        fn read_bang_inserts_below_the_cursor() {
+            let (_dir, mut ed, _fake) = filter_project("read", "one\ntwo\n", Ok("x\n"));
+
+            ex(&mut ed, "r !echo x");
+
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\nx\ntwo\n");
+            assert!(ed.session.status.contains("read 1 line"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn write_bang_shows_output_and_keeps_modified() {
+            let (_dir, mut ed, _fake) = filter_project("write", "one\ntwo\n", Ok("one\ntwo\n"));
+            ed.apply(cmd(Action::InsertChar('X')));
+            ed.apply(cmd(Action::EnterNormal));
+            let buf = ed.window().buffer().unwrap();
+            assert!(ed.entry(buf).buffer.is_modified(), "set up dirty");
+
+            ex(&mut ed, "w !cat");
+
+            let id = console_window(&ed);
+            assert_eq!(
+                console_lines(&ed, id),
+                vec!["$ cat".to_string(), "one".to_string(), "two".to_string()]
+            );
+            assert!(ed.entry(buf).buffer.is_modified(), "a filter write is not a save");
+        }
+
+        #[test]
+        fn filter_runs_through_sh_c() {
+            let (dir, mut ed, fake) = filter_project("argv", "b\na\n", Ok("a\nb\n"));
+
+            ex(&mut ed, "%!sort");
+
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (argv, cwd, stdin) = &calls[0];
+            assert_eq!(argv, &["sh", "-c", "sort"]);
+            assert_eq!(cwd.to_str().unwrap(), dir.path());
+            assert_eq!(stdin, "b\na\n");
+        }
+
+        #[test]
+        fn a_filter_with_no_runner_says_so() {
+            let dir = ScratchDir::new("shell-filter-no-runner").written("main.rs", "b\na\n");
+            let mut ed = Editor::open(format!("{}/main.rs", dir.path())).unwrap();
+            sized(&mut ed);
+
+            ex(&mut ed, "%!sort");
+
+            assert!(ed.session.status.contains("no runner"), "{}", ed.session.status);
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "b\na\n", "untouched");
         }
     }
 
