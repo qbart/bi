@@ -152,8 +152,8 @@ impl Spawn for ProcessSpawn {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
-        spawn_reader(stdout, slot.clone(), wake.clone(), Line::Out)?;
-        spawn_reader(stderr, slot.clone(), wake.clone(), Line::Err)?;
+        let stdout_reader = spawn_reader(stdout, slot.clone(), wake.clone(), Line::Out)?;
+        let stderr_reader = spawn_reader(stderr, slot.clone(), wake.clone(), Line::Err)?;
 
         // The `Child` moves behind a mutex rather than into the waiter
         // thread outright: `Handle::kill` needs to reach it too (for the
@@ -173,6 +173,23 @@ impl Spawn for ProcessSpawn {
                     let status = waiter_child.lock().expect("child mutex poisoned").try_wait();
                     match status {
                         Ok(Some(status)) => {
+                            // Join the readers before filing the exit: a
+                            // child can be reaped while its last lines still
+                            // sit in the pipe buffer, unread. `join` gives
+                            // the happens-before edge that `push`ing a line
+                            // and storing the exit otherwise lack — every
+                            // push the readers will ever make is visible
+                            // here before `finish` runs, so "exit delivered"
+                            // implies "all output delivered", and a drain
+                            // that sees the exit never misses a line that
+                            // preceded it. (`kill()`'s own `finish(Killed)`
+                            // doesn't go through here: it's called directly
+                            // from `Handle::kill`, and if it wins the race
+                            // to reap the child first, this waiter's next
+                            // `try_wait` hits the `Err(_)` arm below and
+                            // returns before ever reaching this join.)
+                            let _ = stdout_reader.join();
+                            let _ = stderr_reader.join();
                             let exit = match status.code() {
                                 Some(code) => Exit::Code(code),
                                 None => Exit::Signal,
@@ -199,12 +216,17 @@ impl Spawn for ProcessSpawn {
 /// `read_until` rather than `BufRead::lines`: `lines` errors out on invalid
 /// UTF-8 and drops the rest of the stream, which a build's stray byte
 /// should not be able to do.
+///
+/// Returns the thread's `JoinHandle` rather than discarding it: the waiter
+/// thread joins both readers before filing the exit, so a `drain()` that
+/// sees the exit can never be missing lines that were still sitting in the
+/// pipe when the child was reaped.
 fn spawn_reader(
     pipe: impl Read + Send + 'static,
     slot: Slot,
     wake: Arc<dyn Fn() + Send + Sync>,
     make: fn(String) -> Line,
-) -> Result<(), String> {
+) -> Result<thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name("shell-read".into())
         .spawn(move || {
@@ -225,7 +247,6 @@ fn spawn_reader(
                 }
             }
         })
-        .map(|_| ())
         .map_err(|e| format!("spawning reader thread: {e}"))
 }
 
@@ -397,6 +418,13 @@ mod tests {
         assert_eq!(s.drain(), (vec![], None), "drained means drained");
     }
 
+    // `run_to_exit` returns on the very first drain that shows an exit, so
+    // its two `lines.contains` asserts below are already the check: an exit
+    // is never seen before the output that preceded it (the waiter joins
+    // both reader threads before filing the exit — see the join in
+    // `ProcessSpawn::spawn`'s waiter thread — so this would fail on a
+    // reader that hadn't yet been scheduled to push its line when the child
+    // was reaped, which is exactly the race that fix round 2 closed).
     #[test]
     fn the_real_spawner_streams_stdout_and_stderr_and_reports_the_exit() {
         let slot = Slot::default();
