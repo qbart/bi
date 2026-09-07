@@ -7,8 +7,8 @@ vim's `buftype=nofile`.
 
 ## Status
 
-**Approved for build.** Decisions resolved with the user on 2026-09-07; see
-the end.
+**Built.** Decisions resolved with the user on 2026-09-07; see the end. Four
+deviations from the design are recorded after them.
 
 ## Why
 
@@ -88,9 +88,11 @@ src/buffer.rs      Buffer::kind: Kind { File, Transient { name } };
                    line cap; save/save_as honour the kind
 src/editor.rs      transient_buffer(name) -> BufferId (find-or-create);
                    show_transient(id) (reuse a window or split below, focus
-                   kept); the :! / :w ! sinks call append instead of the
-                   Console; :bd on the job buffer stops the job; the nags and
-                   :wa skip transient buffers; name_of shows [name]
+                   kept); append_to_transient(id, lines) (per-window
+                   tail-follow); the :! / :w ! sinks call append_to_transient
+                   instead of the Console; :bd on the job buffer stops the
+                   job; the nags and :wa skip transient buffers; name_of
+                   shows [name]
 ```
 
 The `DapConsole` pane is untouched: the debugger's `:debug console`, output
@@ -122,3 +124,36 @@ events and `:eval` keep using it. Only the shell's use of it goes.
 4. **Append, don't clear, on the next `:!`;** one buffer, renamed to the
    latest command.
 5. **Cap at 10 000 lines**, trimming from the top.
+
+## Deviations from the design
+
+Four places where the build settled a question this spec's text left
+implicit, each recorded here so nobody re-derives it from scratch:
+
+1. **`show_transient` reports whether a window opened.** The spec's text
+   says where the buffer shows; it does not say what happens when there is
+   no room to split. The build answers: `show_transient` returns `bool`, and
+   a caller that gets `false` folds the fact into its own status instead of
+   silently losing it — `! <cmd> — output in [!<cmd>] (no room to split; :b
+   to see it)` — naming the buffer and how to reach it, since there is no
+   window open on it to switch to instead.
+2. **`job_buffer` lives on the editor, not the job.** `shell::Job` is the
+   pure state a job's own spec (`docs/specs/shell.md`) describes; a
+   `BufferId` is an editor concept, and threading one into the core would
+   put an editor id where the sans-IO job state has no business knowing
+   about buffers at all. The editor keeps `job_buffer: Option<BufferId>`
+   beside `shell: Option<shell::Job>` instead, and clears it when that
+   buffer is `:bd`-closed.
+3. **A transient buffer's kind lives on `Buffer` beside `path`,** not as a
+   wrapper or a separate table: `Buffer::kind: Kind { File, Transient { name
+   } }` is one field change, and every place that already asks "does this
+   buffer have a path" (LSP attach, git baseline, trim-on-write,
+   `.editorconfig` lookup) keeps working unchanged, since a transient
+   buffer's `path` is `None` exactly as it always would be.
+4. **`sweep_scratch` explicitly excludes transient buffers.** The sweep's
+   criteria — no path, empty, unmodified — would otherwise also match a
+   transient buffer the instant `transient_buffer` creates it, before
+   anything has shown or appended to it: a fresh, unshown `[!make]` is not
+   "an empty scratch buffer nobody is using," it is a job about to write
+   into it. The check is `!entry.buffer.is_transient()`, stated outright
+   rather than left to be inferred from the other three conditions.

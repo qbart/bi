@@ -486,10 +486,7 @@ already open; all four share the tree pane's keymap (`j`/`k`/`gg`/`G`/
 expand/collapse a node. `:eval <expr>` evaluates in the frame that is
 stopped and appends the result to every open console; `:watch <expr>` /
 `:unwatch <n>` add to or remove from the Watches list. `:debug stop` ends
-the session. `:!` jobs share the Console pane with the debuggee's own
-output, and inside it `Ctrl-C` and `x` stop the running job rather than
-their usual meanings. See [docs/specs/debug.md](specs/debug.md) and
-[docs/specs/shell.md](specs/shell.md).
+the session. See [docs/specs/debug.md](specs/debug.md).
 
 ### Shell
 
@@ -499,7 +496,14 @@ inside the line is literal (`:!grep '!' %` means what it says) — `:!!` is how
 you repeat the last job. A **range is what makes a `!` a filter**: bare `:!cmd`
 is always the background job, so the current line alone is `:.!cmd`, as in
 vim. Filters are synchronous under a 5 s guard; a job has no timeout, it has
-`:stop`. See [docs/specs/shell.md](specs/shell.md).
+`:stop`.
+
+A job's output goes to a transient buffer, `[!<cmd>]`, opened in a split
+below the current window (or reused if a window already shows it) — focus
+stays where you were. `:bd` on that buffer stops the running job, then
+closes it; `:w` on it is refused with a hint (`:w <path>` writes a copy, and
+the buffer stays transient). See [docs/specs/shell.md](specs/shell.md) and
+[docs/specs/transient.md](specs/transient.md).
 
 ### Picker
 
@@ -630,11 +634,11 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:break` | toggle a breakpoint on the cursor's line, from any mode |
 | `:eval <expr>` | evaluate an expression in the stopped frame, appended to every open console |
 | `:watch <expr>` `:unwatch <n>` | add / remove a Watches expression, 1-based |
-| `:!cmd` `:!!` | run a command as a background job in the Console; `!!` repeats the last one |
+| `:!cmd` `:!!` | run a command as a background job, output in the `[!cmd]` transient buffer; `!!` repeats the last one |
 | `:stop` | end the running job |
 | `:{range}!cmd` `:.!cmd` | filter the range's lines through a command, synchronously, as one undo step |
 | `:r !cmd` | insert a command's stdout below the cursor |
-| `:w !cmd` | feed the buffer to a command's stdin and show its output in the Console |
+| `:w !cmd` | feed the buffer to a command's stdin and show its output in the same transient buffer as a job's |
 | `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
@@ -722,6 +726,16 @@ showing it closes, and the layout collapses to fill the space, so what is left
 on screen is what you did not delete. The window you are in is the one that
 survives if they all showed it; there is always a window, and it falls through
 to the next buffer.
+
+**Transient buffers.** A `:!` job's output, and nothing else, lives in one —
+shown as `[!cmd]` in `:ls`, the status line and the switcher, otherwise a
+buffer like any other: Normal, Insert and Visual modes, motions, registers,
+search, undo, splits, `gb`, `Ctrl-^`. Four things it does not do: it does not
+save (`:w` is refused with a copy hint, `:wa` skips it); it does not nag
+(`:bd`/`:q`/`:qa` never ask about it); it does not attach (no LSP, no git
+signs, no trim-on-write, no `.editorconfig` lookup); and it does not grow
+without bound (capped at 10,000 lines, oldest dropped first). See
+[docs/specs/transient.md](specs/transient.md).
 
 ### The file tree
 

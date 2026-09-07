@@ -36,16 +36,15 @@ command, and the four spellings split into two shapes by what they are *for*:
 `! is running <cmd> — :stop it first`. One job is legible; a list of them is
 a feature nobody asked for.
 
-**Output goes to the debugger's Console pane** (`docs/specs/debug.md`), reused
-whole: the same `DapConsole`, the same 2000-line bound, the same renderer,
-the same keys. `:!` opens it if no window shows one, exactly as
-`:debug console` does, and appends `$ <cmd>` as the first line so a run is
-delimited from the debuggee output or the previous run above it. The pane's
-title reads `! <cmd>` while the job runs, then `! <cmd> — exited <n>` or
-`! <cmd> — killed`. The verdict outlives the job so the last run stays
-readable, but not past the point where the pane goes back to being the
-debugger's: a session starting, or `:debug console` opened with no job,
-gives it the plain `Console` again.
+**Output goes to a transient buffer** (`docs/specs/transient.md`), named
+`[!<cmd>]` and renamed to the latest command each time `:!` runs. `:!` opens
+it in a horizontal split below the current window if no window shows it
+already, and appends `$ <cmd>` as the first line so a run is delimited from
+the previous run above it — the buffer keeps at most `TRANSIENT_MAX_LINES`
+(10 000) lines. The status line carries the verdict that used to live on a
+pane title: `! <cmd>` while the job runs, then `! exited <n>`, `! killed` or
+`! signal` once it ends — there is no pane title any more, because there is
+no pane, only a buffer any window can show or not.
 
 **stdin is closed at spawn.** A program that prompts gets EOF, not a hang.
 That is the honest answer without a pty: interactive programs are what the
@@ -53,30 +52,29 @@ terminal is for.
 
 **stderr is interleaved with stdout** in arrival order, each line prefixed
 `! ` the way debuggee stderr already is — a build's errors belong beside its
-progress, not in a second pane.
+progress, not in a second buffer.
 
 **Exit:** the status line says `! exited 0` (or `1`, or `killed`), and the
-trailer line lands in the console. Non-UTF-8 output is decoded lossily.
+trailer line lands in the buffer. Non-UTF-8 output is decoded lossily.
 
-**Stopping.** `:stop` — and `Ctrl-C` or `x` *in the Console pane* — sends
-SIGTERM, waits ~2 s, then SIGKILL, in the order the debugger's
-`end_session` already uses. The waiting happens on a thread of its own:
-`:stop` returns to the editor the moment the SIGTERM is away, or a job that
-ignores it would freeze the session for the whole grace period. The signals
-go to the job's **process group**, not to the `sh` at its head — `sh -c`
-only execs a *simple* command, so `:!cargo build; ./run` leaves a shell
-with a child underneath it, and signalling the leader alone would kill the
-shell and orphan the build. The exit is filed only once the process is
+**Stopping.** `:stop` sends SIGTERM, waits ~2 s, then SIGKILL, in the order
+the debugger's `end_session` already uses. The waiting happens on a thread of
+its own: `:stop` returns to the editor the moment the SIGTERM is away, or a
+job that ignores it would freeze the session for the whole grace period. The
+signals go to the job's **process group**, not to the `sh` at its head —
+`sh -c` only execs a *simple* command, so `:!cargo build; ./run` leaves a
+shell with a child underneath it, and signalling the leader alone would kill
+the shell and orphan the build. The exit is filed only once the process is
 confirmed gone, so the job the editor still holds is a job that is still
 alive, and quitting can always take it with it. One consequence worth
 knowing: because the job has its own process group, a `Ctrl-C` typed at the
-terminal reaches bi and not the job — the Console's `Ctrl-C` is the way to
-stop it. `Ctrl-C` is bound only in the pane: in Normal
-mode it keeps meaning what it means. `x` is the Console's own override too:
-every other tree-shaped pane binds `x` to `TreeCmd::Mark(Cut)`, but the
-Console has nothing to cut, so there `x` means stop, not cut. Quitting with
-a job running kills it on the way out (`shutdown_shell`, beside
-`shutdown_lsp` and `shutdown_dap`); nothing is orphaned.
+terminal reaches bi and not the job — `:stop` is the way to stop it, not a
+key. **`:bd` on the job's buffer while it runs stops the job first, then
+closes the buffer** — closing the thing you were watching a job in means you
+are done with it, the way closing a terminal tab does, and it leaves no
+orphan (`docs/specs/transient.md` §"Stopping"). Quitting with a job running
+kills it on the way out (`shutdown_shell`, beside `shutdown_lsp` and
+`shutdown_dap`); nothing is orphaned.
 
 ## Filters
 
@@ -94,8 +92,8 @@ edit, and so leaves no undo step.
 
 `:[range]r !cmd` inserts stdout below the cursor line (or below the range's
 last line). `:[range]w !cmd` feeds the lines (default: whole buffer) to the
-command's stdin and shows its output in the Console like a job's — but
-synchronously, under the guard, and the buffer is not marked saved.
+command's stdin and shows its output in the same transient buffer as a job's
+— but synchronously, under the guard, and the buffer is not marked saved.
 
 `:!!` repeats the last `:!` job; a `!` inside a filter or job command line is
 **not** expanded to the previous command (vim's rule, dropped: `:!grep '!'`
@@ -109,35 +107,39 @@ src/shell.rs        Job (pure state: cmd, lines seen, exit), the Spawn seam,
                     ProcessSpawn (the thread that pumps output into an Inbox-
                     shaped slot), and the pure `expand` for %/#      (core)
 src/editor.rs       :! / :{range}! / :r ! / :w ! / :!! / :stop parsing and
-                    dispatch; `pump_shell` in settle; Console reuse
+                    dispatch; `pump_shell` in settle appends into the job's
+                    transient buffer (`docs/specs/transient.md`); `:bd` on
+                    that buffer stops the job
 src/main.rs         Wake::Shell; the waker; ProcessSpawn registered
-src/input.rs        Ctrl-C and x in the Console pane → ShellCmd::Stop
 ```
 
 The lib boundary keeps its rule: the editor never spawns. `set_shell_spawner`
 / `set_shell_waker` cross it the way `set_dap_spawner` / `set_dap_waker` do,
 so a headless embedder or a test supplies a fake and no process ever starts.
 The reader thread does nothing but push lines into the job's slot and ring
-the waker; `pump_shell` in `settle` turns them into console lines, the way
-`pump_install` turns an install's result into state.
+the waker; `pump_shell` in `settle` turns them into lines appended to the
+job's transient buffer, the way `pump_install` turns an install's result
+into state.
 
 Filters do not need any of that: they call the fmt runner and apply the
 result inside the command, like `:format`.
 
 ## Tests
 
-- `:!echo hi` opens the Console (or reuses it), shows `$ echo hi`, `hi`, and
-  `exited 0`; the status says so.
+- `:!echo hi` opens `[!echo hi]` in a split below (or reuses a window
+  already showing it), shows `$ echo hi`, `hi`, and `exited 0`; the status
+  says so.
 - A second `:!` while one runs is refused and names the running command.
-- `:stop` kills a job that does not exit on SIGTERM; the title says killed.
+- `:stop` kills a job that does not exit on SIGTERM; the status says killed.
+- `:bd` on the job's buffer while it runs stops the job, then closes the
+  buffer.
 - Quit with a job running kills it.
 - `:%!sort` replaces the buffer's lines with sorted ones, as one undo step; a
   failing filter leaves the buffer untouched and reports the first stderr
   line.
-- `:r !echo x` inserts `x` below the cursor; `:w !cat` shows the buffer in
-  the Console and does not clear the modified flag.
+- `:r !echo x` inserts `x` below the cursor; `:w !cat` shows the buffer's
+  lines in the transient buffer and does not clear the modified flag.
 - `%` and `#` expand; `\%` does not; `:!!` repeats.
-- The Console's `Ctrl-C` stops a job; Normal-mode `Ctrl-C` is unchanged.
 - A prompting command (`read x`) exits on EOF rather than hanging.
 - With a fake spawner nothing is spawned and the whole flow still works.
 
@@ -145,17 +147,18 @@ result inside the command, like `:format`.
 
 1. **Two shapes:** filters synchronous under the 5 s guard; bare `:!` a
    background job with no timeout.
-2. **Console reuse:** job output goes to the debugger's Console pane (the
-   user's explicit choice), not a new pane.
-3. **One job at a time;** `:stop` / pane `Ctrl-C` / pane `x` to end it;
-   killed on quit.
+2. ~~**Console reuse:** job output goes to the debugger's Console pane (the
+   user's explicit choice), not a new pane.~~ Superseded — see
+   `docs/specs/transient.md` and the Deviations below.
+3. **One job at a time;** `:stop` or `:bd` on its buffer to end it; killed
+   on quit.
 4. **stdin closed;** no pty; no interactive commands in v1.
 5. **`!` in a command line is literal** (vim expands it to the previous
    command); `:!!` is the repeat.
 
 ## Deviations from the design
 
-Five places where the build settled a question this spec's text left
+Six places where the build settled a question this spec's text left
 implicit, each recorded here so nobody re-derives it from scratch:
 
 1. **The grammar ruling: bare `:!cmd` is the job; the current-line filter is
@@ -171,18 +174,28 @@ implicit, each recorded here so nobody re-derives it from scratch:
    nobody asked for reports `signal`.** The spec's text names `exited <n>`
    and `killed` only, but a job can also end on a SIGSEGV or a SIGHUP that
    bi had nothing to do with, and there is no exit code to print for it.
-   `signal` is that third trailer — in the console line, in the status
-   (`! signal`) and in the pane title (`! <cmd> — signal`) alike. Which of
-   the two a death gets is a question of *who asked*, not of what the kernel
-   did: `:stop` marks the job before it signals it, so even a job that
-   handles SIGTERM and exits 0 is reported `killed`.
-4. **`:!` does not move the cursor.** The Console gets the output; the focus
-   stays in the buffer you ran the command from, as in vim. It has to: the
-   editor stays live while a job runs, and the Console pane has no buffer
-   behind it, so a `:!` that parked the cursor there would leave `%` with no
-   file to name and `#` meaning the file it had just displaced.
+   `signal` is that third trailer — in the buffer's own line and in the
+   status (`! signal`) alike. Which of the two a death gets is a question of
+   *who asked*, not of what the kernel did: `:stop` marks the job before it
+   signals it, so even a job that handles SIGTERM and exits 0 is reported
+   `killed`.
+4. **`:!` does not move the cursor.** The transient buffer gets the output;
+   the focus stays in the buffer you ran the command from, as in vim. It has
+   to: the editor stays live while a job runs, and a `:!` that parked the
+   cursor in the job's buffer would leave `%` with no file to name and `#`
+   meaning the file it had just displaced.
 5. **One "no runner" status, shared by jobs and filters.** A headless
    embedder that supplies no spawner (`set_shell_spawner`) sees the same
    `! : this frontend supplies no runner` whether `:!cmd`, `:{range}!cmd`,
    `:r !cmd` or `:w !cmd` triggered it — there was no reason for the two
    shapes to word a missing seam differently.
+6. **Console reuse is reversed: `:!` output goes to a transient buffer, not
+   the debugger's Console pane.** Resolved decision 2 above was the user's
+   explicit call at the time this spec was written, before
+   `docs/specs/transient.md` existed to make the alternative concrete. A
+   pane is a window *content kind*, like the file tree: it cannot be
+   `:bd`-closed, edited, or yanked from, and its stop keys are its own,
+   separate from every other key in the editor. Build log text is text, and
+   text belongs in a buffer — one you can read, search, filter with
+   `:%!sort`, switch to with `Ctrl-^`, and close with `:bd` like any other.
+   The debugger's own Console is untouched; only `:!`'s use of it moved.

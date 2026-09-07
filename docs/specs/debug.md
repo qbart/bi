@@ -143,8 +143,7 @@ It needs the usual four touches: a `Mode` variant + `label()`, arms in
 - **Panes**: new `ContentKind` variants rendered like Tree/Results —
   **Variables** (lazy expandable tree; scopes at the root),
   **Stack** (frames; enter jumps source to the frame),
-  **Console** (`output` events + an `evaluate` REPL line — `:!` jobs share
-  this pane too, see `docs/specs/shell.md`),
+  **Console** (`output` events + an `evaluate` REPL line),
   **Watches** (expressions re-evaluated on every stop).
 - Frame navigation moves the source window and re-scopes Variables/Watches
   to the selected frame.
