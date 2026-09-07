@@ -44,8 +44,11 @@ const GRACE: Duration = Duration::from_secs(2);
 /// the pipe open for as long as it likes (`sh -c '(sleep 300 &)'`), and the
 /// exit is a fact about the job, not about that fd: past this the waiter
 /// files the exit and lets the readers finish whenever they finish. Their
-/// pushes are still safe — the `Slot` mutex, not the join, is what makes
-/// them visible — they just arrive after the trailer instead of before it.
+/// pushes are still safe — the `Slot` mutex, not a join, is what makes them
+/// visible — but a line that lands after the editor has drained the exit is
+/// lost: `pump_shell` drops the `Job`, and the `Slot` with it, once an exit
+/// is in. That is the price of the bound, paid only by a job that outlives
+/// its own `sh` by more than a second.
 const READER_GRACE: Duration = Duration::from_secs(1);
 
 /// One line of a job's output, tagged by which pipe it came from — arrival
@@ -610,9 +613,9 @@ mod tests {
 
     // `run_to_exit` returns on the very first drain that shows an exit, so
     // its two `lines.contains` asserts below are already the check: an exit
-    // is never seen before the output that preceded it (the waiter joins
-    // both reader threads before filing the exit — see the join in
-    // `ProcessSpawn::spawn`'s waiter thread — so this would fail on a
+    // is never seen before the output that preceded it (the waiter waits,
+    // up to `READER_GRACE`, for both reader threads to reach EOF before
+    // filing the exit — see `wait_for_eof` — so this would fail on a
     // reader that hadn't yet been scheduled to push its line when the child
     // was reaped, which is exactly the race that fix round 2 closed).
     #[test]

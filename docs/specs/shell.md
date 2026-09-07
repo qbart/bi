@@ -68,7 +68,10 @@ only execs a *simple* command, so `:!cargo build; ./run` leaves a shell
 with a child underneath it, and signalling the leader alone would kill the
 shell and orphan the build. The exit is filed only once the process is
 confirmed gone, so the job the editor still holds is a job that is still
-alive, and quitting can always take it with it. `Ctrl-C` is bound only in the pane: in Normal
+alive, and quitting can always take it with it. One consequence worth
+knowing: because the job has its own process group, a `Ctrl-C` typed at the
+terminal reaches bi and not the job — the Console's `Ctrl-C` is the way to
+stop it. `Ctrl-C` is bound only in the pane: in Normal
 mode it keeps meaning what it means. `x` is the Console's own override too:
 every other tree-shaped pane binds `x` to `TreeCmd::Mark(Cut)`, but the
 Console has nothing to cut, so there `x` means stop, not cut. Quitting with
