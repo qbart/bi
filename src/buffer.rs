@@ -934,6 +934,84 @@ impl Buffer {
         changed.then(|| self.first_non_blank(self.clamped(self.at_row(last, false), false)))
     }
 
+    /// Toggles a line-comment `marker` over rows `first..=last` — `gcc`,
+    /// `gc{motion}`, visual `gc`. See `docs/specs/comment.md`.
+    ///
+    /// One decision for the whole range, commentary's rule: if every
+    /// non-blank row already starts, after its indent, with `marker` (a
+    /// following space is not required — `//x` counts), the range reads as
+    /// commented and every one of those rows is uncommented; otherwise every
+    /// non-blank row is commented. Blank rows are skipped both ways — no
+    /// marker goes on one, and it has no vote in whether the range already
+    /// counts as commented, so a blank line in the middle of a commented
+    /// block doesn't split it.
+    ///
+    /// Commenting inserts `marker` and one space at the range's *minimum*
+    /// indent, measured in display columns so a tab-indented row and a
+    /// space-indented row agree on where that is — with the tab width
+    /// [`Indent::default`] uses, since this operator has no file settings to
+    /// consult and only needs the rows in front of it to agree with each
+    /// other, not with the buffer's real tab stops. When that column falls
+    /// inside a tab, the marker goes after the whitespace character that
+    /// reaches it rather than splitting the tab: `"\ta"` at column 4 gets its
+    /// marker after the tab, not before it.
+    ///
+    /// Uncommenting removes the marker and, if it's there, one following
+    /// space — the one commenting itself would have added — from wherever it
+    /// sits after the indent, so a hand-written `//x` and a `// x` both come
+    /// back clean.
+    ///
+    /// One edit, one undo step, the same shape as [`Buffer::indent_rows`].
+    /// Lands the cursor on the first row's first non-blank. `None` when every
+    /// row in the range is blank — nothing to toggle, nothing on the undo
+    /// stack.
+    pub fn comment_rows(&mut self, first: usize, last: usize, marker: &str) -> Option<Cursor> {
+        let last = last.min(self.line_count().saturating_sub(1));
+        let tab_width = Indent::default().tab_width;
+
+        let lines: Vec<String> = (first..=last).map(|row| self.line(row)).collect();
+        let min_col = lines
+            .iter()
+            .filter(|line| !indent::is_blank(line))
+            .map(|line| indent::width_of(indent::leading(line), tab_width))
+            .min()?;
+
+        let is_commented = |line: &str| {
+            let lead = indent::leading(line);
+            line[lead.len()..].starts_with(marker)
+        };
+        let uncomment =
+            lines.iter().filter(|line| !indent::is_blank(line)).all(|line| is_commented(line));
+
+        let mut changed = false;
+
+        // Bottom-up, so an edit on one row cannot move the rows still to
+        // come — the same reason `indent_rows` walks this way.
+        for row in (first..=last).rev() {
+            let text = &lines[row - first];
+            if indent::is_blank(text) {
+                continue;
+            }
+            let lead = indent::leading(text);
+            let new = if uncomment {
+                let rest = text[lead.len()..].strip_prefix(marker).unwrap_or(&text[lead.len()..]);
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                format!("{lead}{rest}")
+            } else {
+                let at = comment_insert_at(lead, min_col, tab_width);
+                format!("{}{marker} {}", &text[..at], &text[at..])
+            };
+            if new == *text {
+                continue;
+            }
+            let start = self.rope.line_to_char(row);
+            self.apply_edit(start, start + text.chars().count(), &new);
+            changed = true;
+        }
+
+        changed.then(|| self.first_non_blank(self.clamped(self.at_row(first, false), false)))
+    }
+
     /// `Tab` in insert mode: forward to the next indent stop.
     ///
     /// Aligns rather than inserting a fixed width, which is what a tab has
@@ -2441,6 +2519,28 @@ impl Buffer {
     }
 }
 
+/// The char index into `lead` (leading whitespace only, so ASCII and byte
+/// index coincide with char index) at which a comment marker belongs, given
+/// the range's minimum indent `min_col` in display columns.
+///
+/// Walks columns as [`indent::display_col`] does, and stops at the first
+/// character whose column has already reached `min_col` — so a column that
+/// lands inside a tab never splits it: the marker goes after the whole tab,
+/// not partway through it. A row whose own indent is exactly `min_col` (true
+/// of at least one row in the range, by definition) lands right after its
+/// own leading whitespace.
+fn comment_insert_at(lead: &str, min_col: usize, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut col = 0;
+    for (i, ch) in lead.chars().enumerate() {
+        if col >= min_col {
+            return i;
+        }
+        col += if ch == '\t' { tab_width - (col % tab_width) } else { indent::char_width(ch) };
+    }
+    lead.chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2722,6 +2822,89 @@ mod tests {
         let mut buffer = rows("alpha   \n");
         assert_eq!(buffer.clear_blank_line(Cursor::at(8)).at, 8);
         assert_eq!(shown(&buffer), "alpha   \n");
+    }
+
+    // ---- comment toggle ------------------------------------------------------
+
+    #[test]
+    fn commenting_puts_the_marker_at_the_minimum_indent() {
+        let mut buffer = rows("    a\n  b\n");
+
+        buffer.comment_rows(0, 1, "//").expect("commented");
+
+        assert_eq!(shown(&buffer), "  //   a\n  // b\n");
+    }
+
+    #[test]
+    fn a_fully_commented_range_uncomments_and_strips_one_space() {
+        let mut buffer = rows("// x\n//y\n");
+
+        buffer.comment_rows(0, 1, "//").expect("uncommented");
+
+        assert_eq!(shown(&buffer), "x\ny\n");
+    }
+
+    #[test]
+    fn one_uncommented_line_makes_the_whole_range_comment() {
+        let mut buffer = rows("// a\nb\n");
+
+        buffer.comment_rows(0, 1, "//").expect("commented");
+        assert_eq!(shown(&buffer), "// // a\n// b\n");
+
+        buffer.comment_rows(0, 1, "//").expect("uncommented");
+        assert_eq!(shown(&buffer), "// a\nb\n", "gc gc is a no-op");
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_and_neutral() {
+        let mut buffer = rows("a\n\nb\n");
+
+        buffer.comment_rows(0, 2, "//").expect("commented");
+        assert_eq!(shown(&buffer), "// a\n\n// b\n");
+
+        // A blank line in the middle does not stop the range from reading
+        // as fully commented.
+        buffer.comment_rows(0, 2, "//").expect("uncommented");
+        assert_eq!(shown(&buffer), "a\n\nb\n");
+    }
+
+    #[test]
+    fn tabs_and_spaces_agree_on_the_indent_column() {
+        // Tab width 4: a leading tab and four leading spaces are both column
+        // 4, so the markers land right after each row's own leading
+        // whitespace.
+        let mut buffer = rows("\ta\n    b\n");
+
+        buffer.comment_rows(0, 1, "//").expect("commented");
+
+        assert_eq!(shown(&buffer), "\t// a\n    // b\n");
+    }
+
+    #[test]
+    fn an_all_blank_range_changes_nothing() {
+        let mut buffer = rows("   \n\t\n");
+        let before = buffer.edits();
+
+        assert!(buffer.comment_rows(0, 1, "//").is_none(), "nothing to toggle");
+
+        assert_eq!(shown(&buffer), "   \n\t\n");
+        assert_eq!(buffer.edits(), before);
+    }
+
+    #[test]
+    fn the_toggle_is_one_undo_step() {
+        // Built with the rope set directly, the way `open` does, so no
+        // pending edit from construction itself rides along on the undo
+        // stack — `rows` builds through `insert_str`, which would.
+        let mut buffer = Buffer::empty();
+        buffer.rope = Rope::from_str("a\nb\nc\n");
+
+        buffer.comment_rows(0, 2, "//").expect("commented");
+        buffer.commit_undo(Vec::new(), Vec::new());
+        assert_eq!(shown(&buffer), "// a\n// b\n// c\n");
+
+        buffer.undo(Vec::new(), Vec::new()).expect("undone");
+        assert_eq!(shown(&buffer), "a\nb\nc\n");
     }
 
     // ---- trimming -----------------------------------------------------------
