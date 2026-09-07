@@ -6,7 +6,7 @@ language's own — `//`, `#`, `--`, `;` — and bi already knows it.
 
 ## Status
 
-**Approved for build.** Decisions are resolved at the end.
+**Built.** Decisions are resolved at the end, deviations after them.
 
 ## Why
 
@@ -79,9 +79,9 @@ A buffer with no filetype is `None` too — the status names the gap.
 - `gc{motion}` — toggle the lines the motion covers; `gcgc` is `gcc`.
 - Visual `gc` — toggle the selected lines.
 
-`gc` sits in the `g` block beside `gq`. `[keys.normal]` names it
-`comment` (the operator); the doubled form needs no name of its own, exactly
-as `indent_right` covers `>>`.
+`gc` sits in the `g` block beside `gq`. It is not rebindable by name in
+`[keys.normal]`, exactly as `gq`, `>` and `=` are not: the `g` prefix is what
+carries it, not a named command.
 
 ## Where it hooks in
 
@@ -121,3 +121,22 @@ as `indent_right` covers `>>`.
 4. **No config override for the marker in v1.** `line_comment`'s table covers
    every language bi highlights; a `[filetype.<name>] comment = "…"` key
    waits for the first language that needs one.
+
+## Deviations from the design
+
+1. **Visual `gc` returns to Normal**, consuming the selection, rather than
+   keeping it. That is vim-commentary's own behaviour. `>` is the one
+   exception in this operator family — it keeps the selection because
+   indenting *accumulates*, so `>` `>` goes deeper and a lingering selection
+   is what makes repeating it useful. A toggle does not accumulate: `gc` `gc`
+   on the same rows is a no-op, so there is nothing for a kept selection to
+   usefully repeat, and keeping it around would just be a trap for a `d` or a
+   `>` that lands on rows the user no longer meant to touch.
+2. **No `[keys.normal]` name for the operator.** See "Keys" above: `gq`, `>`
+   and `=` are not rebindable by name either, and `gc` follows them.
+3. **A marker that is only a text-prefix of the line counts as "already
+   commented."** `#!/bin/sh` starts with `#`, so a shebang line is treated as
+   commented even though nobody meant it that way. This is the literal rule
+   this spec always had ("every non-blank line ... already starts ... with
+   the marker") and it is vim-commentary's rule too, not a bug found during
+   the build — kept deliberately rather than special-cased.

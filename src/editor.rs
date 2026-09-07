@@ -12001,10 +12001,9 @@ impl View<'_> {
                     }
                 });
             }
-            // Beside `>`: the selection survives, reshaped to the rows the
-            // toggle touched. That is what lets a visual `gc` `gc` undo
-            // itself without reselecting — the no-op the spec calls for.
-            // See `docs/specs/comment.md`.
+            // Unlike `>`, a toggle does not accumulate, so it consumes the
+            // selection exactly as `gq`/`=` do: back to Normal, cursor on
+            // the first row's first non-blank. See `docs/specs/comment.md`.
             Action::OperateSelection { op: Operator::Comment, .. } => {
                 let Some(filetype) = *self.filetype else {
                     self.session.status = "no filetype".into();
@@ -12019,17 +12018,12 @@ impl View<'_> {
                     let (lo, hi) = sel.range();
                     let first = ed.buffer.row_at(Cursor::at(lo));
                     let last = ed.buffer.row_at(Cursor::at(hi));
-                    if ed.buffer.comment_rows(first, last, marker, &indent).is_none() {
-                        return sel;
-                    }
-                    let backwards = sel.head.at < sel.anchor.at;
-                    let start = ed.buffer.at_row(first, false);
-                    let end = ed.buffer.line_end(ed.buffer.at_row(last, false), false);
-                    match backwards {
-                        true => Selection { anchor: end, head: start },
-                        false => Selection { anchor: start, head: end },
+                    match ed.buffer.comment_rows(first, last, marker, &indent) {
+                        Some(landed) => Selection::collapsed(landed),
+                        None => Selection::collapsed(sel.head),
                     }
                 });
+                self.session.mode = Mode::Normal;
             }
             Action::OperateSelection { op: Operator::Reindent, .. } => {
                 let indent = self.options.indent();
@@ -24013,20 +24007,26 @@ int main(void) {
             assert_eq!(rope_of(&ed), "// aaa\n// bbb\n");
         }
 
-        /// Beside `>`: the selection survives the toggle, which is what
-        /// lets a second visual `gc` undo the first without reselecting.
+        /// Unlike `>`, a toggle does not accumulate, so visual `gc` consumes
+        /// the selection exactly as `gq`/`=` do: back to Normal, cursor on
+        /// the first row's first non-blank. A second toggle needs a fresh
+        /// selection, not a lingering one.
         #[test]
-        fn visual_gc_toggles_the_selected_rows_and_keeps_the_selection() {
+        fn visual_gc_toggles_the_selected_rows_and_returns_to_normal() {
             let (_d, mut ed) = on("comment-visual", "a.rs", "aaa\nbbb\n");
             ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
             ed.apply(cmd(Action::Move(Motion::Down)));
 
             ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
             assert_eq!(rope_of(&ed), "// aaa\n// bbb\n");
-            assert_eq!(ed.session.mode.visual(), Some(Shape::Lines), "the selection survives");
+            assert_eq!(ed.session.mode, Mode::Normal, "the selection was consumed");
 
+            // Reselecting the same rows and toggling again is a no-op.
+            ed.apply(cmd(Action::EnterVisual(Shape::Lines)));
+            ed.apply(cmd(Action::Move(Motion::Down)));
             ed.apply(cmd(Action::OperateSelection { op: Operator::Comment, sink: Sink::Ring }));
             assert_eq!(rope_of(&ed), "aaa\nbbb\n", "gc gc is a no-op");
+            assert_eq!(ed.session.mode, Mode::Normal);
         }
     }
 

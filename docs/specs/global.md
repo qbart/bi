@@ -31,7 +31,7 @@ smartcase one `/` and `:s` share; regex lands under all of them at once.
 | `:g//d` | the pattern is the last thing you searched for |
 | `:2,20g/foo/d` | only lines 2 to 20 are scanned |
 | `:g/fixme/normal A !` | append ` !` to every fixme line |
-| `:%normal I// ` | comment out every line, no pattern needed |
+| `:%normal I// ` | comment out every line, no pattern needed — `gc` is the language-aware way, see [comment.md](comment.md) |
 | `:d` | delete the cursor's line |
 | `:2,5d` | delete lines 2 to 5 |
 

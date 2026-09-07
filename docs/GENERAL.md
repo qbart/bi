@@ -87,6 +87,7 @@ the word, `dw` takes the word and the space after it.
 | `y{motion}` | yank |
 | `>{motion}` `<{motion}` | indent / outdent the lines it covers |
 | `gq{motion}` | reflow prose to `textwidth`, comment leaders kept — `gqq` / `gqgq` for the line |
+| `gc{motion}` | comment/uncomment the lines it covers, language-aware — `gcc` / `gcgc` for the line |
 | `={motion}` | reindent to what the brackets say — `==` the line, `gg=G` the file |
 | `dd` `cc` `yy` | the whole line, `{n}` of them when counted |
 | `>>` `<<` | the whole line, `{n}` of them when counted |
@@ -362,6 +363,7 @@ expect.
 | `p` `P` | replace it with the register |
 | `r{char}` | overwrite every selected character |
 | `>` `<` | indent / outdent the selected lines, `{n}` steps |
+| `gc` | comment/uncomment the selected lines, language-aware — returns to Normal |
 | `o` | swap the ends, to adjust the other one |
 | `iw` `i(` … | make that text object the selection |
 
@@ -680,7 +682,8 @@ before the first command runs, so nothing chases its own output; the whole
 run is one undo step; and the sub-command is one of `d`, `s`, `&`, `m`,
 `case`, `retab`, `normal`, refused by name otherwise — the failure mode of
 anything looser is `:g/x/q` closing the editor. `:normal {keys}` replays keys
-as typed, once per line under a range, so `:%normal I// ` comments the file.
+as typed, once per line under a range, so `:%normal I// ` comments the file —
+though `gc` (above) is the language-aware way to do that.
 See [docs/specs/global.md](specs/global.md).
 
 ### Windows and buffers
