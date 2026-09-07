@@ -5842,12 +5842,25 @@ impl Editor {
         self.drain_edits();
 
         let focus = self.focus;
-        if !at_tail.contains(&focus)
-            && let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut)
-            && text.buffer == id
-        {
-            let mapped = Self::remapped(&text.selections, &edits);
-            text.selections.set(mapped);
+        let reader_scroll = (!at_tail.contains(&focus))
+            .then(|| self.window_mut_of(focus).and_then(Window::text_mut))
+            .flatten()
+            .filter(|text| text.buffer == id)
+            .map(|text| text.scroll);
+        if let Some(scroll) = reader_scroll {
+            // Selections and the scroll row alike, as `drain_edits` does for
+            // every other window: a cursor that is right in a viewport that
+            // still points at the old row slides the text under the eye by
+            // the trimmed amount until the margin drags it back.
+            let buffer = &self.entry(id).buffer;
+            let start =
+                buffer.rope().line_to_char(scroll.min(buffer.line_count().saturating_sub(1)));
+            let moved = buffer.row_at(Cursor::at(edits.iter().fold(start, |at, e| e.map(at))));
+            if let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) {
+                let mapped = Self::remapped(&text.selections, &edits);
+                text.selections.set(mapped);
+                text.scroll = moved;
+            }
         }
 
         let last_after = self.entry(id).buffer.line_count().saturating_sub(1);
@@ -14397,7 +14410,12 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str, text: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("bi-test-{}-{name}", std::process::id()));
+            // Pid plus a counter: two tests in one process that pick the
+            // same name must not race each other over one file.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("bi-test-{}-{n}-{name}", std::process::id()));
             std::fs::write(&path, text).unwrap();
             Self(path)
         }
@@ -28319,8 +28337,9 @@ int main(void) {
             let first: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
             ed.append_to_transient(id, &first);
             let at = ed.entry(id).buffer.at_row(90, false);
-            ed.window_mut_of(reader).and_then(Window::text_mut).unwrap().selections =
-                Selections::single(Cursor::at(at.at + 2));
+            let text = ed.window_mut_of(reader).and_then(Window::text_mut).unwrap();
+            text.selections = Selections::single(Cursor::at(at.at + 2));
+            text.scroll = 80;
 
             // Five past the cap: the oldest five lines go.
             let more: Vec<String> =
@@ -28332,6 +28351,8 @@ int main(void) {
             assert_eq!(ed.entry(id).buffer.row_at(cursor), 85, "up by the five that went");
             assert_eq!(ed.entry(id).buffer.col_at(cursor), 2, "and in the same column");
             assert_eq!(ed.entry(id).buffer.line(85), "line90", "still the line it was reading");
+            let scroll = ed.window_of(reader).and_then(Window::text).unwrap().scroll;
+            assert_eq!(scroll, 75, "the viewport moved with the text, not just the cursor");
 
             let last = ed.entry(id).buffer.line_count() - 1;
             let watching =

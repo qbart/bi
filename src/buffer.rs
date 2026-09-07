@@ -548,21 +548,22 @@ impl Buffer {
         self.history.commit(before, after);
     }
 
-    /// Opens an undo group: every `commit_undo` until `end_undo_group` is
-    /// deferred into one revision. `:g` and `:normal` run sub-commands that
-    /// commit at their own boundaries, and this is what makes the batch one
-    /// `u` anyway. Nests; the outermost pair wins.
     /// Throws the undo history away — the text stays exactly as it is, but
     /// `u` can no longer reach anything before this call.
     ///
     /// Only [`Buffer::append_lines_capped`] calls it, and only when the cap
     /// has fired. `History::default()` is saved at its root, so a buffer
-    /// that forgets stays unmodified — which is what a transient buffer is
-    /// anyway. See `docs/specs/transient.md`.
+    /// that forgets reads as unmodified from then on — harmless for a
+    /// transient buffer, which nothing nags about. See
+    /// `docs/specs/transient.md`.
     pub fn forget_history(&mut self) {
         self.history = History::default();
     }
 
+    /// Opens an undo group: every `commit_undo` until `end_undo_group` is
+    /// deferred into one revision. `:g` and `:normal` run sub-commands that
+    /// commit at their own boundaries, and this is what makes the batch one
+    /// `u` anyway. Nests; the outermost pair wins.
     pub fn begin_undo_group(&mut self, before: Cursors) {
         self.history.begin_group(before);
     }
@@ -3772,7 +3773,7 @@ mod tests {
             "line5\nline6\nline7\nline8\nline9\n",
             "and the trimmed lines did not come back"
         );
-        assert!(!b.is_modified(), "a transient buffer is never dirty");
+        assert!(!b.is_modified(), "a fresh history is saved at its root");
     }
 
     #[test]
