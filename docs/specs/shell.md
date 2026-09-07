@@ -6,8 +6,7 @@ out to one. Vim's four spellings, with one deliberate split underneath them.
 
 ## Status
 
-**Approved for build.** Decisions resolved with the user on 2026-09-06; see
-the end.
+**Built.** Decisions resolved with the user on 2026-09-06; see the end.
 
 ## What vim does, and what bi cannot
 
@@ -59,9 +58,11 @@ trailer line lands in the console. Non-UTF-8 output is decoded lossily.
 **Stopping.** `:stop` — and `Ctrl-C` or `x` *in the Console pane* — sends
 SIGTERM, waits ~2 s, then SIGKILL, in the order the debugger's
 `end_session` already uses. `Ctrl-C` is bound only in the pane: in Normal
-mode it keeps meaning what it means. Quitting with a job running kills it on
-the way out (`shutdown_shell`, beside `shutdown_lsp` and `shutdown_dap`);
-nothing is orphaned.
+mode it keeps meaning what it means. `x` is the Console's own override too:
+every other tree-shaped pane binds `x` to `TreeCmd::Mark(Cut)`, but the
+Console has nothing to cut, so there `x` means stop, not cut. Quitting with
+a job running kills it on the way out (`shutdown_shell`, beside
+`shutdown_lsp` and `shutdown_dap`); nothing is orphaned.
 
 ## Filters
 
@@ -132,3 +133,23 @@ result inside the command, like `:format`.
 4. **stdin closed;** no pty; no interactive commands in v1.
 5. **`!` in a command line is literal** (vim expands it to the previous
    command); `:!!` is the repeat.
+
+## Deviations from the design
+
+Three places where the build settled a question this spec's text left
+implicit, each recorded here so nobody re-derives it from scratch:
+
+1. **The grammar ruling: bare `:!cmd` is the job; the current-line filter is
+   `:.!cmd`.** This is vim's real grammar, not a bi invention — `:!` with no
+   range is `:!{cmd}`, the shell form; a range of *any* kind, `.` included,
+   is what makes a `!` command a filter. A scope-less `:!` is therefore never
+   a filter, even for "just the current line" — you write `:.!cmd` for that,
+   the same as vim.
+2. **`Read`/`Write` report `read N lines` / `wrote N lines`.** Wording
+   chosen at build time to match the buffer's own "N lines" phrasing
+   elsewhere in the status line; nothing in the spec's text mandated it.
+3. **One "no runner" status, shared by jobs and filters.** A headless
+   embedder that supplies no spawner (`set_shell_spawner`) sees the same
+   `! : this frontend supplies no runner` whether `:!cmd`, `:{range}!cmd`,
+   `:r !cmd` or `:w !cmd` triggered it — there was no reason for the two
+   shapes to word a missing seam differently.

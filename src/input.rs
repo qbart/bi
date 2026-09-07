@@ -11,7 +11,8 @@
 
 use crate::config::{Bind, KeyMode, Keymap, Lookup};
 use crate::editor::{
-    Action, BufferCmd, CmdMove, Command, DebugCmd, FileOp, Mode, ResultsCmd, TreeCmd, WindowCmd,
+    Action, BufferCmd, CmdMove, Command, DebugCmd, FileOp, Mode, ResultsCmd, ShellCmd, TreeCmd,
+    WindowCmd,
 };
 use crate::key::{Key, KeyCode};
 use crate::motion::{Motion, Operator, Target, TextObject};
@@ -784,6 +785,18 @@ impl Input {
         let ctrl = key.mods.ctrl;
         let count = self.count.unwrap_or(1).max(1);
         let g = std::mem::take(&mut self.g_pending);
+
+        // The Console's stop keys. `x` means cut in every other tree pane
+        // (see `tree`'s `TreeCmd::Mark(Cut)`), but the Console has nothing to
+        // cut and a job to stop, so it wins here ahead of the shared grammar.
+        // `Ctrl-C` is bound only in this pane — Normal mode's `Ctrl-C` keeps
+        // meaning what it means (`Action::CollapseCursors`).
+        if content == ContentKind::DapConsole
+            && (key.code == KeyCode::Char('x') || (ctrl && key.code == KeyCode::Char('c')))
+        {
+            self.reset();
+            return Some(Command { count: 1, action: Action::Shell(ShellCmd::Stop) });
+        }
 
         let cmd = match key.code {
             KeyCode::Char('g') if g => TreeCmd::First,
@@ -2430,6 +2443,41 @@ leader = \" \"
         }
         // And the mode's own keys still reach a source window.
         assert_eq!(debug_action("c"), Action::Debug(DebugCmd::Continue));
+    }
+
+    /// The Console's stop keys: `Ctrl-C` and `x` both send `ShellCmd::Stop`,
+    /// in either mode a Console-focused window can be in — `dap_pane` routes
+    /// both `Mode::Normal` and `Mode::Debug`.
+    #[test]
+    fn ctrl_c_and_x_in_the_console_stop_the_job() {
+        let mut input = Input::default();
+        for mode in [Mode::Normal, Mode::Debug] {
+            let stop =
+                input.on_key(ctrl('c'), &mode, ContentKind::DapConsole).expect("resolved");
+            assert_eq!(stop.action, Action::Shell(ShellCmd::Stop), "{mode:?} ctrl-c");
+
+            let stop = input.on_key(key('x'), &mode, ContentKind::DapConsole).expect("resolved");
+            assert_eq!(stop.action, Action::Shell(ShellCmd::Stop), "{mode:?} x");
+        }
+    }
+
+    /// `Ctrl-C` is bound only in the Console pane. In a text window, Normal
+    /// mode's `Ctrl-C` keeps meaning what it means today — collapse extra
+    /// cursors — not stop a job.
+    #[test]
+    fn ctrl_c_in_a_text_window_is_unchanged() {
+        let mut input = Input::default();
+        let cmd = input.on_key(ctrl('c'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert_eq!(cmd.action, Action::CollapseCursors);
+        assert_ne!(cmd.action, Action::Shell(ShellCmd::Stop));
+    }
+
+    /// `x` is the Console's stop key, but everywhere else in the tree
+    /// grammar it is still cut — the Console arm must not leak into other
+    /// panes.
+    #[test]
+    fn x_in_a_tree_pane_still_cuts() {
+        assert_eq!(tree_action("x"), Action::Tree(TreeCmd::Mark(ClipMode::Cut)));
     }
 
     /// `<C-n>` takes a match, `<C-x>` passes it over. They are the same

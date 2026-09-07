@@ -483,7 +483,10 @@ already open; all four share the tree pane's keymap (`j`/`k`/`gg`/`G`/
 expand/collapse a node. `:eval <expr>` evaluates in the frame that is
 stopped and appends the result to every open console; `:watch <expr>` /
 `:unwatch <n>` add to or remove from the Watches list. `:debug stop` ends
-the session. See [docs/specs/debug.md](specs/debug.md).
+the session. `:!` jobs share the Console pane with the debuggee's own
+output, and inside it `Ctrl-C` and `x` stop the running job rather than
+their usual meanings. See [docs/specs/debug.md](specs/debug.md) and
+[docs/specs/shell.md](specs/shell.md).
 
 ### Picker
 
@@ -614,6 +617,11 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:break` | toggle a breakpoint on the cursor's line, from any mode |
 | `:eval <expr>` | evaluate an expression in the stopped frame, appended to every open console |
 | `:watch <expr>` `:unwatch <n>` | add / remove a Watches expression, 1-based |
+| `:!cmd` `:!!` | run a command as a background job in the Console; `!!` repeats the last one |
+| `:stop` | end the running job |
+| `:{range}!cmd` | filter the range's lines through a command, synchronously, as one undo step |
+| `:r !cmd` | insert a command's stdout below the cursor |
+| `:w !cmd` | feed the buffer to a command's stdin and show its output in the Console |
 | `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
