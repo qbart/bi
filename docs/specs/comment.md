@@ -89,7 +89,7 @@ as `indent_right` covers `>>`.
 - `input.rs`: the `g` block's `q` arm gains a `c` twin; the doubled-form
   match gains `(Operator::Comment, 'c')`; `Comment` joins the capture-nothing
   arms wherever `Reflow` is listed (surround, dot-repeat spelling, names).
-- `buffer.rs`: `pub fn comment_rows(&mut self, first, last, marker) ->
+- `buffer.rs`: `pub fn comment_rows(&mut self, first, last, marker, indent) ->
   Option<Cursor>` — the toggle over rows, one edit, landing the cursor on
   the first row's first non-blank, the shape `indent_rows` has.
 - `editor.rs`: an `Action::Operate { op: Comment, .. }` arm beside

@@ -947,11 +947,9 @@ impl Buffer {
     /// block doesn't split it.
     ///
     /// Commenting inserts `marker` and one space at the range's *minimum*
-    /// indent, measured in display columns so a tab-indented row and a
-    /// space-indented row agree on where that is — with the tab width
-    /// [`Indent::default`] uses, since this operator has no file settings to
-    /// consult and only needs the rows in front of it to agree with each
-    /// other, not with the buffer's real tab stops. When that column falls
+    /// indent, measured in display columns — `indent.tab_width`, the same
+    /// width `>`/`Tab`/`=` use for this buffer — so a tab-indented row and a
+    /// space-indented row agree on where that is. When that column falls
     /// inside a tab, the marker goes after the whitespace character that
     /// reaches it rather than splitting the tab: `"\ta"` at column 4 gets its
     /// marker after the tab, not before it.
@@ -965,9 +963,15 @@ impl Buffer {
     /// Lands the cursor on the first row's first non-blank. `None` when every
     /// row in the range is blank — nothing to toggle, nothing on the undo
     /// stack.
-    pub fn comment_rows(&mut self, first: usize, last: usize, marker: &str) -> Option<Cursor> {
+    pub fn comment_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        marker: &str,
+        indent: &Indent,
+    ) -> Option<Cursor> {
         let last = last.min(self.line_count().saturating_sub(1));
-        let tab_width = Indent::default().tab_width;
+        let tab_width = indent.tab_width;
 
         let lines: Vec<String> = (first..=last).map(|row| self.line(row)).collect();
         let min_col = lines
@@ -2830,7 +2834,7 @@ mod tests {
     fn commenting_puts_the_marker_at_the_minimum_indent() {
         let mut buffer = rows("    a\n  b\n");
 
-        buffer.comment_rows(0, 1, "//").expect("commented");
+        buffer.comment_rows(0, 1, "//", &spaces()).expect("commented");
 
         assert_eq!(shown(&buffer), "  //   a\n  // b\n");
     }
@@ -2839,7 +2843,7 @@ mod tests {
     fn a_fully_commented_range_uncomments_and_strips_one_space() {
         let mut buffer = rows("// x\n//y\n");
 
-        buffer.comment_rows(0, 1, "//").expect("uncommented");
+        buffer.comment_rows(0, 1, "//", &spaces()).expect("uncommented");
 
         assert_eq!(shown(&buffer), "x\ny\n");
     }
@@ -2848,10 +2852,10 @@ mod tests {
     fn one_uncommented_line_makes_the_whole_range_comment() {
         let mut buffer = rows("// a\nb\n");
 
-        buffer.comment_rows(0, 1, "//").expect("commented");
+        buffer.comment_rows(0, 1, "//", &spaces()).expect("commented");
         assert_eq!(shown(&buffer), "// // a\n// b\n");
 
-        buffer.comment_rows(0, 1, "//").expect("uncommented");
+        buffer.comment_rows(0, 1, "//", &spaces()).expect("uncommented");
         assert_eq!(shown(&buffer), "// a\nb\n", "gc gc is a no-op");
     }
 
@@ -2859,12 +2863,12 @@ mod tests {
     fn blank_lines_are_skipped_and_neutral() {
         let mut buffer = rows("a\n\nb\n");
 
-        buffer.comment_rows(0, 2, "//").expect("commented");
+        buffer.comment_rows(0, 2, "//", &spaces()).expect("commented");
         assert_eq!(shown(&buffer), "// a\n\n// b\n");
 
         // A blank line in the middle does not stop the range from reading
         // as fully commented.
-        buffer.comment_rows(0, 2, "//").expect("uncommented");
+        buffer.comment_rows(0, 2, "//", &spaces()).expect("uncommented");
         assert_eq!(shown(&buffer), "a\n\nb\n");
     }
 
@@ -2875,9 +2879,29 @@ mod tests {
         // whitespace.
         let mut buffer = rows("\ta\n    b\n");
 
-        buffer.comment_rows(0, 1, "//").expect("commented");
+        buffer.comment_rows(0, 1, "//", &spaces()).expect("commented");
 
         assert_eq!(shown(&buffer), "\t// a\n    // b\n");
+    }
+
+    /// A pure-tab lead is width-invariant — the char position where two tabs'
+    /// worth of column is reached is the same whether a tab is 4 columns or
+    /// 8 — so the only way to catch a hardcoded tab width is a range that
+    /// mixes tabs and spaces closely enough for their relative depth to flip
+    /// between widths. At `tab_width = 8`, two tabs (16 columns) are deeper
+    /// than eight spaces (8 columns), so the minimum indent is the spaces'
+    /// row, and the tab row's marker lands after just its first tab, leaving
+    /// the second as content. Hardcoding `tab_width = 4` instead makes both
+    /// rows measure 8 columns, a tie that (wrongly) puts the marker after
+    /// *both* of the tab row's tabs — the bug this test guards against.
+    #[test]
+    fn the_markers_follow_the_buffers_tab_width() {
+        let mut buffer = rows("\t\tfoo\n        bar\n");
+        let wide = Indent { tab_width: 8, expandtab: false, ..spaces() };
+
+        buffer.comment_rows(0, 1, "//", &wide).expect("commented");
+
+        assert_eq!(shown(&buffer), "\t// \tfoo\n        // bar\n");
     }
 
     #[test]
@@ -2885,7 +2909,7 @@ mod tests {
         let mut buffer = rows("   \n\t\n");
         let before = buffer.edits();
 
-        assert!(buffer.comment_rows(0, 1, "//").is_none(), "nothing to toggle");
+        assert!(buffer.comment_rows(0, 1, "//", &spaces()).is_none(), "nothing to toggle");
 
         assert_eq!(shown(&buffer), "   \n\t\n");
         assert_eq!(buffer.edits(), before);
@@ -2899,7 +2923,7 @@ mod tests {
         let mut buffer = Buffer::empty();
         buffer.rope = Rope::from_str("a\nb\nc\n");
 
-        buffer.comment_rows(0, 2, "//").expect("commented");
+        buffer.comment_rows(0, 2, "//", &spaces()).expect("commented");
         buffer.commit_undo(Vec::new(), Vec::new());
         assert_eq!(shown(&buffer), "// a\n// b\n// c\n");
 
