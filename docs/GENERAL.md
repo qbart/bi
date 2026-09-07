@@ -13,7 +13,8 @@ cursor, completion opens by itself as you type — `Ctrl-N`/`Ctrl-P` walk it,
 `Tab` or `Enter` accepts, auto-imports included — and typing `(` floats the
 signature with the parameter you are on highlighted.
 Batch edits run through `:g`/`:v`/`:normal`, `:s` substitutes and `&` repeats
-it, `gq` reflows comments to `textwidth`, `=` reindents, `]]`/`[[` walk the
+it, `gq` reflows comments to `textwidth`, `=` reindents, `gc` toggles
+comments, `]]`/`[[` walk the
 parse tree's boundaries (`:ts` paints them), and `:peek` opens a definition
 in a split beside you. `:tssplit`/`:tsjoin` break the bracketed list at the
 cursor onto a line per element and back. Git is built in the minimal way: a

@@ -49,14 +49,21 @@ column** (measured in display columns, so tabs and spaces agree), so the
 markers line up in one column and the code's own shape survives underneath:
 
 ```
-    if x {            //     if x {
-        y();     →    //         y();
-    }                 //     }
+    if x {           →    // if x {
+        y();         →    //     y();
+    }                →    // }
 ```
+
+The minimum column can fall inside a row's own leading tab rather than
+between characters; a tab is never split, so that row's marker lands after
+the whole tab instead of at the shared column, and its marker does not line
+up with the rest of the range.
 
 **Uncommenting** removes the marker and *one* following space if there is
 one — the space `gc` itself added — from wherever it sits after the indent,
-so a hand-written `//x` and a `// x` both come back clean.
+so a hand-written `//x` and a `// x` both come back clean. A row that was
+nothing but the marker uncomments to an empty line — and, being blank, is
+skipped by every `gc` after that, same as vim-commentary.
 
 The whole range is **one edit and one undo step**, like `>` and `gq`.
 
@@ -88,13 +95,14 @@ carries it, not a named command.
 - `motion.rs`: `Operator::Comment`, documented beside `Reflow`/`Reindent`.
 - `input.rs`: the `g` block's `q` arm gains a `c` twin; the doubled-form
   match gains `(Operator::Comment, 'c')`; `Comment` joins the capture-nothing
-  arms wherever `Reflow` is listed (surround, dot-repeat spelling, names).
+  arms wherever `Reflow` is listed (surround, dot-repeat spelling).
 - `buffer.rs`: `pub fn comment_rows(&mut self, first, last, marker, indent) ->
   Option<Cursor>` — the toggle over rows, one edit, landing the cursor on
   the first row's first non-blank, the shape `indent_rows` has.
 - `editor.rs`: an `Action::Operate { op: Comment, .. }` arm beside
   `Reindent`'s and an `OperateSelection` arm beside `Indent`'s, both reading
-  the marker from `syntax::line_comment(self.filetype_of(buffer))`.
+  the marker from `syntax::line_comment(*self.filetype)` — the View's own
+  resolved filetype.
 
 ## Tests
 
@@ -140,3 +148,10 @@ carries it, not a named command.
    this spec always had ("every non-blank line ... already starts ... with
    the marker") and it is vim-commentary's rule too, not a bug found during
    the build — kept deliberately rather than special-cased.
+4. **Overlapping multi-cursor ranges toggle once.** When two cursors' ranges
+   land on the same row(s) — `gcc` with two collapsed cursors on one line,
+   or `gcj` from two adjacent rows sharing the row between them — the first
+   range claims those rows and every later range that overlaps it is
+   skipped whole, not re-applied. Without this a shared row would be
+   toggled once per cursor that reaches it, which for an even number of
+   cursors is a silent no-op and for an odd number doubles the marker.
