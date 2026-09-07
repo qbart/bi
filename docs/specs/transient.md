@@ -7,7 +7,7 @@ vim's `buftype=nofile`.
 
 ## Status
 
-**Built.** Decisions resolved with the user on 2026-09-07; see the end. Four
+**Built.** Decisions resolved with the user on 2026-09-07; see the end. Eight
 deviations from the design are recorded after them.
 
 ## Why
@@ -42,7 +42,8 @@ What it does not do:
 
 **Growth is bounded.** A transient buffer keeps at most `TRANSIENT_MAX_LINES`
 (10 000) lines; appending past that drops lines from the top. A runaway
-`make` must not eat the session.
+`make` must not eat the session — and the undo history goes with the trim,
+so the dropped text is really gone (deviation 8).
 
 ## `:!` in a transient buffer
 
@@ -109,9 +110,19 @@ events and `:eval` keep using it. Only the shell's use of it goes.
   the buffer is still transient and still `[!…]`.
 - `:bd` closes it without a nag while the job is finished; while the job is
   running, `:bd` kills the job (the fake's `killed` count) and closes it.
-- `:q` with a modified transient buffer does not nag.
-- Appending past `TRANSIENT_MAX_LINES` drops lines from the top.
+- `:q` with a modified transient buffer does not nag; `:qa` with a job
+  running quits without one, and the job dies with the editor.
+- Appending past `TRANSIENT_MAX_LINES` drops lines from the top, and takes
+  the undo history with it: `u` does not bring the trimmed lines back, and
+  the buffer is still not modified.
+- A trim moves the *focused* reader's cursor too — the row shifts up by the
+  number of lines dropped, the column is kept, and the window watching the
+  tail still is.
+- A log window closed and re-opened by the next `:!` starts at the tail.
+- `:set syntax rust` and then `:!echo x` leaves the log with no grammar.
+- `:!!` after the log buffer was `:bd`-closed opens a fresh one.
 - `:%!sort` on the transient buffer works (it is a buffer).
+- `:w !cmd` while a `:!` job runs is refused in the job's own words.
 - The debugger's Console pane still receives `output` events and `:eval`
   (regression: nothing about `DapConsole` changed).
 - No LSP attach, no git baseline, no trim for a transient buffer.
@@ -127,7 +138,7 @@ events and `:eval` keep using it. Only the shell's use of it goes.
 
 ## Deviations from the design
 
-Four places where the build settled a question this spec's text left
+Eight places where the build settled a question this spec's text left
 implicit, each recorded here so nobody re-derives it from scratch:
 
 1. **`show_transient` reports whether a window opened.** The spec's text
@@ -157,3 +168,28 @@ implicit, each recorded here so nobody re-derives it from scratch:
    "an empty scratch buffer nobody is using," it is a job about to write
    into it. The check is `!entry.buffer.is_transient()`, stated outright
    rather than left to be inferred from the other three conditions.
+5. **`:w <path>` says the write was a copy.** The status is `wrote <path>
+   (copy)`, not the plain `wrote <path>` a file buffer gets: the word is the
+   only place the user is told that the buffer they just wrote is still
+   `[!<cmd>]`, still path-less, and will not be written again by the next
+   bare `:w`.
+6. **`:w !cmd` folds "no room to split" into its own status,** the way `:!`
+   does: `wrote <n> lines to [!<cmd>] (no room to split; :b to see it)`. The
+   filter ran and its output is in the buffer either way — unlike the
+   Console pane it replaced, a transient buffer holds its text whether or
+   not a window can show it.
+7. **`:w !cmd` is refused while a `:!` job runs,** in the job's own words:
+   `! is running <cmd> — :stop it first`. One job, one buffer: the filter
+   would rename a live job's buffer and interleave its output into the
+   stream the job is still writing. Both commands ask the same guard
+   (`Editor::a_job_is_in_the_way`), which pumps first, so a job that has
+   already exited refuses nothing.
+8. **The cap trim discards the buffer's undo history.** `u` never reaches
+   past a trim. The history is append-only by design (`src/history.rs`), so
+   a trim that left a revision behind would keep every dropped line alive in
+   it — the cap would bound the rope and nothing else, and a runaway `make`
+   would eat the session through the undo tree instead. Until the cap is
+   reached each batch is one undo step, as before; from the first trim on,
+   the buffer's history starts over at the text it has now. Nothing is lost
+   that a transient buffer promised to keep: it has no file to be behind,
+   and `History::default()` is saved at its root, so it stays unmodified.

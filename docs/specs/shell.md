@@ -27,7 +27,7 @@ command, and the four spellings split into two shapes by what they are *for*:
   process runner formatters already use (`fmt::Run` / `ProcessRun`), with
   its **5 s guard**: a filter that needs longer is not a filter, it is a job.
 - **Bare `:!cmd`** — `:!cargo test`, `:!make` — is a **job**. It runs in the
-  background, its output streams into a pane as it arrives, and the editor
+  background, its output streams into a buffer as it arrives, and the editor
   stays live. A job has no timeout; it has `:stop`.
 
 ## Jobs
