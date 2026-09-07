@@ -4200,7 +4200,12 @@ impl Editor {
         if let Some(name) = entry.buffer.transient_name() {
             return format!("[{name}]");
         }
-        entry.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".into())
+        entry
+            .buffer
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "[No Name]".into())
     }
 
     pub fn is_modified(&self, id: BufferId) -> bool {
@@ -4431,6 +4436,25 @@ impl Editor {
     /// its text is modified and its undo history is a reason to keep it. Shown
     /// nowhere, which is what makes it unreachable — a `:enew` you are looking
     /// at survives.
+    ///
+    /// A transient buffer is unnamed by this test's own measure (no path,
+    /// same as `[No Name]`), so it is excluded explicitly rather than by
+    /// accident: `transient_buffer` can create one and hand back its id
+    /// before anything has shown or appended to it, and this sweep is what
+    /// every other buffer switch runs.
+    ///
+    /// Separately: a transient buffer the user empties by hand (`ggdG`)
+    /// would survive even without the check above, because `is_modified` is
+    /// revision-identity, not content — it compares the current revision to
+    /// the one `saved` names, and a transient buffer's `save` never runs
+    /// (`:w` bails before touching history), so `saved` stays fixed at the
+    /// revision it was created on. Emptying it moves `current` away from
+    /// that revision, so `is_modified` reports true of an empty buffer,
+    /// exactly as it would for a `File` buffer undone back to a blank
+    /// state. Worth writing down so it is not re-derived — but it is not
+    /// what the explicit check above is for: that one protects the
+    /// *freshly created, never touched* transient buffer, which this fact
+    /// does nothing for.
     fn sweep_scratch(&mut self) {
         if self.buffers.len() < 2 {
             return;
@@ -4442,6 +4466,7 @@ impl Editor {
                 entry.buffer.path.is_none()
                     && entry.buffer.rope().len_chars() == 0
                     && !entry.buffer.is_modified()
+                    && !entry.buffer.is_transient()
             })
             .map(|entry| entry.id)
             .filter(|id| !self.windows.iter().any(|w| w.buffer() == Some(*id)))
@@ -5716,9 +5741,14 @@ impl Editor {
             return;
         }
         let focus = self.focus;
+        // `previous` means "where focus was before the last deliberate
+        // jump" — a round trip through the split this makes is not one, and
+        // must not be what a later `Ctrl-W p` answers with.
+        let previous = self.previous;
         let Some(new) = self.split_focus(Dir::Horizontal) else { return };
         self.show(new, id);
         self.set_focus(focus);
+        self.previous = previous;
     }
 
     /// Appends `lines` to a transient buffer and moves the cursor of every
@@ -6424,8 +6454,11 @@ impl Editor {
     /// transient one, which has no file to be behind and so nothing to
     /// nag about (`docs/specs/transient.md`).
     fn quit_all(&mut self, force: bool) {
-        let unsaved =
-            self.buffers.iter().find(|b| b.buffer.is_modified() && !b.buffer.is_transient()).map(|b| b.id);
+        let unsaved = self
+            .buffers
+            .iter()
+            .find(|b| b.buffer.is_modified() && !b.buffer.is_transient())
+            .map(|b| b.id);
         match unsaved {
             Some(id) if !force => {
                 self.session.status =
@@ -27849,6 +27882,18 @@ int main(void) {
         fn a_transient_buffer_shows_in_a_split_below_and_keeps_focus() {
             let mut ed = editor("hello");
             sized(&mut ed);
+            // A deliberate jump first, back to a single window, so
+            // `previous` names something real before `show_transient` runs
+            // — and closing the split rather than leaving it open keeps the
+            // window-count assertions below about `show_transient`'s own
+            // split, not this setup's.
+            ex(&mut ed, "sp");
+            ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Up))));
+            let stray = ed.window_ids().into_iter().find(|&w| w != ed.focus()).unwrap();
+            ed.close_window(stray);
+            let previous_before = ed.previous;
+            assert!(previous_before.is_some(), "set up a real jump to check against");
+
             let before = ed.focus();
             let before_rect = ed.layout.rect_of(before, ed.area, &ed.chrome).unwrap();
 
@@ -27857,6 +27902,10 @@ int main(void) {
 
             assert_eq!(ed.focus(), before, "focus never moved");
             assert_eq!(ed.window_ids().len(), 2, "a split");
+            assert_eq!(
+                ed.previous, previous_before,
+                "the round trip through the transient split did not overwrite it"
+            );
 
             let shown =
                 ed.window_ids().into_iter().find(|&w| w != before).expect("a second window");
@@ -28017,6 +28066,22 @@ int main(void) {
             let id = ed.transient_buffer("!make");
 
             assert_eq!(ed.name_of(id), "[!make]");
+        }
+
+        /// `transient_buffer` can hand back an id before anything has shown
+        /// or appended to it — an empty, unmodified, path-less buffer nobody
+        /// is looking at, which is exactly `sweep_scratch`'s prune criteria
+        /// for a stray `[No Name]`. `:enew` runs a `switch`, which is where
+        /// the sweep lives, without ever touching the transient buffer
+        /// itself.
+        #[test]
+        fn a_fresh_unshown_transient_buffer_survives_a_sweep() {
+            let mut ed = editor("hello");
+            let id = ed.transient_buffer("job");
+
+            ex(&mut ed, "enew");
+
+            assert!(ed.buffer_ids().contains(&id), "the sweep left it alone");
         }
 
         #[test]
