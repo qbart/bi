@@ -74,10 +74,10 @@ change.
 ## Where it lives
 
 ```
-src/shell.rs         sanitize()                                        (core)
-src/indent.rs        char_width() = 2 for controls; the glyph helper   (core)
-src/editor.rs        pump_shell / run_write call sanitize              (core)
-src/tui/render.rs    cells(): styled_line, the plain branch, console, results (tui)
+src/shell.rs         sanitize()                                                        (core)
+src/indent.rs        char_width() = 2 for controls; the glyph helper                   (core)
+src/editor.rs        pump_shell / run_write call sanitize                              (core)
+src/tui/render.rs    cells()/cells_at(): every path that draws text bi did not write   (tui)
 ```
 
 A frontend that is not a terminal draws `^[` too, or draws what it likes:
@@ -101,7 +101,7 @@ the glyph helper is advice from the core, not a screen contract.
 
 ## Deviations from the design
 
-Five places where the build corrected or completed what this spec's text
+Eight places where the build corrected or completed what this spec's text
 said, each recorded here so nobody re-derives it from scratch:
 
 1. **An `ESC` followed by an intermediate byte is consumed through to its
@@ -124,3 +124,25 @@ said, each recorded here so nobody re-derives it from scratch:
 5. **`display_col` on `\x1b[1mx` puts `x` at column 5, not 6.** `^[` costs 2
    cells, and `[`, `1`, `m` cost one each — 2+1+1+1 — the spec's Tests
    section had the arithmetic one column high.
+6. **C1 controls are dropped by `cells`, not drawn.** `^X` names a C0
+   character and `^?` names `DEL`; `0x80-0x9f` have no such name to be
+   drawn as, `char_width` answers 0 for them, and the results pane's
+   helper this grew out of dropped every control it saw. So they leave no
+   cell behind — the thing that matters is that they are never *sent*.
+7. **`glyph` returns `[char; 2]`, not `[u8; 2]`.** The spec wrote the
+   shape as bytes; what a cell holds is characters, and the two the
+   caller pushes are `char`s wherever they go from there.
+8. **Every path carrying foreign text goes through `cells_at`, not four
+   of them.** The spec counted the buffer view's two branches, the
+   Console and the results pane. The rule is wider than that list:
+   wherever text bi did not write itself is drawn, a control character can
+   reach a cell, and `unicode-width` measures every one of them as a
+   single cell — so ratatui writes the raw byte into the screen and the
+   terminal executes it. `cells_at` — `cells` from column zero — is the
+   entry point, and the classes that take it are the LSP's (hover,
+   completion, signature, and a diagnostic's `Eol`), the debugger's
+   (Stack, Variables, Watches, Console), the picker's (query, rows,
+   preview — registers, history, file names), the names (tree rows,
+   results headings, an image's label, a window's status row) and the
+   session's own two lines (the status message, and the `:` and `/`
+   lines).

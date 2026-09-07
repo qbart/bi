@@ -8989,7 +8989,9 @@ impl Editor {
     /// buffer) to the command's stdin and shows its output in the same
     /// transient buffer as a job's, under `$ <cmd>` — but synchronously, and
     /// the buffer's modified flag is untouched, because nothing here saves
-    /// anything. See `docs/specs/transient.md`.
+    /// anything. The output is stripped of its escape sequences on the way
+    /// in, the same as a job's, because it is a log too (`docs/specs/ansi.md`
+    /// §Rule 1). See `docs/specs/transient.md`.
     fn run_write(&mut self, scope: Option<Scope>, cmd: String) {
         if self.a_job_is_in_the_way() {
             return;
@@ -9063,6 +9065,10 @@ impl Editor {
     /// sets the status, and drops the `Job` — its `Handle`'s `Drop` does
     /// nothing to an already-finished process (see `shell::Handle`), so this
     /// never kills a job that already ended on its own.
+    ///
+    /// Every line is stripped of its escape sequences on the way in — a job
+    /// prints for a terminal that is not there, and what lands is text
+    /// (`docs/specs/ansi.md` §Rule 1).
     ///
     /// If `job_buffer` was `:bd`-closed mid-run, the lines are dropped —
     /// there is nowhere left to put them — but the status still lands, so

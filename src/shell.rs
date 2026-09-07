@@ -519,10 +519,14 @@ pub fn expand(cmd: &str, current: Option<&str>, alternate: Option<&str>) -> Resu
 /// `:!` has no pty, so a program that prints escape sequences is printing
 /// for a terminal that is not there — and the buffer the line lands in is
 /// text, which must never carry an `ESC` a screen could execute
-/// (`docs/specs/ansi.md` §"Rule 1"). CSI and OSC sequences and every other
-/// `ESC x` pair go; a carriage return rewinds the line, so a progress bar
-/// that redrew itself keeps its final state; the other C0 controls are
-/// dropped, except the tab, which is text.
+/// (`docs/specs/ansi.md` §"Rule 1"). CSI and OSC sequences go, and so does
+/// an `ESC` followed by an intermediate byte (`0x20-0x2f` — a charset
+/// designation like `ESC ( B`), which runs on to its final byte rather than
+/// ending at the next one; any other `ESC x` is two bytes. A carriage
+/// return *discards* what came before it on the line, which is what a
+/// terminal ends up showing for a progress bar that overwrites itself from
+/// column 0. The other C0 controls are dropped, except the tab, which is
+/// text.
 pub fn sanitize(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
