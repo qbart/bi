@@ -51,7 +51,7 @@ impl Default for ProcessRun {
 
 impl Run for ProcessRun {
     fn run(&self, argv: &[String], cwd: &Path, input: &str) -> Result<String, String> {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
         let (name, args) = argv.split_first().ok_or("empty command")?;
@@ -73,33 +73,63 @@ impl Run for ProcessRun {
             let _ = stdin.write_all(text.as_bytes());
         });
 
-        // The guard: poll rather than block, kill on expiry. The hung path
-        // reaps with `wait`, never `wait_with_output` — draining the pipes
-        // would block again on any grandchild still holding them.
+        // And drain both pipes from theirs, for the mirror image of the same
+        // reason: a pipe holds about 64 KB, so a tool whose output is bigger
+        // than that blocks in `write` until somebody reads it — and the
+        // guard below only polls `try_wait`, which reads nothing. The tool
+        // would then never exit and the guard would kill it as "hung",
+        // which is exactly what `:%!sort` on a two-thousand-line file did.
+        // Reading must overlap the wait, not follow it (the shape
+        // `shell.rs`'s reader threads use), and it is `read_to_end` rather
+        // than a line loop because a filter's answer is one blob of text,
+        // not a stream anyone watches arrive.
+        let mut stdout = child.stdout.take().expect("piped above");
+        let mut stderr = child.stderr.take().expect("piped above");
+        let out_drain = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let err_drain = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+
+        // The guard: poll rather than block, kill on expiry.
         let deadline = std::time::Instant::now() + self.guard;
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if std::time::Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = feeder.join();
+                    // The two drains are left to end on their own: they are
+                    // blocked on a read that only EOF ends, and a grandchild
+                    // still holding the pipe would make joining them the
+                    // very hang the guard just broke. Their output is not
+                    // wanted anyway — this run has no answer.
                     return Err(format!("{name} hung — killed after {:?}", self.guard));
                 }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
                 Err(e) => return Err(format!("{name}: {e}")),
             }
-        }
-        let output = child.wait_with_output().map_err(|e| format!("{name}: {e}"))?;
+        };
+        // The child has exited, so both pipes are at EOF and these joins are
+        // the last few bytes, not a wait — the same join `wait_with_output`
+        // used to do inside itself.
+        let stdout = out_drain.join().unwrap_or_default();
+        let stderr = err_drain.join().unwrap_or_default();
         let _ = feeder.join();
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             let first = stderr.lines().find(|l| !l.trim().is_empty());
             return Err(first
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("{name}: {}", output.status)));
+                .unwrap_or_else(|| format!("{name}: {status}")));
         }
-        String::from_utf8(output.stdout).map_err(|_| format!("{name}: output is not UTF-8"))
+        String::from_utf8(stdout).map_err(|_| format!("{name}: output is not UTF-8"))
     }
 }
 
@@ -135,6 +165,23 @@ mod tests {
     #[test]
     fn a_missing_binary_is_an_error_not_a_panic() {
         assert!(run(&["bi-no-such-formatter"]).is_err());
+    }
+
+    /// A pipe holds about 64 KB. Polling `try_wait` without reading it
+    /// deadlocks any tool that writes more: it blocks in `write`, never
+    /// exits, and the guard kills it as "hung" — which is what `:%!sort` on
+    /// a two-thousand-line file used to do. 150 KB through a short guard is
+    /// that regression, and the guard being short is the proof there was no
+    /// waiting involved.
+    #[test]
+    fn a_tool_that_outruns_the_pipe_buffer_is_drained_not_killed() {
+        let argv: Vec<String> =
+            ["sh", "-c", "yes | head -c 150000"].iter().map(|s| s.to_string()).collect();
+        let runner = ProcessRun { guard: Duration::from_secs(2) };
+
+        let out = runner.run(&argv, Path::new("/"), "").expect("drained, not killed");
+
+        assert_eq!(out.len(), 150_000);
     }
 
     #[test]
