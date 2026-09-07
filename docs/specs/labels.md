@@ -89,6 +89,10 @@ guides and are painted by the same code.
 `Ctrl-W f` — *focus* — labels every window at the top-left of its text area and
 goes to the one you press.
 
+With exactly two windows it asks nothing: there is one place to go, so it goes
+there, and pressing it again comes back. A label mode with one real choice is a
+question with one answer. One window says "only one window" and stays put.
+
 **Not `<Tab>`**, which TODO.md asked for. `Tab` and `Ctrl-I` are the same byte
 in a terminal, so `<Tab>` for window picking would silently take `Ctrl-I` —
 jump-forward, in the jump list (`docs/specs/jumplist.md`) — with it. The

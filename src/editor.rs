@@ -3445,11 +3445,19 @@ impl Editor {
     /// Every window, the focused one included: jumping to where you already
     /// are is a no-op, and leaving it out would move the letters around
     /// depending on where you were, which is what a label is supposed not to
-    /// do. One window is not worth a mode, so it says so and stays put.
+    /// do. One window is not worth a mode, so it says so and stays put. Two
+    /// windows are not worth one either: there is exactly one other place to
+    /// go, so it goes there — a label mode with one real choice is a question
+    /// with one answer, and asking it costs a keystroke every time.
     fn pick_window(&mut self) {
         let ids: Vec<WindowId> = self.windows.iter().map(|w| w.id).collect();
         if ids.len() < 2 {
             self.session.status = "only one window".into();
+            return;
+        }
+        if let [a, b] = ids[..] {
+            let other = if a == self.focus { b } else { a };
+            self.set_focus(other);
             return;
         }
         let targets = crate::label::labels(ids.len(), &[])
@@ -22413,14 +22421,40 @@ int main(void) {
         ed
     }
 
+    /// Three windows: enough that `Ctrl-W f` has to ask with letters rather
+    /// than jump to the only other one. The label tests want the asking.
+    fn three_windows(text: &str) -> Editor {
+        let mut ed = two_windows(text);
+        split(&mut ed, Dir::Horizontal);
+        ed
+    }
+
+    /// Two windows is a question with one answer: the other one. No letters,
+    /// no mode — `Ctrl-W f` just goes there, and pressing it again comes back.
+    #[test]
+    fn ctrl_w_f_with_two_windows_goes_straight_to_the_other() {
+        let mut ed = two_windows("alpha\n");
+        let from = ed.focus();
+        let other = ed.window_ids().into_iter().find(|&w| w != from).expect("two windows");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+
+        assert_eq!(ed.focus(), other, "went to the other window");
+        assert_eq!(ed.session.mode, Mode::Normal, "without a label mode");
+        assert!(ed.session.labels.is_none(), "and without letters");
+
+        ed.apply(cmd(Action::Window(WindowCmd::Pick)));
+        assert_eq!(ed.focus(), from, "and again is a toggle");
+    }
+
     #[test]
     fn ctrl_w_f_puts_a_letter_on_every_window_including_this_one() {
-        let mut ed = two_windows("alpha\n");
+        let mut ed = three_windows("alpha\n");
         ed.apply(cmd(Action::Window(WindowCmd::Pick)));
 
         assert_eq!(ed.session.mode, Mode::Label);
         let labels = ed.session.labels.as_ref().expect("letters are up");
-        assert_eq!(labels.targets.len(), 2, "the focused window gets one too");
+        assert_eq!(labels.targets.len(), 3, "the focused window gets one too");
         assert_eq!(labels.targets[0].0, "f", "the hand, not the alphabet");
 
         // And each one is drawn in its own window.
@@ -22441,7 +22475,7 @@ int main(void) {
     /// pane it belongs to.
     #[test]
     fn a_window_letter_is_a_block_in_the_middle_of_its_pane() {
-        let mut ed = two_windows("one\ntwo\nthree\nfour\nfive\n");
+        let mut ed = three_windows("one\ntwo\nthree\nfour\nfive\n");
         sized(&mut ed);
         let focus = ed.focus();
         ed.size_window(focus, 21, 5);
@@ -22477,7 +22511,7 @@ int main(void) {
     /// to decorate.
     #[test]
     fn a_short_file_gets_as_much_of_the_block_as_it_has_room_for() {
-        let mut ed = two_windows("only\n");
+        let mut ed = three_windows("only\n");
         sized(&mut ed);
         let focus = ed.focus();
         ed.size_window(focus, 21, 20);
@@ -22497,7 +22531,7 @@ int main(void) {
 
     #[test]
     fn pressing_a_letter_goes_to_that_window() {
-        let mut ed = two_windows("alpha\n");
+        let mut ed = three_windows("alpha\n");
         let here = ed.focus();
         ed.apply(cmd(Action::Window(WindowCmd::Pick)));
         let elsewhere = other(&ed);
@@ -22522,7 +22556,7 @@ int main(void) {
 
     #[test]
     fn a_key_that_is_no_label_cancels_and_so_does_esc() {
-        let mut ed = two_windows("alpha\n");
+        let mut ed = three_windows("alpha\n");
         let here = ed.focus();
 
         ed.apply(cmd(Action::Window(WindowCmd::Pick)));
