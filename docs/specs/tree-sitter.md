@@ -255,6 +255,39 @@ rather than the exception:
 All four get the base query concatenated in front of their own, which is what
 `; inherits:` means, and all four are pinned by a snippet test.
 
+### And the C family's whole query still has holes in it
+
+**C's upstream query stops short in two places, and every grammar that
+inherits or borrows it inherits the holes.** Both were found the same way:
+someone opened a real file and a token that plainly deserved a colour had
+none.
+
+**Booleans.** The query captures `(null)` and every number and never names
+`true` or `false`, which are their own node types in the grammar. `nullptr`
+and `0` took a colour and `true` rendered plain.
+
+**Operators.** The query lists sixteen of them — `<`, `>`, `==`, `!=`, `&&`,
+`||`, `+`, `-`, `*`, `&`, `=`, `++`, `--`, `+=`, `-=`, `->` — and none of the
+rest. `a < b` had a red `<` and `a <= b` did not; `/`, `%`, `!`, `~`, `^`,
+`|`, `<<`, `>>` and every compound assignment but two were plain. C++ adds
+`<=>`, `->*` and `.*` on top, which C's query has no reason to know about.
+
+Both holes are closed by appending to the query rather than by editing a copy
+of it: one line of booleans and one list of operators go on the end of C's,
+and the C++ file gets the three C++-only operators after that. Appending is
+safe because a later pattern only ever wins a *tie* over the same range — none
+of these tokens was captured by anything before, so nothing is displaced. The
+addition lands on the whole family at once: C, C++, the borrowers (Slang,
+HLSL), and GLSL's own query, which has both holes in the same places. That
+works because a query naming a node the grammar lacks refuses to compile, and
+every one of those five grammars defines every token in the shared list; the
+three C++ operators exist in C++, HLSL and Slang and not in C or GLSL, which
+is why they ride on the C++ query alone.
+
+The ternary's `?` and `:` are captured only inside a `conditional_expression`.
+A bare `":"` would also colour `case 1:`, `public:` and bit-field widths,
+which are punctuation, not operators.
+
 The general lesson is that a crate shipping `HIGHLIGHTS_QUERY` is not evidence
 that the query is whole. Only a snippet with captures in it is, which is why
 the per-language snippet tests below are now the rule rather than a special
@@ -480,7 +513,7 @@ tree-sitter-ini = "1.4"
 tree-sitter-md = "0.5"       # LANGUAGE is the block grammar; INLINE_LANGUAGE waits on injections
 tree-sitter-cmake = "0.7"
 tree-sitter-go = "0.25"
-tree-sitter-c = "0.24"
+tree-sitter-c = "0.24"       # no booleans, sixteen operators — both appended, family-wide
 tree-sitter-cpp = "0.23"     # ships the `; inherits: c` half only — prepend C's query
 tree-sitter-lua = "0.5"
 tree-sitter-bash = "0.25"

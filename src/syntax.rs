@@ -305,7 +305,7 @@ const TEMPL_HIGHLIGHTS_OWN: &str = include_str!("queries/templ.scm");
 /// its own `(identifier) @variable`, and C++'s overrides after both.
 static CPP_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "{}\n{}\n{C_BOOLEANS}",
+        "{}\n{}\n{C_BOOLEANS}\n{C_OPERATORS}\n{CPP_OPERATORS}",
         tree_sitter_c::HIGHLIGHT_QUERY,
         tree_sitter_cpp::HIGHLIGHT_QUERY
     )
@@ -320,11 +320,34 @@ static CPP_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 /// matters — a query naming a node a grammar lacks refuses to compile.
 const C_BOOLEANS: &str = "[(true) (false)] @boolean";
 
-static C_HIGHLIGHTS: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}\n{C_BOOLEANS}", tree_sitter_c::HIGHLIGHT_QUERY));
+/// The same query's other hole. It names sixteen operators — `<`, `>`, `==`,
+/// `!=`, `&&`, `||`, `+`, `-`, `*`, `&`, `=`, `++`, `--`, `+=`, `-=`, `->` —
+/// and none of the rest, so `a < b` had a coloured `<` and `a <= b` did not.
+/// Every token here is defined by all five C-family grammars, which is what
+/// lets the one list ride on every one of their queries. The ternary's `?`
+/// and `:` are scoped to the expression: a bare `":"` would also colour
+/// `case 1:`, `public:` and bit-field widths.
+const C_OPERATORS: &str = r#"
+[
+  "!" "~" "%" "/" "^" "|"
+  "<=" ">=" "<<" ">>"
+  "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>="
+] @operator
+(conditional_expression ["?" ":"] @operator)
+"#;
 
-static GLSL_HIGHLIGHTS: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}\n{C_BOOLEANS}", tree_sitter_glsl::HIGHLIGHTS_QUERY));
+/// C++'s three on top, which C and GLSL do not define — a query naming a
+/// token the grammar lacks refuses to compile, so these cannot join the list
+/// above.
+const CPP_OPERATORS: &str = r#"["<=>" "->*" ".*"] @operator"#;
+
+static C_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{C_BOOLEANS}\n{C_OPERATORS}", tree_sitter_c::HIGHLIGHT_QUERY)
+});
+
+static GLSL_HIGHLIGHTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{C_BOOLEANS}\n{C_OPERATORS}", tree_sitter_glsl::HIGHLIGHTS_QUERY)
+});
 
 /// TypeScript's highlights are JavaScript's, then TypeScript's own.
 ///
@@ -1214,6 +1237,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The regression behind `C_OPERATORS`: `a < b` had a coloured `<` and
+    /// `a <= b` did not. C's upstream query lists sixteen operators and no
+    /// others, and the whole family inherits the list.
+    #[test]
+    fn the_c_family_operators_take_the_operator_capture() {
+        let text = "int f(int a, int b) { return a <= b || a >= b / 2 % 3 || !a || a << 1 || a ? a : b; }\n";
+        for file in ["c", "cpp", "glsl", "hlsl", "slang"] {
+            let found = captures(file, text);
+            for op in ["<=", ">=", "/", "%", "!", "<<", "||", "?", ":"] {
+                assert!(
+                    found.iter().any(|(name, t)| name == "operator" && t == op),
+                    "{file}: {op} is not an @operator — got {found:?}"
+                );
+            }
+        }
+
+        // C++'s own three, which C and GLSL do not define at all.
+        let found = captures("cpp", "auto f(A a, A b) { return a <=> b; }\n");
+        covers(&found, "operator", "<=>");
     }
 
     #[test]
