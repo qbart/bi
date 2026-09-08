@@ -499,8 +499,10 @@ vim. Filters are synchronous under a 5 s guard; a job has no timeout, it has
 `:stop`.
 
 A job's output goes to a transient buffer, `[!<cmd>]`, opened in a split
-below the current window (or reused if a window already shows it) — focus
-stays where you were. `:bd` on that buffer stops the running job, then
+below the current window (or reused if a window already shows it) — and
+focus moves into it; `Ctrl-W p` goes back to where you ran the command,
+and `%` in a `:!` typed from the log still means the file the log was
+opened over. `:bd` on that buffer stops the running job, then
 closes it; `:w` on it is refused with a hint (`:w <path>` writes a copy, and
 the buffer stays transient). See [docs/specs/shell.md](specs/shell.md) and
 [docs/specs/transient.md](specs/transient.md).

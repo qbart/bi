@@ -187,11 +187,14 @@ implicit, each recorded here so nobody re-derives it from scratch:
    *who asked*, not of what the kernel did: `:stop` marks the job before it
    signals it, so even a job that handles SIGTERM and exits 0 is reported
    `killed`.
-4. **`:!` does not move the cursor.** The transient buffer gets the output;
-   the focus stays in the buffer you ran the command from, as in vim. It has
-   to: the editor stays live while a job runs, and a `:!` that parked the
-   cursor in the job's buffer would leave `%` with no file to name and `#`
-   meaning the file it had just displaced.
+4. **`:!` moves focus into the log.** The transient buffer gets the output
+   and you land in it — a job that opens a program and closes it leaves you
+   where its output is, not two windows away (the user's call, 2026-09-08,
+   reversing the first build, which kept focus in your buffer the way vim
+   leaves you in place). `%` and `#` are expanded before focus moves, and
+   from inside the log `%` resolves through the log window's alternate — the
+   file it was opened over — so `:!!` from the log repeats the same command.
+   `Ctrl-W p` goes back to the window the command was run from.
 5. **One "no runner" status, shared by jobs and filters.** A headless
    embedder that supplies no spawner (`set_shell_spawner`) sees the same
    `! : this frontend supplies no runner` whether `:!cmd`, `:{range}!cmd`,

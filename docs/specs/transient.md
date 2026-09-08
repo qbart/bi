@@ -54,10 +54,16 @@ time; a new `:!` reuses it — clears it? No: **appends**, under a fresh
 against. Its name follows the latest command.
 
 **Where it shows.** If a window already shows the buffer, output goes there
-and the window stays where it is. Otherwise `:!` opens it in a horizontal
+and focus moves to that window. Otherwise `:!` opens it in a horizontal
 split below the current window, the way `:results` opens a Results pane —
-and **the focus stays in your buffer**, as `docs/specs/shell.md` already
-requires.
+and **the focus moves into it**: you ran a command, so you land where its
+output is, and a job that opens a program and closes it leaves you in the
+log rather than two windows away from it. The window you ran it from is
+what `Ctrl-W p` goes back to. `%` and `#` are expanded before focus moves;
+from inside the log, `%` still means the file the log was opened over
+(the log window's alternate), so `:!!` from the log repeats the same
+command. (This reversed the first design, which kept focus in your buffer
+— the user asked for the log on 2026-09-08.)
 
 **The cursor follows the tail only if it was at the tail.** A window whose
 cursor sits on the last line is watching the job: each appended line moves
@@ -89,7 +95,7 @@ src/buffer.rs      Buffer::kind: Kind { File, Transient { name } };
                    line cap; save/save_as honour the kind
 src/editor.rs      transient_buffer(name) -> BufferId (find-or-create);
                    show_transient(id) (reuse a window or split below, focus
-                   kept); append_to_transient(id, lines) (per-window
+                   moves in); append_to_transient(id, lines) (per-window
                    tail-follow); the :! / :w ! sinks call append_to_transient
                    instead of the Console; :bd on the job buffer stops the
                    job; the nags and :wa skip transient buffers; name_of
@@ -101,7 +107,7 @@ events and `:eval` keep using it. Only the shell's use of it goes.
 
 ## Tests
 
-- `:!echo hi` creates `[!echo hi]`, shown in a split below, focus unchanged;
+- `:!echo hi` creates `[!echo hi]`, shown in a split below, focus in it;
   it contains `$ echo hi`, `hi`, `exited 0`.
 - A second `:!` appends under a new `$` line and renames the buffer.
 - With the cursor on the last line, appended output moves it; with the cursor

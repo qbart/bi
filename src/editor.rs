@@ -5755,27 +5755,24 @@ impl Editor {
 
     /// Shows a transient buffer, the way `:!` and `:results` both want: reuse
     /// a window already looking at it, otherwise open one in a split below
-    /// the focused window — and leave focus exactly where it was. Returns
+    /// the focused window — and move focus into it. Returns
     /// whether some window now shows `id` — `false` only when there was no
     /// room to split (`split_focus` has already put that on the status
     /// line), so a caller whose own status would otherwise overwrite that
     /// message knows to fold the "no room" fact into its own instead.
     ///
     /// Mirrors `WindowCmd::New { dir: Some(Horizontal) }`'s mechanics
-    /// (`split_focus` then `show`), with one difference on purpose: that
-    /// command moves focus into the new window because you asked for a
-    /// window to work in, and this one restores focus because you asked
-    /// for a buffer to watch, not to leave what you were doing.
+    /// (`split_focus` then `show`), focus included: you asked to run a
+    /// command, so you land where its output is, and the window you ran it
+    /// from is what `Ctrl-W p` goes back to. A job that opens a program and
+    /// closes it leaves you in the log, not two windows away from it.
     /// `docs/specs/transient.md` §"Where it shows".
     fn show_transient(&mut self, id: BufferId) -> bool {
-        if self.windows.iter().any(|w| w.buffer() == Some(id)) {
+        if let Some(shown) = self.windows.iter().find(|w| w.buffer() == Some(id)).map(|w| w.id)
+        {
+            self.set_focus(shown);
             return true;
         }
-        let focus = self.focus;
-        // `previous` means "where focus was before the last deliberate
-        // jump" — a round trip through the split this makes is not one, and
-        // must not be what a later `Ctrl-W p` answers with.
-        let previous = self.previous;
         let Some(new) = self.split_focus(Dir::Horizontal) else { return false };
         self.show(new, id);
         // A window opened on a log starts at the tail, whatever the buffer
@@ -5789,8 +5786,6 @@ impl Editor {
         if let Some(text) = self.window_mut_of(new).and_then(Window::text_mut) {
             text.selections = Selections::single(cursor);
         }
-        self.set_focus(focus);
-        self.previous = previous;
         true
     }
 
@@ -8733,9 +8728,17 @@ impl Editor {
     /// alternate — what `run_bang` and the filter family (`run_filter`,
     /// `run_read`, `run_write`) all share. See `docs/specs/shell.md`.
     fn expand_shell(&self, cmd: &str) -> Result<String, String> {
-        let current = self.window().buffer().and_then(|id| self.entry(id).buffer.path.clone());
-        let alternate =
-            self.window().alt_buffer().and_then(|id| self.entry(id).buffer.path.clone());
+        // From inside a job's log — where `:!` leaves you — `%` still means
+        // the file the command was run from: the log's window was split off
+        // that file, so it is the window's alternate. A log has no path of
+        // its own to offer, and "no file name" would make `:!!` from the
+        // log a different command from the one it repeats.
+        let (current, alternate) = match self.window().buffer() {
+            Some(id) if self.entry(id).buffer.is_transient() => (self.window().alt_buffer(), None),
+            current => (current, self.window().alt_buffer()),
+        };
+        let current = current.and_then(|id| self.entry(id).buffer.path.clone());
+        let alternate = alternate.and_then(|id| self.entry(id).buffer.path.clone());
         let current = current.map(|p| p.display().to_string());
         let alternate = alternate.map(|p| p.display().to_string());
         shell::expand(cmd, current.as_deref(), alternate.as_deref())
@@ -8791,10 +8794,8 @@ impl Editor {
         // filesystem and a file name may hold a control byte.
         // `docs/specs/ansi.md` §"Rule 1".
         let shown_cmd = shell::sanitize(&expanded);
-        // `show_transient` restores focus and `previous` itself, so there is
-        // nothing here to save and put back — the cursor never leaves the
-        // buffer the command was run from, the way vim leaves you in place
-        // and `docs/specs/transient.md` already requires.
+        // Focus lands in the log (`show_transient`); `%` and `#` were
+        // expanded above, against the buffer the command was run from.
         let id = self.transient_buffer(&format!("!{shown_cmd}"));
         self.append_to_transient(id, &[format!("$ {shown_cmd}")]);
         let shown = self.show_transient(id);
@@ -27421,11 +27422,12 @@ int main(void) {
             assert_eq!(spawned.len(), 1);
             assert_eq!(spawned[0].0, "echo hi");
             drop(spawned);
-            assert_eq!(ed.focus(), before, "focus stayed in the buffer");
             let id = transient_id(&ed);
             assert_eq!(ed.name_of(id), "[!echo hi]");
             let shown = transient_window(&ed, id);
-            assert_ne!(shown, before, "shown in a split, not the focused window");
+            assert_ne!(shown, before, "shown in a split of its own");
+            assert_eq!(ed.focus(), shown, "and focus went with it");
+            assert_eq!(ed.previous, Some(before), "Ctrl-W p goes back to where it was run");
             assert_eq!(transient_lines(&ed, id), vec!["$ echo hi".to_string()]);
 
             let (_, slot) = last_spawned(&fake);
@@ -27603,13 +27605,13 @@ int main(void) {
         /// parked the cursor there would make the next `%` fail with "no
         /// file name" and the next `#` mean the file it displaced.
         #[test]
-        fn a_job_takes_the_split_but_not_the_focus() {
+        fn a_job_takes_the_focus_and_percent_still_means_the_file() {
             let (dir, mut ed, fake) = project("focus");
             let before = ed.focus();
 
             ex(&mut ed, "!echo %");
 
-            assert_eq!(ed.focus(), before, "the cursor stayed in the buffer");
+            assert_ne!(ed.focus(), before, "focus moved into the log");
             let (_, slot) = last_spawned(&fake);
             slot.finish(Exit::Code(0));
             ed.settle();
@@ -28323,8 +28325,6 @@ int main(void) {
             ed.apply(cmd(Action::Window(WindowCmd::Focus(Side::Up))));
             let stray = ed.window_ids().into_iter().find(|&w| w != ed.focus()).unwrap();
             ed.close_window(stray);
-            let previous_before = ed.previous;
-            assert!(previous_before.is_some(), "set up a real jump to check against");
 
             let before = ed.focus();
             let before_rect = ed.layout.rect_of(before, ed.area, &ed.chrome).unwrap();
@@ -28332,24 +28332,22 @@ int main(void) {
             let id = ed.transient_buffer("!make");
             ed.show_transient(id);
 
-            assert_eq!(ed.focus(), before, "focus never moved");
             assert_eq!(ed.window_ids().len(), 2, "a split");
-            assert_eq!(
-                ed.previous, previous_before,
-                "the round trip through the transient split did not overwrite it"
-            );
-
             let shown =
                 ed.window_ids().into_iter().find(|&w| w != before).expect("a second window");
             assert_eq!(ed.window_of(shown).and_then(Window::buffer), Some(id));
+            assert_eq!(ed.focus(), shown, "focus moved into the log");
+            assert_eq!(ed.previous, Some(before), "and the window it was run from is previous");
 
             let rect = ed.layout.rect_of(shown, ed.area, &ed.chrome).unwrap();
             assert!(rect.y > before_rect.y, "below, not above");
 
-            // A second call with a window already showing it does nothing.
+            // A second call with a window already showing it opens nothing
+            // and focuses that window, wherever focus was.
+            ed.set_focus(before);
             ed.show_transient(id);
             assert_eq!(ed.window_ids().len(), 2, "no second split");
-            assert_eq!(ed.focus(), before);
+            assert_eq!(ed.focus(), shown);
         }
 
         #[test]
