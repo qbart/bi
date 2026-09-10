@@ -645,7 +645,15 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
 | `:base64e` `:base64d` | base64 the selection, a range, or the whole file — each piece on its own, in place |
+| `:hexe` `:hexd` `:urle` `:urld` | the same, as hex or percent-encoding |
+| `:jsonfmt` `:jsonmin` | pretty-print JSON with the buffer's indent, or minify it |
+| `:md5` `:sha256` | the digest in place of the text |
 | `:uuid4` `:uuid7` `:uuidzero` | a random, a time-ordered, or the nil uuid — after each cursor, or in place of each selection |
+| `:ulid` `:nanoid` `:epoch` | likewise: a ulid, a nanoid, unix seconds |
+| `:date [fmt]` `:time [fmt]` | today or now, local, ISO unless a strftime format says otherwise |
+| `:lorem [n]` `:password [len]` | n paragraphs of filler; len random characters |
+| `:uniq` `:dedup` `:reverse` | adjacent repeats collapsed; every repeat dropped; last line first |
+| `:align seq` `:align! seq` | pad before the first `seq` on each line so they share a column — or after it |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
@@ -669,16 +677,23 @@ case, and the flags combine in any order. The sort is stable, one undo step,
 and a range already in order says `already sorted` and touches nothing. See
 [docs/specs/sort.md](specs/sort.md).
 
-`:base64e` and `:base64d` respell what the scope names — the whole file when
+`:base64e`, `:hexe`, `:urle` and their decoders, `:jsonfmt`, `:jsonmin`,
+`:md5` and `:sha256` respell what the scope names — the whole file when
 nothing narrows it — and each contiguous piece on its own: a selection across
 lines is one blob, a rectangle is one per row, a line range is its rows joined
-as one. Decoding forgives whitespace, the URL-safe alphabet and missing
-padding, and refuses anything that is not base64 or does not decode to text,
-touching nothing. See [docs/specs/transform.md](specs/transform.md).
+as one. The decoders forgive whitespace and dialects on the way in and refuse
+anything that is not what they read, or does not decode to text, touching
+nothing. See [docs/specs/transform.md](specs/transform.md).
 
-`:uuid4`, `:uuid7` and `:uuidzero` put an id after the cursor, or in place of
-the selection — one per cursor, each its own. A line range is refused. See
-[docs/specs/generate.md](specs/generate.md).
+`:uuid4`, `:ulid`, `:date`, `:password` and the rest put a value after the
+cursor, or in place of the selection — one per cursor, each its own. A line
+range is refused. See [docs/specs/generate.md](specs/generate.md).
+
+`:uniq`, `:dedup`, `:reverse` and `:align` rearrange whole rows the way
+`:sort` does — the file, a range, or the selected rows. `:uniq` is adjacent
+repeats, `:dedup` is every repeat. `:align =` pads before the first `=` on
+each line until they share a column; `:align! :` pads after it. See
+[docs/specs/lines.md](specs/lines.md).
 
 `:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `dash` or
 `const` — one name each, no aliases.

@@ -192,6 +192,7 @@ const LIB_MODULES: &[&str] = &[
     "jumps.rs",
     "key.rs",
     "label.rs",
+    "lines.rs",
     "lsp/client.rs",
     "lsp/mod.rs",
     "lsp/pos.rs",

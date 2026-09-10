@@ -1770,6 +1770,12 @@ enum ExLine {
         scope: Option<Scope>,
         what: crate::generate::Generator,
     },
+    /// `:uniq`, `:dedup`, `:reverse`, `:align` — whole rows rearranged, the
+    /// whole file when nothing narrows it. See `docs/specs/lines.md`.
+    Lines {
+        scope: Option<Scope>,
+        op: crate::lines::LineOp,
+    },
     /// `:[scope]case snake` — respell what is named, or the word under each
     /// cursor when nothing is.
     ///
@@ -2107,6 +2113,9 @@ fn parse_ex(line: &str) -> Option<ExLine> {
     // bi does not, and a command that ignores half of what you typed is the
     // worse of the two ways to not support something.
     if scope.is_some()
+        && !crate::transform::NAMES.contains(&name)
+        && !crate::generate::NAMES.contains(&name)
+        && !crate::lines::NAMES.contains(&name)
         && !matches!(
             name,
             "m" | "move"
@@ -2116,11 +2125,6 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 | "retab"
                 | "case"
                 | "sort"
-                | "base64e"
-                | "base64d"
-                | "uuid4"
-                | "uuid7"
-                | "uuidzero"
                 | "&"
                 | "&&"
                 | "d"
@@ -2130,6 +2134,29 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         )
     {
         return Some(ExLine::Error(format!("`:{name}` takes no range")));
+    }
+
+    // Three families of commands that each own their names: a respelling
+    // of the text in range, a value typed at the cursor, a rearrangement of
+    // whole rows. Each module says which names are its own, so a new one is
+    // an arm there and nothing here.
+    if let Some(how) = crate::transform::Transform::parse(name) {
+        return Some(match arg.is_empty() {
+            true => ExLine::Transform { scope, how },
+            false => ExLine::Error(format!("{name} takes no argument")),
+        });
+    }
+    if let Some(parsed) = crate::generate::Generator::parse(name, arg) {
+        return Some(match parsed {
+            Ok(what) => ExLine::Generate { scope, what },
+            Err(message) => ExLine::Error(message),
+        });
+    }
+    if let Some(parsed) = crate::lines::LineOp::parse(name, arg, force) {
+        return Some(match parsed {
+            Ok(op) => ExLine::Lines { scope, op },
+            Err(message) => ExLine::Error(message),
+        });
     }
 
     Some(match name {
@@ -2336,14 +2363,6 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             Ok(how) => ExLine::Sort { scope, how },
             Err(message) => ExLine::Error(message),
         },
-        "base64e" | "base64d" | "uuid4" | "uuid7" | "uuidzero" if !arg.is_empty() => {
-            ExLine::Error(format!("{name} takes no argument"))
-        }
-        "base64e" => ExLine::Transform { scope, how: crate::transform::Transform::Base64Encode },
-        "base64d" => ExLine::Transform { scope, how: crate::transform::Transform::Base64Decode },
-        "uuid4" => ExLine::Generate { scope, what: crate::generate::Generator::Uuid4 },
-        "uuid7" => ExLine::Generate { scope, what: crate::generate::Generator::Uuid7 },
-        "uuidzero" => ExLine::Generate { scope, what: crate::generate::Generator::UuidZero },
         "case" => match crate::case::Style::parse(arg) {
             Some(style) => ExLine::Case { scope, style },
             None => {
@@ -7171,7 +7190,10 @@ impl Editor {
                 self.in_view(|view| view.transform(scope, shape, how));
             }
             ExLine::Generate { scope, what } => {
-                self.in_view(|view| view.generate(scope, shape, what));
+                self.in_view(|view| view.generate(scope, shape, &what));
+            }
+            ExLine::Lines { scope, op } => {
+                self.in_view(|view| view.edit_rows(scope, shape, &op));
             }
             ExLine::Retab(scope) => {
                 self.in_view(|view| view.retab(scope, shape));
@@ -13158,6 +13180,9 @@ impl View<'_> {
         shape: Option<Shape>,
         how: crate::transform::Transform,
     ) {
+        // `:jsonfmt` indents the way this buffer does.
+        let indent = self.options.indent();
+        let how = how.with_indent(&indent.render(indent.step()));
         let region = match self.region(scope, shape, Fallback::File) {
             Ok(region) => region,
             Err(message) => {
@@ -13173,7 +13198,7 @@ impl View<'_> {
             _ => region,
         };
         if region.is_empty() {
-            self.session.status = format!("nothing to {}", how.verb().trim_end_matches('d'));
+            self.session.status = format!("nothing to {}", how.deed());
             return;
         }
 
@@ -13207,8 +13232,8 @@ impl View<'_> {
 
         let pieces = outputs.len();
         self.session.status = match pieces {
-            1 => how.verb().to_string(),
-            n => format!("{n} pieces {}", how.verb()),
+            1 => how.done().to_string(),
+            n => format!("{n} pieces {}", how.done()),
         };
         self.session.mode = Mode::Normal;
     }
@@ -13219,7 +13244,7 @@ impl View<'_> {
         &mut self,
         scope: Option<Scope>,
         shape: Option<Shape>,
-        what: crate::generate::Generator,
+        what: &crate::generate::Generator,
     ) {
         let region = match scope {
             Some(Scope::Lines(_)) => {
@@ -13249,7 +13274,16 @@ impl View<'_> {
             ),
         };
 
-        let outputs: Vec<String> = region.parts().iter().map(|_| what.generate()).collect();
+        let mut outputs = Vec::with_capacity(region.parts().len());
+        for _ in region.parts() {
+            match what.generate() {
+                Ok(text) => outputs.push(text),
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            }
+        }
         let before = self.selections.as_pairs();
         let edits = region.replace(self.buffer, &outputs);
         // On the last character of each id, as after `p`.
@@ -13513,6 +13547,50 @@ impl View<'_> {
     /// `:m` and `:retab` do. The ordering itself lives in `crate::sort`,
     /// which has never heard of a buffer. See `docs/specs/sort.md`.
     fn sort_rows(&mut self, scope: Option<Scope>, shape: Option<Shape>, how: &crate::sort::Sort) {
+        self.rewrite_whole_rows(scope, shape, 2, "nothing to sort", "already sorted", |lines| {
+            let (sorted, dropped) = crate::sort::sort_lines(lines, how);
+            let rows = sorted.len() + dropped;
+            let mut report = format!("{rows} line{} sorted", if rows == 1 { "" } else { "s" });
+            if dropped > 0 {
+                report.push_str(&format!(
+                    ", {dropped} duplicate{} dropped",
+                    if dropped == 1 { "" } else { "s" }
+                ));
+            }
+            Ok((sorted, report))
+        });
+    }
+
+    /// `:uniq`, `:dedup`, `:reverse`, `:align` — see `docs/specs/lines.md`.
+    fn edit_rows(&mut self, scope: Option<Scope>, shape: Option<Shape>, op: &crate::lines::LineOp) {
+        let tab_width = self.options.indent().tab_width;
+        self.rewrite_whole_rows(
+            scope,
+            shape,
+            op.min_rows(),
+            op.too_few(),
+            &op.unchanged(),
+            |lines| op.apply(lines, tab_width),
+        );
+    }
+
+    /// The shape every command that rearranges whole rows shares: the file
+    /// when nothing narrows it, a scope widened to its rows and said so,
+    /// the rows through `f`, and one `replace_range` for what changed.
+    ///
+    /// `f` hands back the new rows and a report, or a message for a range it
+    /// could do nothing with. Rows that come back as they went in are
+    /// `unchanged` — no edit and no undo entry, because an unchanged buffer
+    /// with a revision in its history is a `u` that appears to do nothing.
+    fn rewrite_whole_rows(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        min_rows: usize,
+        too_few: &str,
+        unchanged: &str,
+        f: impl FnOnce(Vec<String>) -> Result<(Vec<String>, String), String>,
+    ) {
         let region = match self.region(scope, shape, Fallback::File) {
             Ok(region) => region,
             Err(message) => {
@@ -13521,38 +13599,33 @@ impl View<'_> {
             }
         };
         let Some((first, last)) = self.whole_rows(region) else { return };
-        if last - first < 1 {
-            self.session.status = "nothing to sort".into();
+        if last - first + 1 < min_rows {
+            self.session.status = too_few.into();
             return;
         }
 
         let lines: Vec<String> = (first..=last).map(|row| self.buffer.line(row)).collect();
-        let (sorted, dropped) = crate::sort::sort_lines(lines.clone(), how);
-        if sorted == lines {
-            // No edit and no undo entry: an unchanged buffer with a revision
-            // in its history is a `u` that appears to do nothing.
-            self.session.status = "already sorted".into();
+        let (rewritten, report) = match f(lines.clone()) {
+            Ok(done) => done,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        if rewritten == lines {
+            self.session.status = unchanged.into();
             return;
         }
 
         let before = self.selections.as_pairs();
         let start = self.buffer.rope().line_to_char(first);
         let stop = self.buffer.rope().line_to_char(last) + self.buffer.line_len(last);
-        self.buffer.replace_range(start, stop, &sorted.join("\n"));
+        self.buffer.replace_range(start, stop, &rewritten.join("\n"));
 
         // The block starts here, and the selection that named it has been
         // consumed.
         *self.selections = Selections::single(self.buffer.clamped(Cursor::at(start), false));
         self.buffer.commit_undo(before, self.selections.as_pairs());
-
-        let rows = last - first + 1;
-        let mut report = format!("{rows} line{} sorted", if rows == 1 { "" } else { "s" });
-        if dropped > 0 {
-            report.push_str(&format!(
-                ", {dropped} duplicate{} dropped",
-                if dropped == 1 { "" } else { "s" }
-            ));
-        }
         self.session.status = report;
     }
 
@@ -23637,6 +23710,133 @@ int main(void) {
         assert_ne!(whole(&ed), "one\ntwo\n");
         ed.apply(cmd(Action::Undo));
         assert_eq!(whole(&ed), "one\ntwo\n");
+    }
+
+    // ---- the rest of the transform family -----------------------------------
+
+    #[test]
+    fn hexe_and_hexd_respell_the_selection_and_md5_replaces_it() {
+        let mut ed = visual("say hi now\n", 4, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Right)));
+
+        ex(&mut ed, "'v hexe");
+        assert_eq!(whole(&ed), "say 6869 now\n");
+
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        for _ in 0..3 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+        ex(&mut ed, "'v hexd");
+        assert_eq!(whole(&ed), "say hi now\n");
+
+        let mut ed = editor("hello\n");
+        ex(&mut ed, "md5");
+        assert_eq!(whole(&ed), "5d41402abc4b2a76b9719d911017c592\n");
+        assert_eq!(ed.session.status, "hashed");
+    }
+
+    #[test]
+    fn jsonfmt_indents_the_way_the_buffer_does_and_jsonmin_undoes_it() {
+        let mut ed = editor("{\"a\":[1,2],\"b\":{}}\n");
+        let indent = ed.options().indent();
+        let unit = indent.render(indent.step());
+
+        ex(&mut ed, "jsonfmt");
+        assert_eq!(
+            whole(&ed),
+            format!(
+                "{{\n{unit}\"a\": [\n{unit}{unit}1,\n{unit}{unit}2\n{unit}],\n{unit}\"b\": {{}}\n}}\n"
+            )
+        );
+        assert_eq!(ed.session.status, "formatted");
+
+        ex(&mut ed, "jsonmin");
+        assert_eq!(whole(&ed), "{\"a\":[1,2],\"b\":{}}\n");
+
+        ex(&mut ed, "urle");
+        assert_eq!(whole(&ed), "%7B%22a%22%3A%5B1%2C2%5D%2C%22b%22%3A%7B%7D%7D\n");
+        ex(&mut ed, "jsonfmt");
+        assert!(ed.session.status.starts_with("not JSON: "), "{}", ed.session.status);
+    }
+
+    // ---- the rest of the generate family ------------------------------------
+
+    #[test]
+    fn lorem_password_and_date_land_after_the_cursor() {
+        let mut ed = editor("x\n");
+        ex(&mut ed, "lorem 2");
+        let text = whole(&ed);
+        assert!(text.starts_with("xLorem ipsum"), "{text}");
+        assert_eq!(text.matches("\n\n").count(), 1, "two paragraphs");
+
+        let mut ed = editor("pw=\n");
+        ed.set_cursor(Cursor::at(2));
+        ex(&mut ed, "password 8");
+        assert_eq!(whole(&ed).len(), 3 + 8 + 1);
+        assert_eq!(ed.cursor().unwrap().at, 10, "on the last character");
+
+        let mut ed = editor("\n");
+        ex(&mut ed, "date %Y");
+        let text = whole(&ed);
+        assert_eq!(text.len(), 5, "{text}");
+        assert!(text.trim().chars().all(|c| c.is_ascii_digit()), "{text}");
+
+        ex(&mut ed, "lorem lots");
+        assert_eq!(ed.session.status, "lorem how many? `:lorem 3`");
+        ex(&mut ed, "epoch now");
+        assert_eq!(ed.session.status, "epoch takes no argument");
+    }
+
+    // ---- :uniq / :dedup / :reverse / :align ---------------------------------
+
+    #[test]
+    fn uniq_drops_adjacent_repeats_and_dedup_drops_every_repeat() {
+        let mut ed = editor("a\na\nb\na\n");
+        ex(&mut ed, "uniq");
+        assert_eq!(whole(&ed), "a\nb\na\n");
+        assert_eq!(ed.session.status, "1 line dropped");
+
+        ex(&mut ed, "dedup");
+        assert_eq!(whole(&ed), "a\nb\n");
+        assert_eq!(ed.session.status, "1 line dropped");
+
+        ex(&mut ed, "dedup");
+        assert_eq!(ed.session.status, "nothing to drop");
+    }
+
+    #[test]
+    fn reverse_flips_the_range_and_is_one_undo_step() {
+        let mut ed = editor("1\n2\n3\n4\n");
+        ex(&mut ed, "2,3reverse");
+        assert_eq!(whole(&ed), "1\n3\n2\n4\n");
+        assert_eq!(ed.session.status, "2 lines reversed");
+
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), "1\n2\n3\n4\n");
+
+        ex(&mut ed, "1reverse");
+        assert_eq!(ed.session.status, "nothing to reverse");
+    }
+
+    #[test]
+    fn align_pads_before_the_sequence_and_bang_after_it() {
+        let mut ed = editor("a = 1\nbbb = 2\n");
+        ex(&mut ed, "align =");
+        assert_eq!(whole(&ed), "a   = 1\nbbb = 2\n");
+        assert_eq!(ed.session.status, "2 lines aligned");
+
+        ex(&mut ed, "align =");
+        assert_eq!(ed.session.status, "already aligned on `=`");
+
+        let mut ed = visual("k: v\nlongkey: v\nskip: me\n", 0, Shape::Lines);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+        ex(&mut ed, "'v align! :");
+        assert_eq!(whole(&ed), "k:       v\nlongkey: v\nskip: me\n");
+
+        ex(&mut ed, "align");
+        assert_eq!(ed.session.status, "align on what? `:align =`");
+        ex(&mut ed, "align ~");
+        assert_eq!(ed.session.status, "no `~` here");
     }
 
     // ---- labels -------------------------------------------------------------

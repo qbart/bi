@@ -10,7 +10,9 @@ ropey = "1.6"
 # are bi's own (src/lsp/types.rs), not the `lsp-types` crate — see
 # docs/specs/lsp.md for why.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` because `:jsonfmt` must not reorder keys: a formatter
+# that sorts them has changed the document.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Display width in cells, not chars — a CJK char is two columns and a
 # combining mark is none, and the cursor lands wrong without knowing that.
 unicode-width = "0.2"
@@ -86,6 +88,15 @@ encoding_rs = "0.8.35"
 # `:uuid4` and `:uuid7`. Randomness is a thing to get right once, and this
 # crate is where it has been gotten right. See docs/specs/generate.md.
 uuid = { version = "1.26.1", features = ["v4", "v7"] }
+# `:md5` and `:sha256`.
+md-5 = "0.11.0"
+sha2 = "0.11.0"
+# `:password`, `:nanoid` — and the ids below draw from it too.
+rand = "0.10.2"
+# `:date`, `:time`, `:epoch`. Local time means the zone database, which is
+# the part nobody should write twice.
+jiff = "0.2.35"
+ulid = "3.0.0"
 
 [profile.release]
 lto = true

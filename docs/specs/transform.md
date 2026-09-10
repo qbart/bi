@@ -1,14 +1,20 @@
-# `:base64e` and `:base64d`
+# Transforms: `:base64e`, `:hexe`, `:urle`, `:jsonfmt`, `:md5` and kin
 
 A token in a config file, a blob in a JSON fixture, a header in a request
-log: base64 turns up in text you are editing, and reading it means leaving
-the editor to `echo | base64 -d` and coming back. These two commands are that
-round trip, in place.
+log: encoded text turns up in text you are editing, and reading it means
+leaving the editor to `echo | base64 -d` and coming back. These commands are
+that round trip, in place.
 
 ```
-:base64e        encode what the scope names
-:base64d        decode it
+:base64e  :base64d     base64
+:hexe     :hexd        hex
+:urle     :urld        percent-encoding
+:jsonfmt  :jsonmin     JSON, pretty-printed or minified
+:md5      :sha256      the digest, in place of the text
 ```
+
+Every one is *text in, text out*, over the same scope, with the same
+afterwards. Below, "encode" stands for whichever of them you ran.
 
 ## Status
 
@@ -40,15 +46,13 @@ rows as one — and the terminator after the last row stays where it was, so
 An empty file, or a selection with nothing in it, says `nothing to encode`
 and does nothing.
 
-## Encoding
+## Each one
 
-The standard alphabet, `+` and `/`, padded with `=`, on one line — no
+**`:base64e`** — the standard alphabet, `+` and `/`, padded with `=`, on one line — no
 wrapping at 76 columns. Wrapping is a transport concern and every decoder
 ignores it anyway; the editor's job is the bytes.
 
-## Decoding
-
-Decoding is **lenient on the way in**, since the text was pasted from
+**`:base64d`** is **lenient on the way in**, since the text was pasted from
 somewhere: whitespace anywhere in it is ignored, so a blob wrapped by
 whatever produced it decodes as one; the URL-safe alphabet (`-` and `_`) is
 read as well as the standard one; and the `=` padding may be there or not.
@@ -59,9 +63,31 @@ to something other than UTF-8 are an error too, `decoded bytes are not
 UTF-8`, and nothing changes: the buffer holds text, and a decoded PNG
 sprayed into it as replacement characters is not what anyone asked for.
 
-Every piece is decoded before any is written. Two selected blobs where the
-second is broken is an error and an unchanged buffer, not one blob decoded
-and a message about the other.
+**`:hexe`** is the UTF-8 bytes as lowercase hex, no separators. **`:hexd`**
+reads either case, ignores whitespace, names a stray character with its
+offset — `not hex: \`g\` at 1` — and refuses an odd count of digits, since
+half a byte is not a byte.
+
+**`:urle`** percent-encodes every byte outside RFC 3986's unreserved set
+(`A-Z a-z 0-9 - _ . ~`), a space included, as `%XX` per UTF-8 byte.
+**`:urld`** turns `%XX` back and leaves a `+` a `+`: reading it as a space
+is the form-encoding dialect, and a query string is not the only place a URL
+escape turns up. A `%` without two hex digits after it is an error naming
+the offset.
+
+**`:jsonfmt`** pretty-prints, one indent unit per level, **the buffer's
+unit** — `tab_width` and `expandtab` as they stand for this file, so a
+tab-indented file gets tabs. Keys keep the order they had; a formatter that
+sorts them has changed the document. **`:jsonmin`** removes every
+insignificant byte. Anything that is not JSON is `not JSON: …` with the
+parser's own reason, and nothing changes.
+
+**`:md5`** and **`:sha256`** replace the text with its digest, lowercase
+hex. There is no decoding a digest, so the pair is one command.
+
+Every piece is transformed before any is written. Two selected blobs where
+the second is broken is an error and an unchanged buffer, not one blob
+decoded and a message about the other.
 
 ## Afterwards
 
@@ -69,8 +95,9 @@ and a message about the other.
 - **One cursor per piece, at its start**, collapsed. The selection that named
   the piece has been consumed; what stands in its place is the start of the
   new text, which is where the next thing you do begins.
-- The report says `encoded` or `decoded` — with a count, `3 pieces decoded`,
-  when there was more than one.
+- The report says what was done — `encoded`, `decoded`, `formatted`,
+  `minified`, `hashed` — with a count, `3 pieces decoded`, when there was
+  more than one.
 
 ## Where it lives
 
@@ -78,28 +105,40 @@ and a message about the other.
 error, and no knowledge of a buffer anywhere in it:
 
 ```rust
-pub enum Transform { Base64Encode, Base64Decode }
+pub enum Transform {
+    Base64Encode, Base64Decode, HexEncode, HexDecode, UrlEncode, UrlDecode,
+    JsonFormat { indent: String }, JsonMinify, Md5, Sha256,
+}
 
 impl Transform {
-    pub fn apply(self, text: &str) -> Result<String, String>;
+    pub fn parse(name: &str) -> Option<Self>;
+    pub fn apply(&self, text: &str) -> Result<String, String>;
 }
+pub const NAMES: &[&str];
 ```
 
-The enum, rather than two functions, is the point: `:hexe`, `:urle`, a JSON
-string escape — every "this text, spelled differently" command is a third
-arm here and nothing new in the editor. The doing is `View::transform`,
-beside `recase`, which resolves the scope through `View::region`, joins a
-line range into one piece, applies the transform to each, and writes them
-back through `Region::replace`.
+The enum, rather than a function per command, is the point: every "this
+text, spelled differently" command is an arm here and nothing new in the
+editor, which asks `parse` whether a name is one of these and never lists
+them itself. The doing is `View::transform`, beside `recase`, which resolves
+the scope through `View::region`, joins a line range into one piece, fills
+in the indent unit for `:jsonfmt`, applies the transform to each piece, and
+writes them back through `Region::replace`.
 
 ## Tests
 
 In `transform.rs`, no buffer involved:
 
-- encoding is standard-alphabet, padded, unwrapped; the empty string encodes
-  to itself.
-- decoding accepts whitespace, both alphabets, and missing padding.
-- a bad character names itself and its offset; non-UTF-8 output is refused.
+- every name parses and a stranger does not.
+- base64 encoding is standard-alphabet, padded, unwrapped; decoding accepts
+  whitespace, both alphabets, and missing padding; a bad character names
+  itself and its offset.
+- hex is lowercase out and either case in; an odd digit count is refused.
+- `:urle` escapes everything but the unreserved set; `+` survives `:urld`.
+- `:jsonfmt` uses the unit it is given and keeps key order; `:jsonmin`
+  strips; non-JSON is refused with the parser's reason.
+- the digests of `hello`.
+- every decoder refuses bytes that are not UTF-8; every pair round-trips.
 
 In `editor.rs`:
 
@@ -111,3 +150,6 @@ In `editor.rs`:
 - `:2,3base64e` encodes the rows as one piece and leaves the rest alone.
 - a broken piece leaves the buffer untouched, and the message names the byte.
 - one undo step.
+- `:'v hexe` then `:'v hexd` is the selection back; `:md5` replaces the file
+  with its digest.
+- `:jsonfmt` indents with the buffer's own unit and `:jsonmin` undoes it.

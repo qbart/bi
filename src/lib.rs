@@ -44,6 +44,7 @@ pub mod input;
 pub mod jumps;
 pub mod key;
 pub mod label;
+pub mod lines;
 pub mod lsp;
 pub mod motion;
 pub mod picker;
