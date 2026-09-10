@@ -264,6 +264,40 @@ impl Region {
         buffer.pending_edits[base..].to_vec()
     }
 
+    /// Replaces every part with its own text — `texts[i]` for `parts[i]` —
+    /// and hands back the edits it made.
+    ///
+    /// For a rewrite whose outputs were computed, and checked, before any
+    /// of them is written: `:base64d` decodes every piece first so that a
+    /// broken second piece is an unchanged buffer, not half a command. An
+    /// empty part with text is an insertion, which is what `:uuid4` after a
+    /// cursor is. Bottom to top, for the reason [`Region::rewrite`] gives.
+    pub fn replace(&self, buffer: &mut Buffer, texts: &[String]) -> Vec<Edit> {
+        debug_assert_eq!(texts.len(), self.parts.len());
+        let base = buffer.pending_edits.len();
+        for (part, text) in self.parts.iter().zip(texts).rev() {
+            if part.is_empty() && text.is_empty() {
+                continue;
+            }
+            buffer.replace_range(part.start, part.end.max(part.start), text);
+        }
+        buffer.pending_edits[base..].to_vec()
+    }
+
+    /// The same region as one part, from the first character to the last.
+    ///
+    /// What a line range means to a command that reads its rows as one
+    /// text: `:2,5base64e` encodes the rows *and the terminators between
+    /// them* as one piece. The terminator after the last row is not inside,
+    /// so it stays where it was.
+    pub fn joined(&self) -> Self {
+        let parts = match (self.parts.first(), self.parts.last()) {
+            (Some(first), Some(last)) => vec![Part { start: first.start, end: last.end }],
+            _ => Vec::new(),
+        };
+        Self { shape: self.shape, parts }
+    }
+
     /// Applies an operator over every part, bottom to top.
     ///
     /// Same ordering and same reason as [`Region::rewrite`]: a cut shifts

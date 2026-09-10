@@ -1757,6 +1757,19 @@ enum ExLine {
         scope: Option<Scope>,
         how: crate::sort::Sort,
     },
+    /// `:[scope]base64e` / `:[scope]base64d` — respell each piece the scope
+    /// names, the whole file when nothing narrows it. See
+    /// `docs/specs/transform.md`.
+    Transform {
+        scope: Option<Scope>,
+        how: crate::transform::Transform,
+    },
+    /// `:uuid4` and kin — text after each cursor, or in place of each
+    /// selection. See `docs/specs/generate.md`.
+    Generate {
+        scope: Option<Scope>,
+        what: crate::generate::Generator,
+    },
     /// `:[scope]case snake` — respell what is named, or the word under each
     /// cursor when nothing is.
     ///
@@ -2103,6 +2116,11 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 | "retab"
                 | "case"
                 | "sort"
+                | "base64e"
+                | "base64d"
+                | "uuid4"
+                | "uuid7"
+                | "uuidzero"
                 | "&"
                 | "&&"
                 | "d"
@@ -2251,9 +2269,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
                 let pid_arg = arg["attach-pid".len()..].trim();
                 match pid_arg.parse::<u32>() {
                     Ok(pid) => ExLine::Debug(DebugCmd::AttachTo { name: None, pid }),
-                    Err(_) => {
-                        ExLine::Error(format!("attach-pid wants a number — got `{pid_arg}`"))
-                    }
+                    Err(_) => ExLine::Error(format!("attach-pid wants a number — got `{pid_arg}`")),
                 }
             }
             name => ExLine::Debug(DebugCmd::Start { name: Some(name.to_string()) }),
@@ -2320,6 +2336,14 @@ fn parse_ex(line: &str) -> Option<ExLine> {
             Ok(how) => ExLine::Sort { scope, how },
             Err(message) => ExLine::Error(message),
         },
+        "base64e" | "base64d" | "uuid4" | "uuid7" | "uuidzero" if !arg.is_empty() => {
+            ExLine::Error(format!("{name} takes no argument"))
+        }
+        "base64e" => ExLine::Transform { scope, how: crate::transform::Transform::Base64Encode },
+        "base64d" => ExLine::Transform { scope, how: crate::transform::Transform::Base64Decode },
+        "uuid4" => ExLine::Generate { scope, what: crate::generate::Generator::Uuid4 },
+        "uuid7" => ExLine::Generate { scope, what: crate::generate::Generator::Uuid7 },
+        "uuidzero" => ExLine::Generate { scope, what: crate::generate::Generator::UuidZero },
         "case" => match crate::case::Style::parse(arg) {
             Some(style) => ExLine::Case { scope, style },
             None => {
@@ -2494,23 +2518,14 @@ pub enum ShellCmd {
     /// vim — though the parser never produces that for this variant, since
     /// a scope-less `!` is always `Run`; only `:.!cmd` spells the current
     /// line explicitly.
-    Filter {
-        scope: Option<Scope>,
-        cmd: String,
-    },
+    Filter { scope: Option<Scope>, cmd: String },
     /// `:[range]r !cmd` — inserts stdout below the cursor line or the
     /// range's last line.
-    Read {
-        scope: Option<Scope>,
-        cmd: String,
-    },
+    Read { scope: Option<Scope>, cmd: String },
     /// `:[range]w !cmd` — feeds the lines (default: the whole buffer) to
     /// the command's stdin and shows its output in the same transient
     /// buffer as a job's.
-    Write {
-        scope: Option<Scope>,
-        cmd: String,
-    },
+    Write { scope: Option<Scope>, cmd: String },
 }
 
 /// `DebugCmd::AttachPid` and `DebugCmd::AttachTo`'s shared resolution —
@@ -2610,7 +2625,8 @@ fn scan_processes(proc_root: &Path) -> Vec<(u32, String, String)> {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
             let cmdline = std::fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
-            let cmdline = cmdline.split('\0').filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+            let cmdline =
+                cmdline.split('\0').filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
             Some((pid, comm.trim().to_string(), cmdline))
         })
         .collect();
@@ -5768,8 +5784,7 @@ impl Editor {
     /// closes it leaves you in the log, not two windows away from it.
     /// `docs/specs/transient.md` §"Where it shows".
     fn show_transient(&mut self, id: BufferId) -> bool {
-        if let Some(shown) = self.windows.iter().find(|w| w.buffer() == Some(id)).map(|w| w.id)
-        {
+        if let Some(shown) = self.windows.iter().find(|w| w.buffer() == Some(id)).map(|w| w.id) {
             self.set_focus(shown);
             return true;
         }
@@ -7152,6 +7167,12 @@ impl Editor {
             ExLine::Case { scope, style } => {
                 self.in_view(|view| view.recase(scope, shape, style));
             }
+            ExLine::Transform { scope, how } => {
+                self.in_view(|view| view.transform(scope, shape, how));
+            }
+            ExLine::Generate { scope, what } => {
+                self.in_view(|view| view.generate(scope, shape, what));
+            }
             ExLine::Retab(scope) => {
                 self.in_view(|view| view.retab(scope, shape));
             }
@@ -8236,8 +8257,7 @@ impl Editor {
             self.session.status = "debug is off (`enabled = false` in [debug])".into();
             return;
         }
-        let launch_name = match resolve_attach_config(&self.config.debug.launch, name.as_deref())
-        {
+        let launch_name = match resolve_attach_config(&self.config.debug.launch, name.as_deref()) {
             Ok(launch) => launch.name.clone(),
             Err(status) => {
                 self.session.status = status;
@@ -13127,6 +13147,124 @@ impl View<'_> {
                 format!("{rows} line{} recased", if rows == 1 { "" } else { "s" });
         }
         // A selection that has been rewritten is not a selection any more.
+        self.session.mode = Mode::Normal;
+    }
+
+    /// `:[scope]base64e` and `:[scope]base64d`: each piece the scope names,
+    /// respelled on its own. See `docs/specs/transform.md`.
+    fn transform(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        how: crate::transform::Transform,
+    ) {
+        let region = match self.region(scope, shape, Fallback::File) {
+            Ok(region) => region,
+            Err(message) => {
+                self.session.status = message;
+                return;
+            }
+        };
+        // A line range is its rows as one text, terminators between them
+        // included — not a piece per row, which would encode a file as a
+        // column of unrelated blobs.
+        let region = match region.shape() {
+            Shape::Lines => region.joined(),
+            _ => region,
+        };
+        if region.is_empty() {
+            self.session.status = format!("nothing to {}", how.verb().trim_end_matches('d'));
+            return;
+        }
+
+        // Every piece before any write: a broken second piece is an
+        // unchanged buffer and a message, not half a command.
+        let mut outputs = Vec::with_capacity(region.parts().len());
+        for text in region.texts(self.buffer) {
+            match how.apply(&text) {
+                Ok(out) => outputs.push(out),
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            }
+        }
+
+        let before = self.selections.as_pairs();
+        let edits = region.replace(self.buffer, &outputs);
+        // One cursor per piece, at its start: the selection that named the
+        // piece has been consumed, and what stands there now is new text.
+        let cursors: Vec<Selection> = region
+            .parts()
+            .iter()
+            .map(|part| {
+                let at = Region::carry(&edits, part.start);
+                Selection::collapsed(self.buffer.clamped(Cursor::at(at), false))
+            })
+            .collect();
+        self.selections.set(cursors);
+        self.buffer.commit_undo(before, self.selections.as_pairs());
+
+        let pieces = outputs.len();
+        self.session.status = match pieces {
+            1 => how.verb().to_string(),
+            n => format!("{n} pieces {}", how.verb()),
+        };
+        self.session.mode = Mode::Normal;
+    }
+
+    /// `:uuid4` and kin: after each cursor, or in place of each selection.
+    /// See `docs/specs/generate.md`.
+    fn generate(
+        &mut self,
+        scope: Option<Scope>,
+        shape: Option<Shape>,
+        what: crate::generate::Generator,
+    ) {
+        let region = match scope {
+            Some(Scope::Lines(_)) => {
+                self.session.status =
+                    format!("{} takes a selection or the cursor, not a range", what.name());
+                return;
+            }
+            Some(Scope::Selection) => match self.region(scope, shape, Fallback::CursorRow) {
+                Ok(region) => region,
+                Err(message) => {
+                    self.session.status = message;
+                    return;
+                }
+            },
+            // After the cursor, for the reason `p` is: `Esc` stepped the
+            // cursor back onto the last character typed, and after it is
+            // where insert mode was.
+            None => Region::spanning(
+                Shape::Chars,
+                self.selections.all().iter().map(|selection| {
+                    let at = selection.head.at;
+                    let row = self.buffer.row_at(Cursor::at(at));
+                    let end = self.buffer.rope().line_to_char(row) + self.buffer.line_len(row);
+                    let after = (at + 1).min(end);
+                    (after, after)
+                }),
+            ),
+        };
+
+        let outputs: Vec<String> = region.parts().iter().map(|_| what.generate()).collect();
+        let before = self.selections.as_pairs();
+        let edits = region.replace(self.buffer, &outputs);
+        // On the last character of each id, as after `p`.
+        let cursors: Vec<Selection> = region
+            .parts()
+            .iter()
+            .zip(&outputs)
+            .map(|(part, text)| {
+                let start = Region::carry(&edits, part.start);
+                let last = start + text.chars().count().saturating_sub(1);
+                Selection::collapsed(self.buffer.clamped(Cursor::at(last), false))
+            })
+            .collect();
+        self.selections.set(cursors);
+        self.buffer.commit_undo(before, self.selections.as_pairs());
         self.session.mode = Mode::Normal;
     }
 
@@ -23338,6 +23476,169 @@ int main(void) {
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "fooBar\nfooBar\n");
     }
 
+    // ---- :base64e / :base64d ------------------------------------------------
+
+    const NIL: &str = "00000000-0000-0000-0000-000000000000";
+
+    #[test]
+    fn base64e_with_no_scope_is_the_whole_file_and_base64d_undoes_it() {
+        let mut ed = editor("hello\nworld\n");
+
+        ex(&mut ed, "base64e");
+        assert_eq!(whole(&ed), "aGVsbG8Kd29ybGQ=\n", "the final newline stays outside");
+        assert_eq!(ed.session.status, "encoded");
+
+        ex(&mut ed, "base64d");
+        assert_eq!(whole(&ed), "hello\nworld\n");
+        assert_eq!(ed.session.status, "decoded");
+        assert_eq!(ed.cursor().unwrap().at, 0);
+    }
+
+    #[test]
+    fn base64e_over_a_charwise_selection_across_lines_is_one_piece() {
+        let mut ed = visual("say hello\nworld now\n", 4, Shape::Chars);
+        ed.apply(cmd(Action::Move(Motion::Down)));
+
+        ex(&mut ed, "'v base64e");
+
+        assert_eq!(whole(&ed), "say aGVsbG8Kd29ybGQ= now\n");
+        assert_eq!(ed.session.mode, Mode::Normal);
+        assert_eq!(ed.cursor().unwrap().at, 4, "at the start of the new text");
+    }
+
+    #[test]
+    fn base64e_over_a_rectangle_is_a_piece_per_row() {
+        let mut ed = block_over_the_names(NAMES);
+
+        ex(&mut ed, "'v base64e");
+
+        assert_eq!(whole(&ed), "let YWxwaGE= = 1;\nlet YmV0YSA= = 2;\nlet Z2FtbWE= = 3;\n");
+        assert_eq!(ed.session.status, "3 pieces encoded");
+    }
+
+    #[test]
+    fn base64d_over_two_cursors_leaves_a_cursor_at_each_start() {
+        let mut ed = editor("aGVsbG8=\nd29ybGQ=\n");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        for _ in 0..7 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v base64d");
+
+        assert_eq!(whole(&ed), "hello\nworld\n");
+        assert_eq!(heads(&ed), [0, 6]);
+    }
+
+    #[test]
+    fn base64e_over_a_line_range_is_the_rows_as_one_piece() {
+        let mut ed = editor("keep\nhello\nworld\nkeep\n");
+
+        ex(&mut ed, "2,3base64e");
+
+        assert_eq!(whole(&ed), "keep\naGVsbG8Kd29ybGQ=\nkeep\n");
+
+        ex(&mut ed, "2base64d");
+        assert_eq!(whole(&ed), "keep\nhello\nworld\nkeep\n");
+    }
+
+    #[test]
+    fn base64d_of_a_broken_piece_changes_nothing_and_names_the_byte() {
+        let mut ed = editor("aGVsbG8=\nnot*base64\n");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        ed.apply(cmd(Action::EnterVisual(Shape::Chars)));
+        for _ in 0..7 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v base64d");
+
+        assert_eq!(whole(&ed), "aGVsbG8=\nnot*base64\n", "the good piece waits for the bad one");
+        assert_eq!(ed.session.status, "not base64: `*` at 3");
+    }
+
+    #[test]
+    fn base64e_is_one_undo_step_and_takes_no_argument() {
+        let mut ed = editor("hello\n");
+        ex(&mut ed, "base64e");
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), "hello\n");
+
+        ex(&mut ed, "base64e url");
+        assert_eq!(ed.session.status, "base64e takes no argument");
+
+        let mut empty = editor("");
+        ex(&mut empty, "base64e");
+        assert_eq!(empty.session.status, "nothing to encode");
+    }
+
+    // ---- :uuid4 / :uuid7 / :uuidzero ----------------------------------------
+
+    #[test]
+    fn uuidzero_lands_after_the_cursor_with_the_cursor_on_its_last_char() {
+        let mut ed = editor("id = \n");
+        ed.set_cursor(Cursor::at(4));
+
+        ex(&mut ed, "uuidzero");
+
+        assert_eq!(whole(&ed), format!("id = {NIL}\n"));
+        assert_eq!(ed.cursor().unwrap().at, 5 + 35);
+    }
+
+    #[test]
+    fn uuid_on_an_empty_line_is_the_line() {
+        let mut ed = editor("\n");
+        ex(&mut ed, "uuid4");
+        let text = whole(&ed);
+        assert_eq!(text.len(), 37, "{text}");
+        assert_eq!(text.chars().nth(14), Some('4'));
+    }
+
+    #[test]
+    fn uuidzero_replaces_the_selection() {
+        let mut ed = visual("id = OLD;\n", 5, Shape::Chars);
+        for _ in 0..2 {
+            ed.apply(cmd(Action::Move(Motion::Right)));
+        }
+
+        ex(&mut ed, "'v uuidzero");
+
+        assert_eq!(whole(&ed), format!("id = {NIL};\n"));
+        assert_eq!(ed.session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn every_cursor_gets_its_own_uuid4_and_the_same_nil() {
+        let mut ed = editor("a\na\n");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+
+        ex(&mut ed, "uuid4");
+        let lines: Vec<String> = whole(&ed).lines().map(String::from).collect();
+        assert_eq!(lines.len(), 2);
+        assert_ne!(lines[0], lines[1]);
+        assert!(lines.iter().all(|l| l.len() == 37), "{lines:?}");
+
+        let mut ed = editor("a\na\n");
+        ed.apply(cmd(Action::AddCursorLine { below: true }));
+        ex(&mut ed, "uuidzero");
+        assert_eq!(whole(&ed), format!("a{NIL}\na{NIL}\n"));
+        assert_eq!(heads(&ed), [36, 74]);
+    }
+
+    #[test]
+    fn uuid_refuses_a_line_range_and_is_one_undo_step() {
+        let mut ed = editor("one\ntwo\n");
+        ex(&mut ed, "2uuid4");
+        assert_eq!(whole(&ed), "one\ntwo\n");
+        assert_eq!(ed.session.status, "uuid4 takes a selection or the cursor, not a range");
+
+        ex(&mut ed, "uuid7");
+        assert_ne!(whole(&ed), "one\ntwo\n");
+        ed.apply(cmd(Action::Undo));
+        assert_eq!(whole(&ed), "one\ntwo\n");
+    }
+
     // ---- labels -------------------------------------------------------------
 
     /// The letter `Ctrl-W f` put on one window.
@@ -24431,10 +24732,11 @@ int main(void) {
         #[test]
         fn two_cursors_on_one_row_toggle_it_once() {
             let (_d, mut ed) = on("comment-dedupe-row", "a.rs", "y();\n");
-            ed.window_mut().text_mut().unwrap().selections.set(vec![
-                Selection::at(0),
-                Selection::at(1),
-            ]);
+            ed.window_mut()
+                .text_mut()
+                .unwrap()
+                .selections
+                .set(vec![Selection::at(0), Selection::at(1)]);
 
             ed.apply(operate(Operator::Comment, Motion::CurrentLine, 1));
             assert_eq!(rope_of(&ed), "// y();\n", "commented once, not toggled back off");
@@ -24453,10 +24755,11 @@ int main(void) {
         #[test]
         fn cursors_on_adjacent_rows_do_not_double_a_shared_row() {
             let (_d, mut ed) = on("comment-dedupe-adjacent", "a.rs", "a();\nb();\nc();\n");
-            ed.window_mut().text_mut().unwrap().selections.set(vec![
-                Selection::at(0),
-                Selection::at(5),
-            ]);
+            ed.window_mut()
+                .text_mut()
+                .unwrap()
+                .selections
+                .set(vec![Selection::at(0), Selection::at(5)]);
 
             ed.apply(operate(Operator::Comment, Motion::Down, 1));
 
@@ -26120,10 +26423,7 @@ int main(void) {
 
     #[test]
     fn colon_debug_pane_names_parse_to_pane_commands() {
-        assert_eq!(
-            parse_ex("debug stack"),
-            Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Stack)))
-        );
+        assert_eq!(parse_ex("debug stack"), Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Stack))));
         assert_eq!(
             parse_ex("debug console"),
             Some(ExLine::Debug(DebugCmd::Pane(DebugPane::Console)))
@@ -26192,7 +26492,13 @@ int main(void) {
             assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
 
             // Answer initialize; the next settle sends launch.
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
             ed.settle();
             assert!(fake.methods(SessionId(0)).contains(&"launch".to_string()));
         }
@@ -26241,7 +26547,13 @@ int main(void) {
         fn stopped_at_thread_7(ed: &mut Editor, fake: &FakeSpawn) {
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26265,7 +26577,13 @@ int main(void) {
             let (_dir, mut ed, fake) = project("toggle-bp-repush");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26375,7 +26693,13 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26412,7 +26736,13 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26568,7 +26898,13 @@ int main(void) {
             let (_dir, mut ed, fake) = project("terminated");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             assert_eq!(ed.session.mode, Mode::Debug);
 
@@ -26597,7 +26933,13 @@ int main(void) {
             ex(&mut ed, "debug stack");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26638,7 +26980,13 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
 
             fake.event(SessionId(0), "output", json!({"category": "stdout", "output": "a\n"}));
@@ -26679,7 +27027,13 @@ int main(void) {
             ex(&mut ed, "debug stack");
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26734,7 +27088,13 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -26891,7 +27251,11 @@ int main(void) {
                 };
                 assert_eq!(vars.visible().len(), 2);
             }
-            assert_eq!(fake.methods(SessionId(0)).len(), requests_before, "collapsing asks nothing");
+            assert_eq!(
+                fake.methods(SessionId(0)).len(),
+                requests_before,
+                "collapsing asks nothing"
+            );
 
             let variables_calls = |fake: &FakeSpawn| {
                 fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "variables").count()
@@ -26983,7 +27347,13 @@ int main(void) {
 
             ed.debug_launch("run tests");
             ed.settle();
-            fake.respond(SessionId(0), 1, "initialize", true, json!({"supportsConfigurationDoneRequest": true}));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({"supportsConfigurationDoneRequest": true}),
+            );
             ed.settle();
             fake.event(SessionId(0), "initialized", json!({}));
             ed.settle();
@@ -27041,7 +27411,10 @@ int main(void) {
             let Content::DapVariables(vars) = &ed.window_of(vars_id).unwrap().content else {
                 panic!("not a variables pane")
             };
-            assert!(vars.roots.is_empty(), "cleared by rescope — refilled only once scopes answers");
+            assert!(
+                vars.roots.is_empty(),
+                "cleared by rescope — refilled only once scopes answers"
+            );
         }
 
         #[test]
@@ -27128,8 +27501,9 @@ int main(void) {
             let path = ed.buffer().unwrap().path.clone().unwrap();
 
             stopped_at_frame(&mut ed, &fake, &path, 3, 1);
-            let scopes_calls =
-                |fake: &FakeSpawn| fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "scopes").count();
+            let scopes_calls = |fake: &FakeSpawn| {
+                fake.methods(SessionId(0)).iter().filter(|m| m.as_str() == "scopes").count()
+            };
             let before = scopes_calls(&fake);
             assert_eq!(before, 1, "apply_stopped_frame's own request");
 
@@ -27163,7 +27537,10 @@ int main(void) {
         /// instead of the request-"launch" one `project` always writes —
         /// attach tests want `request = "attach"` configs, sometimes more
         /// than one.
-        fn attach_project(name: &str, launch_toml: &'static str) -> (ScratchDir, Editor, FakeSpawn) {
+        fn attach_project(
+            name: &str,
+            launch_toml: &'static str,
+        ) -> (ScratchDir, Editor, FakeSpawn) {
             let dir = ScratchDir::new(&format!("dap-{name}"))
                 .written("Cargo.toml", "[package]\n")
                 .written("src/main.rs", "fn main() {\n}\n");
@@ -27189,7 +27566,13 @@ int main(void) {
             assert!(fake.methods(SessionId(0)).contains(&"initialize".to_string()));
             assert_eq!(ed.session.mode, Mode::Debug);
 
-            fake.respond(SessionId(0), 1, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+            fake.respond(
+                SessionId(0),
+                1,
+                "initialize",
+                true,
+                json!({ "supportsConfigurationDoneRequest": true }),
+            );
             ed.settle();
 
             let attach = fake.last(SessionId(0), "attach").expect("attach sent");
@@ -27933,10 +28316,7 @@ int main(void) {
 
             ex(&mut ed, "r !echo x");
 
-            assert_eq!(
-                ed.buffer().unwrap().rope().to_string(),
-                "one\n\x1b[32mx\x1b[0m\n"
-            );
+            assert_eq!(ed.buffer().unwrap().rope().to_string(), "one\n\x1b[32mx\x1b[0m\n");
         }
 
         #[test]

@@ -83,6 +83,9 @@ base64 = "0.22"
 # UTF-8. The WHATWG set, whose label table already speaks vim ("latin1",
 # "cp1250"). See docs/specs/encoding.md.
 encoding_rs = "0.8.35"
+# `:uuid4` and `:uuid7`. Randomness is a thing to get right once, and this
+# crate is where it has been gotten right. See docs/specs/generate.md.
+uuid = { version = "1.26.1", features = ["v4", "v7"] }
 
 [profile.release]
 lto = true

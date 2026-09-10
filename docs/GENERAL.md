@@ -644,6 +644,8 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:zen` | toggle the chrome: gutter, line numbers and status rows off; the command line stays |
 | `:sort` `:sort!` | order the lines — the file, a range, or the selected rows; `!` descends |
 | `:sort n` `u` `i` | by the first number; dropping duplicates; without case |
+| `:base64e` `:base64d` | base64 the selection, a range, or the whole file — each piece on its own, in place |
+| `:uuid4` `:uuid7` `:uuidzero` | a random, a time-ordered, or the nil uuid — after each cursor, or in place of each selection |
 | `:create <path>` | an empty file, or a directory for a trailing `/`; parents are made too |
 | `:rename <old> <new>` | move a file, taking any open buffer's path with it |
 | `:delete <path>` `:delete!` | remove a file, or a directory `!` says may have things in it |
@@ -666,6 +668,17 @@ or the selection names otherwise. `n` compares the first number on each line,
 case, and the flags combine in any order. The sort is stable, one undo step,
 and a range already in order says `already sorted` and touches nothing. See
 [docs/specs/sort.md](specs/sort.md).
+
+`:base64e` and `:base64d` respell what the scope names — the whole file when
+nothing narrows it — and each contiguous piece on its own: a selection across
+lines is one blob, a rectangle is one per row, a line range is its rows joined
+as one. Decoding forgives whitespace, the URL-safe alphabet and missing
+padding, and refuses anything that is not base64 or does not decode to text,
+touching nothing. See [docs/specs/transform.md](specs/transform.md).
+
+`:uuid4`, `:uuid7` and `:uuidzero` put an id after the cursor, or in place of
+the selection — one per cursor, each its own. A line range is refused. See
+[docs/specs/generate.md](specs/generate.md).
 
 `:case` takes `upper`, `lower`, `title`, `camel`, `pascal`, `snake`, `dash` or
 `const` — one name each, no aliases.
