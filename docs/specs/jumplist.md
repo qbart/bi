@@ -46,8 +46,10 @@ it is on the day it is written.
 
 Per **window**, like vim, and for vim's reason: two windows on one buffer are
 two trains of thought, and `Ctrl-O` in one must not replay the other's
-history. It lives on [`window::Text`] beside `selections` and `scroll` — view
-state, exactly what those two are.
+history. It lives on [`window::Window`] itself, not on the `Text` inside
+it: a window keeps showing things after its text is displaced by a results
+pane or a tree, and the history has to still be there when a file comes
+back — the file it comes back with is usually not the one it left.
 
 ```
 Jumps {
@@ -111,6 +113,11 @@ Three seams, each already the single place its kind of move happens:
    an operator is a range, not a move.
 2. `Editor::show(window, buffer)` — push before switching. Every file/buffer
    change goes through it: pickers, `:e`, `gd`, results, tree, `Ctrl-^`.
+   A pane that displaces the text — `:find`'s results, `:results`, a tree,
+   an image — pushes as it displaces (`Editor::show_pane`), because by the
+   time a row in it opens a file there is no cursor left to record: the
+   window shows the pane, not text. `Ctrl-O` after `Enter` on a hit is back
+   where `:find` was typed.
 3. The in-buffer non-motion jumps — `goto_row` (`:{n}`), `apply_goto` when
    the target is the current buffer, the debugger's `jump_source_window` —
    push before moving. Each is a one-line call at a site that already exists.
@@ -130,6 +137,8 @@ jump), which is what keeps the list stable while you flip through it.
 - `''` twice is a toggle.
 - `Tab` and `Ctrl-I` produce the same action; `Tab` no longer changes buffer.
 - Two windows on one buffer keep separate lists.
+- `:find`, `Enter` on a hit, `Ctrl-O` is back where `:find` was typed;
+  `Ctrl-I` is on the hit again.
 - `h`/`j` record nothing; `d/foo` records nothing.
 
 ## Resolved decisions
@@ -154,11 +163,8 @@ jump), which is what keeps the list stable while you flip through it.
    reserved for them, as decision 3 above says; today a stray letter after
    `'` or `` ` `` is swallowed rather than doing anything, because there are
    no marks yet to look up.
-4. **A window that goes text → tree → *another* file starts a fresh list.**
-   The list lives on [`window::Text`], and a window showing a tree has parked
-   its one `Text` in the single `alt` slot; coming back to a different file
-   builds a new `Text` and the parked one goes, jump list and all. The common
-   tree-toggle-back keeps everything, because that *is* the parked `Text`
-   returning. Living on `Text` is the design (§"The list"): a second slot to
-   carry a list across a buffer the window never showed would be a
-   window-level history by another name.
+4. **A window that goes text → tree → *another* file keeps its list.** It
+   did not always: the list once lived on `Text`, the parked `Text` went when
+   a different file came back, and the list went with it — `:find`, `Enter`
+   on a hit, `Ctrl-O` did nothing. The list is the window's history and now
+   lives on the window (§"The list"), where a pane cannot take it.

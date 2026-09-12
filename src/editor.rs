@@ -4201,7 +4201,7 @@ impl Editor {
         // Destructured rather than borrowed whole: `height` and the selections
         // live in different fields, and only splitting them lets the view hold
         // both at once.
-        let Window { content, height, .. } = window;
+        let Window { content, height, jumps, .. } = window;
         let Content::Text(text) = content else { return None };
         let entry = self
             .buffers
@@ -4221,7 +4221,7 @@ impl Editor {
             height,
             width,
             session: &mut self.session,
-            jumps: &mut text.jumps,
+            jumps,
         })
     }
 
@@ -4327,13 +4327,14 @@ impl Editor {
     /// call site moves it — a jump is the position being LEFT, not the one
     /// arrived at, so every caller sits before its move rather than after.
     /// See `docs/specs/jumplist.md` §"What a jump is". A window showing
-    /// anything other than text (a tree, Results, an image) has no jump list
-    /// of its own and this is a no-op.
+    /// anything other than text (a tree, Results, an image) has no cursor to
+    /// record and this is a no-op — which is why [`Editor::show_pane`]
+    /// records *before* such content goes up.
     fn record_jump_in(&mut self, window: WindowId) {
-        if let Some(text) = self.window_mut_of(window).and_then(Window::text_mut) {
-            let jump = Jump { buffer: text.buffer, at: text.selections.primary().head.at };
-            text.jumps.push(jump);
-        }
+        let Some(window) = self.window_mut_of(window) else { return };
+        let Some(text) = window.text() else { return };
+        let jump = Jump { buffer: text.buffer, at: text.selections.primary().head.at };
+        window.jumps.push(jump);
     }
 
     /// [`Editor::record_jump_in`] for the focused window — the common case,
@@ -4358,18 +4359,21 @@ impl Editor {
         }
         let focus = self.focus;
         let ids = self.buffer_ids();
-        let Some(text) = self.window_mut_of(focus).and_then(Window::text_mut) else {
+        let from = self
+            .window_of(focus)
+            .and_then(Window::text)
+            .map(|text| Jump { buffer: text.buffer, at: text.selections.primary().head.at });
+        let Some((window, from)) = self.window_mut_of(focus).zip(from) else {
             self.session.status = "no buffer in this window".into();
             return;
         };
         // A buffer closed since the last walk is dropped here — the one
         // place every walk passes through, jump list or not.
-        text.jumps.prune(|b| ids.contains(&b));
-        let from = Jump { buffer: text.buffer, at: text.selections.primary().head.at };
+        window.jumps.prune(|b| ids.contains(&b));
         let target = match which {
-            Walk::Back(count) => text.jumps.back(from, count),
-            Walk::Forward(count) => text.jumps.forward(count),
-            Walk::Last => text.jumps.last(from),
+            Walk::Back(count) => window.jumps.back(from, count),
+            Walk::Forward(count) => window.jumps.forward(count),
+            Walk::Last => window.jumps.last(from),
         };
         let Some(target) = target else {
             self.session.status = match which {
@@ -4436,10 +4440,8 @@ impl Editor {
         let Some(current) = self.window_of(window) else { return };
 
         // Leaving a buffer writes where this window was into the entry, whether
-        // what replaces it is another buffer or a tree. The jump list comes
-        // along too: it is the window's history, not this buffer's, and must
-        // survive the switch to answer a `Ctrl-O` made after several more.
-        let jumps = current.text().map(|text| text.jumps.clone()).unwrap_or_default();
+        // what replaces it is another buffer or a tree. The jump list needs no
+        // such care: it is the window's, and the window is staying.
         if let Some(from) = from {
             let leaving = current.text().map(|text| text.selections.as_pairs()).unwrap_or_default();
             self.entry_mut(from).last = leaving;
@@ -4457,7 +4459,6 @@ impl Editor {
             .collect();
 
         let mut text = Text::new(to);
-        text.jumps = jumps;
         if !last.is_empty() {
             text.selections = Selections::from_pairs(last);
         }
@@ -4784,6 +4785,23 @@ impl Editor {
         }
     }
 
+    /// Puts non-text content — a results pane, a tree, an image — up in
+    /// `window`, parking a results list it displaces.
+    ///
+    /// The jump is recorded here, before the text goes: the place being
+    /// left is a jump (`docs/specs/jumplist.md` §"What a jump is"), and once
+    /// the pane is up there is no cursor to record it from — `Enter` on a
+    /// hit switches from a window showing no text, so `Editor::switch` sees
+    /// nothing to push. This is the one seam for every such displacement,
+    /// so the record cannot be forgotten at a new one.
+    fn show_pane(&mut self, window: WindowId, content: Content) {
+        self.record_jump_in(window);
+        self.park_results(window);
+        if let Some(window) = self.window_mut_of(window) {
+            window.show(content);
+        }
+    }
+
     /// `:results` — the last list back, as it was.
     fn reopen_results(&mut self) {
         if self.window().results().is_some() {
@@ -4795,9 +4813,7 @@ impl Editor {
             return;
         };
         let target = self.results_window();
-        if let Some(window) = self.window_mut_of(target) {
-            window.show(Content::Results(results));
-        }
+        self.show_pane(target, Content::Results(results));
         self.set_focus(target);
     }
 
@@ -4816,10 +4832,7 @@ impl Editor {
     /// whatever list it displaces, and moves focus to them.
     fn show_results(&mut self, results: crate::results::Results) {
         let target = self.results_window();
-        self.park_results(target);
-        if let Some(window) = self.window_mut_of(target) {
-            window.show(Content::Results(Box::new(results)));
-        }
+        self.show_pane(target, Content::Results(Box::new(results)));
         self.set_focus(target);
     }
 
@@ -6713,10 +6726,7 @@ impl Editor {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| img.path.display().to_string());
         self.session.status = format!("\"{name}\" {}×{}", img.width, img.height);
-        self.park_results(window);
-        if let Some(window) = self.window_mut_of(window) {
-            window.show(Content::Image(img));
-        }
+        self.show_pane(window, Content::Image(img));
         self.sweep_scratch();
     }
 
@@ -6802,8 +6812,7 @@ impl Editor {
         // is scoped — `+` and `-` are the others.
         self.session.tree_root = Some(tree.root().to_path_buf());
         let focus = self.focus;
-        self.park_results(focus);
-        self.window_mut().show(Content::Tree(tree));
+        self.show_pane(focus, Content::Tree(tree));
     }
 
     /// `-` from a text window: the tree on the session's root, with the file
@@ -7909,23 +7918,26 @@ impl Editor {
                 self.lsp.change(doc, entry.buffer.rope(), &edits);
             }
 
-            // Text windows only: a tree pane shows no rope and has nothing in
-            // it that an edit could move.
             for window in self.windows.iter_mut() {
                 let id = window.id;
-                let Some(text) = window.text_mut() else { continue };
 
-                // Above the "does this window show the edited buffer" guard,
-                // and deliberately: a jump list is the *window's* history and
-                // holds entries in files this window is not looking at right
-                // now, which nothing else would ever shift. Skipping those
-                // windows is how a `Ctrl-O` into another file lands in the
-                // middle of the wrong function. `Jumps::remap` does its own
-                // per-entry filtering by buffer, so every list can be offered
-                // every buffer's edits. Focused window included: nothing else
-                // moves its entries the way the selection remap below moves
-                // its cursor. See `docs/specs/jumplist.md` §"Where it hooks in".
-                text.jumps.remap(entry.id, &edits);
+                // Every window, text or not, and above the "does this window
+                // show the edited buffer" guard — deliberately: a jump list
+                // is the *window's* history and holds entries in files this
+                // window is not looking at right now (or, behind a results
+                // pane, in any file at all), which nothing else would ever
+                // shift. Skipping those windows is how a `Ctrl-O` into
+                // another file lands in the middle of the wrong function.
+                // `Jumps::remap` does its own per-entry filtering by buffer,
+                // so every list can be offered every buffer's edits. Focused
+                // window included: nothing else moves its entries the way
+                // the selection remap below moves its cursor. See
+                // `docs/specs/jumplist.md` §"Where it hooks in".
+                window.jumps.remap(entry.id, &edits);
+
+                // Text windows only from here: a tree pane shows no rope and
+                // has nothing else in it that an edit could move.
+                let Some(text) = window.text_mut() else { continue };
 
                 if text.buffer != entry.id {
                     continue;
@@ -20166,9 +20178,9 @@ mod tests {
     fn far_motions_record_a_jump_and_near_ones_do_not() {
         let mut ed = editor("a\nb\nc\nd\n");
         ed.apply(cmd(Action::Move(Motion::Down)));
-        assert!(ed.window().text().unwrap().jumps.is_empty(), "j is not a jump");
+        assert!(ed.window().jumps.is_empty(), "j is not a jump");
         ed.apply(cmd(Action::Move(Motion::LastLine)));
-        let jumps = &ed.window().text().unwrap().jumps;
+        let jumps = &ed.window().jumps;
         assert_eq!(jumps.len(), 1);
         assert_eq!(ed.cursor_row().unwrap(), 3);
     }
@@ -20179,7 +20191,7 @@ mod tests {
     fn an_operator_over_a_far_motion_records_nothing() {
         let mut ed = editor("a\nb\nc\n");
         ed.apply(operate(Operator::Delete, Motion::LastLine, 1));
-        assert!(ed.window().text().unwrap().jumps.is_empty());
+        assert!(ed.window().jumps.is_empty());
     }
 
     /// Every switch of what a window shows is a jump, and the list survives
@@ -20195,7 +20207,7 @@ mod tests {
         ex(&mut ed, &format!("e {}/b.rs", d.path()));
 
         assert_ne!(ed.window().buffer(), Some(first), "the window now shows b.rs");
-        let jumps = &ed.window().text().unwrap().jumps;
+        let jumps = &ed.window().jumps;
         // Read, not walked: `entries` is the listing view, so the assertion
         // says what was recorded without a throwaway `back` (and its
         // synthetic "now") standing in for a look.
@@ -20209,13 +20221,13 @@ mod tests {
     fn repeating_a_search_over_one_hit_records_once() {
         let mut ed = editor("foo\nbar\n");
         search_for(&mut ed, "foo", true);
-        assert_eq!(ed.window().text().unwrap().jumps.len(), 1, "the search itself is a jump");
+        assert_eq!(ed.window().jumps.len(), 1, "the search itself is a jump");
 
         for _ in 0..3 {
             ed.apply(cmd(Action::Move(Motion::Search { reverse: false })));
         }
         assert_eq!(
-            ed.window().text().unwrap().jumps.len(),
+            ed.window().jumps.len(),
             1,
             "n n n over the one hit dedupes against the top entry each time"
         );
@@ -20243,18 +20255,14 @@ mod tests {
         let a = ed.window().buffer().unwrap();
         ed.apply(cmd(Action::Move(Motion::Line(2)))); // row 1, recorded row 0
         ex(&mut ed, &format!("e {}/b.rs", d.path())); // switch recorded row 1 in a.rs
-        assert_eq!(
-            ed.window().text().unwrap().jumps.len(),
-            2,
-            "the move and the file switch each recorded one"
-        );
+        assert_eq!(ed.window().jumps.len(), 2, "the move and the file switch each recorded one");
 
         ed.apply(cmd(Action::JumpBack { count: 1 }));
 
         assert_eq!(ed.window().buffer(), Some(a), "back in a.rs");
         assert_eq!(ed.cursor_row().unwrap(), 1, "the row `:e` left");
         assert_eq!(
-            ed.window().text().unwrap().jumps.len(),
+            ed.window().jumps.len(),
             3,
             "unchanged by the walk except the end-of-list push that lets Ctrl-I return"
         );
@@ -20398,7 +20406,7 @@ mod tests {
         goto(&mut ed, &a, 1, 3);
 
         assert_eq!(ed.cursor_row().unwrap(), 1, "went to the definition");
-        assert_eq!(ed.window().text().unwrap().jumps.len(), 1, "the call site, once");
+        assert_eq!(ed.window().jumps.len(), 1, "the call site, once");
     }
 
     /// The spec's own bullet: "`gd` into another file, `Ctrl-O`, is back in
@@ -20414,13 +20422,13 @@ mod tests {
         let a = ed.window().buffer().unwrap();
         ed.apply(cmd(Action::Move(Motion::Line(2)))); // the call, row 1
         let call = ed.cursor().unwrap().at;
-        let recorded = ed.window().text().unwrap().jumps.len();
+        let recorded = ed.window().jumps.len();
 
         goto(&mut ed, &format!("{}/b.rs", d.path()), 0, 3);
 
         assert_ne!(ed.window().buffer(), Some(a), "b.rs is on screen");
         assert_eq!(
-            ed.window().text().unwrap().jumps.len(),
+            ed.window().jumps.len(),
             recorded + 1,
             "the file switch recorded the call site, and only `show` recorded it"
         );
@@ -20475,7 +20483,7 @@ mod tests {
         for row in 1..=(crate::jumps::CAP + 5) {
             ed.apply(cmd(Action::Move(Motion::Line(row))));
         }
-        assert_eq!(ed.window().text().unwrap().jumps.entries().len(), crate::jumps::CAP);
+        assert_eq!(ed.window().jumps.entries().len(), crate::jumps::CAP);
     }
 
     /// Pins `docs/specs/jumplist.md` §"Deviations from the design" #2, which
@@ -21326,6 +21334,31 @@ mod tests {
         let at = ed.cursor().unwrap();
         assert_eq!(ed.buffer().unwrap().row_at(at), 1);
         assert_eq!(ed.buffer().unwrap().col_at(at), 4, "on the match, in the new pane");
+    }
+
+    /// `:find`, `Enter` on a hit, `Ctrl-O`: back where `:find` was typed.
+    /// The pane displaces the window's text, and the window's history has
+    /// to survive that trip and come back with the hit — it is the window's,
+    /// not the text's. See `docs/specs/jumplist.md` §"What a jump is".
+    #[test]
+    fn ctrl_o_after_opening_a_hit_returns_to_where_find_was_typed() {
+        let files = project("find-jump-back");
+        let mut ed = in_project(&files, "c.rs");
+        let origin = ed.window().buffer().unwrap();
+        ex(&mut ed, "find other");
+
+        ed.apply(cmd(Action::Results(ResultsCmd::Move(1))));
+        ed.apply(cmd(Action::Results(ResultsCmd::Open { split: false })));
+        assert_eq!(ed.buffer().unwrap().line(1), "let other = 2;");
+        let hit = ed.cursor().unwrap().at;
+
+        ed.apply(cmd(Action::JumpBack { count: 1 }));
+        assert_eq!(ed.window().buffer(), Some(origin), "Ctrl-O went back to the file :find left");
+        assert_eq!(ed.cursor().unwrap().at, 0);
+
+        ed.apply(cmd(Action::JumpForward { count: 1 }));
+        assert_eq!(ed.buffer().unwrap().line(1), "let other = 2;");
+        assert_eq!(ed.cursor().unwrap().at, hit, "and Ctrl-I comes back to the hit");
     }
 
     #[test]
