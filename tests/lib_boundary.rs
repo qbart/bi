@@ -168,6 +168,7 @@ const LIB_MODULES: &[&str] = &[
     "config/keys.rs",
     "config/mod.rs",
     "config/parse.rs",
+    "config/xdg.rs",
     "context.rs",
     "dap/client.rs",
     "dap/mod.rs",

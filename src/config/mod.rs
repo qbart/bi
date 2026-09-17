@@ -10,9 +10,11 @@ use crate::editor::LineNumbers;
 
 mod keys;
 mod parse;
+pub mod xdg;
 
 pub use keys::{Bind, KeyMode, Keymap, Lookup, listing, parse_key, parse_keys, spell};
 pub use parse::{parse, parse_local};
+pub use xdg::Xdg;
 
 /// Where a frontend gets config text from.
 ///
