@@ -5,14 +5,15 @@
 //! `docs/specs/gui.md`.
 
 use gpui::{
-    AnyElement, Context, FocusHandle, Hsla, IntoElement, KeyDownEvent, Render, StyledText, Task,
-    TextRun, Window, div, font, prelude::*, px, rgb,
+    AnyElement, Context, FocusHandle, FontStyle, FontWeight, Hsla, IntoElement, KeyDownEvent,
+    Render, StyledText, Task, TextRun, UnderlineStyle, Window, div, font, prelude::*, px, rgb,
 };
 
 use bi::editor::{Editor, Mode, Pane};
-use bi::indent::{char_width, display_col, glyph};
+use bi::indent::{display_col, glyph};
 use bi::input::Input;
-use bi::theme::{Color as ThemeColor, Style as ThemeStyle};
+use bi::syntax::{Span as HlSpan, Syntax};
+use bi::theme::{Color as ThemeColor, Style as ThemeStyle, Theme};
 use bi::window::{Chrome, Rect};
 
 /// Monospace families, in order of preference. gpui matches a family name
@@ -69,39 +70,170 @@ impl View {
         cx.notify();
     }
 
-    fn run(&self, len: usize, color: Hsla, background: Option<Hsla>) -> TextRun {
+    fn run(&self, len: usize, look: Look) -> TextRun {
+        let mut font = font(self.family);
+        if look.bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if look.italic {
+            font.style = FontStyle::Italic;
+        }
         TextRun {
             len,
-            font: font(self.family),
-            color,
-            background_color: background,
-            underline: None,
+            font,
+            color: look.fg,
+            background_color: look.bg,
+            underline: look.underline.then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(look.fg),
+                wavy: false,
+            }),
             strikethrough: None,
         }
     }
 
-    /// One row of cells, with the cursor drawn in reverse video over the cell
-    /// at `cursor`, if any. Past the end of the text the cursor sits on a
-    /// blank cell, which is where insert mode puts it.
-    fn row(&self, text: &str, cursor: Option<usize>, fg: Hsla, bg: Hsla) -> StyledText {
-        let Some(col) = cursor else {
-            return StyledText::new(text.to_string()).with_runs(vec![self.run(
-                text.len(),
-                fg,
-                None,
-            )]);
+    /// One row of cells as runs, with the cursor drawn in reverse video over
+    /// the cell at `cursor`, if any. Past the end of the text the cursor sits
+    /// on a blank cell, which is where insert mode puts it. Adjacent cells
+    /// that look the same become one run: a run per cell would shape every
+    /// glyph on its own.
+    fn row(&self, cells: &[Cell], cursor: Option<usize>, base: Look, bg: Hsla) -> StyledText {
+        let mut text = String::new();
+        let mut runs: Vec<TextRun> = Vec::new();
+        let mut last: Option<Look> = None;
+        let blank = Cell { ch: ' ', look: base };
+        let count = match cursor {
+            Some(at) => cells.len().max(at + 1),
+            None => cells.len(),
         };
-        let chars: Vec<char> = text.chars().collect();
-        let before: String = chars.iter().take(col).collect();
-        let cell = chars.get(col).copied().unwrap_or(' ').to_string();
-        let after: String = chars.iter().skip(col + 1).collect();
-        let runs = vec![
-            self.run(before.len(), fg, None),
-            self.run(cell.len(), bg, Some(fg)),
-            self.run(after.len(), fg, None),
-        ];
-        StyledText::new(format!("{before}{cell}{after}")).with_runs(runs)
+        for col in 0..count {
+            let cell = cells.get(col).unwrap_or(&blank);
+            let look = match cursor {
+                Some(at) if at == col => cell.look.reversed(bg),
+                _ => cell.look,
+            };
+            let len = cell.ch.len_utf8();
+            text.push(cell.ch);
+            match (&mut runs.last_mut(), last) {
+                (Some(run), Some(prev)) if prev == look => run.len += len,
+                _ => runs.push(self.run(len, look)),
+            }
+            last = Some(look);
+        }
+        StyledText::new(text).with_runs(runs)
     }
+}
+
+/// How a cell is drawn: a theme style resolved over the base colours, in the
+/// terms a text run takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Look {
+    fg: Hsla,
+    bg: Option<Hsla>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+impl Look {
+    fn plain(fg: Hsla) -> Self {
+        Self { fg, bg: None, bold: false, italic: false, underline: false }
+    }
+
+    /// A theme style laid over this one: what it names wins, what it leaves
+    /// unsaid stays.
+    fn styled(self, s: ThemeStyle) -> Self {
+        let out = Self {
+            fg: s.fg.map(color).unwrap_or(self.fg),
+            bg: s.bg.map(color).or(self.bg),
+            bold: self.bold || s.bold,
+            italic: self.italic || s.italic,
+            underline: self.underline || s.underline,
+        };
+        if s.reverse { out.reversed_over(self.bg) } else { out }
+    }
+
+    /// The cursor: foreground and background swapped, with `bg` standing in
+    /// for a background this cell never named.
+    fn reversed(self, bg: Hsla) -> Self {
+        self.reversed_over(Some(bg))
+    }
+
+    fn reversed_over(self, fallback: Option<Hsla>) -> Self {
+        let bg = self.bg.or(fallback).unwrap_or(self.fg);
+        Self { fg: bg, bg: Some(self.fg), ..self }
+    }
+}
+
+/// One cell of a row: a character and how to draw it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cell {
+    ch: char,
+    look: Look,
+}
+
+/// A line as cells: tabs to the next stop, control characters as `^X`, the
+/// C1 controls dropped — `tui::render::cells`, from column zero — with each
+/// character's look carried onto every cell it became.
+///
+/// `looks` is one per char of `text`, or empty for a line with no
+/// highlights; a short list means the rest is `base`.
+fn expand(text: &str, looks: &[Look], base: Look, tab: usize) -> Vec<Cell> {
+    let tab = tab.max(1);
+    let mut out = Vec::with_capacity(text.len());
+    for (i, ch) in text.chars().enumerate() {
+        let look = looks.get(i).copied().unwrap_or(base);
+        if ch == '\t' {
+            let n = tab - (out.len() % tab);
+            out.extend(std::iter::repeat_n(Cell { ch: ' ', look }, n));
+        } else if let Some([a, b]) = glyph(ch) {
+            out.push(Cell { ch: a, look });
+            out.push(Cell { ch: b, look });
+        } else if ch.is_control() {
+        } else {
+            out.push(Cell { ch, look });
+        }
+    }
+    out
+}
+
+/// [`expand`] with no looks, for text that is all one colour.
+fn cells(text: &str, base: Look, tab: usize) -> Vec<Cell> {
+    expand(text, &[], base, tab)
+}
+
+/// The look of every char on one line, from the parse tree's spans over it.
+///
+/// `spans` are byte ranges in the whole buffer; `line_start` is the line's.
+/// The first span to claim a byte keeps it, as in `tui::render::styled_line`.
+fn looks(
+    raw: &str,
+    line_start: usize,
+    spans: &[HlSpan],
+    syntax: &Syntax,
+    theme: &Theme,
+    base: Look,
+) -> Vec<Look> {
+    let mut out = vec![base; raw.chars().count()];
+    let bytes: Vec<usize> = raw.char_indices().map(|(i, _)| i).collect();
+    let char_at = |byte: usize| bytes.partition_point(|&b| b < byte);
+    let mut pos = 0usize;
+    for span in spans {
+        let start = span.start_byte.saturating_sub(line_start).max(pos);
+        let end = span.end_byte.saturating_sub(line_start).min(raw.len());
+        if start >= raw.len() {
+            break;
+        }
+        if end <= start {
+            continue;
+        }
+        let Some(style) = theme.style(syntax.capture_name(span.capture)) else { continue };
+        for look in &mut out[char_at(start)..char_at(end)] {
+            *look = look.styled(style);
+        }
+        pos = end;
+    }
+    out
 }
 
 fn keys(ev: &KeyDownEvent) -> Option<bi::key::Key> {
@@ -153,30 +285,6 @@ fn colors(s: ThemeStyle, base_fg: Hsla, base_bg: Hsla) -> (Hsla, Hsla) {
     if s.reverse { (bg, fg) } else { (fg, bg) }
 }
 
-/// A line as cells: tabs to the next stop, control characters as `^X`, the
-/// C1 controls dropped. `tui::render::cells`, from column zero.
-fn cells(text: &str, tab: usize) -> String {
-    let tab = tab.max(1);
-    let mut col = 0usize;
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch == '\t' {
-            let n = tab - (col % tab);
-            out.extend(std::iter::repeat_n(' ', n));
-            col += n;
-        } else if let Some([a, b]) = glyph(ch) {
-            out.push(a);
-            out.push(b);
-            col += 2;
-        } else if ch.is_control() {
-        } else {
-            out.push(ch);
-            col += char_width(ch);
-        }
-    }
-    out
-}
-
 impl Render for View {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.installed != Some(self.editor.config_epoch()) {
@@ -224,7 +332,9 @@ impl Render for View {
 
         let mut lines: Vec<AnyElement> = Vec::with_capacity(rows as usize);
         let mut status = String::new();
-        if let Some(Pane::Text { text, buffer, options, .. }) = self.editor.pane(focus) {
+        let base = Look::plain(fg);
+        if let Some(Pane::Text { text, buffer, syntax, options, .. }) = self.editor.pane(focus) {
+            let theme = self.editor.theme();
             let tab = options.tab_width;
             let (scroll, left) = (text.scroll, text.left);
             let height = rect.height.saturating_sub(1) as usize;
@@ -232,14 +342,34 @@ impl Render for View {
             let (cursor_row, cursor_col) = (buffer.row_at(cursor), buffer.col_at(cursor));
             let last = (scroll + height).min(buffer.line_count());
 
+            // One query for the whole visible range, then partition per line.
+            // Bounded by pane height, never by file size.
+            let rope = buffer.rope();
+            let highlights = syntax.map(|syntax| {
+                let from = rope.line_to_byte(scroll.min(rope.len_lines()));
+                let to = rope.line_to_byte(last.min(rope.len_lines()));
+                (syntax, syntax.highlights(rope, from..to))
+            });
+
             for row in scroll..last {
-                let raw = buffer.rope().line(row).to_string();
+                let raw = rope.line(row).to_string();
                 let raw = raw.trim_end_matches(['\n', '\r']);
-                let visible: String =
-                    cells(raw, tab).chars().skip(left).take(cols as usize).collect();
+                let line_start = rope.line_to_byte(row);
+                let line_looks = match &highlights {
+                    Some((syntax, spans)) => {
+                        let line_end = line_start + raw.len();
+                        let mine = spans.partition_point(|s| s.end_byte <= line_start);
+                        let past = spans[mine..].partition_point(|s| s.start_byte < line_end);
+                        looks(raw, line_start, &spans[mine..mine + past], syntax, theme, base)
+                    }
+                    None => Vec::new(),
+                };
+                let expanded = expand(raw, &line_looks, base, tab);
+                let visible: Vec<Cell> =
+                    expanded.into_iter().skip(left).take(cols as usize).collect();
                 let at = (row == cursor_row && !footer_cursor)
                     .then(|| display_col(raw, cursor_col, tab).saturating_sub(left));
-                lines.push(self.row(&visible, at, fg, bg).into_any_element());
+                lines.push(self.row(&visible, at, base, bg).into_any_element());
             }
 
             // The window's status row, the terminal's arrangement: where the
@@ -262,13 +392,13 @@ impl Render for View {
             Mode::Command(line) => {
                 let text = format!(":{line}");
                 let at = 1 + display_col(&line.to_string(), line.cursor(), 8);
-                self.row(&cells(&text, 8), Some(at), fg, bg).into_any_element()
+                self.row(&cells(&text, base, 8), Some(at), base, bg).into_any_element()
             }
             Mode::Search { query, forward } => {
                 let text = format!("{}{query}", if *forward { '/' } else { '?' });
-                let text = cells(&text, 8);
-                let at = text.chars().count();
-                self.row(&text, Some(at), fg, bg).into_any_element()
+                let text = cells(&text, base, 8);
+                let at = text.len();
+                self.row(&text, Some(at), base, bg).into_any_element()
             }
             mode => {
                 let mode_style = match mode {
@@ -280,7 +410,7 @@ impl Render for View {
                 div()
                     .flex()
                     .justify_between()
-                    .child(cells(&self.editor.session.status, 8))
+                    .child(self.row(&cells(&self.editor.session.status, base, 8), None, base, bg))
                     .child(div().flex().child(format!("{pending} ")).child(
                         div().bg(mode_bg).text_color(mode_fg).child(format!(" {} ", mode.label())),
                     ))
@@ -320,10 +450,38 @@ mod tests {
         assert_eq!(indexed(9), ANSI[9]);
     }
 
+    fn text(cells: &[Cell]) -> String {
+        cells.iter().map(|c| c.ch).collect()
+    }
+
     #[test]
     fn cells_expand_tabs_and_name_controls() {
-        assert_eq!(cells("a\tb", 4), "a   b");
-        assert_eq!(cells("\x01", 4), "^A");
-        assert_eq!(cells("x\u{85}y", 4), "xy", "a C1 control has no glyph and no width");
+        let base = Look::plain(gpui::white());
+        assert_eq!(text(&cells("a\tb", base, 4)), "a   b");
+        assert_eq!(text(&cells("\x01", base, 4)), "^A");
+        assert_eq!(text(&cells("x\u{85}y", base, 4)), "xy", "a C1 control has no glyph, no width");
+    }
+
+    /// A tab is one char with one look, and every cell it becomes keeps it.
+    #[test]
+    fn a_look_rides_onto_every_cell_its_char_became() {
+        let base = Look::plain(gpui::white());
+        let red = Look::plain(gpui::red());
+        let cells = expand("\tx", &[red, base], base, 4);
+        assert_eq!(cells.len(), 5);
+        assert!(cells[..4].iter().all(|c| c.look == red));
+        assert_eq!(cells[4].look, base);
+    }
+
+    #[test]
+    fn a_reversed_look_swaps_its_colours_and_the_cursor_is_one() {
+        let (fg, bg) = (gpui::white(), gpui::black());
+        let look = Look::plain(fg).reversed(bg);
+        assert_eq!((look.fg, look.bg), (bg, Some(fg)));
+        // Reversing a cell that had its own background keeps that background
+        // as the new foreground, so a highlighted cell under the cursor still
+        // reads as that highlight.
+        let own = Look { bg: Some(gpui::red()), ..Look::plain(fg) }.reversed(bg);
+        assert_eq!((own.fg, own.bg), (gpui::red(), Some(fg)));
     }
 }

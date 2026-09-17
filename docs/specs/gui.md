@@ -7,8 +7,9 @@ this is the first thing to link it that is not a terminal.
 ## Status
 
 **Built**, in its smallest possible form: one window, one pane, the focused
-buffer's text, a cursor, two status rows, and keys. Everything past that is
-listed under *Not yet* and is deliberately absent rather than half-present.
+buffer's text in the theme's syntax colours, a cursor, two status rows, and
+keys. Everything past that is listed under *Not yet* and is deliberately
+absent rather than half-present.
 
 ## Why gpui
 
@@ -68,11 +69,16 @@ of bi's own. `View::render` does what `tui::render::render` does, in order:
    One window today, so one rect — but the call is the same one the terminal
    makes, and splits will need nothing new here. `size_window` reports the
    rect less its status row, which scrolls the pane to its cursor.
-3. **Text.** Each visible row, tab-expanded and control characters shown as
-   `^X`, in the theme's foreground on the theme's background. The cursor is
-   the cell under it drawn in reverse video: a row is split into the text
-   before, the cursor cell, and the text after. In Command and Search modes
-   the cursor goes to the footer instead, where typing goes.
+3. **Text.** One `Syntax::highlights` query for the visible byte range, as
+   the terminal makes it, then per row: every char gets a *look* — the
+   theme's style for its capture laid over the base foreground, in the terms
+   a gpui text run takes: colour, background, weight, italic, underline —
+   and the row is expanded to cells, tabs to their stops and control
+   characters to `^X`, each cell keeping its char's look. Adjacent cells that
+   look alike become one run, so a plain row is one run and a keyword costs
+   three. The cursor is the cell under it with its colours swapped. In
+   Command and Search modes the cursor goes to the footer instead, where
+   typing goes.
 4. **Two status rows**, the terminal's arrangement: the window's row
    (`row:col  name [+]`) under the pane, and the footer, which is the `:` line,
    the search line, or the status message with the mode label pushed right.
@@ -147,8 +153,9 @@ moved `Xdg`, because without it there is no theme and no keymap.
 
 In roughly the order they will matter:
 
-- syntax colours — `Syntax::highlights` already gives the spans; they want
-  `StyledText` runs instead of one run per row;
+- the selection in Visual mode, the search matches, the flash — the
+  overlays `tui::render` paints over a row's syntax; the per-cell look is
+  where they go;
 - more than one pane, and the tree, results, image and debug panes;
 - the picker, the hover float, the completion menu, the signature float;
 - the gutter: signs, numbers, indent guides, decorations;
