@@ -2,8 +2,9 @@
 //!
 //! This crate is the editor: text, history, motions, the keymap, registers and
 //! the parse tree. It knows nothing about terminals. Rendering and event input
-//! live in a frontend — `src/tui/` is the one that ships, and a GUI or an
-//! embedding would sit in the same place.
+//! live in a frontend — `src/tui/` is the terminal, `gui/` is the window (a
+//! workspace member, so its dependency tree stays out of this package — see
+//! `docs/specs/gui.md`), and an embedding would sit beside them.
 //!
 //! The boundary is a convention, not a compiler rule: a lib and a bin in one
 //! package share one dependency list, so nothing stops a module here from

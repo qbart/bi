@@ -1,0 +1,13 @@
+[package]
+name = "bi-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bi = { path = ".." }
+anyhow = "1"
+# Zed's UI framework. The default features are the Wayland and X11 backends,
+# which is every Linux desktop.
+gpui = "0.2.2"
+# What gpui speaks through; `BI_GUI_LOG=1` puts it on stderr.
+log = "0.4"

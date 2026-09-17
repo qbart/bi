@@ -100,3 +100,10 @@ ulid = "3.0.0"
 
 [profile.release]
 lto = true
+
+# The GUI is a workspace member rather than a feature of this package, so its
+# dependency tree — gpui and the Vulkan, Wayland and X11 stack beneath it —
+# is built only by `cargo build -p bi-gui`, and the terminal frontend's builds
+# and tests never pay for it. See docs/specs/gui.md.
+[workspace]
+members = ["gui"]
