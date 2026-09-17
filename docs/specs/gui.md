@@ -114,6 +114,26 @@ settle quits the application. The window's close button quits too, without
 the modified-buffer check `:q` makes; that check is an ex command's, and the
 close button has not been taught to run one yet.
 
+## `bi gui`
+
+One command to remember, two programs on disk — git's arrangement, where
+`git gui` is `git` finding and running `git-gui`. The terminal binary's
+`gui` subcommand looks for `bi-gui` beside its own executable, then on
+`PATH`, and execs it with the rest of the line unparsed. Nothing of gpui is
+linked into `bi`: it knows a name, and if the name resolves to nothing the
+error says so and names `make install-gui`, which builds `bi-gui` in release
+and copies it beside `bi`. `make install` stays terminal-only, so a server
+never builds a GPU stack for an editor it will run over SSH.
+
+`gui` is a subcommand in every form, unlike `config` and `debug`, which
+take two words: `bi gui` alone has to mean the window on an empty buffer.
+A file actually named `gui` opens as `bi ./gui`.
+
+The alternative — gpui behind a cargo feature, `bi gui` compiled in — was
+rejected for the reason the workspace split exists: every `cargo build` of
+the terminal would pay for the GPU stack, and `bi gui` would exist in some
+builds and not others.
+
 ## What it does not wire
 
 The hosts the terminal attaches on startup — clipboard, LSP, DAP, shell,

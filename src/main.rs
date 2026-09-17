@@ -59,6 +59,7 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Invocation::Gui(args) => return launch_gui(&args),
         Invocation::Open(path) => path,
     };
 
@@ -132,13 +133,19 @@ enum Invocation {
     ConfigEdit,
     /// `bi debug init` — a project's `.bi.toml` seeded with launch configs.
     DebugInit,
+    /// `bi gui [path]` — the window, which is another program. See
+    /// [`launch_gui`].
+    Gui(Vec<String>),
 }
 
 /// `config` and `debug` are subcommands only in the two-word form, so a file
-/// actually named `config` still opens.
+/// actually named `config` still opens. `gui` is one in every form, because
+/// `bi gui` alone has to mean the window with an empty buffer; a file named
+/// `gui` opens as `bi ./gui`.
 fn parse_args(args: &[String]) -> Result<Invocation> {
     match args {
         [] => Ok(Invocation::Open(None)),
+        [first, rest @ ..] if first == "gui" => Ok(Invocation::Gui(rest.to_vec())),
         [one] => Ok(Invocation::Open(Some(one.clone()))),
         [first, sub] if first == "config" => match sub.as_str() {
             "init" => Ok(Invocation::ConfigInit),
@@ -149,7 +156,53 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
             "init" => Ok(Invocation::DebugInit),
             other => bail!("no such command: bi debug {other} — try `init`"),
         },
-        _ => bail!("usage: bi [path] | bi config init | bi config edit | bi debug init"),
+        _ => bail!(
+            "usage: bi [path] | bi gui [path] | bi config init | bi config edit | bi debug init"
+        ),
+    }
+}
+
+/// `bi gui`: hands the arguments to `bi-gui`, git's arrangement for `git gui`.
+///
+/// The window is a separate program rather than a subcommand compiled in,
+/// because compiling it in would put gpui's whole dependency tree — Vulkan,
+/// Wayland, X11 — into every build of the terminal, and a server install
+/// would need a GPU stack to link. So this binary only knows the name. It
+/// looks beside its own executable first, which is where `make install-gui`
+/// puts it, then on `PATH`. See `docs/specs/gui.md`.
+fn launch_gui(args: &[String]) -> Result<()> {
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let program = gui_program(beside.as_deref());
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(args);
+    // `exec` rather than spawn-and-wait: nothing this process holds is worth
+    // keeping around under a window, and the exit status is then the GUI's
+    // own rather than a relay of it.
+    #[cfg(unix)]
+    let err = {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    };
+    #[cfg(not(unix))]
+    let err = match cmd.status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) => e,
+    };
+    if err.kind() == io::ErrorKind::NotFound {
+        bail!(
+            "bi-gui is not installed — not beside {} and not on PATH. `make install-gui` puts it \
+             beside bi",
+            beside.as_deref().unwrap_or(Path::new("bi")).display()
+        );
+    }
+    Err(err).context(format!("running {}", program.display()))
+}
+
+/// The sibling when there is one, else the bare name for `PATH` to resolve.
+fn gui_program(beside: Option<&Path>) -> PathBuf {
+    match beside.map(|dir| dir.join("bi-gui")) {
+        Some(sibling) if sibling.is_file() => sibling,
+        _ => PathBuf::from("bi-gui"),
     }
 }
 
@@ -509,6 +562,39 @@ mod tests {
         assert!(matches!(parse_args(&args(&["debug", "init"])).unwrap(), Invocation::DebugInit));
         assert!(parse_args(&args(&["debug", "nope"])).is_err());
         assert!(parse_args(&args(&["a.rs", "b.rs"])).is_err());
+    }
+
+    /// `gui` is a subcommand in every form, unlike `config`: `bi gui` alone
+    /// is the window on an empty buffer, and whatever follows is the GUI's
+    /// to parse, not this binary's.
+    #[test]
+    fn gui_takes_the_rest_of_the_line_unparsed() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            matches!(parse_args(&args(&["gui"])).unwrap(), Invocation::Gui(rest) if rest.is_empty())
+        );
+        assert!(matches!(
+            parse_args(&args(&["gui", "a.rs"])).unwrap(),
+            Invocation::Gui(rest) if rest == ["a.rs"]
+        ));
+        // Two paths is this binary's usage error, but the GUI's to reject.
+        assert!(matches!(parse_args(&args(&["gui", "a", "b"])).unwrap(), Invocation::Gui(_)));
+    }
+
+    /// Installed beside `bi` wins; otherwise the bare name goes to `PATH`.
+    #[test]
+    fn the_gui_beside_the_binary_is_preferred_over_path() {
+        let dir = std::env::temp_dir().join(format!("bi-gui-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(gui_program(Some(&dir)), PathBuf::from("bi-gui"), "nothing beside: PATH");
+        assert_eq!(gui_program(None), PathBuf::from("bi-gui"));
+
+        std::fs::write(dir.join("bi-gui"), "").unwrap();
+        assert_eq!(gui_program(Some(&dir)), dir.join("bi-gui"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

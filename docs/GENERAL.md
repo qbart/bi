@@ -39,6 +39,7 @@ See [docs/specs](specs) for the designs behind each piece.
 cargo run -- <file>
 cargo run -- .            # a directory opens the file tree
 cargo run -p bi-gui -- <file>   # the same editor in a window; see docs/specs/gui.md
+make install-gui                # after which `bi gui <file>` opens it
 cargo test
 cargo fmt --check
 python3 scripts/vim_differential.py   # needs vim; not part of cargo test
