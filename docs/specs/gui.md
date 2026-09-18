@@ -92,6 +92,14 @@ of bi's own. `View::render` does what `tui::render::render` does, in order:
    tested without a window. A cell knows its width — two for a CJK char,
    none for a combining mark — so the columns agree with the core's
    `display_col`, which is what a selection's edges are expressed in.
+
+   The gutter goes on last, in front: the sign column, then the line number
+   or a blank where one is not due. Every pass above it spoke in columns of
+   the text area, so none of them knows how wide the numbers are, and a
+   linewise selection stops at the gutter's edge while the cursor line
+   crosses it — the terminal's rules, for the terminal's reasons. Widths
+   are the core's (`Options::gutter_width`, `number_width`), fixed across
+   modes so the file never slides sideways, and zen takes them back.
 4. **Two status rows**, the terminal's arrangement: the window's row
    (`row:col  name [+]`) under the pane, and the footer, which is the `:` line,
    the search line, or the status message with the mode label pushed right.
@@ -168,7 +176,6 @@ In roughly the order they will matter:
 
 - more than one pane, and the tree, results, image and debug panes;
 - the picker, the hover float, the completion menu, the signature float;
-- the gutter: signs, numbers, indent guides, decorations;
 - the hosts above, and a real clipboard through gpui's;
 - `focus_gained` on window activation, for checktime;
 - mouse: click to place the cursor, wheel to scroll.

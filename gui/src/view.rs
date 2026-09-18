@@ -6,6 +6,8 @@
 //! row of cells into text runs, and what knows the window. See
 //! `docs/specs/gui.md`.
 
+use std::collections::HashMap;
+
 use gpui::{
     AnyElement, Context, FocusHandle, FontStyle, FontWeight, Hsla, IntoElement, KeyDownEvent,
     Render, StyledText, Task, TextRun, UnderlineStyle, Window, div, font, prelude::*, px, rgb,
@@ -204,6 +206,21 @@ impl Render for View {
                 (syntax, syntax.highlights(rope, from..to))
             });
             let decorations = ed.decorations(focus, scroll..last);
+            // Columns to the left of the text: the sign column, then the widest
+            // line number plus a space — fixed across modes so the file does
+            // not slide sideways as the cursor moves, and reserved whether or
+            // not anything is in it. Zen takes them back — see docs/specs/zen.md.
+            let zen = ed.session.zen;
+            let total = buffer.line_count();
+            let sign_width = if zen { 0 } else { options.gutter };
+            let numbers = if zen { 0 } else { options.number_width(total) };
+            let gutter = sign_width + numbers;
+            let text_width = width.saturating_sub(gutter);
+            let signs: HashMap<usize, (char, ThemeStyle)> = ed
+                .gutter_signs(focus, scroll..last)
+                .into_iter()
+                .map(|(row, ch, style)| (row, (ch, style)))
+                .collect();
             // The shape only applies to the pane that pressed `v`/`V`/`Ctrl-V`,
             // and this is that pane: the one window is the focused one.
             let shape = ed.visual();
@@ -302,19 +319,52 @@ impl Render for View {
                 // absolute columns.
                 r.scroll(left, base);
 
-                // A linewise selection reaches the edge of the pane; the
-                // cursor line paints only what nothing else has claimed.
+                // A linewise selection reaches the edge of the pane but stays
+                // out of the gutter: the number column is not part of what
+                // you selected.
                 if linewise {
-                    r.fill(ui.selection.bg, 0, width, base);
+                    r.fill(ui.selection.bg, 0, text_width, base);
                 }
+                r.clip(text_width, base);
+
+                // The gutter, in front of everything above — every pass so far
+                // spoke in columns of the text area, and none of them has to
+                // know how wide the numbers are. The sign column first, then
+                // the number, or a blank where one is not due so the text
+                // stays put.
+                let mut head: Vec<Cell> = Vec::with_capacity(gutter);
+                if sign_width > 0 {
+                    match signs.get(&row) {
+                        Some((sign, style)) => {
+                            let text = format!("{sign}{}", " ".repeat(sign_width - 1));
+                            head.extend(cells(&text, base.styled(*style), tab));
+                        }
+                        None => head.extend(cells(&" ".repeat(sign_width), base, tab)),
+                    }
+                }
+                if numbers > 0 {
+                    match options.number.label_for(row, cursor_row) {
+                        Some(n) => {
+                            let style =
+                                if row == cursor_row { ui.gutter_current } else { ui.gutter };
+                            let text = format!("{n:>width$} ", width = numbers - 1);
+                            head.extend(cells(&text, base.styled(style), tab));
+                        }
+                        None => head.extend(cells(&" ".repeat(numbers), base, tab)),
+                    }
+                }
+                head.append(&mut r.cells);
+                r.cells = head;
+
+                // The cursor line takes the whole row, numbers included, and
+                // paints only what nothing else has claimed.
                 if row == cursor_row {
                     r.fill(ui.cursorline.bg, 0, width, base);
                 }
-                r.clip(width, base);
 
                 let at = (row == cursor_row && !footer_cursor).then(|| {
                     let col = display_col(raw, cursor_col, tab);
-                    (col + inline_shift(&decorations, row, col)).saturating_sub(left)
+                    gutter + (col + inline_shift(&decorations, row, col)).saturating_sub(left)
                 });
                 lines.push(self.row(&r.cells, at, base, bg).into_any_element());
             }
