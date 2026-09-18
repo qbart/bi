@@ -6,10 +6,10 @@ this is the first thing to link it that is not a terminal.
 
 ## Status
 
-**Built**, in its smallest possible form: one window, one pane, the focused
-buffer's text in the theme's syntax colours, a cursor, two status rows, and
-keys. Everything past that is listed under *Not yet* and is deliberately
-absent rather than half-present.
+**Built**: one window, every pane the layout hands out — text, tree and
+results — each with its status row, the footer, and keys. Everything past
+that is listed under *Not yet* and is deliberately absent rather than
+half-present.
 
 ## Why gpui
 
@@ -66,10 +66,20 @@ of bi's own. `View::render` does what `tui::render::render` does, in order:
    gpui matches family names literally and knows no aliases. Its advance
    width is the cell width, so the window's pixel size becomes a grid of
    columns and rows exactly as a terminal's does.
-2. **Layout.** `Editor::layout` with that grid, less one row for the footer.
-   One window today, so one rect — but the call is the same one the terminal
-   makes, and splits will need nothing new here. `size_window` reports the
-   rect less its status row, which scrolls the pane to its cursor.
+2. **Layout.** `Editor::layout` with that grid, less one row for the footer,
+   and one rect per pane back, the terminal's chrome between them: a column
+   for the rule between side-by-side panes, nothing between stacked ones.
+   Every pane is told its size before anything is drawn — the rect less its
+   status row, or the whole rect for a tree or under zen — which scrolls it
+   to its cursor. Each pane is then an absolutely positioned element at its
+   rect's cell coordinates, holding one element per row and its status row;
+   the rule is another, one column wide, in the column the layout reserved
+   to the pane's left. A pane kind draws its own body: text as below, a tree
+   as `render_tree` does it — marks, indent, the open/closed marker, the
+   selected row filled in every tree pane since it is where the next Enter
+   goes — and results as `render_results` does, file groups and painted
+   hits, with the armed-replace preview. The image and debug panes have a
+   status row that says what they are and a body that says nothing yet.
 3. **Text.** One `Syntax::highlights` query for the visible byte range, as
    the terminal makes it, then per row: every char gets a *look* — the
    theme's style for its capture laid over the base foreground, in the terms
@@ -100,9 +110,12 @@ of bi's own. `View::render` does what `tui::render::render` does, in order:
    crosses it — the terminal's rules, for the terminal's reasons. Widths
    are the core's (`Options::gutter_width`, `number_width`), fixed across
    modes so the file never slides sideways, and zen takes them back.
-4. **Two status rows**, the terminal's arrangement: the window's row
-   (`row:col  name [+]`) under the pane, and the footer, which is the `:` line,
-   the search line, or the status message with the mode label pushed right.
+4. **Status rows**, the terminal's arrangement: each window's own row under
+   its pane — the focused one leads with `row:col`, wears the mode label and
+   the git numstat at its right, and takes the `statusline` style; the
+   others lead with the name and take `status_inactive` — and the footer,
+   which is the `:` line, the search line, or the message with the cursor
+   count and pending keys pushed right.
 5. **The redraw timer.** `Editor::redraw_in` says how long the frontend may
    sit before something on screen changes on its own — a yank's flash
    expiring, the checktime poll coming due. The terminal blocks its
@@ -174,7 +187,7 @@ moved `Xdg`, because without it there is no theme and no keymap.
 
 In roughly the order they will matter:
 
-- more than one pane, and the tree, results, image and debug panes;
+- the image and debug panes' bodies;
 - the picker, the hover float, the completion menu, the signature float;
 - the hosts above, and a real clipboard through gpui's;
 - `focus_gained` on window activation, for checktime;
@@ -202,9 +215,11 @@ gpui's and blade's logging on stderr, which is how the first two were found.
 ## What this exposes about the boundary
 
 The status rows' *text* — the name with its `[+]` and encoding badges, the
-`row:col`, the footer's precedence of command line over search over message —
-is computed inside `tui/render.rs`, and the GUI repeats a slice of it. That
-text is not a terminal fact. The day the GUI draws a second pane it should
-move into the core as something both frontends read, the way `Mode::label`
-already did. The same goes for `cells`, the tab-and-control expansion: both
-frontends want the same string for a row, and today both write the loop.
+`row:col`, what a results or debug pane calls itself, the footer's precedence
+of command line over search over message — is computed inside
+`tui/render.rs`, and the GUI now repeats all of it. That text is not a
+terminal fact. It should move into the core as something both frontends
+read, the way `Mode::label` already did; the same goes for the tree's row
+parts and the results rows' shape, which both frontends now assemble from
+the same core facts with the same glyphs. Two copies is the signal; three
+would be the mistake.
