@@ -4,6 +4,7 @@
 //! The editor is the `bi` library; the window is [`view::View`]. See
 //! `docs/specs/gui.md`.
 
+mod cells;
 mod keys;
 mod view;
 

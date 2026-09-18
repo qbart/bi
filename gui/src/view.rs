@@ -1,7 +1,9 @@
 //! The window: one pane, the focused buffer, two status rows, and keys.
 //!
 //! Does what `tui::render::render` does, in the same order — cell size, layout,
-//! text, status rows — with gpui's `Render` in place of ratatui's `draw`. See
+//! text, status rows — with gpui's `Render` in place of ratatui's `draw`. The
+//! rows themselves are built in [`crate::cells`]; this file is what turns a
+//! row of cells into text runs, and what knows the window. See
 //! `docs/specs/gui.md`.
 
 use gpui::{
@@ -9,12 +11,16 @@ use gpui::{
     Render, StyledText, Task, TextRun, UnderlineStyle, Window, div, font, prelude::*, px, rgb,
 };
 
+use bi::buffer::Cursor;
+use bi::decoration::Layer;
 use bi::editor::{Editor, Mode, Pane};
-use bi::indent::{display_col, glyph};
+use bi::indent::display_col;
 use bi::input::Input;
-use bi::syntax::{Span as HlSpan, Syntax};
-use bi::theme::{Color as ThemeColor, Style as ThemeStyle, Theme};
+use bi::region::Shape;
+use bi::theme::Style as ThemeStyle;
 use bi::window::{Chrome, Rect};
+
+use crate::cells::{Cell, Look, Row, cells, color, expand, inline_shift, looks};
 
 /// Monospace families, in order of preference. gpui matches a family name
 /// against what fontconfig reports and nothing else — there is no
@@ -56,7 +62,7 @@ impl View {
 
     /// The terminal loop's key arm: translate, resolve, apply, settle, draw.
     fn key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        let Some(key) = keys(ev) else { return };
+        let Some(key) = crate::keys::translate(&ev.keystroke) else { return };
         let ed = &mut self.editor;
         if let Some(cmd) = self.input.on_key(key, &ed.session.mode, ed.content_kind()) {
             ed.session.status.clear();
@@ -93,25 +99,23 @@ impl View {
     }
 
     /// One row of cells as runs, with the cursor drawn in reverse video over
-    /// the cell at `cursor`, if any. Past the end of the text the cursor sits
-    /// on a blank cell, which is where insert mode puts it. Adjacent cells
-    /// that look the same become one run: a run per cell would shape every
-    /// glyph on its own.
+    /// the cell at column `cursor`, if any. Past the end of the text the
+    /// cursor sits on a blank cell, which is where insert mode puts it.
+    /// Adjacent cells that look the same become one run: a run per cell
+    /// would shape every glyph on its own.
     fn row(&self, cells: &[Cell], cursor: Option<usize>, base: Look, bg: Hsla) -> StyledText {
         let mut text = String::new();
         let mut runs: Vec<TextRun> = Vec::new();
         let mut last: Option<Look> = None;
-        let blank = Cell { ch: ' ', look: base };
-        let count = match cursor {
-            Some(at) => cells.len().max(at + 1),
-            None => cells.len(),
-        };
-        for col in 0..count {
-            let cell = cells.get(col).unwrap_or(&blank);
-            let look = match cursor {
-                Some(at) if at == col => cell.look.reversed(bg),
-                _ => cell.look,
-            };
+        let mut col = 0usize;
+        let width: usize = cells.iter().map(|c| c.width).sum();
+        let pad = cursor.map_or(0, |at| (at + 1).saturating_sub(width));
+        let blank = Cell { ch: ' ', look: base, width: 1 };
+        for cell in cells.iter().chain(std::iter::repeat_n(&blank, pad)) {
+            let under =
+                cursor.is_some_and(|at| cell.width > 0 && col <= at && at < col + cell.width);
+            let look = if under { cell.look.reversed(bg) } else { cell.look };
+            col += cell.width;
             let len = cell.ch.len_utf8();
             text.push(cell.ch);
             match (&mut runs.last_mut(), last) {
@@ -121,160 +125,6 @@ impl View {
             last = Some(look);
         }
         StyledText::new(text).with_runs(runs)
-    }
-}
-
-/// How a cell is drawn: a theme style resolved over the base colours, in the
-/// terms a text run takes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Look {
-    fg: Hsla,
-    bg: Option<Hsla>,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-}
-
-impl Look {
-    fn plain(fg: Hsla) -> Self {
-        Self { fg, bg: None, bold: false, italic: false, underline: false }
-    }
-
-    /// A theme style laid over this one: what it names wins, what it leaves
-    /// unsaid stays.
-    fn styled(self, s: ThemeStyle) -> Self {
-        let out = Self {
-            fg: s.fg.map(color).unwrap_or(self.fg),
-            bg: s.bg.map(color).or(self.bg),
-            bold: self.bold || s.bold,
-            italic: self.italic || s.italic,
-            underline: self.underline || s.underline,
-        };
-        if s.reverse { out.reversed_over(self.bg) } else { out }
-    }
-
-    /// The cursor: foreground and background swapped, with `bg` standing in
-    /// for a background this cell never named.
-    fn reversed(self, bg: Hsla) -> Self {
-        self.reversed_over(Some(bg))
-    }
-
-    fn reversed_over(self, fallback: Option<Hsla>) -> Self {
-        let bg = self.bg.or(fallback).unwrap_or(self.fg);
-        Self { fg: bg, bg: Some(self.fg), ..self }
-    }
-}
-
-/// One cell of a row: a character and how to draw it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Cell {
-    ch: char,
-    look: Look,
-}
-
-/// A line as cells: tabs to the next stop, control characters as `^X`, the
-/// C1 controls dropped — `tui::render::cells`, from column zero — with each
-/// character's look carried onto every cell it became.
-///
-/// `looks` is one per char of `text`, or empty for a line with no
-/// highlights; a short list means the rest is `base`.
-fn expand(text: &str, looks: &[Look], base: Look, tab: usize) -> Vec<Cell> {
-    let tab = tab.max(1);
-    let mut out = Vec::with_capacity(text.len());
-    for (i, ch) in text.chars().enumerate() {
-        let look = looks.get(i).copied().unwrap_or(base);
-        if ch == '\t' {
-            let n = tab - (out.len() % tab);
-            out.extend(std::iter::repeat_n(Cell { ch: ' ', look }, n));
-        } else if let Some([a, b]) = glyph(ch) {
-            out.push(Cell { ch: a, look });
-            out.push(Cell { ch: b, look });
-        } else if ch.is_control() {
-        } else {
-            out.push(Cell { ch, look });
-        }
-    }
-    out
-}
-
-/// [`expand`] with no looks, for text that is all one colour.
-fn cells(text: &str, base: Look, tab: usize) -> Vec<Cell> {
-    expand(text, &[], base, tab)
-}
-
-/// The look of every char on one line, from the parse tree's spans over it.
-///
-/// `spans` are byte ranges in the whole buffer; `line_start` is the line's.
-/// The first span to claim a byte keeps it, as in `tui::render::styled_line`.
-fn looks(
-    raw: &str,
-    line_start: usize,
-    spans: &[HlSpan],
-    syntax: &Syntax,
-    theme: &Theme,
-    base: Look,
-) -> Vec<Look> {
-    let mut out = vec![base; raw.chars().count()];
-    let bytes: Vec<usize> = raw.char_indices().map(|(i, _)| i).collect();
-    let char_at = |byte: usize| bytes.partition_point(|&b| b < byte);
-    let mut pos = 0usize;
-    for span in spans {
-        let start = span.start_byte.saturating_sub(line_start).max(pos);
-        let end = span.end_byte.saturating_sub(line_start).min(raw.len());
-        if start >= raw.len() {
-            break;
-        }
-        if end <= start {
-            continue;
-        }
-        let Some(style) = theme.style(syntax.capture_name(span.capture)) else { continue };
-        for look in &mut out[char_at(start)..char_at(end)] {
-            *look = look.styled(style);
-        }
-        pos = end;
-    }
-    out
-}
-
-fn keys(ev: &KeyDownEvent) -> Option<bi::key::Key> {
-    crate::keys::translate(&ev.keystroke)
-}
-
-/// A theme colour as gpui's.
-///
-/// This function is the whole of what `gui/` knows about colour that `tui/`
-/// does not: a terminal is handed the ANSI names and its own palette
-/// answers, but a window has no palette to defer to, so the sixteen names
-/// and the 256-colour cube get xterm's defaults.
-fn color(c: ThemeColor) -> Hsla {
-    let hex = match c {
-        ThemeColor::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
-        ThemeColor::Ansi(name) => ANSI[name as usize],
-        ThemeColor::Indexed(n) => indexed(n),
-    };
-    rgb(hex).into()
-}
-
-/// xterm's sixteen, in `theme::Ansi`'s order.
-const ANSI: [u32; 16] = [
-    0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5, 0x7f7f7f,
-    0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
-];
-
-fn indexed(n: u8) -> u32 {
-    const STEPS: [u32; 6] = [0, 95, 135, 175, 215, 255];
-    match n {
-        0..=15 => ANSI[n as usize],
-        16..=231 => {
-            let n = n as u32 - 16;
-            (STEPS[(n / 36) as usize] << 16)
-                | (STEPS[(n / 6 % 6) as usize] << 8)
-                | STEPS[(n % 6) as usize]
-        }
-        232..=255 => {
-            let v = 8 + 10 * (n as u32 - 232);
-            (v << 16) | (v << 8) | v
-        }
     }
 }
 
@@ -333,23 +183,30 @@ impl Render for View {
         let mut lines: Vec<AnyElement> = Vec::with_capacity(rows as usize);
         let mut status = String::new();
         let base = Look::plain(fg);
-        if let Some(Pane::Text { text, buffer, syntax, options, .. }) = self.editor.pane(focus) {
-            let theme = self.editor.theme();
+        let ed = &self.editor;
+        if let Some(Pane::Text { text, buffer, syntax, options, .. }) = ed.pane(focus) {
+            let theme = ed.theme();
             let tab = options.tab_width;
             let (scroll, left) = (text.scroll, text.left);
-            let height = rect.height.saturating_sub(1) as usize;
-            let cursor = text.selections.cursor();
+            let (width, height) = (rect.width as usize, rect.height.saturating_sub(1) as usize);
+            let selections = &text.selections;
+            let cursor = selections.cursor();
             let (cursor_row, cursor_col) = (buffer.row_at(cursor), buffer.col_at(cursor));
             let last = (scroll + height).min(buffer.line_count());
 
             // One query for the whole visible range, then partition per line.
-            // Bounded by pane height, never by file size.
+            // Bounded by pane height, never by file size — and the same rule
+            // for everything drawn that is not buffer text.
             let rope = buffer.rope();
             let highlights = syntax.map(|syntax| {
                 let from = rope.line_to_byte(scroll.min(rope.len_lines()));
                 let to = rope.line_to_byte(last.min(rope.len_lines()));
                 (syntax, syntax.highlights(rope, from..to))
             });
+            let decorations = ed.decorations(focus, scroll..last);
+            // The shape only applies to the pane that pressed `v`/`V`/`Ctrl-V`,
+            // and this is that pane: the one window is the focused one.
+            let shape = ed.visual();
 
             for row in scroll..last {
                 let raw = rope.line(row).to_string();
@@ -364,12 +221,108 @@ impl Render for View {
                     }
                     None => Vec::new(),
                 };
-                let expanded = expand(raw, &line_looks, base, tab);
-                let visible: Vec<Cell> =
-                    expanded.into_iter().skip(left).take(cols as usize).collect();
-                let at = (row == cursor_row && !footer_cursor)
-                    .then(|| display_col(raw, cursor_col, tab).saturating_sub(left));
-                lines.push(self.row(&visible, at, base, bg).into_any_element());
+                let start = rope.line_to_char(row);
+                let chars = raw.chars().count();
+                let mut r =
+                    Row { cells: expand(raw, &line_looks, base, tab), row, raw, start, tab };
+
+                // Under the selection: a guide or a swatch has to let a
+                // selected line still look selected.
+                r.decorate(&decorations, Layer::Under, base);
+
+                // Search matches, under the selection so a selected match
+                // still reads as selected.
+                if options.hlsearch
+                    && let Some(search) = &ed.session.last_search
+                {
+                    for (from, to) in
+                        buffer.matches_in(start, start + chars, &search.pattern, search.whole_word)
+                    {
+                        let from = display_col(raw, from.saturating_sub(start), tab);
+                        let to = display_col(raw, (to - start).min(chars), tab);
+                        r.paint(from..to, ui.search);
+                    }
+                }
+
+                // Selected columns on this row. Charwise includes the character
+                // under the head; linewise covers the row whatever the columns
+                // are, and is filled to the pane's edge below.
+                let mut linewise = false;
+                for selection in selections.all() {
+                    if selection.is_collapsed() && shape.is_none() {
+                        continue;
+                    }
+                    let (lo, hi) = selection.range();
+                    let (first, end) =
+                        (buffer.row_at(Cursor::at(lo)), buffer.row_at(Cursor::at(hi)));
+                    if row < first || row > end {
+                        continue;
+                    }
+                    let cols = match shape {
+                        Some(Shape::Lines) => {
+                            linewise = true;
+                            0..display_col(raw, chars, tab).max(1)
+                        }
+                        Some(Shape::Block) => {
+                            let (from, to) = ed.block_span_in(focus, row);
+                            let (from, to) = (from - start, to - start);
+                            display_col(raw, from, tab)
+                                ..display_col(raw, to, tab).max(display_col(raw, from, tab) + 1)
+                        }
+                        _ => {
+                            let from = lo.saturating_sub(start).min(chars);
+                            let to = if row < end { chars } else { (hi - start + 1).min(chars) };
+                            display_col(raw, from, tab)
+                                ..display_col(raw, to, tab).max(display_col(raw, from, tab) + 1)
+                        }
+                    };
+                    r.paint(cols, ui.selection);
+                }
+
+                // The cursor is drawn on the primary head below; the others
+                // have to be painted or they are invisible.
+                if selections.len() > 1 {
+                    for (i, selection) in selections.all().iter().enumerate() {
+                        if i == selections.primary_index() || buffer.row_at(selection.head) != row {
+                            continue;
+                        }
+                        let col = display_col(raw, buffer.col_at(selection.head), tab);
+                        r.paint(col..col + 1, ui.cursor_alt);
+                    }
+                }
+
+                // Over everything: a letter you are about to press has to be
+                // readable wherever it lands. Then the ones that make their
+                // own cells, because every column above is a column of the
+                // text as it stands.
+                r.decorate(&decorations, Layer::Over, base);
+                r.insert_inline(&decorations, base);
+
+                // The horizontal scroll, after every pass that speaks in
+                // absolute columns.
+                r.scroll(left, base);
+
+                // A linewise selection reaches the edge of the pane; the
+                // cursor line paints only what nothing else has claimed.
+                if linewise {
+                    r.fill(ui.selection.bg, 0, width, base);
+                }
+                if row == cursor_row {
+                    r.fill(ui.cursorline.bg, 0, width, base);
+                }
+                r.clip(width, base);
+
+                let at = (row == cursor_row && !footer_cursor).then(|| {
+                    let col = display_col(raw, cursor_col, tab);
+                    (col + inline_shift(&decorations, row, col)).saturating_sub(left)
+                });
+                lines.push(self.row(&r.cells, at, base, bg).into_any_element());
+            }
+
+            // Past-the-end rows, so an empty buffer doesn't look like a hang.
+            let filler = cells("~", base.styled(ui.filler), tab);
+            while lines.len() < height {
+                lines.push(self.row(&filler, None, base, bg).into_any_element());
             }
 
             // The window's status row, the terminal's arrangement: where the
@@ -397,7 +350,7 @@ impl Render for View {
             Mode::Search { query, forward } => {
                 let text = format!("{}{query}", if *forward { '/' } else { '?' });
                 let text = cells(&text, base, 8);
-                let at = text.len();
+                let at = text.iter().map(|c| c.width).sum();
                 self.row(&text, Some(at), base, bg).into_any_element()
             }
             mode => {
@@ -433,55 +386,5 @@ impl Render for View {
             .child(div().flex_1().flex().flex_col().children(lines))
             .child(div().h(cell_h).bg(status_bg).text_color(status_fg).child(status))
             .child(div().h(cell_h).child(footer))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_cube_and_the_ramp_are_xterms() {
-        assert_eq!(indexed(16), 0x000000);
-        assert_eq!(indexed(196), 0xff0000, "the cube's red corner");
-        assert_eq!(indexed(231), 0xffffff);
-        assert_eq!(indexed(232), 0x080808);
-        assert_eq!(indexed(255), 0xeeeeee);
-        assert_eq!(indexed(9), ANSI[9]);
-    }
-
-    fn text(cells: &[Cell]) -> String {
-        cells.iter().map(|c| c.ch).collect()
-    }
-
-    #[test]
-    fn cells_expand_tabs_and_name_controls() {
-        let base = Look::plain(gpui::white());
-        assert_eq!(text(&cells("a\tb", base, 4)), "a   b");
-        assert_eq!(text(&cells("\x01", base, 4)), "^A");
-        assert_eq!(text(&cells("x\u{85}y", base, 4)), "xy", "a C1 control has no glyph, no width");
-    }
-
-    /// A tab is one char with one look, and every cell it becomes keeps it.
-    #[test]
-    fn a_look_rides_onto_every_cell_its_char_became() {
-        let base = Look::plain(gpui::white());
-        let red = Look::plain(gpui::red());
-        let cells = expand("\tx", &[red, base], base, 4);
-        assert_eq!(cells.len(), 5);
-        assert!(cells[..4].iter().all(|c| c.look == red));
-        assert_eq!(cells[4].look, base);
-    }
-
-    #[test]
-    fn a_reversed_look_swaps_its_colours_and_the_cursor_is_one() {
-        let (fg, bg) = (gpui::white(), gpui::black());
-        let look = Look::plain(fg).reversed(bg);
-        assert_eq!((look.fg, look.bg), (bg, Some(fg)));
-        // Reversing a cell that had its own background keeps that background
-        // as the new foreground, so a highlighted cell under the cursor still
-        // reads as that highlight.
-        let own = Look { bg: Some(gpui::red()), ..Look::plain(fg) }.reversed(bg);
-        assert_eq!((own.fg, own.bg), (gpui::red(), Some(fg)));
     }
 }

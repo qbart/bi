@@ -29,7 +29,8 @@ Cargo.toml          [workspace] members = ["gui"]; the root package is unchanged
 gui/Cargo.toml      package bi-gui: bi by path, gpui
 gui/src/main.rs     args, editor setup, the gpui application, one window
 gui/src/keys.rs     gpui Keystroke → bi::key::Key
-gui/src/view.rs     the Render impl: layout, draw, key handling, the redraw timer
+gui/src/view.rs     the Render impl: layout, key handling, the redraw timer, rows to runs
+gui/src/cells.rs    a row as cells, and every pass that paints over one
 src/config/xdg.rs   moved out of src/main.rs — see below
 ```
 
@@ -79,6 +80,18 @@ of bi's own. `View::render` does what `tui::render::render` does, in order:
    three. The cursor is the cell under it with its colours swapped. In
    Command and Search modes the cursor goes to the footer instead, where
    typing goes.
+
+   Over the syntax, in the terminal's order and for the terminal's reasons:
+   decorations on the under layer, search matches, the selection — charwise,
+   linewise filled to the pane's edge, or the block's own spans — the other
+   cursors, decorations on the over layer, inline labels, then the
+   horizontal scroll and the cursor-line fill. The terminal does this by
+   splitting styled spans at every edge a highlight lands on; the GUI does
+   it by painting cells, one per display column, which is the same
+   arithmetic without the splitting, and lives in `cells.rs` where it is
+   tested without a window. A cell knows its width — two for a CJK char,
+   none for a combining mark — so the columns agree with the core's
+   `display_col`, which is what a selection's edges are expressed in.
 4. **Two status rows**, the terminal's arrangement: the window's row
    (`row:col  name [+]`) under the pane, and the footer, which is the `:` line,
    the search line, or the status message with the mode label pushed right.
@@ -153,9 +166,6 @@ moved `Xdg`, because without it there is no theme and no keymap.
 
 In roughly the order they will matter:
 
-- the selection in Visual mode, the search matches, the flash — the
-  overlays `tui::render` paints over a row's syntax; the per-cell look is
-  where they go;
 - more than one pane, and the tree, results, image and debug panes;
 - the picker, the hover float, the completion menu, the signature float;
 - the gutter: signs, numbers, indent guides, decorations;
