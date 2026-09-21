@@ -2805,6 +2805,8 @@ pub enum FormCmd {
     CycleMap,
     /// `Esc`: back to the window the form belongs to.
     Leave,
+    /// `q`: the form closes — and the tool that owns it, result and all.
+    Close,
 }
 
 /// What a key does in a window holding a tree.
@@ -6113,6 +6115,15 @@ impl Editor {
 
     /// A key in the focused form window. See `docs/specs/form.md`.
     fn run_form_cmd(&mut self, cmd: FormCmd) {
+        if cmd == FormCmd::Close {
+            match self.tools.iter().position(|t| t.form == self.focus) {
+                Some(index) => self.close_tool(index),
+                None => {
+                    self.close_window(self.focus);
+                }
+            }
+            return;
+        }
         if cmd == FormCmd::Leave {
             let home = self.form_home(self.focus).or(self.previous);
             if let Some(home) = home.filter(|&w| w != self.focus && self.window_of(w).is_some()) {
@@ -6152,7 +6163,7 @@ impl Editor {
                 self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
                 return;
             }
-            FormCmd::Leave => unreachable!("handled above"),
+            FormCmd::Leave | FormCmd::Close => unreachable!("handled above"),
         }
         if let Some(status) = status {
             self.session.status = status.into();
@@ -29899,6 +29910,29 @@ int main(void) {
             assert_eq!(ed.window_ids(), vec![source]);
             ed.run_ex("tool normalmap strength 3");
             assert_eq!(ed.session.status, "no normal map here (:set editor normalmap)");
+        }
+
+        /// `q` in the form is the way out: the form and the result go, the
+        /// source stays and takes the focus.
+        #[test]
+        fn q_in_the_form_closes_the_tool() {
+            let (_d, mut ed, source) = open("q");
+            ed.apply(cmd(Action::Form(FormCmd::Close)));
+            assert_eq!(ed.window_ids(), vec![source]);
+            assert_eq!(ed.focus(), source);
+            assert!(ed.tools.is_empty());
+        }
+
+        /// A form nobody owns closes like any pane.
+        #[test]
+        fn q_in_a_bare_form_closes_only_the_form() {
+            let mut ed = editor("text");
+            sized(&mut ed);
+            let home = ed.focus();
+            let form = ed.open_form_sidebar(crate::form::Form::new("x", "X")).unwrap();
+            assert_eq!(ed.focus(), form);
+            ed.apply(cmd(Action::Form(FormCmd::Close)));
+            assert_eq!(ed.window_ids(), vec![home]);
         }
 
         #[test]

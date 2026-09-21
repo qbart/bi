@@ -72,8 +72,8 @@ source is dirty only if you edit *it*.
 
 ## Leaving
 
-`:set editor image` on the source closes the result and the form and
-forgets the tool. Closing either of those windows by hand does the same;
+`q` in the form, or `:set editor image` on the source, closes the result
+and the form and forgets the tool. Closing either of those windows by hand does the same;
 closing the source leaves them as a plain picture and a plain form, since
 what they showed is still on screen and taking it away would be a
 surprise. `:set editor normalmap` on a window that already has the tool

@@ -65,6 +65,8 @@ Enter  i            edit the value on the ex line: `:tool <owner> <field> <value
 u  Ctrl-R           undo, redo a change
 Tab                 cycle the field named `map`, when the form has one — see below
 Esc                 back to the picture the form belongs to
+q                   close the form — and the tool that owns it, result and all
+:                   the ex line, so `:q` and `:tool …` are typeable here
 ```
 
 `Enter` prefills the ex line rather than opening a prompt of its own: the
@@ -95,6 +97,7 @@ pane says `12:40`. No mode segment: like an image, a form has no modes.
   clears redo; each bumps the generation.
 - The keys: `j`/`k`/`gg`/`G` select, `h`/`l`/`H`/`L` nudge with counts,
   `Space` toggles, `Enter` prefills the ex line, `u` undoes, `Tab` cycles
-  `map`, `Esc` leaves.
+  `map`, `Esc` leaves, `:` opens the ex line, `q` closes the form and the
+  tool that owns it, or just the form when none does.
 - The renderer draws a slider whose filled length follows the value and
   highlights the selected field.

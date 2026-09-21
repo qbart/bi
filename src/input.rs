@@ -1017,6 +1017,9 @@ impl Input {
             KeyCode::Char('u') => FormCmd::Undo,
             KeyCode::Tab => FormCmd::CycleMap,
             KeyCode::Esc => FormCmd::Leave,
+            KeyCode::Char('q') => FormCmd::Close,
+            // The ex line, as from every pane: `:q` has to be typeable here.
+            KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
             _ => {
                 self.reset();
                 return None;
@@ -3967,6 +3970,8 @@ leader = \" \"
                 ContentKind::Form,
             );
             assert_eq!(esc.map(|c| c.action), Some(Action::Form(FormCmd::Leave)));
+            assert_eq!(form(&mut input, ":"), Some(Action::EnterCommandMode), "the ex line opens");
+            assert_eq!(form(&mut input, "q"), Some(Action::Form(FormCmd::Close)));
         }
 
         #[test]
