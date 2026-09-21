@@ -54,7 +54,7 @@ let the picture machinery show it".
 - **Curve and plot tool.** Render an easing curve, a damage formula or an
   XP table as a graph, move bezier handles with the cursor, write the
   numbers back. Tuning is where designers spend hours in spreadsheets.
-  Next up — see `curve.md` once it exists.
+  Designed, editing code in place — see `curve.md`.
 - **Table view** for CSV and TSV. Aligned columns, cell-wise navigation,
   sort and sum. Balance sheets and loot tables live in these files.
 - **Graph preview.** A state machine, behaviour tree or dialogue script

@@ -21,6 +21,7 @@ pub struct Form {
     selected: usize,
     undo: Vec<(usize, Value)>, redo: Vec<(usize, Value)>,
     generation: u64,         // bumped by every change; the owner watches it
+    cycle: Option<String>,   // the field `Tab` turns, named by the owner
 }
 
 pub struct Field { name: String, label: String, kind: Kind, value: Value }
@@ -63,7 +64,7 @@ H  L                ten steps
 Space               toggle a bool, cycle a choice
 Enter  i            edit the value on the ex line: `:tool <owner> <field> <value>`
 u  Ctrl-R           undo, redo a change
-Tab                 cycle the field named `map`, when the form has one — see below
+Tab                 cycle the form's cycle field, when it names one — see below
 Esc                 back to the picture the form belongs to
 q                   close the form — and the tool that owns it, result and all
 :                   the ex line, so `:q` and `:tool …` are typeable here
@@ -76,10 +77,12 @@ value. A number that does not parse, a choice that is not an option, a
 bool that is not `true` or `false` — each is refused with a message
 naming what the field takes.
 
-**`Tab`** is a convenience for tools with several outputs: a field named
-`map` is the one that says which output the picture shows, and `Tab` from
-anywhere in the form cycles it without first selecting it. A form with no
-such field ignores `Tab`.
+**`Tab`** is a convenience for the one field a tool cycles most: the
+owner names it when it builds the form — `map` for the normal map, which
+says which output the picture shows; `point` for the curve editor, which
+says which point the keys move — and `Tab` from anywhere in the form
+cycles it without first selecting it. A form that names none ignores
+`Tab`.
 
 ## The status row
 
