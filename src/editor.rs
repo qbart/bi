@@ -6230,6 +6230,13 @@ impl Editor {
             }
             return;
         }
+        // A curve's form mirrors the code, so its history is the code's.
+        // See `docs/specs/curve.md`.
+        if matches!(cmd, FormCmd::Undo | FormCmd::Redo)
+            && let Some(index) = self.curve_at(self.focus)
+        {
+            return self.curve_undo(index, cmd == FormCmd::Redo);
+        }
         let Some(form) = self.window_mut().form_mut() else { return };
         let mut status = None;
         match cmd {
@@ -7623,7 +7630,12 @@ impl Editor {
                 let Some(path) = self.expand_path(&path) else { return };
                 self.edit_path_how(&path, enc, ff, force)
             }
-            ExLine::Quit { force } => self.quit(force),
+            ExLine::Quit { force } => match self.curve_at(self.focus) {
+                // `:q` on the plot or in the form closes the tool and puts
+                // the cursor back in the code. See `docs/specs/curve.md`.
+                Some(index) if self.tools[index].source() != self.focus => self.close_tool(index),
+                _ => self.quit(force),
+            },
             ExLine::QuitAll { force } => self.quit_all(force),
             ExLine::WriteAll { force } => self.write_all(force),
             ExLine::Checktime => {
@@ -7721,7 +7733,14 @@ impl Editor {
             // The rest need the rope, and so need a view.
             ExLine::Write { path, force } => {
                 let Some(path) = self.expand_path(&path) else { return };
-                if self.window().img().is_some() {
+                if let Some(source) = self.curve_source_of(self.focus) {
+                    // The plot and the form are views of the code: `:w`
+                    // there writes the code. See `docs/specs/curve.md`.
+                    let back = self.focus;
+                    self.set_focus(source);
+                    self.in_view(|view| view.write(&path, force));
+                    self.set_focus(back);
+                } else if self.window().img().is_some() {
                     self.write_image(&path);
                 } else {
                     self.in_view(|view| view.write(&path, force));
@@ -8402,9 +8421,89 @@ impl Editor {
         }
     }
 
-    /// The form's mirror fields moved: apply them to the curve, which
-    /// edits the buffer. Filled in with the keys.
-    fn curve_form_changed(&mut self, _index: usize) {}
+    /// The source of the curve tool whose plot or form is `window`.
+    fn curve_source_of(&self, window: WindowId) -> Option<WindowId> {
+        self.tools.iter().find_map(|t| match t {
+            Tool::Curve(c) if c.plot == window || c.form == window => Some(c.source),
+            _ => None,
+        })
+    }
+
+    /// The form's mirror fields moved: whichever differs from the curve is
+    /// applied — `point` picks, `x` and `y` edit the code, the steps are
+    /// kept. The tangents and the lock are read-only for now.
+    fn curve_form_changed(&mut self, index: usize) {
+        use crate::curve::Field;
+        let Some(tool) = self.curve(index) else { return };
+        let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
+        let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+        let point = form.get_i64("point").max(1) as usize - 1;
+        let (x, y) = (form.get_f32("x"), form.get_f32("y"));
+        let (xstep, ystep) = (form.get_f32("xstep"), form.get_f32("ystep"));
+        if let Some(t) = self.curve_mut(index) {
+            if xstep > 0.0 {
+                t.xstep = xstep;
+            }
+            if ystep > 0.0 {
+                t.ystep = ystep;
+            }
+        }
+        if point != tool.selected {
+            self.curve_select(index, point.min(tool.curve.points.len().saturating_sub(1)));
+        } else if x != p.x {
+            self.curve_set(index, Field::X, x);
+        } else if y != p.y {
+            self.curve_set(index, Field::Y, y);
+        }
+    }
+
+    /// `:tool curve <field> [value]` and `:tool curve layout <fields>`,
+    /// from any of the tool's three windows. See `docs/specs/curve.md`.
+    fn curve_tool(&mut self, arg: &str) {
+        let Some(index) = self.curve_at(self.focus) else {
+            self.session.status = "no curve here (:set editor curve)".into();
+            return;
+        };
+        let (what, value) = match arg.split_once(char::is_whitespace) {
+            Some((what, value)) => (what, value.trim()),
+            None => (arg, ""),
+        };
+        let Some(tool) = self.curve(index) else { return };
+        match what {
+            "" => {
+                self.session.status = "curve what? (point, x, y, xstep, ystep, layout)".into();
+            }
+            "layout" if value.is_empty() => {
+                self.session.status = format!("curve layout={}", tool.layout.text());
+            }
+            "layout" => match crate::curve::Layout::parse(value) {
+                Ok(layout) => {
+                    if let Some(t) = self.curve_mut(index) {
+                        t.layout = layout;
+                        t.seen = None;
+                    }
+                    self.session.status.clear();
+                    self.sync_tools();
+                }
+                Err(e) => self.session.status = e,
+            },
+            "point" | "x" | "y" | "xstep" | "ystep" => {
+                let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else {
+                    return;
+                };
+                self.session.status = if value.is_empty() {
+                    format!("curve {what}={}", form.value_text(what).unwrap_or_default())
+                } else {
+                    form.set(what, value).err().unwrap_or_default()
+                };
+                self.sync_tools();
+            }
+            other => {
+                self.session.status =
+                    format!("not a curve setting: {other} (want point, x, y, xstep, ystep, layout)");
+            }
+        }
+    }
 
     /// The buffer as it stands now, re-found from the anchor or the source
     /// window's cursor, read, drawn and mirrored into the form — or lost.
@@ -8818,13 +8917,14 @@ impl Editor {
             None => (arg.trim(), ""),
         };
         match tool {
-            "" => self.session.status = "tool what? (tileset, image, normalmap)".into(),
+            "" => self.session.status = "tool what? (tileset, image, normalmap, curve)".into(),
             "tileset" => self.tileset_tool(rest),
             "image" => self.image_tool(rest),
             "normalmap" => self.normalmap_tool(rest),
+            "curve" => self.curve_tool(rest),
             other => {
                 self.session.status =
-                    format!("not a tool: {other} (want tileset, image or normalmap)")
+                    format!("not a tool: {other} (want tileset, image, normalmap or curve)")
             }
         }
     }
@@ -30615,7 +30715,7 @@ int main(void) {
             let (mut ed, source) = open();
             key(&mut ed, Action::EditValue);
             assert!(
-                matches!(&ed.session.mode, Mode::Command(c) if c.to_string() == "tool curve y 0.8"),
+                matches!(&ed.session.mode, Mode::Command(c) if c == "tool curve y 0.8"),
                 "{:?}",
                 ed.session.mode
             );
@@ -30623,6 +30723,88 @@ int main(void) {
             key(&mut ed, Action::EnterNormal);
             assert_eq!(ed.focus(), source);
             assert_eq!(ed.window_ids().len(), 3, "the tool stays open");
+        }
+
+        #[test]
+        fn tool_curve_sets_x_and_y_and_reports() {
+            let (mut ed, _s) = open();
+            ed.run_ex("tool curve y 0.6");
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.6f"));
+            ed.run_ex("tool curve x 5");
+            assert!(text(&ed).contains("{1.0f, 0.6f"), "clamped: {}", text(&ed));
+            ed.run_ex("tool curve point 1");
+            ed.run_ex("tool curve point");
+            assert_eq!(ed.session.status, "curve point=1");
+            ed.run_ex("tool curve y wide");
+            assert!(ed.session.status.starts_with("y wants a number"), "{}", ed.session.status);
+            ed.run_ex("tool curve");
+            assert_eq!(ed.session.status, "curve what? (point, x, y, xstep, ystep, layout)");
+            ed.run_ex("tool curve ystep 0.1");
+            ed.run_ex("tool curve ystep");
+            assert_eq!(ed.session.status, "curve ystep=0.100");
+            key(&mut ed, Action::Move(Motion::Up));
+            assert!(text(&ed).contains("{0.0f, 0.1f"), "the new step: {}", text(&ed));
+        }
+
+        #[test]
+        fn tool_curve_needs_the_tool() {
+            let mut ed = editor(CPP);
+            ed.run_ex("tool curve y 1");
+            assert_eq!(ed.session.status, "no curve here (:set editor curve)");
+        }
+
+        #[test]
+        fn tool_curve_layout_rereads_and_refuses() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            ed.run_ex("tool curve layout y,x");
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.800 y 0.500");
+            ed.run_ex("tool curve layout");
+            assert_eq!(ed.session.status, "curve layout=y,x");
+            ed.run_ex("tool curve layout x,z");
+            assert_eq!(ed.session.status, "not a field: z (want x, y, out, in, locked or _)");
+        }
+
+        #[test]
+        fn turning_y_in_the_form_edits_the_code_and_tab_cycles_the_point() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            ed.set_focus(form_of(&ed));
+            ed.run_form_cmd(FormCmd::Select { down: true, count: 2 }); // point → x → y
+            ed.run_form_cmd(FormCmd::Nudge(1));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            ed.run_form_cmd(FormCmd::CycleMap);
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 3 of 3"));
+            ed.run_form_cmd(FormCmd::Undo);
+            assert_eq!(text(&ed), CPP, "the form's u is the buffer's");
+            ed.run_form_cmd(FormCmd::Redo);
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+        }
+
+        #[test]
+        fn w_writes_the_code_and_q_closes_the_tool() {
+            let dir = std::env::temp_dir().join(format!("bi-curve-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("damage.cpp");
+            std::fs::write(&path, CPP).unwrap();
+            let mut ed = Editor::empty();
+            sized(&mut ed);
+            ed.run_ex(&format!("e {}", path.display()));
+            ed.set_cursor(Cursor::at(CPP.find("0.8f").unwrap()));
+            let source = ed.focus();
+            ed.run_ex("set editor curve");
+            key(&mut ed, Action::Move(Motion::Up));
+            ed.run_ex("w");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), CPP.replace("0.8f", "0.81f"));
+            assert!(ed.session.status.contains("written"), "{}", ed.session.status);
+            assert_eq!(ed.focus(), plot_of(&ed, source), "still on the plot");
+            ed.set_focus(form_of(&ed));
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids().len(), 1);
+            assert_eq!(ed.focus(), source);
+            assert!(ed.tools.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -31101,9 +31283,12 @@ int main(void) {
                 "tileset what? (size, kind, select, image resize, image grow)"
             );
             ed.run_ex("tool");
-            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap)");
+            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap, curve)");
             ed.run_ex("tool lathe");
-            assert_eq!(ed.session.status, "not a tool: lathe (want tileset, image or normalmap)");
+            assert_eq!(
+                ed.session.status,
+                "not a tool: lathe (want tileset, image, normalmap or curve)"
+            );
 
             ed.run_ex("set tileset size 8");
             assert_eq!(ed.session.status, "unknown option: tileset", "no longer a :set");
