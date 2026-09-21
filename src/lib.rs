@@ -39,6 +39,7 @@ pub mod git;
 pub mod gitignore;
 pub mod history;
 pub mod img;
+pub mod imgops;
 pub mod indent;
 pub mod input;
 pub mod jumps;

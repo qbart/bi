@@ -671,6 +671,29 @@ pub struct Pasting {
 /// any one view of it — what a single keyboard has, regardless of what it is
 /// pointed at.
 ///
+/// `a b --x 1 --y` as positional words and `(name, value)` flags. A flag
+/// with no value carries an empty one; a value is the word after it, so
+/// `--alg` at the end is `("alg", "")` and the command says what it wanted.
+fn split_flags(arg: &str) -> std::result::Result<(Vec<String>, Vec<(String, String)>), String> {
+    let mut args = Vec::new();
+    let mut flags = Vec::new();
+    let mut words = arg.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        match word.strip_prefix("--") {
+            Some(name) if name.is_empty() => return Err("not a flag: --".into()),
+            Some(name) => {
+                let value = match words.peek() {
+                    Some(next) if !next.starts_with("--") => words.next().unwrap_or(""),
+                    _ => "",
+                };
+                flags.push((name.to_string(), value.to_string()));
+            }
+            None => args.push(word.to_string()),
+        }
+    }
+    Ok((args, flags))
+}
+
 /// An image's file name, for the status row — the path when there is no
 /// name, which a path always has.
 pub fn image_name(img: &Img) -> String {
@@ -6281,6 +6304,18 @@ impl Editor {
             // A turn with no grid to turn on. Swallowed rather than passed to
             // a view this window does not have.
             Action::Turn(_) => {}
+            // The history is the image's, grid or no grid: `u` after a
+            // `:tool image grayscale` brings the colours back either way.
+            Action::Undo => {
+                if !img.tile_undo() {
+                    self.session.status = "already at oldest change".into();
+                }
+            }
+            Action::Redo => {
+                if !img.tile_redo() {
+                    self.session.status = "already at newest change".into();
+                }
+            }
             _ => return false,
         }
         true
@@ -7821,10 +7856,133 @@ impl Editor {
             None => (arg.trim(), ""),
         };
         match tool {
-            "" => self.session.status = "tool what? (tileset)".into(),
+            "" => self.session.status = "tool what? (tileset, image)".into(),
             "tileset" => self.tileset_tool(rest),
-            other => self.session.status = format!("not a tool: {other} (want tileset)"),
+            "image" => self.image_tool(rest),
+            other => self.session.status = format!("not a tool: {other} (want tileset or image)"),
         }
+    }
+
+    /// `:tool image …` — whole-image operations, one undo step each, and
+    /// `conv`, which decides what `:w` writes. See `docs/specs/image-ops.md`.
+    fn image_tool(&mut self, arg: &str) {
+        use crate::imgops::{Axis, Filter, Format, Kind};
+        use crate::tileset::parse_pair;
+        const OPS: &str = "image what? (grayscale, invert, flip, blur, resize, crop, conv)";
+        let Some(img) = self.window_mut().img_mut() else {
+            self.session.status = "no image here".into();
+            return;
+        };
+        let (args, flags) = match split_flags(arg) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.session.status = e;
+                return;
+            }
+        };
+        let (op, value) = match args.split_first() {
+            Some((op, rest)) => (op.as_str(), rest.join(" ")),
+            None => ("", String::new()),
+        };
+        let value = value.as_str();
+        let flag = |name: &str| flags.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        let allowed: &[&str] = match op {
+            "resize" => &["alg"],
+            "conv" => &["rgb", "rgba", "quality"],
+            _ => &[],
+        };
+        if let Some((stray, _)) = flags.iter().find(|(n, _)| !allowed.contains(&n.as_str())) {
+            self.session.status = format!("not a flag: --{stray}");
+            return;
+        }
+        let message = match op {
+            "grayscale" => {
+                img.op_grayscale();
+                String::new()
+            }
+            "invert" => {
+                img.op_invert();
+                String::new()
+            }
+            "flip" => match Axis::parse(value) {
+                Some(axis) => {
+                    img.op_flip(axis);
+                    String::new()
+                }
+                None => "flip what? (x or y)".into(),
+            },
+            "blur" => match value.parse::<f32>() {
+                Ok(sigma) if sigma > 0.0 && sigma.is_finite() => {
+                    img.op_blur(sigma);
+                    String::new()
+                }
+                _ => format!("not a sigma: {value}"),
+            },
+            "resize" => {
+                let filter = match flag("alg") {
+                    None => Ok(Filter::default()),
+                    Some("") => Err("--alg wants a value".to_string()),
+                    Some(name) => Filter::parse(name).ok_or_else(|| {
+                        format!("not an algorithm: {name} (nearest, bilinear, lanczos)")
+                    }),
+                };
+                match (parse_pair(value), filter) {
+                    (Ok(size), Ok(filter)) => {
+                        img.op_resize(size, filter);
+                        format!("{}×{}", img.width, img.height)
+                    }
+                    (Err(e), _) | (_, Err(e)) => e,
+                }
+            }
+            "crop" => {
+                let parts: Vec<Option<u32>> =
+                    value.split(',').map(|n| n.trim().parse::<u32>().ok()).collect();
+                match parts.as_slice() {
+                    [Some(x), Some(y), Some(w), Some(h)] => match img.op_crop((*x, *y, *w, *h)) {
+                        Ok(()) => format!("{}×{}", img.width, img.height),
+                        Err(e) => e,
+                    },
+                    _ => format!("not a rectangle: {value} (want x,y,w,h)"),
+                }
+            }
+            "conv" => {
+                let mut format = img.format;
+                let result: std::result::Result<(), String> = (|| {
+                    if !value.is_empty() {
+                        format.kind = Kind::parse(value).ok_or_else(|| Format::refusal(value))?;
+                    }
+                    if flag("rgb").is_some() {
+                        format.alpha = false;
+                    }
+                    if flag("rgba").is_some() {
+                        format.alpha = true;
+                    }
+                    if let Some(q) = flag("quality") {
+                        format.quality = match q.parse::<u8>() {
+                            Ok(q) if (1..=100).contains(&q) => q,
+                            _ => return Err(format!("not a quality: {q} (1..100)")),
+                        };
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        if !value.is_empty() || !flags.is_empty() {
+                            img.set_format(format);
+                        }
+                        let detail = match img.format.kind {
+                            Kind::Jpg => img.format.quality.to_string(),
+                            _ if img.format.alpha => "rgba".into(),
+                            _ => "rgb".into(),
+                        };
+                        format!("\"{}\" {}, {detail}", image_name(img), img.format.kind.extension())
+                    }
+                    Err(e) => e,
+                }
+            }
+            _ => OPS.into(),
+        };
+        self.session.status = message;
     }
 
     fn tileset_tool(&mut self, arg: &str) {
@@ -29229,6 +29387,134 @@ int main(void) {
         assert!(matches!(ed.session.mode, Mode::Command(_)));
     }
 
+    /// `:tool image …` — whole-image operations, each one undo step, and
+    /// `conv` deciding what `:w` writes. See `docs/specs/image-ops.md`.
+    mod image_ops {
+        use super::*;
+
+        fn photo(tag: &str) -> (PngDir, Editor) {
+            let d = PngDir::new(tag);
+            let mut ed = Editor::empty();
+            ed.run_ex(&format!("e {}", d.png().display()));
+            (d, ed)
+        }
+
+        fn img(ed: &Editor) -> &Img {
+            ed.window().img().unwrap()
+        }
+
+        #[test]
+        fn operations_need_an_image_and_a_known_name() {
+            let mut ed = editor("text");
+            ed.run_ex("tool image grayscale");
+            assert_eq!(ed.session.status, "no image here");
+
+            let (_d, mut ed) = photo("names");
+            ed.run_ex("tool image sharpen");
+            assert_eq!(
+                ed.session.status,
+                "image what? (grayscale, invert, flip, blur, resize, crop, conv)"
+            );
+            ed.run_ex("tool image");
+            assert_eq!(
+                ed.session.status,
+                "image what? (grayscale, invert, flip, blur, resize, crop, conv)"
+            );
+        }
+
+        #[test]
+        fn grayscale_and_invert_are_undo_steps() {
+            let (_d, mut ed) = photo("gray");
+            let before = img(&ed).rgba.clone();
+            ed.run_ex("tool image invert");
+            assert_eq!(&img(&ed).rgba[0..3], &[246, 246, 246]);
+            assert!(img(&ed).dirty);
+            ed.run_ex("tool image grayscale");
+            assert_eq!(img(&ed).rgba[0], img(&ed).rgba[1]);
+            ed.run_ex("set editor tileset");
+            ed.apply(cmd(Action::Undo));
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(img(&ed).rgba, before, "two steps back");
+        }
+
+        #[test]
+        fn resize_takes_pixels_and_an_algorithm() {
+            let (_d, mut ed) = photo("resize");
+            ed.run_ex("tool image resize 10,8");
+            assert_eq!((img(&ed).width, img(&ed).height), (10, 8));
+            assert_eq!(ed.session.status, "10×8");
+            ed.run_ex("tool image resize 5,4 --alg lanczos");
+            assert_eq!((img(&ed).width, img(&ed).height), (5, 4));
+            ed.run_ex("tool image resize 5,4 --alg cubic");
+            assert_eq!(ed.session.status, "not an algorithm: cubic (nearest, bilinear, lanczos)");
+            ed.run_ex("tool image resize 5x4");
+            assert_eq!(ed.session.status, "not a pair: 5x4 (want 16 or 16,16)");
+            ed.run_ex("tool image resize 5,4 --alg");
+            assert_eq!(ed.session.status, "--alg wants a value");
+            ed.run_ex("tool image resize 5,4 --wat 1");
+            assert_eq!(ed.session.status, "not a flag: --wat");
+
+            // With the grid off: the history is the image's, not the grid's.
+            ed.apply(cmd(Action::Undo));
+            ed.apply(cmd(Action::Undo));
+            assert_eq!((img(&ed).width, img(&ed).height), (50, 40), "back to the photo");
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(ed.session.status, "already at oldest change");
+            ed.apply(cmd(Action::Redo));
+            assert_eq!((img(&ed).width, img(&ed).height), (10, 8));
+        }
+
+        #[test]
+        fn flip_blur_and_crop() {
+            let (_d, mut ed) = photo("crop");
+            ed.run_ex("tool image flip x");
+            ed.run_ex("tool image flip z");
+            assert_eq!(ed.session.status, "flip what? (x or y)");
+            ed.run_ex("tool image blur 1.5");
+            assert!(img(&ed).dirty);
+            ed.run_ex("tool image blur soft");
+            assert_eq!(ed.session.status, "not a sigma: soft");
+            ed.run_ex("tool image crop 10,10,20,20");
+            assert_eq!((img(&ed).width, img(&ed).height), (20, 20));
+            ed.run_ex("tool image crop 10,10,20,20");
+            assert_eq!(ed.session.status, "10,10,20,20 runs past 20×20");
+            ed.run_ex("tool image crop 1,2,3");
+            assert_eq!(ed.session.status, "not a rectangle: 1,2,3 (want x,y,w,h)");
+        }
+
+        #[test]
+        fn conv_repoints_the_name_and_decides_what_w_writes() {
+            let (d, mut ed) = photo("conv");
+            ed.run_ex("tool image conv jpg --quality 80");
+            assert_eq!(img(&ed).path, d.0.join("photo.jpg"));
+            assert_eq!(ed.session.status, "\"photo.jpg\" jpg, 80");
+            ed.run_ex("w");
+            assert_eq!(ed.session.status, "\"photo.jpg\" written");
+            let back = image::open(d.0.join("photo.jpg")).unwrap();
+            assert!(!back.color().has_alpha());
+
+            ed.run_ex("tool image conv png --rgb");
+            assert_eq!(img(&ed).path, d.0.join("photo.png"));
+            ed.run_ex("w");
+            assert!(!image::open(d.0.join("photo.png")).unwrap().color().has_alpha());
+
+            ed.run_ex("tool image conv tiff");
+            assert_eq!(ed.session.status, "cannot write tiff (png, jpg, webp, bmp)");
+            ed.run_ex("tool image conv jpg --quality 200");
+            assert_eq!(ed.session.status, "not a quality: 200 (1..100)");
+            ed.run_ex("tool image conv png --rgba");
+            ed.run_ex("tool image conv");
+            assert_eq!(ed.session.status, "\"photo.png\" png, rgba");
+
+            ed.run_ex("w other.gif");
+            assert_eq!(ed.session.status, "cannot write gif (png, jpg, webp, bmp)");
+            let webp = d.0.join("other.webp");
+            ed.run_ex(&format!("w {}", webp.display()));
+            assert!(webp.exists());
+            assert_eq!(img(&ed).path, webp);
+        }
+    }
+
     /// `:set editor tileset` and the keys it re-reads as tiles. The mode is
     /// the image's, the register slot is the session's, and `:w` writes PNG.
     /// See `docs/specs/tileset.md`.
@@ -29308,9 +29594,9 @@ int main(void) {
                 "tileset what? (size, kind, select, image resize, image grow)"
             );
             ed.run_ex("tool");
-            assert_eq!(ed.session.status, "tool what? (tileset)");
+            assert_eq!(ed.session.status, "tool what? (tileset, image)");
             ed.run_ex("tool lathe");
-            assert_eq!(ed.session.status, "not a tool: lathe (want tileset)");
+            assert_eq!(ed.session.status, "not a tool: lathe (want tileset or image)");
 
             ed.run_ex("set tileset size 8");
             assert_eq!(ed.session.status, "unknown option: tileset", "no longer a :set");
@@ -29548,8 +29834,8 @@ int main(void) {
             let back = image::open(d.0.join("photo.png")).unwrap().to_rgba8();
             assert_eq!(back.as_raw(), &edited);
 
-            ed.run_ex("w other.jpg");
-            assert_eq!(ed.session.status, "only png");
+            ed.run_ex("w other.gif");
+            assert_eq!(ed.session.status, "cannot write gif (png, jpg, webp, bmp)");
 
             let copy = d.0.join("copy.png");
             ed.run_ex(&format!("w {}", copy.display()));

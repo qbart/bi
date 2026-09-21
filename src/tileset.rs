@@ -138,9 +138,10 @@ impl Turn {
 enum Edit {
     /// A rectangle of pixels — where, and both versions.
     Block { rect: (u32, u32, u32, u32), before: Vec<u8>, after: Vec<u8> },
-    /// The whole sheet before a resize, and the size it became. Redo is
-    /// the resize again, which is deterministic; undo puts the pixels back.
-    Canvas { before: (u32, u32), pixels: Vec<u8>, after: (u32, u32) },
+    /// The whole sheet replaced — a resize, a grayscale, a blur. Both
+    /// versions are kept, dimensions and all: an operation is not
+    /// guaranteed reversible, so undo and redo are copies.
+    Sheet { before: (u32, u32, Vec<u8>), after: (u32, u32, Vec<u8>) },
 }
 
 #[derive(Debug, Clone)]
@@ -307,13 +308,8 @@ impl Tileset {
             return Err(format!("a canvas of {},{} tiles is nothing", tiles.0, tiles.1));
         }
         let after = (tiles.0 * self.size.0, tiles.1 * self.size.1);
-        let before = sheet.dims();
-        let pixels = std::mem::take(sheet.rgba);
-        *sheet.rgba = resized(&pixels, before, after);
-        (*sheet.width, *sheet.height) = after;
-        self.undo.push(Edit::Canvas { before, pixels, after });
-        self.redo.clear();
-        self.fit(after.0, after.1);
+        let pixels = resized(sheet.rgba, sheet.dims(), after);
+        self.replace(sheet, after, pixels);
         Ok(())
     }
 
@@ -326,28 +322,31 @@ impl Tileset {
             (width as i64 + delta.0 * self.size.0 as i64).max(self.size.0 as i64) as u32,
             (height as i64 + delta.1 * self.size.1 as i64).max(self.size.1 as i64) as u32,
         );
-        let before = sheet.dims();
-        if after == before {
+        if after == sheet.dims() {
             return Ok(());
         }
-        let pixels = std::mem::take(sheet.rgba);
-        *sheet.rgba = resized(&pixels, before, after);
-        (*sheet.width, *sheet.height) = after;
-        self.undo.push(Edit::Canvas { before, pixels, after });
-        self.redo.clear();
-        self.fit(after.0, after.1);
+        let pixels = resized(sheet.rgba, sheet.dims(), after);
+        self.replace(sheet, after, pixels);
         Ok(())
+    }
+
+    /// The whole sheet swapped for `pixels` at `dims` — how every
+    /// whole-image operation lands, and one undo step holding both
+    /// versions. Selection and cursor are re-fitted to the new size.
+    pub fn replace(&mut self, sheet: &mut Sheet, dims: (u32, u32), pixels: Vec<u8>) {
+        debug_assert_eq!(pixels.len() as u32, dims.0 * dims.1 * 4);
+        let before = (*sheet.width, *sheet.height, std::mem::replace(sheet.rgba, pixels.clone()));
+        (*sheet.width, *sheet.height) = dims;
+        self.undo.push(Edit::Sheet { before, after: (dims.0, dims.1, pixels) });
+        self.redo.clear();
+        self.fit(dims.0, dims.1);
     }
 
     pub fn undo(&mut self, sheet: &mut Sheet) -> bool {
         let Some(edit) = self.undo.pop() else { return false };
         match &edit {
             Edit::Block { rect, before, .. } => write(sheet, *rect, before),
-            Edit::Canvas { before, pixels, .. } => {
-                *sheet.rgba = pixels.clone();
-                (*sheet.width, *sheet.height) = *before;
-                self.fit(before.0, before.1);
-            }
+            Edit::Sheet { before, .. } => self.restore(sheet, before),
         }
         self.redo.push(edit);
         true
@@ -357,14 +356,16 @@ impl Tileset {
         let Some(edit) = self.redo.pop() else { return false };
         match &edit {
             Edit::Block { rect, after, .. } => write(sheet, *rect, after),
-            Edit::Canvas { before, pixels, after } => {
-                *sheet.rgba = resized(pixels, *before, *after);
-                (*sheet.width, *sheet.height) = *after;
-                self.fit(after.0, after.1);
-            }
+            Edit::Sheet { after, .. } => self.restore(sheet, after),
         }
         self.undo.push(edit);
         true
+    }
+
+    fn restore(&mut self, sheet: &mut Sheet, (w, h, pixels): &(u32, u32, Vec<u8>)) {
+        *sheet.rgba = pixels.clone();
+        (*sheet.width, *sheet.height) = (*w, *h);
+        self.fit(*w, *h);
     }
 
     /// One recorded block edit: what was there goes on the undo stack,
@@ -788,5 +789,23 @@ mod tests {
         map.set_select((2, 1), 2, 2);
         map.turn(&mut c.sheet(), Turn::Right).unwrap();
         assert_eq!(corners(&c), [3, 1, 4, 2], "two tall tiles side by side are a square");
+    }
+
+    /// `replace` is how a whole-image operation lands: new pixels, new
+    /// dimensions, one undo step that holds both versions.
+    #[test]
+    fn replace_is_one_undo_step_holding_both_versions() {
+        let mut map = Tileset::new((2, 2), Kind::Tile);
+        let mut c = Canvas::new(4, 4);
+        let before = c.rgba.clone();
+        let after = vec![7u8; 2 * 2 * 4];
+        map.replace(&mut c.sheet(), (2, 2), after.clone());
+        assert_eq!((c.w, c.h), (2, 2));
+        assert_eq!(c.rgba, after);
+        assert!(map.undo(&mut c.sheet()));
+        assert_eq!((c.w, c.h), (4, 4));
+        assert_eq!(c.rgba, before);
+        assert!(map.redo(&mut c.sheet()));
+        assert_eq!(c.rgba, after, "redo is the copy, not a recomputation");
     }
 }

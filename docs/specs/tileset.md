@@ -101,7 +101,7 @@ pub struct Tileset {
     kind: Kind,                // Tile; Hex is parsed and refused
     cursor: (u32, u32),        // column, row — in tiles; the block's top-left
     select: (u32, u32),        // columns, rows the cursor selects
-    undo: Vec<Edit>,           // Block { rect, before, after } | Canvas { .. }
+    undo: Vec<Edit>,           // Block { rect, before, after } | Sheet { before, after }
     redo: Vec<Edit>,
 }
 
@@ -127,10 +127,11 @@ paste into each other, so one ring for both would be two rings wearing one
 coat.
 
 **Undo is per image.** Each `dd`, `p` and `r` records the block it
-overwrote — where, and the pixels that were there — and a resize records
-the whole sheet it replaced. `u` puts them back, moving the edit to the
-redo stack for `Ctrl-R`; redoing a resize is the resize again. A fresh
-edit clears redo, as text undo does. `dd` without undo is a scary key.
+overwrote — where, and the pixels that were there — and a resize, like
+every whole-image operation in `image-ops.md`, records the whole sheet
+before and after. `u` puts them back, moving the edit to the redo stack
+for `Ctrl-R`, and works with the grid off too. A fresh edit clears redo,
+as text undo does. `dd` without undo is a scary key.
 
 **Dirty and generation.** Every edit sets `dirty` and bumps `generation`.
 `dirty` is what `:q` reads; `generation` is what a frontend that uploaded

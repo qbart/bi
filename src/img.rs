@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::imgops::{self, Format};
 use crate::tileset::{Kind, Sheet, Tile, Tileset, Turn};
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,9 @@ pub struct Img {
     grid: Tileset,
     /// Whether the grid is on screen — `:set editor tileset`.
     grid_on: bool,
+    /// What `:w` encodes: from the extension at open, changed by
+    /// `:tool image conv`. See `docs/specs/image-ops.md`.
+    pub format: Format,
     /// Edited since it was read or written. What `:q` reads.
     pub dirty: bool,
     /// Bumped by every edit. What a frontend that uploaded the pixels once
@@ -79,7 +83,12 @@ impl Img {
             .with_context(|| format!("decoding {}", path.display()))?;
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
-        Ok(Self::from_pixels(path.to_path_buf(), width, height, rgba.into_raw(), id))
+        let mut img = Self::from_pixels(path.to_path_buf(), width, height, rgba.into_raw(), id);
+        // A gif opens fine and cannot be written back; the default (png)
+        // stands until `:w name.png` or `conv` says otherwise, and `:w`
+        // bare is refused by the extension check either way.
+        img.format = Format::from_path(path).unwrap_or_default();
+        Ok(img)
     }
 
     /// The constructor the decode feeds, and the one a test can feed pixels
@@ -96,6 +105,7 @@ impl Img {
             id,
             grid: Tileset::new((16, 16), Kind::Tile),
             grid_on: false,
+            format: Format::default(),
             dirty: false,
             generation: 0,
             zoom: 1.0,
@@ -116,29 +126,65 @@ impl Img {
         self.set_zoom(if closer { self.zoom * 2.0 } else { self.zoom / 2.0 });
     }
 
-    /// Writes the pixels as PNG — to `path` when given, re-pointing the
-    /// image at it the way `:w other.rs` re-points a buffer, else to its
-    /// own. Any other extension is refused rather than writing PNG bytes
-    /// under a `.jpg` name.
+    /// `:w`: the pixels encoded in the image's format — to `path` when
+    /// given, re-pointing the image at it and taking the format its
+    /// extension names, the way `:w other.rs` re-types a buffer; else to
+    /// its own path. An extension nothing can write is refused rather than
+    /// written as PNG under the wrong name. See `docs/specs/image-ops.md`.
     pub fn save(&mut self, path: Option<&Path>) -> std::result::Result<(), String> {
         let target = path.unwrap_or(&self.path).to_path_buf();
-        let png = target
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("png"));
-        if !png {
-            return Err("only png".into());
+        let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let Some(named) = Format::from_path(&target) else { return Err(Format::refusal(ext)) };
+        if named.kind != self.format.kind {
+            self.format = Format { kind: named.kind, ..self.format };
         }
-        image::save_buffer(
-            &target,
-            &self.rgba,
-            self.width,
-            self.height,
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| format!("error: {e}"))?;
+        self.format.write(&target, &self.rgba, self.width, self.height)?;
         self.path = target;
         self.dirty = false;
+        Ok(())
+    }
+
+    /// `:tool image conv`: what `:w` writes from now on, and the path's
+    /// extension to match, so PNG bytes never land in a `.jpg` name.
+    pub fn set_format(&mut self, format: Format) {
+        self.format = format;
+        self.path = format.repoint(&self.path);
+    }
+
+    // ---- whole-image operations: see `docs/specs/image-ops.md` ----
+
+    /// One operation on the whole sheet, landed through the grid's
+    /// `replace` so it is one undo step wherever it came from.
+    fn whole(&mut self, op: impl FnOnce(&[u8], u32, u32) -> (Vec<u8>, u32, u32)) {
+        let (pixels, w, h) = op(&self.rgba, self.width, self.height);
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.replace(&mut Sheet { rgba, width, height }, (w, h), pixels);
+        self.resized();
+    }
+
+    pub fn op_grayscale(&mut self) {
+        self.whole(|px, w, h| (imgops::grayscale(px, w, h), w, h));
+    }
+
+    pub fn op_invert(&mut self) {
+        self.whole(|px, w, h| (imgops::invert(px, w, h), w, h));
+    }
+
+    pub fn op_flip(&mut self, axis: imgops::Axis) {
+        self.whole(|px, w, h| (imgops::flip(px, w, h, axis), w, h));
+    }
+
+    pub fn op_blur(&mut self, sigma: f32) {
+        self.whole(|px, w, h| (imgops::blur(px, w, h, sigma), w, h));
+    }
+
+    pub fn op_resize(&mut self, size: (u32, u32), filter: imgops::Filter) {
+        self.whole(|px, w, h| imgops::resize(px, w, h, size, filter));
+    }
+
+    pub fn op_crop(&mut self, rect: (u32, u32, u32, u32)) -> std::result::Result<(), String> {
+        let cropped = imgops::crop(&self.rgba, self.width, self.height, rect)?;
+        self.whole(|_, _, _| cropped);
         Ok(())
     }
 

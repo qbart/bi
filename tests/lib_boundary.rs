@@ -187,6 +187,7 @@ const LIB_MODULES: &[&str] = &[
     "gitignore.rs",
     "history.rs",
     "img.rs",
+    "imgops.rs",
     "indent.rs",
     "input.rs",
     "jumps.rs",
