@@ -1807,6 +1807,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
         _ => (false, false),
     };
     let right = match (focused, image, tileset) {
+        (true, true, _) if ed.is_curve_plot(id) => " CURVE ".to_string(),
         (true, true, true) => " TILESET ".to_string(),
         (true, false, _) => format!(" {} ", ed.session.mode.label()),
         _ => String::new(),
@@ -1872,6 +1873,11 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
             let mut at = format!("{}×{}", img.width, img.height);
             if img.zoom() != 1.0 {
                 at.push_str(&format!(" {}x", img.zoom()));
+            }
+            // A curve's plot says which point is picked, not how many
+            // pixels it was drawn at. See docs/specs/curve.md.
+            if let Some(point) = ed.curve_status(id) {
+                at = point;
             }
             if let Some(map) = img.tileset() {
                 let (tw, th) = map.size();

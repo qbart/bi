@@ -698,6 +698,27 @@ fn split_flags(arg: &str) -> std::result::Result<(Vec<String>, Vec<(String, Stri
 }
 
 /// `atlas.png` → `atlas_normal.png`, beside it.
+/// The curve tool's form: the selected point mirrored, then the steps.
+/// See `docs/specs/curve.md` §The form.
+fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f32) -> Form {
+    use crate::form::Field;
+    let mut form = Form::with_cycle("curve", "Curve", "point");
+    let n = curve.points.len();
+    let p = curve.points.get(selected).copied().unwrap_or_default();
+    form.push(Field::int("point", "Point", 1, n.max(1) as i64, 1, selected as i64 + 1));
+    let x_min = if selected > 0 { curve.points[selected - 1].x } else { p.x - 1.0 };
+    let x_max = if selected + 1 < n { curve.points[selected + 1].x } else { p.x + 1.0 };
+    let (_, (y0, y1)) = crate::curve::ranges(curve, xstep, ystep);
+    form.push(Field::float("x", "X", x_min, x_max, xstep, p.x));
+    form.push(Field::float("y", "Y", y0, y1, ystep, p.y));
+    form.push(Field::float("out", "Out", p.out, p.out, 0.1, p.out));
+    form.push(Field::float("in", "In", p.in_, p.in_, 0.1, p.in_));
+    form.push(Field::bool("locked", "Locked", p.locked));
+    form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, xstep));
+    form.push(Field::float("ystep", "Y step", 0.001, 1.0, 0.001, ystep));
+    form
+}
+
 fn map_path(source: &Path, map: crate::normalmap::Map) -> PathBuf {
     let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     source.with_file_name(format!("{stem}_{}.png", map.suffix()))
@@ -8077,11 +8098,17 @@ impl Editor {
         if value == "normalmap" {
             return self.open_normalmap();
         }
-        if value == "image"
+        if value == "curve" {
+            return self.open_curve();
+        }
+        if (value == "image" || value == "text")
             && let Some(index) = tool
             && self.tools[index].source() == self.focus
         {
             return self.close_tool(index);
+        }
+        if value == "text" && self.window().text().is_some() {
+            return;
         }
         let Some(img) = self.window_mut().img_mut() else {
             self.session.status = "no image here".into();
@@ -8093,7 +8120,7 @@ impl Editor {
                 img.leave_tileset();
                 String::new()
             }
-            other => format!("not an editor: {other} (want tileset, normalmap or image)"),
+            other => format!("not an editor: {other} (want tileset, normalmap, curve or image)"),
         };
     }
 
@@ -8222,9 +8249,217 @@ impl Editor {
         true
     }
 
-    /// One curve's sync. False when the tool is done and should go.
-    fn sync_curve(&mut self, _index: usize) -> bool {
+    // ---- the curve tool: see `docs/specs/curve.md` ----
+
+    /// The curve tool one of whose windows is `window`.
+    fn curve_at(&self, window: WindowId) -> Option<usize> {
+        self.tools
+            .iter()
+            .position(|t| matches!(t, Tool::Curve(_)) && t.windows().contains(&window))
+    }
+
+    /// The tool at `index`, when it is a curve.
+    fn curve(&self, index: usize) -> Option<CurveTool> {
+        match self.tools.get(index) {
+            Some(Tool::Curve(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    fn curve_mut(&mut self, index: usize) -> Option<&mut CurveTool> {
+        match self.tools.get_mut(index) {
+            Some(Tool::Curve(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `:set editor curve`: the list under the cursor drawn in a plot split
+    /// to the right, a form down the edge, focus on the plot. On a window
+    /// that already has the tool, just the focus.
+    fn open_curve(&mut self) {
+        if let Some(index) = self.curve_at(self.focus) {
+            let plot = self.tools[index].result();
+            self.set_focus(plot);
+            return;
+        }
+        let found = self.window().text().and_then(|text| {
+            let buffer = text.buffer;
+            let cursor = text.selections.primary().head.at;
+            let rope = self.entry(buffer).buffer.rope();
+            let at = rope.char_to_byte(cursor.min(rope.len_chars()));
+            let source = rope.to_string();
+            let lit = crate::curve::find(&source, at)?;
+            let selected = lit.points.iter().position(|p| p.start <= at && at < p.end).unwrap_or(0);
+            Some((buffer, source, lit, selected))
+        });
+        let Some((buffer, text, lit, selected)) = found else {
+            self.session.status = "no curve under the cursor".into();
+            return;
+        };
+        let layout = crate::curve::Layout::default();
+        let curve = crate::curve::read(&text, &lit, &layout);
+        let (xstep, ystep) = (0.01, 0.01);
+        let source = self.focus;
+        let name = self.name_of(buffer);
+        let Some(plot) = self.split_focus(Dir::Vertical) else { return };
+        let img = Img::from_pixels(
+            PathBuf::from(format!("{name}.curve")),
+            1,
+            1,
+            vec![0; 4],
+            self.next_image,
+        );
+        self.next_image += 1;
+        if let Some(window) = self.window_mut_of(plot) {
+            window.content = Content::Image(img);
+            window.alt = None;
+        }
+        let form = curve_form(&curve, selected, xstep, ystep);
+        let Some(form) = self.open_form_sidebar(form) else {
+            self.close_window(plot);
+            self.set_focus(source);
+            return;
+        };
+        self.tools.push(Tool::Curve(CurveTool {
+            source,
+            plot,
+            form,
+            buffer,
+            anchor: lit.open,
+            layout,
+            selected,
+            xstep,
+            ystep,
+            curve,
+            literal: Some(lit),
+            lost: false,
+            seen: None,
+        }));
+        self.sync_tools();
+        self.set_focus(plot);
+    }
+
+    /// One curve's sync. False when the tool is done and should go: a
+    /// window closed by hand, or the buffer gone.
+    fn sync_curve(&mut self, index: usize) -> bool {
+        let Some(tool) = self.curve(index) else { return true };
+        let alive = |ed: &Self, id: WindowId| ed.window_of(id).is_some();
+        if !alive(self, tool.form) || !alive(self, tool.plot) {
+            return false;
+        }
+        let Some(edits) = self.buffer_edits(tool.buffer) else { return false };
+        let Some(form_generation) =
+            self.window_of(tool.form).and_then(Window::form).map(Form::generation)
+        else {
+            return false;
+        };
+        let viewport = self.plot_size(tool.plot);
+        let stamp = (edits, form_generation, viewport.0, viewport.1);
+        if tool.seen == Some(stamp) {
+            return true;
+        }
+        if tool.seen.is_some_and(|seen| seen.1 != form_generation) {
+            self.curve_form_changed(index);
+        }
+        self.curve_reread(index);
+        let edits = self.buffer_edits(tool.buffer).unwrap_or(edits);
+        let form_generation = self
+            .window_of(tool.form)
+            .and_then(Window::form)
+            .map_or(form_generation, Form::generation);
+        if let Some(tool) = self.curve_mut(index) {
+            tool.seen = Some((edits, form_generation, viewport.0, viewport.1));
+        }
         true
+    }
+
+    fn buffer_edits(&self, id: BufferId) -> Option<u64> {
+        self.buffers.iter().find(|b| b.id == id).map(|b| b.buffer.edits())
+    }
+
+    /// The room the plot has: its viewport, or a default before the first
+    /// frame, so a test without a frontend still gets a picture.
+    fn plot_size(&self, plot: WindowId) -> (u32, u32) {
+        match self.window_of(plot).and_then(Window::img).map(Img::viewport) {
+            Some((w, h)) if w > 0 && h > 0 => (w, h),
+            _ => (512, 256),
+        }
+    }
+
+    /// The form's mirror fields moved: apply them to the curve, which
+    /// edits the buffer. Filled in with the keys.
+    fn curve_form_changed(&mut self, _index: usize) {}
+
+    /// The buffer as it stands now, re-found from the anchor or the source
+    /// window's cursor, read, drawn and mirrored into the form — or lost.
+    fn curve_reread(&mut self, index: usize) {
+        let Some(tool) = self.curve(index) else { return };
+        let Some(entry) = self.buffers.iter().find(|b| b.id == tool.buffer) else { return };
+        let rope = entry.buffer.rope();
+        let text = rope.to_string();
+        let mut lit = crate::curve::find(&text, tool.anchor).filter(|l| l.open == tool.anchor);
+        if lit.is_none()
+            && let Some(cursor) = self.window_of(tool.source).and_then(Window::text)
+        {
+            let at = rope.char_to_byte(cursor.selections.primary().head.at.min(rope.len_chars()));
+            lit = crate::curve::find(&text, at);
+        }
+        let (w, h) = self.plot_size(tool.plot);
+        let (curve, selected, lost) = match &lit {
+            Some(lit) => {
+                let curve = crate::curve::read(&text, lit, &tool.layout);
+                let selected = tool.selected.min(curve.points.len().saturating_sub(1));
+                (curve, selected, false)
+            }
+            None => (crate::curve::Curve::default(), 0, true),
+        };
+        if lost && !tool.lost {
+            self.session.status = "curve lost".into();
+        }
+        let pixels = crate::curve::render(&curve, selected, tool.xstep, tool.ystep, w, h);
+        if let Some(img) = self.window_mut_of(tool.plot).and_then(Window::img_mut) {
+            img.rgba = pixels;
+            img.width = w;
+            img.height = h;
+            img.generation += 1;
+            img.dirty = false;
+        }
+        let fields = if lost {
+            Vec::new()
+        } else {
+            curve_form(&curve, selected, tool.xstep, tool.ystep).fields().to_vec()
+        };
+        if let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) {
+            form.replace_fields(fields);
+        }
+        if let Some(t) = self.curve_mut(index) {
+            t.anchor = lit.as_ref().map_or(t.anchor, |l| l.open);
+            t.literal = lit;
+            t.curve = curve;
+            t.selected = selected;
+            t.lost = lost;
+        }
+    }
+
+    /// Whether `id` is a curve tool's plot.
+    pub fn is_curve_plot(&self, id: WindowId) -> bool {
+        self.tools.iter().any(|t| matches!(t, Tool::Curve(c) if c.plot == id))
+    }
+
+    /// The plot's status row: the selected point, when the plot has one.
+    pub fn curve_status(&self, id: WindowId) -> Option<String> {
+        let tool = self.tools.iter().find_map(|t| match t {
+            Tool::Curve(c) if c.plot == id && !c.lost => Some(c),
+            _ => None,
+        })?;
+        let p = tool.curve.points.get(tool.selected)?;
+        Some(format!(
+            "point {} of {}  x {:.3} y {:.3}",
+            tool.selected + 1,
+            tool.curve.points.len(),
+            p.x,
+            p.y
+        ))
     }
 
     /// The result's pixels and name from the source and the form, now.
@@ -29895,6 +30130,129 @@ int main(void) {
         ed.apply(cmd(Action::EnterCommandMode));
 
         assert!(matches!(ed.session.mode, Mode::Command(_)));
+    }
+
+    /// `:set editor curve`: the point list under the cursor drawn beside
+    /// the code, the keys rewriting it in place. See `docs/specs/curve.md`.
+    mod curve_tool {
+        use super::*;
+
+        pub const CPP: &str = "std::vector<Point> damage = {\n    {0.0f, 0.0f, 1.0f, 1.0f, false},\n    {0.5f, 0.8f, 0.0f, 0.0f, true},\n    {1.0f, 1.0f, 1.0f, 1.0f, false},\n};\n";
+
+        pub fn open() -> (Editor, WindowId) {
+            let mut ed = editor(CPP);
+            sized(&mut ed);
+            let at = CPP.find("0.8f").unwrap();
+            ed.set_cursor(Cursor::at(CPP[..at].chars().count()));
+            let source = ed.focus();
+            ed.run_ex("set editor curve");
+            (ed, source)
+        }
+
+        pub fn plot_of(ed: &Editor, source: WindowId) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&w| w != source && ed.window_of(w).and_then(Window::img).is_some())
+                .expect("a plot window")
+        }
+
+        pub fn form_of(ed: &Editor) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&w| ed.window_of(w).and_then(Window::form).is_some())
+                .expect("a form window")
+        }
+
+        fn rect(ed: &Editor, id: WindowId) -> Rect {
+            ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap()
+        }
+
+        pub fn text(ed: &Editor) -> String {
+            ed.buffers[0].buffer.rope().to_string()
+        }
+
+        #[test]
+        fn needs_a_list_under_the_cursor() {
+            let mut ed = editor("int x = 1;");
+            ed.run_ex("set editor curve");
+            assert_eq!(ed.session.status, "no curve under the cursor");
+            assert_eq!(ed.window_ids().len(), 1);
+        }
+
+        #[test]
+        fn opening_puts_the_plot_beside_the_source_the_form_at_the_edge_and_focuses_the_plot() {
+            let (ed, source) = open();
+            assert_eq!(ed.window_ids().len(), 3, "{:?}", ed.window_ids());
+            let plot = plot_of(&ed, source);
+            assert_eq!(ed.focus(), plot);
+            let form = form_of(&ed);
+            let (s, p, f) = (rect(&ed, source), rect(&ed, plot), rect(&ed, form));
+            assert!(p.x > s.x && f.x > p.x, "{s:?} {p:?} {f:?}");
+            assert_eq!(
+                ed.curve_status(plot).unwrap(),
+                "point 2 of 3  x 0.500 y 0.800",
+                "the cursor's point is selected"
+            );
+            let form = ed.window_of(form).unwrap().form().unwrap();
+            assert!(form.fields().iter().any(|f| f.name() == "point"));
+            assert_eq!(form.get_f32("y"), 0.8);
+            let img = ed.window_of(plot).unwrap().img().unwrap();
+            assert_eq!((img.width, img.height), (512, 256), "drawn at the default size");
+            assert!(ed.is_curve_plot(plot));
+            assert!(!ed.is_curve_plot(source));
+        }
+
+        #[test]
+        fn set_editor_reports_and_reopening_focuses_the_plot() {
+            let (mut ed, source) = open();
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=curve");
+            ed.set_focus(source);
+            ed.run_ex("set editor curve");
+            assert_eq!(ed.focus(), plot_of(&ed, source));
+            ed.set_focus(source);
+            ed.run_ex("set editor text");
+            assert_eq!(ed.window_ids().len(), 1, "closed from the source");
+            assert_eq!(ed.focus(), source);
+        }
+
+        #[test]
+        fn editing_the_number_by_hand_redraws() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            let before = ed.window_of(plot).unwrap().img().unwrap().generation;
+            ed.set_focus(source);
+            let at = CPP.find("0.8f").unwrap();
+            let start = CPP[..at].chars().count();
+            ed.buffer_mut().unwrap().replace_range(start, start + 4, "0.2f");
+            ed.apply(cmd(Action::Move(Motion::Left)));
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.200");
+            assert!(ed.window_of(plot).unwrap().img().unwrap().generation > before);
+            let form = ed.window_of(form_of(&ed)).unwrap().form().unwrap();
+            assert_eq!(form.get_f32("y"), 0.2, "the form mirrors the text");
+        }
+
+        #[test]
+        fn deleting_the_list_says_lost() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            ed.set_focus(source);
+            let len = ed.buffer().unwrap().rope().len_chars();
+            ed.buffer_mut().unwrap().replace_range(0, len, "int x;\n");
+            ed.apply(cmd(Action::Move(Motion::Left)));
+            assert_eq!(ed.session.status, "curve lost");
+            assert!(ed.curve_status(plot).is_none());
+            assert_eq!(ed.window_ids().len(), 3, "the windows stay");
+        }
+
+        #[test]
+        fn closing_the_plot_by_hand_forgets_the_tool() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            ed.close_window(plot);
+            ed.apply(cmd(Action::Move(Motion::Left)));
+            assert!(ed.tools.is_empty());
+        }
     }
 
     /// `:set editor normalmap`: a result beside the source, a form at the
