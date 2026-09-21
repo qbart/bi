@@ -78,17 +78,6 @@ pub enum Turn {
 }
 
 impl Turn {
-    pub fn from_key(ch: char) -> Option<Self> {
-        Some(match ch {
-            'h' => Self::Left,
-            'l' => Self::Right,
-            'j' => Self::Half,
-            'k' | 'y' => Self::MirrorY,
-            'x' => Self::MirrorX,
-            _ => return None,
-        })
-    }
-
     /// `pixels` of a `w`×`h` tile, turned. A quarter turn of a tile that
     /// is not square would not fit its cell, and is refused.
     fn apply(self, pixels: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
@@ -526,16 +515,5 @@ mod tests {
         assert_eq!((px[0], px[4]), (2, 1), "the half turn works at any size");
         assert!(map.undo(&mut px, 2), "the half turn is one step");
         assert!(!map.undo(&mut px, 2), "and the refusals recorded nothing");
-    }
-
-    #[test]
-    fn a_turn_direction_is_spelled_by_its_key() {
-        assert_eq!(Turn::from_key('h'), Some(Turn::Left));
-        assert_eq!(Turn::from_key('l'), Some(Turn::Right));
-        assert_eq!(Turn::from_key('j'), Some(Turn::Half));
-        assert_eq!(Turn::from_key('k'), Some(Turn::MirrorY));
-        assert_eq!(Turn::from_key('x'), Some(Turn::MirrorX));
-        assert_eq!(Turn::from_key('y'), Some(Turn::MirrorY));
-        assert_eq!(Turn::from_key('q'), None);
     }
 }

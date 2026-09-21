@@ -18,6 +18,7 @@ use crate::motion::{Motion, Operator, Target, TextObject};
 use crate::picker::PickerKind;
 use crate::region::Shape;
 use crate::registers::Sink;
+use crate::tileset::Turn;
 use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
 
@@ -99,6 +100,11 @@ pub struct Input {
     remap_pending: Vec<Key>,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
+    /// `r` in an image window: the next key is the direction the tile
+    /// turns. Not in `mid_command`, on purpose — the direction is a fresh
+    /// keymap lookup, the way an operator's motion is, so a rebound `j`
+    /// turns the way it moves. See `docs/specs/tileset.md`.
+    turn_pending: bool,
 }
 
 /// The keys that name a motion on their own. `G` is missing because what it
@@ -382,6 +388,9 @@ impl Input {
             // `dap_pane`. Ahead of `Mode::Debug` for the reason `remap`
             // gives: the pane's grammar is the window's, not the session's.
             Mode::Normal | Mode::Debug if is_dap_pane(content) => self.dap_pane(key, content),
+            // A picture reads the normal grammar, with one key of its own:
+            // `r` has no character to replace, so it turns the tile.
+            Mode::Normal if content == ContentKind::Image => self.image(key),
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -966,6 +975,41 @@ impl Input {
         matches!(key.code, KeyCode::Char('c' | 'n' | 's' | 'o' | 'p' | 'b' | 'K') | KeyCode::Esc)
     }
 
+    /// An image window: normal's grammar, except that `r` waits for a
+    /// direction rather than a character. The direction is whatever the
+    /// keymap makes of the next key — arrows included — and `x`/`y` are the
+    /// mirrors, since neither is a direction.
+    fn image(&mut self, key: Key) -> Option<Command> {
+        let ctrl = key.mods.ctrl;
+        if self.turn_pending {
+            self.reset();
+            let turn = match key.code {
+                KeyCode::Char(c) if !ctrl => match motion_key(c) {
+                    Some(Motion::Left) => Some(Turn::Left),
+                    Some(Motion::Right) => Some(Turn::Right),
+                    Some(Motion::Down) => Some(Turn::Half),
+                    Some(Motion::Up) => Some(Turn::MirrorY),
+                    _ => match c {
+                        'x' => Some(Turn::MirrorX),
+                        'y' => Some(Turn::MirrorY),
+                        _ => None,
+                    },
+                },
+                KeyCode::Left => Some(Turn::Left),
+                KeyCode::Right => Some(Turn::Right),
+                KeyCode::Down => Some(Turn::Half),
+                KeyCode::Up => Some(Turn::MirrorY),
+                _ => None,
+            };
+            return Some(Command { count: 1, action: Action::Turn(turn) });
+        }
+        if key.code == KeyCode::Char('r') && !ctrl && !self.window_pending && !self.g_pending {
+            self.turn_pending = true;
+            return None;
+        }
+        self.normal(key)
+    }
+
     fn normal(&mut self, key: Key) -> Option<Command> {
         let ctrl = key.mods.ctrl;
 
@@ -1214,7 +1258,9 @@ impl Input {
                 // `gc` — the comment-toggle operator, the same doubled shape
                 // as `gq`: `gcgc` covers the line the way `gcc` does. See
                 // `docs/specs/comment.md`.
-                'c' if self.operator == Some(Operator::Comment) => self.resolve(Motion::CurrentLine),
+                'c' if self.operator == Some(Operator::Comment) => {
+                    self.resolve(Motion::CurrentLine)
+                }
                 'c' if self.operator.is_none() => {
                     self.operator = Some(Operator::Comment);
                     None
@@ -3741,5 +3787,82 @@ leader = \" \"
         input.on_key(key('i'), &Mode::Normal, ContentKind::Text);
         input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
         assert_eq!(input.pending_display(), "");
+    }
+
+    /// In an image window `r` is not "replace the character" — there is no
+    /// character — but "turn the tile", and the key after it is a fresh
+    /// lookup in the normal keymap, the way the key after `d` is: a rebound
+    /// `j` turns the tile the way a bare `j` moves it. Mirrors keep `x`
+    /// and `y`. See `docs/specs/tileset.md`.
+    mod image_turn {
+        use super::*;
+        use crate::tileset::Turn;
+
+        fn image(input: &mut Input, keys: &str) -> Option<Command> {
+            feed(input, keys, ContentKind::Image)
+        }
+
+        #[test]
+        fn r_and_a_direction_is_a_turn_in_an_image_window() {
+            let mut input = Input::default();
+            assert_eq!(image(&mut input, "rl").unwrap().action, Action::Turn(Some(Turn::Right)));
+            assert_eq!(image(&mut input, "rh").unwrap().action, Action::Turn(Some(Turn::Left)));
+            assert_eq!(image(&mut input, "rj").unwrap().action, Action::Turn(Some(Turn::Half)));
+            assert_eq!(image(&mut input, "rk").unwrap().action, Action::Turn(Some(Turn::MirrorY)));
+            assert_eq!(image(&mut input, "rx").unwrap().action, Action::Turn(Some(Turn::MirrorX)));
+            assert_eq!(image(&mut input, "ry").unwrap().action, Action::Turn(Some(Turn::MirrorY)));
+            assert_eq!(image(&mut input, "rq").unwrap().action, Action::Turn(None), "asks what");
+        }
+
+        #[test]
+        fn the_arrows_turn_too() {
+            let mut input = Input::default();
+            image(&mut input, "r");
+            let down = Key::new(KeyCode::Down, crate::key::Mods::default());
+            let cmd = input.on_key(down, &Mode::Normal, ContentKind::Image);
+            assert_eq!(cmd.unwrap().action, Action::Turn(Some(Turn::Half)));
+        }
+
+        #[test]
+        fn the_direction_comes_from_the_normal_keymap() {
+            let src = "
+[keys.normal]
+\"j\" = \"left\"
+";
+            let (config, problems) =
+                crate::config::parse(src, crate::config::Config::default()).expect("parses");
+            assert!(problems.is_empty(), "{problems:?}");
+            let mut input = Input::default();
+            input.set_keys(config.keys);
+
+            assert_eq!(image(&mut input, "j").unwrap().action, Action::Move(Motion::Left));
+            assert_eq!(
+                image(&mut input, "rj").unwrap().action,
+                Action::Turn(Some(Turn::Left)),
+                "rebound j turns the way it moves"
+            );
+        }
+
+        #[test]
+        fn a_text_window_still_replaces() {
+            let mut input = Input::default();
+            let cmd = feed(&mut input, "rl", ContentKind::Text).unwrap();
+            assert_eq!(cmd.action, Action::ReplaceChar { ch: 'l', count: 1 });
+        }
+
+        #[test]
+        fn everything_else_in_an_image_is_normal() {
+            let mut input = Input::default();
+            assert_eq!(image(&mut input, "j").unwrap().action, Action::Move(Motion::Down));
+            assert_eq!(
+                image(&mut input, "dd").unwrap().action,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::CurrentLine),
+                    count: 1,
+                    sink: Sink::Ring
+                }
+            );
+        }
     }
 }

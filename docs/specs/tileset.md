@@ -119,13 +119,17 @@ is not the grid's says so — `tile is 16×16, grid is 32×32` — and does
 nothing; a clipped paste is a guess about which corner you meant. `p` and
 `P` are the same key: a tile has no before and after.
 
-**`r` turns the tile in place.** In a text buffer `r` waits for the
-character to put under the cursor, so `rh` already arrives as one action
-carrying `h`; the tileset reads the character as a direction. `rh` and `rl`
-are quarter turns, `rj` a half turn, `rk` the half turn followed by a
-left-right mirror — which is a top-to-bottom mirror, and `ry` spells the
-same thing so the mirrors read as a pair with `rx`. Any other character
-says `rotate what? (r + h j k l x y)`. A quarter turn of a 16×8 tile is an
+**`r` turns the tile in place.** In an image window `r` has no character
+to replace, so `Input` reads it as "turn", and the key after it is a fresh
+lookup in the normal keymap — the way the key after `d` is — rather than a
+literal `h`: a `j` rebound to `left` turns the tile left, and the arrows
+turn too. No `hjkl` is spelled anywhere in the tileset; the directions are
+whatever normal mode's are. `rh` and `rl` are quarter turns, `rj` a half
+turn, `rk` the half turn followed by a left-right mirror — which is a
+top-to-bottom mirror, and `ry` spells the same thing so the mirrors read as
+a pair with `rx`; `x` and `y` are the two keys that are not directions and
+are taken as themselves. Any other key says `rotate what? (r + h j k l x
+y)`. In a text buffer `r` is still replace. A quarter turn of a 16×8 tile is an
 8×16 tile that does not fit its cell, so `rh` and `rl` are refused on a
 tile that is not square — `16×8 does not turn` — while the half turn and
 the mirrors work at any size. Every turn is one undo step, like a paste.
@@ -221,6 +225,8 @@ this one does.
 - `rl` on a 16×8 tile is refused with `16×8 does not turn` and changes
   nothing; `rj` on it works.
 - `rq` says `rotate what? (r + h j k l x y)`.
+- With `"j" = "left"` in `[keys.normal]`, `rj` in an image window turns
+  left; `r<Down>` is the half turn; `rl` in a text buffer is still replace.
 - An edit sets `dirty` and bumps `generation`; `:w` round-trips the pixels
   through a PNG on disk and clears `dirty`; `:w a.jpg` is refused.
 - `:q` on a dirty image refuses, `:q!` closes; `:bd` the same; `:qa` names

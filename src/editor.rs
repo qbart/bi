@@ -371,6 +371,10 @@ pub enum Action {
         ch: char,
         count: usize,
     },
+    /// `r` and a direction in an image window: the tile under the tileset
+    /// cursor, turned. `None` is a key that named no turn, and asks what.
+    /// See `docs/specs/tileset.md`.
+    Turn(Option<crate::tileset::Turn>),
     /// `~`
     ToggleCase {
         count: usize,
@@ -6270,6 +6274,9 @@ impl Editor {
             | Action::SearchWord { .. }
             | Action::ShowScopes
             | Action::EnterVisual(_) => {}
+            // A turn with no grid to turn on. Swallowed rather than passed to
+            // a view this window does not have.
+            Action::Turn(_) => {}
             _ => return false,
         }
         true
@@ -6351,12 +6358,8 @@ impl Editor {
                 None => Some("nothing to paste".to_string()),
                 Some(tile) => img.tile_paste(tile).err(),
             },
-            // `r{char}`: in a buffer the char replaces one under the
-            // cursor; here it is the direction the tile turns.
-            Action::ReplaceChar { ch, .. } => match crate::tileset::Turn::from_key(*ch) {
-                Some(turn) => img.tile_turn(turn).err(),
-                None => Some("rotate what? (r + h j k l x y)".to_string()),
-            },
+            Action::Turn(Some(turn)) => img.tile_turn(*turn).err(),
+            Action::Turn(None) => Some("rotate what? (r + h j k l x y)".to_string()),
             Action::Undo => (!img.tile_undo()).then(|| "already at oldest change".to_string()),
             Action::Redo => (!img.tile_redo()).then(|| "already at newest change".to_string()),
             Action::EnterNormal => {
@@ -12195,6 +12198,9 @@ impl View<'_> {
             // `Action::Buffer` — the walk needs `Editor::show`, which a view
             // cannot reach.
             Action::JumpBack { .. } | Action::JumpForward { .. } | Action::JumpLast => {}
+            // Only ever produced in an image window, which `run_image_action`
+            // answers before a view is looked for.
+            Action::Turn(_) => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // A far motion is a jump — `docs/specs/jumplist.md` §"What a
@@ -29435,8 +29441,9 @@ int main(void) {
         #[test]
         fn r_and_a_direction_turn_the_tile() {
             let (_d, mut ed) = sheet("turn");
-            let turn = |ed: &mut Editor, ch: char| {
-                ed.apply(cmd(Action::ReplaceChar { ch, count: 1 }));
+            use crate::tileset::Turn;
+            let turn = |ed: &mut Editor, turn: Option<Turn>| {
+                ed.apply(cmd(Action::Turn(turn)));
             };
             let img = ed.window_mut().img_mut().unwrap();
             // Paint the cursor's tile so a turn is visible: one red pixel
@@ -29444,7 +29451,7 @@ int main(void) {
             img.rgba[0..4].copy_from_slice(&[255, 0, 0, 255]);
             let before = img.rgba.clone();
 
-            turn(&mut ed, 'l');
+            turn(&mut ed, Some(Turn::Right));
             let img = ed.window().img().unwrap();
             assert!(img.dirty);
             let tile = img.tile_yank().unwrap();
@@ -29452,16 +29459,16 @@ int main(void) {
             assert_eq!(at(&tile, 9, 0), 255, "a quarter turn right puts the corner top-right");
             assert_eq!(at(&tile, 0, 0), 9);
 
-            turn(&mut ed, 'h');
+            turn(&mut ed, Some(Turn::Left));
             assert_eq!(ed.window().img().unwrap().rgba, before, "and back");
 
-            turn(&mut ed, 'q');
+            turn(&mut ed, None);
             assert_eq!(ed.session.status, "rotate what? (r + h j k l x y)");
 
             ed.run_ex("set tileset size 10x5");
-            turn(&mut ed, 'l');
+            turn(&mut ed, Some(Turn::Right));
             assert_eq!(ed.session.status, "10×5 does not turn");
-            turn(&mut ed, 'j');
+            turn(&mut ed, Some(Turn::Half));
             let tile = ed.window().img().unwrap().tile_yank().unwrap();
             assert_eq!(tile.rgba[(4 * 10 + 9) * 4], 255, "the half turn works: bottom-right");
         }
