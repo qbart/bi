@@ -375,6 +375,8 @@ pub enum Action {
     /// cursor, turned. `None` is a key that named no turn, and asks what.
     /// See `docs/specs/tileset.md`.
     Turn(Option<crate::tileset::Turn>),
+    /// A key in a form window. See `docs/specs/form.md`.
+    Form(FormCmd),
     /// `~`
     ToggleCase {
         count: usize,
@@ -2763,6 +2765,28 @@ pub enum ResultsCmd {
     Remove,
 }
 
+/// What a key in a form window asks for. See `docs/specs/form.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormCmd {
+    Select {
+        down: bool,
+        count: usize,
+    },
+    First,
+    Last,
+    /// `h`/`l` by one step per count, `H`/`L` by ten.
+    Nudge(i64),
+    Toggle,
+    /// `Enter`, `i`: the value on the ex line.
+    Edit,
+    Undo,
+    Redo,
+    /// `Tab`: the field named `map`, advanced.
+    CycleMap,
+    /// `Esc`: back to the window the form belongs to.
+    Leave,
+}
+
 /// What a key does in a window holding a tree.
 ///
 /// Every arm here the tree can answer by itself; `Expand` and `Enter` are the
@@ -2995,6 +3019,10 @@ pub enum Pane<'a> {
     Results {
         window: &'a Window,
         results: &'a crate::results::Results,
+    },
+    Form {
+        window: &'a Window,
+        form: &'a crate::form::Form,
     },
     Image {
         window: &'a Window,
@@ -3624,6 +3652,7 @@ impl Editor {
             Content::Tree(tree) => Pane::Tree { window, tree },
             Content::Results(results) => Pane::Results { window, results },
             Content::Image(img) => Pane::Image { window, img },
+            Content::Form(form) => Pane::Form { window, form },
             Content::DapStack(stack) => Pane::DapStack { window, stack },
             Content::DapConsole(console) => Pane::DapConsole { window, console },
             Content::DapVariables(vars) => Pane::DapVariables { window, vars },
@@ -4602,7 +4631,7 @@ impl Editor {
         if cmd == BufferCmd::Alternate
             && matches!(
                 self.window().alt,
-                Some(Content::Tree(_) | Content::Results(_) | Content::Image(_))
+                Some(Content::Tree(_) | Content::Results(_) | Content::Image(_) | Content::Form(_))
             )
         {
             let parked = self.window_mut().alt.take().expect("checked above");
@@ -6032,6 +6061,89 @@ impl Editor {
         }
         Some(new)
     }
+
+    /// Opens `form` as a sidebar down the right edge of the screen — the
+    /// mirror of the tree's column — `Chrome::tree_width` wide, focused.
+    /// `None` when there is no room. See `docs/specs/form.md`.
+    pub fn open_form_sidebar(&mut self, form: crate::form::Form) -> Option<WindowId> {
+        let (area, chrome) = (self.area, self.chrome);
+        let new = self.fresh_window_id();
+        if !self.layout.split_root(new, Dir::Vertical, Place::After, area, &chrome) {
+            self.next_window -= 1;
+            self.session.status = "not enough room to split".into();
+            return None;
+        }
+        self.windows.push(Window::showing(new, Content::Form(form)));
+        self.set_focus(new);
+        let target = self.session.tree_width.unwrap_or(chrome.tree_width);
+        let width = self
+            .layout
+            .rect_of(new, area, &chrome)
+            .map_or(0, |rect| rect.width)
+            .saturating_sub(target);
+        if width > 0 {
+            self.layout.resize(new, Dir::Vertical, -(width as i32), area, &chrome);
+        }
+        Some(new)
+    }
+
+    /// A key in the focused form window. See `docs/specs/form.md`.
+    fn run_form_cmd(&mut self, cmd: FormCmd) {
+        if cmd == FormCmd::Leave {
+            let home = self.form_home(self.focus).or(self.previous);
+            if let Some(home) = home.filter(|&w| w != self.focus && self.window_of(w).is_some()) {
+                self.set_focus(home);
+            }
+            return;
+        }
+        let Some(form) = self.window_mut().form_mut() else { return };
+        let mut status = None;
+        match cmd {
+            FormCmd::Select { down, count } => {
+                form.select_by(if down { count as i64 } else { -(count as i64) })
+            }
+            FormCmd::First => form.first(),
+            FormCmd::Last => form.last(),
+            FormCmd::Nudge(steps) => form.nudge(steps),
+            FormCmd::Toggle => form.toggle(),
+            FormCmd::Undo => {
+                if !form.undo() {
+                    status = Some("already at oldest change");
+                }
+            }
+            FormCmd::Redo => {
+                if !form.redo() {
+                    status = Some("already at newest change");
+                }
+            }
+            FormCmd::CycleMap => {
+                if !form.cycle_map() {
+                    status = Some("nothing to cycle: no map field");
+                }
+            }
+            FormCmd::Edit => {
+                let Some(field) = form.fields().get(form.selected()) else { return };
+                let line = format!("tool {} {} {}", form.tool(), field.name(), field.text());
+                self.session.status.clear();
+                self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
+                return;
+            }
+            FormCmd::Leave => unreachable!("handled above"),
+        }
+        if let Some(status) = status {
+            self.session.status = status.into();
+        }
+        self.sync_tools();
+    }
+
+    /// The window a form belongs to, when a tool owns it — none yet.
+    fn form_home(&self, _form: WindowId) -> Option<WindowId> {
+        None
+    }
+
+    /// After a form moved: every tool whose form's generation changed
+    /// recomputes what depends on it. Nothing to sync yet.
+    fn sync_tools(&mut self) {}
 
     fn run_window_cmd(&mut self, cmd: WindowCmd) {
         let focus = self.focus;
@@ -8224,6 +8336,7 @@ impl Editor {
             Action::Window(window_cmd) => self.run_window_cmd(window_cmd),
             Action::Tree(tree_cmd) => self.run_tree_cmd(tree_cmd),
             Action::Debug(debug_cmd) => self.debug_command(debug_cmd),
+            Action::Form(form_cmd) => self.run_form_cmd(form_cmd),
             Action::Shell(shell_cmd) => self.run_shell_cmd(shell_cmd),
             Action::Results(results_cmd) => {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
@@ -12417,6 +12530,8 @@ impl View<'_> {
             // Only ever produced in an image window, which `run_image_action`
             // answers before a view is looked for.
             Action::Turn(_) => {}
+            // Only ever produced in a form window; answered in `Editor::apply`.
+            Action::Form(_) => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // A far motion is a jump — `docs/specs/jumplist.md` §"What a

@@ -40,6 +40,9 @@ pub enum Content {
     /// position, which is view state, and two panes wanting different crops
     /// is why you would open the second.
     Image(Img),
+    /// A tool's knobs — see `docs/specs/form.md`. In the window for the
+    /// tree's reason: the selected field is view state.
+    Form(crate::form::Form),
     /// The stopped session's call stack — see `docs/specs/debug.md` §UI. Held
     /// whole for the same reason `Tree`/`Results` are: which frame is
     /// selected is view state, not something two panes would want to share.
@@ -207,6 +210,7 @@ pub enum ContentKind {
     Tree,
     Results,
     Image,
+    Form,
     DapStack,
     DapConsole,
     DapVariables,
@@ -220,6 +224,7 @@ impl Content {
             Content::Tree(_) => ContentKind::Tree,
             Content::Results(_) => ContentKind::Results,
             Content::Image(_) => ContentKind::Image,
+            Content::Form(_) => ContentKind::Form,
             Content::DapStack(_) => ContentKind::DapStack,
             Content::DapConsole(_) => ContentKind::DapConsole,
             Content::DapVariables(_) => ContentKind::DapVariables,
@@ -234,6 +239,7 @@ impl Content {
             Content::Tree(_)
             | Content::Results(_)
             | Content::Image(_)
+            | Content::Form(_)
             | Content::DapStack(_)
             | Content::DapConsole(_)
             | Content::DapVariables(_)
@@ -359,6 +365,20 @@ impl Window {
     pub fn img_mut(&mut self) -> Option<&mut Img> {
         match &mut self.content {
             Content::Image(img) => Some(img),
+            _ => None,
+        }
+    }
+
+    pub fn form(&self) -> Option<&crate::form::Form> {
+        match &self.content {
+            Content::Form(form) => Some(form),
+            _ => None,
+        }
+    }
+
+    pub fn form_mut(&mut self) -> Option<&mut crate::form::Form> {
+        match &mut self.content {
+            Content::Form(form) => Some(form),
             _ => None,
         }
     }

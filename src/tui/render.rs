@@ -973,6 +973,62 @@ fn render_watches(
     cursor_at
 }
 
+/// A form: one row per field — label, then a slider and the value for a
+/// number, `[x]` for a bool, `‹ option ›` for a choice — the selected row
+/// in the selection colour. See docs/specs/form.md.
+fn render_form(
+    frame: &mut Frame,
+    form: &bi::form::Form,
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    use bi::form::Kind;
+    let width = area.width as usize;
+    let label_width = form.fields().iter().map(|f| f.label().chars().count()).max().unwrap_or(0);
+    let mut lines = Vec::with_capacity(area.height as usize);
+    for (index, field) in form.fields().iter().enumerate().take(area.height as usize) {
+        let label = format!("{:<label_width$}", field.label());
+        let row = match field.kind() {
+            Kind::Bool => {
+                let mark = if field.display() == "on" { "[x]" } else { "[ ]" };
+                format!(" {mark} {}", field.label())
+            }
+            Kind::Choice { .. } => format!(" {label}  ‹ {} ›", field.display()),
+            Kind::Float { .. } | Kind::Int { .. } => {
+                let value = field.display();
+                // Label, two spaces, slider, two spaces, value — the slider
+                // takes what is left, and none at all in a pane too narrow.
+                let room = width.saturating_sub(1 + label_width + 2 + 2 + value.chars().count());
+                let slider = match (room, field.fraction()) {
+                    (0, _) | (_, None) => String::new(),
+                    (room, Some(fraction)) => {
+                        let filled =
+                            ((room as f32 - 1.0) * fraction.clamp(0.0, 1.0)).round() as usize;
+                        let mut bar: String = "━".repeat(room);
+                        let mut chars: Vec<char> = bar.chars().collect();
+                        if let Some(c) = chars.get_mut(filled.min(room - 1)) {
+                            *c = '●';
+                        }
+                        bar = chars.into_iter().collect();
+                        bar
+                    }
+                };
+                format!(" {label}  {slider}  {value}")
+            }
+        };
+        let style = match (focused, index == form.selected()) {
+            (true, true) => tui(ui.selection),
+            (false, true) => tui(ui.cursorline),
+            _ => Style::default(),
+        };
+        let padded = format!("{row:<width$}");
+        lines.push(Line::from(Span::styled(cells_at(&padded, 8), style)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+    None
+}
+
 /// One window's image: a placement for the graphics module when the terminal
 /// draws pixels, a centered line about them when it does not.
 ///
@@ -1130,6 +1186,9 @@ fn render_window(
         }
         Pane::DapWatches { watches, list, .. } => {
             return render_watches(frame, watches, list, text_area, focused, &ed.theme().ui);
+        }
+        Pane::Form { form, .. } => {
+            return render_form(frame, form, text_area, focused, &ed.theme().ui);
         }
     };
     let (scroll, left, selections) = (text.scroll, text.left, &text.selections);
@@ -1743,6 +1802,8 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     // is the one mode a picture has, and says so.
     let (image, tileset) = match ed.pane(id) {
         Some(Pane::Image { img, .. }) => (true, img.tileset().is_some()),
+        // A form has no modes either.
+        Some(Pane::Form { .. }) => (true, false),
         _ => (false, false),
     };
     let right = match (focused, image, tileset) {
@@ -1838,6 +1899,9 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         }
         Some(Pane::DapWatches { list, .. }) => {
             ("Watches".into(), format!("{} watches", list.len()))
+        }
+        Some(Pane::Form { form, .. }) => {
+            (form.title().to_string(), format!("{} fields", form.fields().len()))
         }
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
@@ -3329,5 +3393,49 @@ int main(void) {
         assert_eq!((atlas.cols, atlas.rows), (8, 4), "fitted to the whole pane");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A form pane: one row per field, a slider whose fill follows the
+    /// value, the selected row in the selection colour, and a status row
+    /// naming the form. See docs/specs/form.md.
+    #[test]
+    fn a_form_pane_draws_its_fields() {
+        use bi::form::{Field, Form};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut ed = Editor::empty();
+        ed.layout(
+            CoreRect::new(0, 0, 60, 8),
+            Chrome { columns: 1, rows: 0, min_width: 8, min_height: 2, tree_width: 34 },
+        );
+        let mut form = Form::new("t", "Knobs");
+        form.push(Field::float("strength", "Strength", 0.0, 10.0, 0.5, 5.0));
+        form.push(Field::bool("on", "Invert", true));
+        form.push(Field::choice("filter", "Filter", &["sobel", "scharr"], 1));
+        let id = ed.open_form_sidebar(form).expect("room for a sidebar");
+        assert_eq!(ed.focus(), id);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", None, &mut places)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..8)
+            .map(|y| {
+                (0..60).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>() + "\n"
+            })
+            .collect();
+        assert!(text.contains("Strength"), "{text}");
+        assert!(text.contains("5.0"), "{text}");
+        assert!(text.contains("[x] Invert"), "{text}");
+        assert!(text.contains("‹ scharr ›"), "{text}");
+        assert!(text.contains("Knobs"), "{text}");
+        assert!(text.contains("3 fields"), "{text}");
+        assert!(!text.contains("NORMAL"), "a form has no mode segment: {text}");
+
+        // The focused row leads with the count and ends with the title, the
+        // way a text pane leads with the position and ends with the name.
+        let status = window_status_text(&ed, id, true);
+        assert!(status.contains("Knobs") && status.contains("3 fields"), "{status}");
     }
 }

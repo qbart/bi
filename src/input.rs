@@ -300,6 +300,8 @@ impl Input {
             // mode the panes exist for must not be what takes their keys
             // away. Content kind wins over the mode.
             Mode::Normal | Mode::Debug if is_dap_pane(content) => KeyMode::Tree,
+            // A form is a list; it borrows the list keymap.
+            Mode::Normal if content == ContentKind::Form => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             Mode::Debug => KeyMode::Debug,
@@ -388,6 +390,7 @@ impl Input {
             // `dap_pane`. Ahead of `Mode::Debug` for the reason `remap`
             // gives: the pane's grammar is the window's, not the session's.
             Mode::Normal | Mode::Debug if is_dap_pane(content) => self.dap_pane(key, content),
+            Mode::Normal if content == ContentKind::Form => self.form(key),
             // A picture reads the normal grammar, with one key of its own:
             // `r` has no character to replace, so it turns the tile.
             Mode::Normal if content == ContentKind::Image => self.image(key),
@@ -973,6 +976,54 @@ impl Input {
     /// binding through to the debugger.
     fn debug_claims(&self, key: Key) -> bool {
         matches!(key.code, KeyCode::Char('c' | 'n' | 's' | 'o' | 'p' | 'b' | 'K') | KeyCode::Esc)
+    }
+
+    /// A form window: list keys, with the form's own vocabulary. See
+    /// `docs/specs/form.md`.
+    fn form(&mut self, key: Key) -> Option<Command> {
+        use crate::editor::FormCmd;
+        if self.window_pending {
+            return self.window_key(key);
+        }
+        let ctrl = key.mods.ctrl;
+        let count = self.count.unwrap_or(1).max(1);
+        let g = std::mem::take(&mut self.g_pending);
+        let steps = count as i64;
+
+        let cmd = match key.code {
+            KeyCode::Char('g') if g => FormCmd::First,
+            KeyCode::Char('g') => {
+                self.g_pending = true;
+                return None;
+            }
+            KeyCode::Char('G') => FormCmd::Last,
+            KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                self.count = Some(self.count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as usize);
+                return None;
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                return None;
+            }
+            KeyCode::Char('r') if ctrl => FormCmd::Redo,
+            KeyCode::Char('j') | KeyCode::Down => FormCmd::Select { down: true, count },
+            KeyCode::Char('k') | KeyCode::Up => FormCmd::Select { down: false, count },
+            KeyCode::Char('l') | KeyCode::Right => FormCmd::Nudge(steps),
+            KeyCode::Char('h') | KeyCode::Left => FormCmd::Nudge(-steps),
+            KeyCode::Char('L') => FormCmd::Nudge(10 * steps),
+            KeyCode::Char('H') => FormCmd::Nudge(-10 * steps),
+            KeyCode::Char(' ') => FormCmd::Toggle,
+            KeyCode::Enter | KeyCode::Char('i') => FormCmd::Edit,
+            KeyCode::Char('u') => FormCmd::Undo,
+            KeyCode::Tab => FormCmd::CycleMap,
+            KeyCode::Esc => FormCmd::Leave,
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        self.reset();
+        Some(Command { count: 1, action: Action::Form(cmd) })
     }
 
     /// An image window: normal's grammar, except that `r` waits for a
@@ -3863,6 +3914,67 @@ leader = \" \"
                     sink: Sink::Ring
                 }
             );
+        }
+    }
+
+    /// A form window: list keys with the form's own vocabulary, and the
+    /// tree keymap borrowed for the rest. See `docs/specs/form.md`.
+    mod form_keys {
+        use super::*;
+        use crate::editor::FormCmd;
+
+        fn form(input: &mut Input, keys: &str) -> Option<Action> {
+            feed(input, keys, ContentKind::Form).map(|c| c.action)
+        }
+
+        #[test]
+        fn the_keys_select_nudge_toggle_and_edit() {
+            let mut input = Input::default();
+            assert_eq!(
+                form(&mut input, "j"),
+                Some(Action::Form(FormCmd::Select { down: true, count: 1 }))
+            );
+            assert_eq!(
+                form(&mut input, "3k"),
+                Some(Action::Form(FormCmd::Select { down: false, count: 3 }))
+            );
+            assert_eq!(form(&mut input, "gg"), Some(Action::Form(FormCmd::First)));
+            assert_eq!(form(&mut input, "G"), Some(Action::Form(FormCmd::Last)));
+            assert_eq!(form(&mut input, "l"), Some(Action::Form(FormCmd::Nudge(1))));
+            assert_eq!(form(&mut input, "4h"), Some(Action::Form(FormCmd::Nudge(-4))));
+            assert_eq!(form(&mut input, "L"), Some(Action::Form(FormCmd::Nudge(10))));
+            assert_eq!(form(&mut input, "2H"), Some(Action::Form(FormCmd::Nudge(-20))));
+            assert_eq!(form(&mut input, " "), Some(Action::Form(FormCmd::Toggle)));
+            assert_eq!(form(&mut input, "i"), Some(Action::Form(FormCmd::Edit)));
+            assert_eq!(form(&mut input, "u"), Some(Action::Form(FormCmd::Undo)));
+            let redo = input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Form);
+            assert_eq!(redo.map(|c| c.action), Some(Action::Form(FormCmd::Redo)));
+            let enter = input.on_key(
+                Key::new(KeyCode::Enter, crate::key::Mods::default()),
+                &Mode::Normal,
+                ContentKind::Form,
+            );
+            assert_eq!(enter.map(|c| c.action), Some(Action::Form(FormCmd::Edit)));
+            let tab = input.on_key(
+                Key::new(KeyCode::Tab, crate::key::Mods::default()),
+                &Mode::Normal,
+                ContentKind::Form,
+            );
+            assert_eq!(tab.map(|c| c.action), Some(Action::Form(FormCmd::CycleMap)));
+            let esc = input.on_key(
+                Key::new(KeyCode::Esc, crate::key::Mods::default()),
+                &Mode::Normal,
+                ContentKind::Form,
+            );
+            assert_eq!(esc.map(|c| c.action), Some(Action::Form(FormCmd::Leave)));
+        }
+
+        #[test]
+        fn window_keys_still_work_from_a_form() {
+            let mut input = Input::default();
+            input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Form);
+            let cmd = input.on_key(key('l'), &Mode::Normal, ContentKind::Form).expect("resolved");
+            assert!(matches!(cmd.action, Action::Window(_)), "{:?}", cmd.action);
         }
     }
 }
