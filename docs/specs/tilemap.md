@@ -145,7 +145,8 @@ however it draws. The terminal frontend draws it as a second kitty image.
 
 **A second placement, not a re-upload.** One small image — the dashed frame,
 tile-sized, transparent inside — is uploaded once per tile size under an id
-the frontend reserves (`u64::MAX`, which the core's counter never reaches),
+the frontend reserves (`u32::MAX` — the protocol's ids are 32-bit, and the
+core's counter never climbs that far),
 and rebuilt when the size changes. Each frame it is placed at `z=0` over
 the atlas's `z=-1`, at the cell the tile's top-left lands in with the pixel
 remainder in the placement's `X`/`Y` offset, cropped where the tile runs

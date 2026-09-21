@@ -15,8 +15,10 @@ use bi::editor::Editor;
 
 /// The id the tilemap's cursor frame is uploaded under — the frontend's
 /// own, and one the core's counter, which starts at one and climbs, never
-/// reaches. See `docs/specs/tilemap.md`.
-pub const FRAME_ID: u64 = u64::MAX;
+/// reaches. The protocol's ids are 32-bit: an id past `u32::MAX` is not
+/// refused out loud under `q=2`, the upload is simply dropped, and the
+/// frame with it. See `docs/specs/tilemap.md`.
+pub const FRAME_ID: u64 = u32::MAX as u64;
 
 /// How, if at all, pixels reach the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,5 +563,15 @@ mod tests {
         assert!(crisp(4096, 4096, 1.0), "exactly the budget");
         assert!(!crisp(4096, 4096, 2.0));
         assert!(!crisp(200, 200, 32.0));
+    }
+
+    /// The protocol's image id is a 32-bit unsigned integer, nonzero. An id
+    /// past that is not an error the terminal reports under `q=2` — the
+    /// upload is dropped and every placement of it with it, which is how
+    /// the tilemap frame once failed to appear at all.
+    #[test]
+    fn the_frame_id_is_a_valid_protocol_id() {
+        assert!(FRAME_ID <= u32::MAX as u64, "{FRAME_ID} does not fit the protocol's u32");
+        assert_ne!(FRAME_ID, 0);
     }
 }
