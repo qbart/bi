@@ -13,11 +13,11 @@ use std::io::{Read, Write};
 use base64::Engine as _;
 use bi::editor::Editor;
 
-/// The id the tilemap's cursor frame is uploaded under — the frontend's
+/// The id the tileset's cursor frame is uploaded under — the frontend's
 /// own, and one the core's counter, which starts at one and climbs, never
 /// reaches. The protocol's ids are 32-bit: an id past `u32::MAX` is not
 /// refused out loud under `q=2`, the upload is simply dropped, and the
-/// frame with it. See `docs/specs/tilemap.md`.
+/// frame with it. See `docs/specs/tileset.md`.
 pub const FRAME_ID: u64 = u32::MAX as u64;
 
 /// How, if at all, pixels reach the terminal.
@@ -375,7 +375,7 @@ pub fn scaled(rgba: &[u8], width: u32, height: u32, zoom: f32) -> (Vec<u8>, u32,
     (out, w, h)
 }
 
-/// The tilemap cursor: a `width`×`height` RGBA frame, transparent inside,
+/// The tileset cursor: a `width`×`height` RGBA frame, transparent inside,
 /// with a one-pixel border whose colour alternates white and black every
 /// three pixels — a dash that reads on any tile, light or dark.
 pub fn frame_pixels(width: u32, height: u32) -> Vec<u8> {
@@ -568,7 +568,7 @@ mod tests {
     /// The protocol's image id is a 32-bit unsigned integer, nonzero. An id
     /// past that is not an error the terminal reports under `q=2` — the
     /// upload is dropped and every placement of it with it, which is how
-    /// the tilemap frame once failed to appear at all.
+    /// the tileset frame once failed to appear at all.
     #[test]
     fn the_frame_id_is_a_valid_protocol_id() {
         assert!(FRAME_ID <= u32::MAX as u64, "{FRAME_ID} does not fit the protocol's u32");

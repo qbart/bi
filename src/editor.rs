@@ -692,8 +692,8 @@ pub struct Session {
     pub pasting: Option<Pasting>,
     /// The one tile slot — `yy`/`dd` fill it, `p` reads it, on any image
     /// in the session. Separate from the text ring: text and pixels do not
-    /// paste into each other. See `docs/specs/tilemap.md`.
-    pub tile: Option<crate::tilemap::Tile>,
+    /// paste into each other. See `docs/specs/tileset.md`.
+    pub tile: Option<crate::tileset::Tile>,
     /// A capture waiting on its register name — the text `"n{operator}` took,
     /// held while the `:yname ` prompt is up. Never survives leaving the
     /// prompt: `:yname` consumes it, anything else sends it to the ring.
@@ -6249,8 +6249,8 @@ impl Editor {
         let count = cmd.count.max(1);
         let steps = count as i64;
         let Some(img) = self.window_mut().img_mut() else { return false };
-        if img.tilemap().is_some() {
-            return self.run_tilemap_action(cmd);
+        if img.tileset().is_some() {
+            return self.run_tileset_action(cmd);
         }
         match &cmd.action {
             Action::Move(Motion::Left) => img.step_by(-steps, 0),
@@ -6276,8 +6276,8 @@ impl Editor {
     }
 
     /// The same keys, read as tiles while the grid is on. Everything the
-    /// plain image swallows is swallowed here too. See `docs/specs/tilemap.md`.
-    fn run_tilemap_action(&mut self, cmd: &Command) -> bool {
+    /// plain image swallows is swallowed here too. See `docs/specs/tileset.md`.
+    fn run_tileset_action(&mut self, cmd: &Command) -> bool {
         let count = cmd.count.max(1);
         let steps = count as i64;
         // Read before the window is borrowed: the slot and the image are
@@ -6354,7 +6354,7 @@ impl Editor {
             Action::Undo => (!img.tile_undo()).then(|| "already at oldest change".to_string()),
             Action::Redo => (!img.tile_redo()).then(|| "already at newest change".to_string()),
             Action::EnterNormal => {
-                img.leave_tilemap();
+                img.leave_tileset();
                 None
             }
             // Swallowed, as the plain image swallows them: each would move
@@ -6720,7 +6720,7 @@ impl Editor {
     }
 
     /// `:w` on an image: PNG to its path, or to `path`. See
-    /// `docs/specs/tilemap.md`.
+    /// `docs/specs/tileset.md`.
     fn write_image(&mut self, path: &str) -> bool {
         let Some(img) = self.window_mut().img_mut() else { return false };
         let target = (!path.is_empty()).then(|| PathBuf::from(path));
@@ -7773,7 +7773,7 @@ impl Editor {
         }
     }
 
-    /// `:set editor tilemap|image` and `:set tilemap size|kind …`, on the
+    /// `:set editor tileset|image` and `:set tileset size|kind …`, on the
     /// focused window's image.
     fn set_image_setting(&mut self, name: &str, value: &str) {
         let Some(img) = self.window_mut().img_mut() else {
@@ -7783,17 +7783,17 @@ impl Editor {
         let message = match name {
             "editor" => match value {
                 "" => {
-                    format!("editor={}", if img.tilemap().is_some() { "tilemap" } else { "image" })
+                    format!("editor={}", if img.tileset().is_some() { "tileset" } else { "image" })
                 }
-                "tilemap" => match img.enter_tilemap() {
+                "tileset" => match img.enter_tileset() {
                     Ok(()) => String::new(),
                     Err(e) => e,
                 },
                 "image" => {
-                    img.leave_tilemap();
+                    img.leave_tileset();
                     String::new()
                 }
-                other => format!("not an editor: {other} (want tilemap or image)"),
+                other => format!("not an editor: {other} (want tileset or image)"),
             },
             _ => {
                 let (what, value) = match value.split_once(' ') {
@@ -7803,17 +7803,17 @@ impl Editor {
                 match (what, value) {
                     ("size", "") => {
                         let (w, h) = img.tile_size();
-                        format!("tilemap size={w}×{h}")
+                        format!("tileset size={w}×{h}")
                     }
-                    ("size", value) => match crate::tilemap::parse_size(value) {
+                    ("size", value) => match crate::tileset::parse_size(value) {
                         Ok(size) => {
                             img.set_tile_size(size);
                             String::new()
                         }
                         Err(e) => e,
                     },
-                    ("kind", "") => format!("tilemap kind={}", img.tile_kind().as_str()),
-                    ("kind", value) => match crate::tilemap::Kind::parse(value) {
+                    ("kind", "") => format!("tileset kind={}", img.tile_kind().as_str()),
+                    ("kind", value) => match crate::tileset::Kind::parse(value) {
                         Some(kind) => match kind.refusal() {
                             Some(why) => why.into(),
                             None => {
@@ -7823,7 +7823,7 @@ impl Editor {
                         },
                         None => format!("not a tile kind: {value} (want tile)"),
                     },
-                    _ => "set what? (tilemap size 16x16, tilemap kind tile)".into(),
+                    _ => "set what? (tileset size 16x16, tileset kind tile)".into(),
                 }
             }
         };
@@ -7848,10 +7848,10 @@ impl Editor {
         if matches!(name, "fileencoding" | "fileformat" | "bom") {
             return self.set_storage(name, value);
         }
-        // The same again for a picture: `editor` and `tilemap` are facts
+        // The same again for a picture: `editor` and `tileset` are facts
         // about the image in the focused window, which no option layer can
-        // hold because an image is not a buffer. See `docs/specs/tilemap.md`.
-        if matches!(name, "editor" | "tilemap") {
+        // hold because an image is not a buffer. See `docs/specs/tileset.md`.
+        if matches!(name, "editor" | "tileset") {
             return self.set_image_setting(name, value);
         }
 
@@ -29159,35 +29159,35 @@ int main(void) {
         assert!(matches!(ed.session.mode, Mode::Command(_)));
     }
 
-    /// `:set editor tilemap` and the keys it re-reads as tiles. The mode is
+    /// `:set editor tileset` and the keys it re-reads as tiles. The mode is
     /// the image's, the register slot is the session's, and `:w` writes PNG.
-    /// See `docs/specs/tilemap.md`.
-    mod tilemap {
+    /// See `docs/specs/tileset.md`.
+    mod tileset {
         use super::*;
-        use crate::tilemap::Tile;
+        use crate::tileset::Tile;
 
-        /// A 50×40 sheet in tilemap mode with 10-pixel tiles: a 5×4 grid.
+        /// A 50×40 sheet in tileset mode with 10-pixel tiles: a 5×4 grid.
         fn sheet(tag: &str) -> (PngDir, Editor) {
             let d = PngDir::new(tag);
             let mut ed = Editor::empty();
             ed.run_ex(&format!("e {}", d.png().display()));
-            ed.run_ex("set tilemap size 10");
-            ed.run_ex("set editor tilemap");
+            ed.run_ex("set tileset size 10");
+            ed.run_ex("set editor tileset");
             (d, ed)
         }
 
         fn cursor(ed: &Editor) -> (u32, u32) {
-            ed.window().img().unwrap().tilemap().unwrap().cursor()
+            ed.window().img().unwrap().tileset().unwrap().cursor()
         }
 
         fn on(ed: &Editor) -> bool {
-            ed.window().img().unwrap().tilemap().is_some()
+            ed.window().img().unwrap().tileset().is_some()
         }
 
         #[test]
         fn the_editor_setting_needs_an_image() {
             let mut ed = editor("text");
-            ed.run_ex("set editor tilemap");
+            ed.run_ex("set editor tileset");
             assert_eq!(ed.session.status, "no image here");
         }
 
@@ -29198,14 +29198,14 @@ int main(void) {
             assert_eq!(cursor(&ed), (0, 0));
 
             ed.run_ex("set editor");
-            assert_eq!(ed.session.status, "editor=tilemap");
+            assert_eq!(ed.session.status, "editor=tileset");
 
             ed.run_ex("set editor image");
             assert!(!on(&ed));
             ed.run_ex("set editor");
             assert_eq!(ed.session.status, "editor=image");
 
-            ed.run_ex("set editor tilemap");
+            ed.run_ex("set editor tileset");
             assert!(on(&ed));
             ed.apply(cmd(Action::EnterNormal));
             assert!(!on(&ed), "Esc is the way out");
@@ -29215,23 +29215,23 @@ int main(void) {
         #[test]
         fn size_and_kind_are_set_reported_and_refused() {
             let (_d, mut ed) = sheet("size");
-            ed.run_ex("set tilemap size");
-            assert_eq!(ed.session.status, "tilemap size=10×10");
+            ed.run_ex("set tileset size");
+            assert_eq!(ed.session.status, "tileset size=10×10");
 
-            ed.run_ex("set tilemap size 8x16");
-            ed.run_ex("set tilemap size");
-            assert_eq!(ed.session.status, "tilemap size=8×16");
+            ed.run_ex("set tileset size 8x16");
+            ed.run_ex("set tileset size");
+            assert_eq!(ed.session.status, "tileset size=8×16");
 
-            ed.run_ex("set tilemap size huge");
+            ed.run_ex("set tileset size huge");
             assert!(ed.session.status.contains("not a tile size"), "{}", ed.session.status);
 
-            ed.run_ex("set tilemap kind hex");
+            ed.run_ex("set tileset kind hex");
             assert_eq!(ed.session.status, "hex is not built yet");
-            ed.run_ex("set tilemap kind");
-            assert_eq!(ed.session.status, "tilemap kind=tile");
+            ed.run_ex("set tileset kind");
+            assert_eq!(ed.session.status, "tileset kind=tile");
 
-            ed.run_ex("set tilemap wat");
-            assert!(ed.session.status.contains("tilemap size"), "{}", ed.session.status);
+            ed.run_ex("set tileset wat");
+            assert!(ed.session.status.contains("tileset size"), "{}", ed.session.status);
         }
 
         #[test]
@@ -29241,12 +29241,12 @@ int main(void) {
             ed.apply(cmd(Action::Move(Motion::LastLine)));
             assert_eq!(cursor(&ed), (4, 3));
 
-            ed.run_ex("set tilemap size 25x20");
+            ed.run_ex("set tileset size 25x20");
             assert_eq!(cursor(&ed), (1, 1), "re-clamped to the 2×2 grid");
 
             ed.apply(cmd(Action::EnterNormal));
-            ed.run_ex("set editor tilemap");
-            assert_eq!(ed.window().img().unwrap().tilemap().unwrap().size(), (25, 20));
+            ed.run_ex("set editor tileset");
+            assert_eq!(ed.window().img().unwrap().tileset().unwrap().size(), (25, 20));
         }
 
         #[test]
@@ -29291,7 +29291,7 @@ int main(void) {
         fn yank_cut_and_paste_move_a_tile_through_the_slot() {
             let (_d, mut ed) = sheet("cut");
             let img = ed.window().img().unwrap();
-            let painted = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+            let painted = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
 
             ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
             assert_eq!(ed.session.tile.as_ref(), Some(&painted));
@@ -29300,13 +29300,13 @@ int main(void) {
             ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
             let img = ed.window().img().unwrap();
             assert!(img.dirty);
-            let cleared = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+            let cleared = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
             assert!(cleared.rgba.iter().all(|&b| b == 0), "transparent");
 
             ed.apply(cmd(Action::Move(Motion::Right)));
             ed.apply(paste(false, 1));
             let img = ed.window().img().unwrap();
-            assert_eq!(img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap(), painted);
+            assert_eq!(img.tileset().unwrap().yank(&img.rgba, img.width).unwrap(), painted);
         }
 
         #[test]
@@ -29319,11 +29319,11 @@ int main(void) {
             let other = d.0.join("other.png");
             image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0])).save(&other).unwrap();
             ed.run_ex(&format!("e {}", other.display()));
-            ed.run_ex("set tilemap size 10");
-            ed.run_ex("set editor tilemap");
+            ed.run_ex("set tileset size 10");
+            ed.run_ex("set editor tileset");
             ed.apply(paste(false, 1));
             let img = ed.window().img().unwrap();
-            let pasted = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+            let pasted = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
             assert_eq!(pasted.rgba[3], 255, "the photo's opaque pixels landed");
         }
 
@@ -29464,8 +29464,8 @@ int main(void) {
             let d = PngDir::new("tiny");
             let mut ed = Editor::empty();
             ed.run_ex(&format!("e {}", d.png().display()));
-            ed.run_ex("set tilemap size 64");
-            ed.run_ex("set editor tilemap");
+            ed.run_ex("set tileset size 64");
+            ed.run_ex("set editor tileset");
             assert!(!on(&ed));
             assert_eq!(ed.session.status, "50×40 holds no 64×64 tile");
         }

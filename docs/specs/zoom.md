@@ -3,7 +3,7 @@
 `images.md` drew a picture at native size and cropped what did not fit:
 "fit-to-window is a zoom feature; zoom is deliberately out until someone
 misses it." A tile sheet at 16 pixels a tile is missed at once — a tile is a
-thumbnail-sized smudge on a high-DPI screen, and the tilemap's dashed cursor
+thumbnail-sized smudge on a high-DPI screen, and the tileset's dashed cursor
 is the only way to tell where one ends.
 
 ## Status
@@ -25,7 +25,7 @@ answer is `no image here`. `:zoom` rather than `:set zoom` for the same
 reason `:set editor` is not an option: zoom is a fact about one picture, and
 the option layers have no picture in them.
 
-**Zoom lives on the image**, like its scroll and its tilemap. A bare `:vs`
+**Zoom lives on the image**, like its scroll and its tileset. A bare `:vs`
 clones it, `Ctrl-^` brings it back, `:bd` throws it away with the rest.
 
 ## The core stays in image pixels
@@ -69,7 +69,7 @@ would be exact needs a crop whose scaled size is a multiple of the cell,
 which the budget case is not worth. Honest and rare: `Place::fit` says when
 this path was taken.
 
-**The tilemap frame** is rebuilt at tile size times zoom, so its dashes stay
+**The tileset frame** is rebuilt at tile size times zoom, so its dashes stay
 one display pixel wide at every zoom, and it always takes the crisp path —
 it is a rectangle. Its placement math is the same display-pixel math as the
 picture's.

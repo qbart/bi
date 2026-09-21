@@ -2,7 +2,7 @@
 //!
 //! State and pixel arithmetic only, like [`crate::img::Img`] — the image
 //! owns the pixels and asks this module to read and write one tile of them.
-//! See `docs/specs/tilemap.md`.
+//! See `docs/specs/tileset.md`.
 
 /// One tile's pixels, RGBA8 — what the session's slot holds between a `yy`
 /// on one sheet and a `p` on another.
@@ -70,7 +70,7 @@ struct Edit {
 }
 
 #[derive(Debug, Clone)]
-pub struct Tilemap {
+pub struct Tileset {
     /// One tile, in pixels.
     size: (u32, u32),
     kind: Kind,
@@ -80,7 +80,7 @@ pub struct Tilemap {
     redo: Vec<Edit>,
 }
 
-impl Tilemap {
+impl Tileset {
     pub fn new(size: (u32, u32), kind: Kind) -> Self {
         Self { size, kind, cursor: (0, 0), undo: Vec::new(), redo: Vec::new() }
     }
@@ -259,14 +259,14 @@ mod tests {
 
     #[test]
     fn the_grid_is_whole_tiles_only() {
-        let map = Tilemap::new((16, 16), Kind::Tile);
+        let map = Tileset::new((16, 16), Kind::Tile);
         assert_eq!(map.grid(100, 100), (6, 6));
         assert_eq!(map.grid(32, 15), (2, 0), "not tall enough for one row");
     }
 
     #[test]
     fn moves_clamp_to_the_grid_and_counts_multiply() {
-        let mut map = Tilemap::new((16, 16), Kind::Tile);
+        let mut map = Tileset::new((16, 16), Kind::Tile);
         let grid = map.grid(100, 100);
         map.move_by(2, 3, grid);
         assert_eq!(map.cursor(), (2, 3));
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn the_edge_keys_go_to_the_grids_edges() {
-        let mut map = Tilemap::new((16, 16), Kind::Tile);
+        let mut map = Tileset::new((16, 16), Kind::Tile);
         let grid = map.grid(100, 100);
         map.to_col(None, grid);
         assert_eq!(map.cursor().0, 5, "$ is the last column");
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_size_change_reclamps_the_cursor() {
-        let mut map = Tilemap::new((16, 16), Kind::Tile);
+        let mut map = Tileset::new((16, 16), Kind::Tile);
         let grid = map.grid(100, 100);
         map.move_by(5, 5, grid);
         map.set_size((32, 32), 100, 100);
@@ -303,14 +303,14 @@ mod tests {
 
     #[test]
     fn the_cursor_rect_is_in_pixels() {
-        let mut map = Tilemap::new((16, 8), Kind::Tile);
+        let mut map = Tileset::new((16, 8), Kind::Tile);
         map.move_by(2, 3, map.grid(100, 100));
         assert_eq!(map.cursor_rect(), (32, 24, 16, 8));
     }
 
     #[test]
     fn yank_reads_the_tile_under_the_cursor() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let px = sheet(4, 4);
         map.move_by(1, 1, map.grid(4, 4));
         let tile = map.yank(&px, 4).unwrap();
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn cut_yanks_then_leaves_transparent_behind() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let mut px = sheet(4, 4);
         let before = px.clone();
         let tile = map.cut(&mut px, 4).unwrap();
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn paste_writes_the_tile_over_the_cursor() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let mut px = sheet(4, 4);
         let tile = map.yank(&px, 4).unwrap();
         map.move_by(1, 1, map.grid(4, 4));
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn a_mismatched_tile_is_refused() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let mut px = sheet(4, 4);
         let tile = Tile { width: 1, height: 1, rgba: vec![0; 4] };
         let err = map.paste(&mut px, 4, &tile).unwrap_err();
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn undo_restores_what_cut_cleared_and_redo_clears_it_again() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let mut px = sheet(4, 4);
         let before = px.clone();
         map.cut(&mut px, 4).unwrap();
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_new_edit_drops_redo() {
-        let mut map = Tilemap::new((2, 2), Kind::Tile);
+        let mut map = Tileset::new((2, 2), Kind::Tile);
         let mut px = sheet(4, 4);
         map.cut(&mut px, 4).unwrap();
         map.undo(&mut px, 4);
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn a_sheet_smaller_than_a_tile_has_no_tile_to_yank() {
-        let mut map = Tilemap::new((8, 8), Kind::Tile);
+        let mut map = Tileset::new((8, 8), Kind::Tile);
         let mut px = sheet(4, 4);
         assert!(map.yank(&px, 4).is_none());
         assert!(map.cut(&mut px, 4).is_none());

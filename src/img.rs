@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::tilemap::{Kind, Tile, Tilemap};
+use crate::tileset::{Kind, Tile, Tileset};
 
 #[derive(Debug, Clone)]
 pub struct Img {
@@ -34,9 +34,9 @@ pub struct Img {
     /// Stable per opened image, for a frontend that uploads pixels to the
     /// terminal once and refers to them by number after.
     pub id: u64,
-    /// The grid, while `:set editor tilemap` is on. See
-    /// `docs/specs/tilemap.md`.
-    tilemap: Option<Tilemap>,
+    /// The grid, while `:set editor tileset` is on. See
+    /// `docs/specs/tileset.md`.
+    tileset: Option<Tileset>,
     /// The tile size and kind outlive the grid: leaving and coming back
     /// finds them where they were.
     tile_size: (u32, u32),
@@ -94,7 +94,7 @@ impl Img {
             viewport: (0, 0),
             step: 1,
             id,
-            tilemap: None,
+            tileset: None,
             tile_size: (16, 16),
             tile_kind: Kind::Tile,
             dirty: false,
@@ -143,10 +143,10 @@ impl Img {
         Ok(())
     }
 
-    // ---- the tilemap: see `docs/specs/tilemap.md` ----
+    // ---- the tileset: see `docs/specs/tileset.md` ----
 
-    pub fn tilemap(&self) -> Option<&Tilemap> {
-        self.tilemap.as_ref()
+    pub fn tileset(&self) -> Option<&Tileset> {
+        self.tileset.as_ref()
     }
 
     pub fn tile_size(&self) -> (u32, u32) {
@@ -161,7 +161,7 @@ impl Img {
     /// re-clamped when it is.
     pub fn set_tile_size(&mut self, size: (u32, u32)) {
         self.tile_size = size;
-        if let Some(map) = &mut self.tilemap {
+        if let Some(map) = &mut self.tileset {
             map.set_size(size, self.width, self.height);
         }
         self.follow_cursor();
@@ -169,41 +169,41 @@ impl Img {
 
     pub fn set_tile_kind(&mut self, kind: Kind) {
         self.tile_kind = kind;
-        if let Some(map) = &mut self.tilemap {
+        if let Some(map) = &mut self.tileset {
             map.set_kind(kind);
         }
     }
 
-    /// `:set editor tilemap`. A sheet too small for one tile has no grid
+    /// `:set editor tileset`. A sheet too small for one tile has no grid
     /// to put a cursor on, and says so.
-    pub fn enter_tilemap(&mut self) -> std::result::Result<(), String> {
-        if self.tilemap.is_some() {
+    pub fn enter_tileset(&mut self) -> std::result::Result<(), String> {
+        if self.tileset.is_some() {
             return Ok(());
         }
-        let map = Tilemap::new(self.tile_size, self.tile_kind);
+        let map = Tileset::new(self.tile_size, self.tile_kind);
         let (cols, rows) = map.grid(self.width, self.height);
         if cols == 0 || rows == 0 {
             let (w, h) = self.tile_size;
             return Err(format!("{}×{} holds no {w}×{h} tile", self.width, self.height));
         }
-        self.tilemap = Some(map);
+        self.tileset = Some(map);
         self.follow_cursor();
         Ok(())
     }
 
     /// `Esc`, or `:set editor image`. Size, kind and edits stay.
-    pub fn leave_tilemap(&mut self) {
-        self.tilemap = None;
+    pub fn leave_tileset(&mut self) {
+        self.tileset = None;
     }
 
     fn grid(&self) -> (u32, u32) {
-        self.tilemap.as_ref().map(|m| m.grid(self.width, self.height)).unwrap_or((0, 0))
+        self.tileset.as_ref().map(|m| m.grid(self.width, self.height)).unwrap_or((0, 0))
     }
 
     /// `hjkl` on the grid, counts multiplied in.
     pub fn tile_move(&mut self, dx: i64, dy: i64) {
         let grid = self.grid();
-        if let Some(map) = &mut self.tilemap {
+        if let Some(map) = &mut self.tileset {
             map.move_by(dx, dy, grid);
         }
         self.follow_cursor();
@@ -212,7 +212,7 @@ impl Img {
     /// `0` and `$`: a column, or the last.
     pub fn tile_to_col(&mut self, col: Option<u32>) {
         let grid = self.grid();
-        if let Some(map) = &mut self.tilemap {
+        if let Some(map) = &mut self.tileset {
             map.to_col(col, grid);
         }
         self.follow_cursor();
@@ -221,7 +221,7 @@ impl Img {
     /// `gg`, `G`, `5G`: a row, or the last.
     pub fn tile_to_row(&mut self, row: Option<u32>) {
         let grid = self.grid();
-        if let Some(map) = &mut self.tilemap {
+        if let Some(map) = &mut self.tileset {
             map.to_row(row, grid);
         }
         self.follow_cursor();
@@ -238,7 +238,7 @@ impl Img {
     /// none when it already is. A viewport smaller than a tile shows the
     /// tile's top-left.
     fn follow_cursor(&mut self) {
-        let Some(map) = &self.tilemap else { return };
+        let Some(map) = &self.tileset else { return };
         let (x, y, w, h) = map.cursor_rect();
         let (vw, vh) = self.viewport;
         if vw == 0 || vh == 0 {
@@ -265,12 +265,12 @@ impl Img {
 
     /// `yy`.
     pub fn tile_yank(&self) -> Option<Tile> {
-        self.tilemap.as_ref()?.yank(&self.rgba, self.width)
+        self.tileset.as_ref()?.yank(&self.rgba, self.width)
     }
 
     /// `dd`: the tile, and transparent left behind.
     pub fn tile_cut(&mut self) -> Option<Tile> {
-        let map = self.tilemap.as_mut()?;
+        let map = self.tileset.as_mut()?;
         let tile = map.cut(&mut self.rgba, self.width)?;
         self.edited();
         Some(tile)
@@ -278,7 +278,7 @@ impl Img {
 
     /// `p`.
     pub fn tile_paste(&mut self, tile: &Tile) -> std::result::Result<(), String> {
-        let Some(map) = self.tilemap.as_mut() else { return Err("no grid here".into()) };
+        let Some(map) = self.tileset.as_mut() else { return Err("no grid here".into()) };
         map.paste(&mut self.rgba, self.width, tile)?;
         self.edited();
         Ok(())
@@ -286,7 +286,7 @@ impl Img {
 
     /// `u`. False when there is nothing left to undo.
     pub fn tile_undo(&mut self) -> bool {
-        let Some(map) = self.tilemap.as_mut() else { return false };
+        let Some(map) = self.tileset.as_mut() else { return false };
         let done = map.undo(&mut self.rgba, self.width);
         if done {
             self.edited();
@@ -296,7 +296,7 @@ impl Img {
 
     /// `Ctrl-R`.
     pub fn tile_redo(&mut self) -> bool {
-        let Some(map) = self.tilemap.as_mut() else { return false };
+        let Some(map) = self.tileset.as_mut() else { return false };
         let done = map.redo(&mut self.rgba, self.width);
         if done {
             self.edited();

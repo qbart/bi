@@ -1,4 +1,4 @@
-# Tilemap
+# Tileset
 
 `images.md` made `:e atlas.png` show the atlas. It still could not touch a
 pixel of it, and the one thing a tile sheet wants touched is a *tile*: this
@@ -10,9 +10,13 @@ different program; a tile mover is a cursor over a grid, three keys and a
 
 **Built.**
 
+**Tileset, not tilemap.** The picture is a *tileset* — the sheet the tiles
+come from. A *tilemap* is a grid of references into one, the thing a TMX
+file holds, and that name is kept for the spec that reads those.
+
 ## What it is
 
-A mode of one picture, not of the session. `:set editor tilemap` on an image
+A mode of one picture, not of the session. `:set editor tileset` on an image
 window puts a grid over it; the cursor is one cell of that grid, drawn as a
 dashed rectangle the size of one tile, starting at pixel 0,0. `Esc` takes the
 grid away. Nothing else leaves the mode — `:` still opens the ex line, which
@@ -20,22 +24,22 @@ is how `:w` and `:q` still work, and `Ctrl-W` still moves between windows,
 because the mode lives on the image and focus moving off it changes nothing.
 
 ```
-:set editor tilemap          the grid goes on
+:set editor tileset          the grid goes on
 :set editor image            and off again — what Esc does
 :set editor                  says which
 
-:set tilemap size 16x16      one tile, in pixels; the default
-:set tilemap size 16         square, same thing
-:set tilemap size            says what it is
-:set tilemap kind tile       the only kind that is built
-:set tilemap kind hex        parses, and is refused: "hex is not built yet"
+:set tileset size 16x16      one tile, in pixels; the default
+:set tileset size 16         square, same thing
+:set tileset size            says what it is
+:set tileset kind tile       the only kind that is built
+:set tileset kind hex        parses, and is refused: "hex is not built yet"
 ```
 
 These are spelled `:set` and are **not options**. Options resolve per
 buffer, and an image is a `Content` on a window, not a buffer — there is no
 `[options]` line, no `[filetype.png]`, no layer stack. `fileencoding` set
 the precedent: buffer-local facts handled in `set_option` before the option
-lookup. `editor` and `tilemap` are handled the same way, on the focused
+lookup. `editor` and `tileset` are handled the same way, on the focused
 window's image, and on any other kind of window say `no image here`.
 
 Size and kind stay on the image after `Esc`, so leaving and coming back
@@ -50,7 +54,7 @@ entering the mode says so.
 ## The model
 
 ```rust
-pub struct Tilemap {
+pub struct Tileset {
     size: (u32, u32),          // one tile, in pixels
     kind: Kind,                // Tile; Hex is parsed and refused
     cursor: (u32, u32),        // column, row — in tiles
@@ -61,10 +65,10 @@ pub struct Tilemap {
 pub struct Tile { pub width: u32, pub height: u32, pub rgba: Vec<u8> }
 ```
 
-`Img` gains three fields beside its pixels: `tilemap: Option<Tilemap>` —
+`Img` gains three fields beside its pixels: `tileset: Option<Tileset>` —
 `Some` exactly while the mode is on — plus `dirty: bool` and
-`generation: u64`. The tilemap's size and kind outlive the `Option`: they
-are kept on the image (`tile_size`, `tile_kind`) and the `Tilemap` is built
+`generation: u64`. The tileset's size and kind outlive the `Option`: they
+are kept on the image (`tile_size`, `tile_kind`) and the `Tileset` is built
 from them on entry. That is what "stays after Esc" is made of.
 
 **One register slot.** `Session::tile: Option<Tile>` — shared by every
@@ -86,10 +90,10 @@ the pixels once reads, to know the upload is stale.
 
 ## The keys
 
-No `KeyMode::Tilemap`, no `[keys.tilemap]`: the window still dispatches
+No `KeyMode::Tileset`, no `[keys.tileset]`: the window still dispatches
 through the normal keymap, and `Editor::run_image_action` — which already
 reads a handful of normal-mode actions as pixels — reads them as tiles when
-the tilemap is on:
+the tileset is on:
 
 ```
 h j k l        one tile; counts multiply
@@ -117,9 +121,9 @@ least that puts the cursor's tile fully inside the viewport — so `G` on a
 tall sheet scrolls to the bottom row, and `gg` back — and stays put when it
 already is. A viewport smaller than one tile shows the tile's top-left.
 
-Everything the plain image swallows, the tilemap swallows too: `i`, `v`,
+Everything the plain image swallows, the tileset swallows too: `i`, `v`,
 `/`, `s` still do nothing. `Esc` in a plain image window is still nothing;
-in the tilemap it is the way out.
+in the tileset it is the way out.
 
 ## Saving and quitting
 
@@ -128,7 +132,7 @@ writes there and re-points the image at the new name, the way `:w other.rs`
 re-points a buffer. Any other extension is refused — `only png` — rather
 than silently writing PNG bytes under a `.jpg` name. A successful write
 clears `dirty` and says `"atlas.png" written`. `:w` works whether or not the
-tilemap is on: the edits are the image's, and leaving the mode does not
+tileset is on: the edits are the image's, and leaving the mode does not
 throw them away.
 
 `:q`, `:bd` and `:qa` refuse a dirty image the way they refuse a dirty
@@ -139,7 +143,7 @@ image the way it names a buffer. `:wq` writes then quits.
 
 ## The frontend
 
-The core says where the cursor is in pixels — `Tilemap::cursor_rect()`,
+The core says where the cursor is in pixels — `Tileset::cursor_rect()`,
 x, y, width, height in image coordinates — and a frontend draws that
 however it draws. The terminal frontend draws it as a second kitty image.
 
@@ -173,18 +177,18 @@ what a test sees.
 
 ## The status row
 
-The left half of an image's row says `1920×1080`; with the tilemap on it
+The left half of an image's row says `1920×1080`; with the tileset on it
 says `1920×1080  16×16 tile 3,2 of 6×6`, and a `+` after the name when the
 image is dirty, as a buffer's row does. The right half — the mode segment
-the plain image omits because it has no modes — says `TILEMAP`, because
+the plain image omits because it has no modes — says `TILESET`, because
 this one does.
 
 ## Tests
 
-- `:set editor tilemap` on a text buffer says `no image here`; on an image
-  the tilemap is on with the cursor at 0,0; `:set editor image` and `Esc`
+- `:set editor tileset` on a text buffer says `no image here`; on an image
+  the tileset is on with the cursor at 0,0; `:set editor image` and `Esc`
   turn it off; `:set editor` reports.
-- `:set tilemap size 16x16` and `16` are the same; `size` reports; a bad
+- `:set tileset size 16x16` and `16` are the same; `size` reports; a bad
   size says so; `kind hex` is refused; `kind tile` is accepted.
 - The grid is whole tiles: 100×100 at 16 is 6×6; the cursor clamps to it;
   a size change re-clamps.
@@ -203,6 +207,6 @@ this one does.
 - `:q` on a dirty image refuses, `:q!` closes; `:bd` the same; `:qa` names
   the image.
 - The render emits a frame `Place` at `z=0` over the tile's cell with the
-  pixel remainder in its offset, and none when the tilemap is off.
+  pixel remainder in its offset, and none when the tileset is off.
 - A dirty image's status row carries `+`, the tile coordinates, and a
-  `TILEMAP` mode segment.
+  `TILESET` mode segment.

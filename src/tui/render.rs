@@ -1041,11 +1041,11 @@ fn render_image(
                 scale,
                 fit,
             });
-            // The tilemap cursor: the frame image over the tile's cell, at
+            // The tileset cursor: the frame image over the tile's cell, at
             // `z=0`, cropped to what the pane shows of the tile — all in
             // display pixels, so the frame is built at tile size times zoom
-            // and its dashes stay one pixel wide. See docs/specs/tilemap.md.
-            if let Some(map) = img.tilemap() {
+            // and its dashes stay one pixel wide. See docs/specs/tileset.md.
+            if let Some(map) = img.tileset() {
                 let (cx, cy, fw, fh) = map.cursor_rect();
                 let (cx, cy) = (disp(cx), disp(cy));
                 let (fw, fh) = (disp(fw).max(1), disp(fh).max(1));
@@ -1739,14 +1739,14 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     // like any other foreign text.
     let left = cells_at(&window_status_text(ed, id, focused), 8);
     // An image pane has no mode segment: modes do not exist there, and the
-    // row should not claim otherwise. See docs/specs/images.md. The tilemap
+    // row should not claim otherwise. See docs/specs/images.md. The tileset
     // is the one mode a picture has, and says so.
-    let (image, tilemap) = match ed.pane(id) {
-        Some(Pane::Image { img, .. }) => (true, img.tilemap().is_some()),
+    let (image, tileset) = match ed.pane(id) {
+        Some(Pane::Image { img, .. }) => (true, img.tileset().is_some()),
         _ => (false, false),
     };
-    let right = match (focused, image, tilemap) {
-        (true, true, true) => " TILEMAP ".to_string(),
+    let right = match (focused, image, tileset) {
+        (true, true, true) => " TILESET ".to_string(),
         (true, false, _) => format!(" {} ", ed.session.mode.label()),
         _ => String::new(),
     };
@@ -1778,7 +1778,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     let pad = (width as usize).saturating_sub(span_width(&left) + stats_width + span_width(&right));
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     spans.extend(stats);
-    if focused && (!image || tilemap) {
+    if focused && (!image || tileset) {
         spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }
     spans
@@ -1801,7 +1801,7 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         }
         // An image says how big it is where a text pane says where you are —
         // the size is the fact about a picture that position was about text.
-        // With the tilemap on, the tile size, the cursor and the grid ride
+        // With the tileset on, the tile size, the cursor and the grid ride
         // beside it, and a `+` marks edits the way a buffer's row does.
         Some(Pane::Image { img, .. }) => {
             let mut name = bi::editor::image_name(img);
@@ -1812,7 +1812,7 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
             if img.zoom() != 1.0 {
                 at.push_str(&format!(" {}x", img.zoom()));
             }
-            if let Some(map) = img.tilemap() {
+            if let Some(map) = img.tileset() {
                 let (tw, th) = map.size();
                 let (c, r) = map.cursor();
                 let (cols, rows) = map.grid(img.width, img.height);
@@ -3181,11 +3181,11 @@ int main(void) {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The tilemap cursor is a second placement — the frame image over the
+    /// The tileset cursor is a second placement — the frame image over the
     /// tile's cell, at `z=0`, with the pixel remainder in the offset — and
-    /// none at all when the grid is off. See docs/specs/tilemap.md.
+    /// none at all when the grid is off. See docs/specs/tileset.md.
     #[test]
-    fn the_tilemap_cursor_is_a_frame_placement_over_the_tile() {
+    fn the_tileset_cursor_is_a_frame_placement_over_the_tile() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -3203,8 +3203,8 @@ int main(void) {
         terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
         assert_eq!(places.len(), 1, "no grid, no frame: {places:?}");
 
-        ed.run_ex("set tilemap size 12");
-        ed.run_ex("set editor tilemap");
+        ed.run_ex("set tileset size 12");
+        ed.run_ex("set editor tileset");
         ed.apply(bi::editor::Command {
             count: 1,
             action: bi::editor::Action::Move(bi::motion::Motion::Right),
@@ -3249,7 +3249,7 @@ int main(void) {
         assert!(text.contains("atlas.png +"), "{text}");
         let spans = window_status(&ed, ed.focus(), true, 60);
         let row: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(row.ends_with(" TILEMAP "), "{row:?}");
+        assert!(row.ends_with(" TILESET "), "{row:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3270,8 +3270,8 @@ int main(void) {
 
         let mut ed = Editor::empty();
         ed.run_ex(&format!("e {}", path.display()));
-        ed.run_ex("set tilemap size 8");
-        ed.run_ex("set editor tilemap");
+        ed.run_ex("set tileset size 8");
+        ed.run_ex("set editor tileset");
         ed.apply(bi::editor::Command {
             count: 1,
             action: bi::editor::Action::Move(bi::motion::Motion::Right),
