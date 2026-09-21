@@ -322,9 +322,28 @@ pub fn find(text: &str, cursor: usize) -> Option<Literal> {
         points: group
             .children
             .iter()
-            .map(|c| PointSpan { start: c.open, end: c.close + 1, tokens: c.flat_tokens() })
+            .map(|c| PointSpan {
+                start: span_start(text, c.open),
+                end: c.close + 1,
+                tokens: c.flat_tokens(),
+            })
             .collect(),
     })
+}
+
+/// Where a point's text starts: at its bracket, or at the name glued to
+/// the bracket — `Point { … }`, `Vec2(…)` — so a copy of it keeps the name.
+fn span_start(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = open;
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+        i -= 1;
+    }
+    let ident_end = i;
+    while i > 0 && is_ident(bytes[i - 1]) {
+        i -= 1;
+    }
+    if i == ident_end || bytes[i].is_ascii_digit() { open } else { i }
 }
 
 /// The numeric part of a token — what is left once a glued suffix like
@@ -372,6 +391,349 @@ pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve {
         })
         .collect();
     Curve { points }
+}
+
+
+// ---- writing back ---------------------------------------------------------
+
+/// How many decimals a step needs: `0.01` two, `0.25` two, `1` none.
+pub fn decimals_for(step: f32) -> usize {
+    (0..=6usize)
+        .find(|&d| {
+            let scaled = step as f64 * 10f64.powi(d as i32);
+            (scaled - scaled.round()).abs() < 1e-6
+        })
+        .unwrap_or(6)
+}
+
+/// `token` respelled as `value`: its suffix kept, at least as many
+/// decimals as it had and never fewer than `step` needs.
+pub fn rewrite(token: &str, value: f32, step: f32) -> String {
+    let num = numeric_part(token);
+    let suffix = &token[num.len()..];
+    let own = num
+        .split_once('.')
+        .map(|(_, frac)| frac.chars().take_while(char::is_ascii_digit).count())
+        .unwrap_or(0);
+    let decimals = own.max(decimals_for(step));
+    let mut text = format!("{:.*}", decimals, value as f64);
+    if decimals > own {
+        let mut keep = decimals;
+        while keep > own && text.ends_with('0') {
+            text.pop();
+            keep -= 1;
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    if text == "-0" || text.starts_with("-0.") && text[1..].bytes().all(|b| b == b'0' || b == b'.') {
+        text.remove(0);
+    }
+    text.push_str(suffix);
+    text
+}
+
+/// A bool token respelled, `true`/`false` or `1`/`0` as it was.
+pub fn rewrite_bool(token: &str, value: bool) -> String {
+    match token {
+        "true" | "false" => if value { "true" } else { "false" }.into(),
+        _ => if value { "1" } else { "0" }.into(),
+    }
+}
+
+/// The text of a new point shaped like `like`: its brackets, separators
+/// and names copied, the layout's fields set from `p`.
+pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String {
+    let mut out = text[like.start..like.end].to_string();
+    let base = like.start;
+    for (i, field) in layout.0.iter().enumerate().rev() {
+        let Some(token) = like.tokens.get(i) else { continue };
+        let old = &text[token.start..token.end];
+        let new = match field {
+            Field::X => rewrite(old, p.x, step),
+            Field::Y => rewrite(old, p.y, step),
+            Field::Out => rewrite(old, p.out, step),
+            Field::In => rewrite(old, p.in_, step),
+            Field::Locked => rewrite_bool(old, p.locked),
+            Field::Skip => continue,
+        };
+        out.replace_range(token.start - base..token.end - base, &new);
+    }
+    out
+}
+
+// ---- evaluation -----------------------------------------------------------
+
+/// The segment `x` falls in: the last point at or before it and the first
+/// strictly after, skipping zero-length segments.
+fn segment(curve: &Curve, x: f32) -> Option<(Point, Point)> {
+    let pts = &curve.points;
+    for i in 0..pts.len().saturating_sub(1) {
+        let (p, q) = (pts[i], pts[i + 1]);
+        if q.x > p.x && p.x <= x && x < q.x {
+            return Some((p, q));
+        }
+    }
+    None
+}
+
+/// The curve's value at `x`: cubic hermite between neighbours, Unity's
+/// way — tangents are slopes scaled by the segment length — and flat
+/// past either end.
+pub fn eval(curve: &Curve, x: f32) -> f32 {
+    let pts = &curve.points;
+    let Some(first) = pts.first() else { return 0.0 };
+    let last = pts[pts.len() - 1];
+    if x <= first.x {
+        return first.y;
+    }
+    if x >= last.x {
+        return last.y;
+    }
+    let Some((p, q)) = segment(curve, x) else { return last.y };
+    let d = q.x - p.x;
+    let t = (x - p.x) / d;
+    let (t2, t3) = (t * t, t * t * t);
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    h00 * p.y + h10 * d * p.out + h01 * q.y + h11 * d * q.in_
+}
+
+/// `dy/dx` at `x`; zero outside the range, where the curve is flat.
+pub fn slope(curve: &Curve, x: f32) -> f32 {
+    let Some((p, q)) = segment(curve, x) else { return 0.0 };
+    let d = q.x - p.x;
+    let t = (x - p.x) / d;
+    let t2 = t * t;
+    let h00 = 6.0 * t2 - 6.0 * t;
+    let h10 = 3.0 * t2 - 4.0 * t + 1.0;
+    let h01 = -6.0 * t2 + 6.0 * t;
+    let h11 = 3.0 * t2 - 2.0 * t;
+    (h00 * p.y + h10 * d * p.out + h01 * q.y + h11 * d * q.in_) / d
+}
+
+/// The visible range on each axis: the points' extent, never thinner
+/// than the step, padded by a tenth.
+pub fn ranges(curve: &Curve, xstep: f32, ystep: f32) -> ((f32, f32), (f32, f32)) {
+    fn axis(values: impl Iterator<Item = f32>, step: f32) -> (f32, f32) {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for v in values {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if !lo.is_finite() {
+            (lo, hi) = (0.0, 1.0);
+        }
+        let step = step.abs().max(1e-6);
+        if hi - lo < step {
+            let mid = (lo + hi) / 2.0;
+            (lo, hi) = (mid - step / 2.0, mid + step / 2.0);
+        }
+        let pad = (hi - lo) * 0.1;
+        (lo - pad, hi + pad)
+    }
+    (axis(curve.points.iter().map(|p| p.x), xstep), axis(curve.points.iter().map(|p| p.y), ystep))
+}
+
+// ---- the picture ----------------------------------------------------------
+
+const BG: [u8; 4] = [24, 24, 28, 255];
+const GRID: [u8; 4] = [44, 44, 52, 255];
+const AXIS: [u8; 4] = [96, 96, 108, 255];
+const LABEL: [u8; 4] = [150, 150, 160, 255];
+const LINE: [u8; 4] = [110, 190, 255, 255];
+const DOT: [u8; 4] = [235, 235, 240, 255];
+const PICK: [u8; 4] = [255, 180, 60, 255];
+const HANDLE: [u8; 4] = [255, 210, 130, 255];
+
+/// A tick spacing that gives four to eight lines across `span`.
+fn nice_step(span: f32) -> f32 {
+    let raw = span / 5.0;
+    let mag = 10f32.powf(raw.abs().max(1e-9).log10().floor());
+    [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|&s| s >= raw).unwrap_or(mag)
+}
+
+/// Three-by-five glyphs for the tick labels: digits, minus, point.
+fn glyph(c: char) -> [u8; 5] {
+    match c {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b001, 0b001, 0b001],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
+        '.' => [0b000, 0b000, 0b000, 0b000, 0b010],
+        _ => [0; 5],
+    }
+}
+
+struct Canvas {
+    w: u32,
+    h: u32,
+    px: Vec<u8>,
+}
+
+impl Canvas {
+    fn new(w: u32, h: u32) -> Self {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            px.extend_from_slice(&BG);
+        }
+        Self { w, h, px }
+    }
+
+    fn put(&mut self, x: i64, y: i64, c: [u8; 4]) {
+        if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 {
+            return;
+        }
+        let at = ((y as u32 * self.w + x as u32) * 4) as usize;
+        self.px[at..at + 4].copy_from_slice(&c);
+    }
+
+    fn line(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
+        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+        let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+        let (mut x, mut y, mut err) = (x0, y0, dx + dy);
+        loop {
+            self.put(x, y, c);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    fn disc(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
+        for y in -r..=r {
+            for x in -r..=r {
+                if x * x + y * y <= r * r {
+                    self.put(cx + x, cy + y, c);
+                }
+            }
+        }
+    }
+
+    /// `text` in the tiny font with its top-left at `x, y`; four pixels
+    /// per glyph. Returns the width drawn.
+    fn text(&mut self, x: i64, y: i64, text: &str, c: [u8; 4]) -> i64 {
+        let mut at = x;
+        for ch in text.chars() {
+            let rows = glyph(ch);
+            for (r, bits) in rows.iter().enumerate() {
+                for col in 0..3 {
+                    if bits & (0b100 >> col) != 0 {
+                        self.put(at + col, y + r as i64, c);
+                    }
+                }
+            }
+            at += 4;
+        }
+        at - x
+    }
+}
+
+const fn text_width(s: &str) -> i64 {
+    s.len() as i64 * 4
+}
+
+/// The plot: axes, grid, the curve, every point, the selected one larger
+/// with its tangents as strokes. `width × height` RGBA.
+pub fn render(
+    curve: &Curve,
+    selected: usize,
+    xstep: f32,
+    ystep: f32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let (width, height) = (width.max(1), height.max(1));
+    let mut cv = Canvas::new(width, height);
+    let ((x0, x1), (y0, y1)) = ranges(curve, xstep, ystep);
+    let ytick = nice_step(y1 - y0);
+    let xtick = nice_step(x1 - x0);
+    let ydec = decimals_for(ytick);
+    let xdec = decimals_for(xtick);
+    let label_w = text_width(&format!("{:.*}", ydec, y0.min(y1).abs().max(y1.abs())));
+    let (left, right, top, bottom) = (label_w + 6 + 4, 8i64, 6i64, 12i64);
+    let (w, h) = (width as i64, height as i64);
+    let (inner_l, inner_r) = (left.min(w - 2), (w - right).max(left.min(w - 2) + 1));
+    let (inner_t, inner_b) = (top.min(h - 2), (h - bottom).max(top.min(h - 2) + 1));
+    let (iw, ih) = ((inner_r - inner_l) as f32, (inner_b - inner_t) as f32);
+    let sx = |x: f32| inner_l as f32 + (x - x0) / (x1 - x0) * iw;
+    let sy = |y: f32| inner_b as f32 - (y - y0) / (y1 - y0) * ih;
+
+    // Grid and tick labels.
+    let mut t = (y0 / ytick).ceil() * ytick;
+    while t <= y1 {
+        let row = sy(t).round() as i64;
+        cv.line(inner_l, row, inner_r, row, GRID);
+        let label = format!("{:.*}", ydec, t);
+        let lw = text_width(&label);
+        cv.text(inner_l - 6 - lw, row - 2, &label, LABEL);
+        t += ytick;
+    }
+    let mut t = (x0 / xtick).ceil() * xtick;
+    while t <= x1 {
+        let col = sx(t).round() as i64;
+        cv.line(col, inner_t, col, inner_b, GRID);
+        let label = format!("{:.*}", xdec, t);
+        let lw = text_width(&label);
+        cv.text(col - lw / 2, inner_b + 4, &label, LABEL);
+        t += xtick;
+    }
+    // Axes: the zero lines when in view, else the frame's left and bottom.
+    let zero_row = if y0 <= 0.0 && 0.0 <= y1 { sy(0.0).round() as i64 } else { inner_b };
+    let zero_col = if x0 <= 0.0 && 0.0 <= x1 { sx(0.0).round() as i64 } else { inner_l };
+    cv.line(inner_l, zero_row, inner_r, zero_row, AXIS);
+    cv.line(zero_col, inner_t, zero_col, inner_b, AXIS);
+
+    // The curve, one sample per column.
+    if !curve.points.is_empty() {
+        let mut prev: Option<(i64, i64)> = None;
+        for col in inner_l..=inner_r {
+            let x = x0 + (col - inner_l) as f32 / iw * (x1 - x0);
+            let row = sy(eval(curve, x)).round() as i64;
+            if let Some((pc, pr)) = prev {
+                cv.line(pc, pr, col, row, LINE);
+                cv.line(pc, pr + 1, col, row + 1, LINE);
+            }
+            prev = Some((col, row));
+        }
+    }
+    // Points, the selected one last so it sits on top.
+    for (i, p) in curve.points.iter().enumerate() {
+        if i != selected {
+            cv.disc(sx(p.x).round() as i64, sy(p.y).round() as i64, 2, DOT);
+        }
+    }
+    if let Some(p) = curve.points.get(selected) {
+        let (cx, cy) = (sx(p.x).round() as i64, sy(p.y).round() as i64);
+        for (m, dir) in [(p.out, 1.0f32), (p.in_, -1.0f32)] {
+            let dx = iw / (x1 - x0);
+            let dy = -m * ih / (y1 - y0);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let (ux, uy) = (dx / len * 24.0 * dir, dy / len * 24.0 * dir);
+            cv.line(cx, cy, cx + ux.round() as i64, cy + uy.round() as i64, HANDLE);
+        }
+        cv.disc(cx, cy, 4, PICK);
+    }
+    cv.px
 }
 
 #[cfg(test)]
@@ -478,5 +840,98 @@ mod tests {
             "not a field: z (want x, y, out, in, locked or _)"
         );
         assert_eq!(Layout::parse("out,in").unwrap_err(), "a layout needs x and y");
+    }
+    #[test]
+    fn rewrite_keeps_suffix_sign_and_decimals() {
+        assert_eq!(rewrite("0.5f", 0.51, 0.01), "0.51f");
+        assert_eq!(rewrite("0.50f", 0.51, 0.01), "0.51f");
+        assert_eq!(rewrite("0.500", 0.51, 0.01), "0.510", "keeps its three");
+        assert_eq!(rewrite("1", 1.25, 0.25), "1.25");
+        assert_eq!(rewrite("1", 2.0, 1.0), "2");
+        assert_eq!(rewrite("0.5f", 0.6, 0.01), "0.6f", "no zeros past its own");
+        assert_eq!(rewrite("-2.0_f32", -1.9, 0.1), "-1.9_f32");
+        assert_eq!(rewrite("1e-3", 0.002, 0.001), "0.002");
+        assert_eq!(rewrite("0.01", 0.0, 0.01), "0.00", "never minus zero");
+        assert_eq!(rewrite_bool("true", false), "false");
+        assert_eq!(rewrite_bool("1", false), "0");
+        assert_eq!(decimals_for(0.01), 2);
+        assert_eq!(decimals_for(0.25), 2);
+        assert_eq!(decimals_for(1.0), 0);
+    }
+
+    #[test]
+    fn a_new_point_copies_its_neighbours_shape() {
+        let lit = find(CPP, CPP.find("0.8f").unwrap()).unwrap();
+        let p = Point { x: 0.25, y: 0.4, out: 1.5, in_: 1.5, locked: true };
+        let text = point_text(CPP, &lit.points[1], &Layout::default(), p, 0.01);
+        assert_eq!(text, "{0.25f, 0.4f, 1.5f, 1.5f, true}");
+        let lit = find(RUST, RUST.find("0.8").unwrap()).unwrap();
+        let text = point_text(RUST, &lit.points[1], &Layout::default(), p, 0.01);
+        assert_eq!(text, "Point { x: 0.25, y: 0.4, out: 1.5, in_: 1.5, locked: true }");
+    }
+
+    fn c(points: &[(f32, f32, f32, f32)]) -> Curve {
+        Curve {
+            points: points
+                .iter()
+                .map(|&(x, y, out, in_)| Point { x, y, out, in_, locked: false })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn eval_hits_points_and_is_flat_outside() {
+        let curve = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
+        assert_eq!(eval(&curve, 0.0), 0.0);
+        assert_eq!(eval(&curve, 1.0), 1.0);
+        assert!((eval(&curve, 0.5) - 0.5).abs() < 1e-6, "smooth step's middle");
+        assert!((eval(&curve, 0.25) - 0.15625).abs() < 1e-5, "3t²-2t³ at 0.25");
+        assert_eq!(eval(&curve, -1.0), 0.0);
+        assert_eq!(eval(&curve, 2.0), 1.0);
+        assert_eq!(eval(&Curve::default(), 0.5), 0.0);
+    }
+
+    #[test]
+    fn eval_with_matching_slopes_is_the_line() {
+        let curve = c(&[(0.0, 0.0, 1.0, 1.0), (2.0, 2.0, 1.0, 1.0)]);
+        for i in 0..=8 {
+            let x = i as f32 * 0.25;
+            assert!((eval(&curve, x) - x).abs() < 1e-5, "at {x}");
+        }
+        assert!((slope(&curve, 1.0) - 1.0).abs() < 1e-4);
+        assert_eq!(slope(&curve, 5.0), 0.0);
+    }
+
+    #[test]
+    fn eval_skips_a_zero_length_segment() {
+        let curve = c(&[
+            (0.0, 0.0, 0.0, 0.0),
+            (0.5, 1.0, 0.0, 0.0),
+            (0.5, 2.0, 0.0, 0.0),
+            (1.0, 3.0, 0.0, 0.0),
+        ]);
+        assert!(eval(&curve, 0.5).is_finite());
+        assert!(eval(&curve, 0.75).is_finite());
+        assert!(eval(&curve, 0.25).is_finite());
+    }
+
+    #[test]
+    fn ranges_pad_and_never_collapse() {
+        let curve = c(&[(0.0, 0.5, 0.0, 0.0), (1.0, 0.5, 0.0, 0.0)]);
+        let ((x0, x1), (y0, y1)) = ranges(&curve, 0.01, 0.01);
+        assert!(x0 < 0.0 && x1 > 1.0);
+        assert!(y1 - y0 >= 0.01 && y0 < 0.5 && y1 > 0.5);
+        assert_eq!(ranges(&Curve::default(), 0.01, 0.01).0, (-0.1, 1.1));
+    }
+
+    #[test]
+    fn render_fills_the_size_and_marks_the_selected_point() {
+        let curve = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
+        let px = render(&curve, 1, 0.01, 0.01, 64, 32);
+        assert_eq!(px.len(), 64 * 32 * 4);
+        let other = render(&curve, 0, 0.01, 0.01, 64, 32);
+        assert_ne!(px, other, "the selection shows");
+        assert_eq!(render(&curve, 0, 0.01, 0.01, 1, 1).len(), 4, "a tiny pane does not panic");
+        assert_eq!(render(&Curve::default(), 0, 0.01, 0.01, 300, 200).len(), 300 * 200 * 4);
     }
 }
