@@ -302,6 +302,8 @@ impl Input {
             Mode::Normal | Mode::Debug if is_dap_pane(content) => KeyMode::Tree,
             // A form is a list; it borrows the list keymap.
             Mode::Normal if content == ContentKind::Form => KeyMode::Tree,
+            // And a property view is a tree of rows.
+            Mode::Normal if content == ContentKind::Props => KeyMode::Tree,
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             Mode::Debug => KeyMode::Debug,
@@ -391,6 +393,7 @@ impl Input {
             // gives: the pane's grammar is the window's, not the session's.
             Mode::Normal | Mode::Debug if is_dap_pane(content) => self.dap_pane(key, content),
             Mode::Normal if content == ContentKind::Form => self.form(key),
+            Mode::Normal if content == ContentKind::Props => self.props(key),
             // A picture reads the normal grammar, with one key of its own:
             // `r` has no character to replace, so it turns the tile.
             Mode::Normal if content == ContentKind::Image => self.image(key),
@@ -976,6 +979,72 @@ impl Input {
     /// binding through to the debugger.
     fn debug_claims(&self, key: Key) -> bool {
         matches!(key.code, KeyCode::Char('c' | 'n' | 's' | 'o' | 'p' | 'b' | 'K') | KeyCode::Esc)
+    }
+
+    /// A property view: tree keys, with the view's own vocabulary. See
+    /// `docs/specs/props.md`.
+    fn props(&mut self, key: Key) -> Option<Command> {
+        use crate::editor::PropsCmd;
+        if self.window_pending {
+            return self.window_key(key);
+        }
+        // `dd` is the whole key, as in the tree.
+        if std::mem::take(&mut self.delete_pending) {
+            return match key.code {
+                KeyCode::Char('d') => self.plain(Action::Props(PropsCmd::Delete)),
+                _ => {
+                    self.reset();
+                    None
+                }
+            };
+        }
+        let ctrl = key.mods.ctrl;
+        let count = self.count.unwrap_or(1).max(1);
+        let g = std::mem::take(&mut self.g_pending);
+        let steps = count as i64;
+
+        let cmd = match key.code {
+            KeyCode::Char('g') if g => PropsCmd::First,
+            KeyCode::Char('d') if g => PropsCmd::Goto,
+            KeyCode::Char('g') => {
+                self.g_pending = true;
+                return None;
+            }
+            KeyCode::Char('G') => PropsCmd::Last,
+            KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                self.count = Some(self.count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as usize);
+                return None;
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.window_pending = true;
+                return None;
+            }
+            KeyCode::Char('d') if ctrl => PropsCmd::HalfPage { down: true },
+            KeyCode::Char('u') if ctrl => PropsCmd::HalfPage { down: false },
+            KeyCode::Char('a') if ctrl => PropsCmd::Nudge(steps),
+            KeyCode::Char('x') if ctrl => PropsCmd::Nudge(-steps),
+            KeyCode::Char('r') if ctrl => PropsCmd::Redo,
+            KeyCode::Char('d') => {
+                self.delete_pending = true;
+                return None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => PropsCmd::Select { down: true, count },
+            KeyCode::Char('k') | KeyCode::Up => PropsCmd::Select { down: false, count },
+            KeyCode::Char('l') | KeyCode::Right => PropsCmd::Expand,
+            KeyCode::Char('h') | KeyCode::Left => PropsCmd::Collapse,
+            KeyCode::Enter | KeyCode::Char('i') => PropsCmd::Enter,
+            KeyCode::Char(' ') => PropsCmd::Toggle,
+            KeyCode::Char('a') => PropsCmd::Add,
+            KeyCode::Char('u') => PropsCmd::Undo,
+            // The ex line, as from every pane: `:bi …` and `:w` live there.
+            KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
+            _ => {
+                self.reset();
+                return None;
+            }
+        };
+        self.reset();
+        Some(Command { count: 1, action: Action::Props(cmd) })
     }
 
     /// A form window: list keys, with the form's own vocabulary. See
@@ -3872,7 +3941,8 @@ leader = \" \"
             let tab = Key::new(KeyCode::Tab, crate::key::Mods::default());
             let cmd = input.on_key(tab, &Mode::Normal, ContentKind::Image);
             assert_eq!(cmd.unwrap().action, Action::NextPoint { back: false });
-            let back = Key::new(KeyCode::Tab, crate::key::Mods { shift: true, ..Default::default() });
+            let back =
+                Key::new(KeyCode::Tab, crate::key::Mods { shift: true, ..Default::default() });
             image(&mut input, "3");
             let cmd = input.on_key(back, &Mode::Normal, ContentKind::Image).unwrap();
             assert_eq!((cmd.count, cmd.action), (3, Action::NextPoint { back: true }));

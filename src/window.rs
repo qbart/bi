@@ -43,6 +43,11 @@ pub enum Content {
     /// A tool's knobs — see `docs/specs/form.md`. In the window for the
     /// tree's reason: the selected field is view state.
     Form(crate::form::Form),
+    /// A schema or a data file as a tree of rows — see `docs/specs/props.md`.
+    /// In the window for the tree's reason: the selected row and what is
+    /// open are view state. Boxed like `Results`: the parsed document is
+    /// large, and most windows show text.
+    Props(Box<crate::props::Props>),
     /// The stopped session's call stack — see `docs/specs/debug.md` §UI. Held
     /// whole for the same reason `Tree`/`Results` are: which frame is
     /// selected is view state, not something two panes would want to share.
@@ -211,6 +216,7 @@ pub enum ContentKind {
     Results,
     Image,
     Form,
+    Props,
     DapStack,
     DapConsole,
     DapVariables,
@@ -225,6 +231,7 @@ impl Content {
             Content::Results(_) => ContentKind::Results,
             Content::Image(_) => ContentKind::Image,
             Content::Form(_) => ContentKind::Form,
+            Content::Props(_) => ContentKind::Props,
             Content::DapStack(_) => ContentKind::DapStack,
             Content::DapConsole(_) => ContentKind::DapConsole,
             Content::DapVariables(_) => ContentKind::DapVariables,
@@ -236,6 +243,9 @@ impl Content {
     pub fn buffer(&self) -> Option<BufferId> {
         match self {
             Content::Text(text) => Some(text.buffer),
+            // A property view is a view of its buffer: `:w`, `:q`, `:bd`
+            // and the modified marker see the file it is.
+            Content::Props(props) => Some(props.buffer),
             Content::Tree(_)
             | Content::Results(_)
             | Content::Image(_)
@@ -372,6 +382,20 @@ impl Window {
     pub fn form(&self) -> Option<&crate::form::Form> {
         match &self.content {
             Content::Form(form) => Some(form),
+            _ => None,
+        }
+    }
+
+    pub fn props(&self) -> Option<&crate::props::Props> {
+        match &self.content {
+            Content::Props(props) => Some(props),
+            _ => None,
+        }
+    }
+
+    pub fn props_mut(&mut self) -> Option<&mut crate::props::Props> {
+        match &mut self.content {
+            Content::Props(props) => Some(props),
             _ => None,
         }
     }

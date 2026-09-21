@@ -386,6 +386,8 @@ pub enum Action {
     },
     /// A key in a form window. See `docs/specs/form.md`.
     Form(FormCmd),
+    /// A key in a property view. See `docs/specs/props.md`.
+    Props(PropsCmd),
     /// `~`
     ToggleCase {
         count: usize,
@@ -1784,6 +1786,8 @@ enum ExLine {
     /// `:tool tileset …` — the grid's settings and canvas commands. See
     /// `docs/specs/tileset.md`.
     Tool(String),
+    /// `:bi …` — the property view's commands. See `docs/specs/props.md`.
+    Bi(String),
     /// `:yname <register>` — stores the capture waiting on a name. Typed by
     /// the prompt `"n` prefills far more often than by hand. With a range or
     /// a selection it is a scoped yank instead: the region goes straight into
@@ -2301,6 +2305,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "set" => ExLine::Set(arg.into()),
         "zoom" => ExLine::Zoom(arg.into()),
         "tool" => ExLine::Tool(arg.into()),
+        "bi" => ExLine::Bi(arg.into()),
         "themes" => ExLine::Themes,
         "yname" => match arg {
             "" => ExLine::Error("name it what? `:yname {register}`".into()),
@@ -2900,6 +2905,38 @@ impl Tool {
     }
 }
 
+/// What a key in a property view asks for. See `docs/specs/props.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropsCmd {
+    Select {
+        down: bool,
+        count: usize,
+    },
+    First,
+    Last,
+    HalfPage {
+        down: bool,
+    },
+    /// `l` — open a struct, a list, a type, a field's attributes.
+    Expand,
+    /// `h` — close it, or go to the parent row.
+    Collapse,
+    /// `Enter` / `i` — open a row with children, edit a value on the ex line.
+    Enter,
+    /// `Space` — flip a bool, cycle an enum, a ref, an optional.
+    Toggle,
+    /// `Ctrl-A` / `Ctrl-X` — a number by its step, an enum or a ref along.
+    Nudge(i64),
+    /// `a` — an item, an instance, a field, a value, a type.
+    Add,
+    /// `dd` — back to the default, or gone.
+    Delete,
+    /// `gd` — a ref's target.
+    Goto,
+    Undo,
+    Redo,
+}
+
 /// What a key in a form window asks for. See `docs/specs/form.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormCmd {
@@ -2978,6 +3015,573 @@ pub enum TreeCmd {
     Prompt(FileOp),
 }
 
+// ---- the property view: see `docs/specs/props.md` ----
+
+impl Editor {
+    /// A text window whose buffer is a `.bidata` or `.bischema` gets the
+    /// property view over it — unless `:set editor text` asked for the
+    /// text. A file that does not parse stays text, with the error said.
+    fn auto_props(&mut self, window: WindowId) {
+        let Some(text) = self.window_of(window).and_then(Window::text) else { return };
+        let buffer = text.buffer;
+        if self.props_text.contains(&buffer) {
+            return;
+        }
+        let Some(kind) = self.entry(buffer).buffer.path.as_deref().and_then(crate::props::kind_of)
+        else {
+            return;
+        };
+        if let Err(e) = self.open_props(window, kind) {
+            self.session.status = e;
+        }
+    }
+
+    /// `:set editor bischema|bidata`: the focused text window as the view.
+    fn set_editor_props(&mut self, kind: crate::props::Kind) {
+        if let Some(props) = self.window().props() {
+            if props.kind == kind {
+                return;
+            }
+            self.props_to_text(self.focus);
+        }
+        if self.window().text().is_none() {
+            self.session.status = "no text here".into();
+            return;
+        }
+        if let Some(buffer) = self.window().buffer() {
+            self.props_text.retain(|&b| b != buffer);
+        }
+        if let Err(e) = self.open_props(self.focus, kind) {
+            self.session.status = e;
+        }
+    }
+
+    /// The window's text replaced by the view over the same buffer, or
+    /// left as it was with the reason.
+    fn open_props(&mut self, window: WindowId, kind: crate::props::Kind) -> Result<(), String> {
+        let Some(text) = self.window_of(window).and_then(Window::text) else {
+            return Err("no text here".into());
+        };
+        let (buffer, pairs) = (text.buffer, text.selections.as_pairs());
+        self.entry_mut(buffer).last = pairs.clone();
+        let path = self.entry(buffer).buffer.path.clone();
+        let props = crate::props::Props::new(kind, buffer, path);
+        if let Some(w) = self.window_mut_of(window) {
+            w.content = Content::Props(Box::new(props));
+        }
+        match self.load_props(window, true) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mut text = Text::new(buffer);
+                text.selections = Selections::from_pairs(pairs);
+                if let Some(w) = self.window_mut_of(window) {
+                    w.content = Content::Text(text);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `:set editor text`: the buffer's text back in the window, and
+    /// remembered as wanted that way.
+    fn props_to_text(&mut self, window: WindowId) {
+        let Some(buffer) = self.window_of(window).and_then(Window::props).map(|p| p.buffer) else {
+            return;
+        };
+        let len = self.entry(buffer).buffer.rope().len_chars();
+        let last: Cursors =
+            self.entry(buffer).last.iter().map(|&(a, h)| (a.min(len), h.min(len))).collect();
+        let mut text = Text::new(buffer);
+        if !last.is_empty() {
+            text.selections = Selections::from_pairs(last);
+        }
+        if let Some(w) = self.window_mut_of(window) {
+            w.content = Content::Text(text);
+        }
+        if !self.props_text.contains(&buffer) {
+            self.props_text.push(buffer);
+        }
+    }
+
+    /// The buffer's text read into the view: the schema resolved and
+    /// read — from its buffer when it is open — and the index over the
+    /// schema's other data files built when `index` says so. The error,
+    /// if any, is on the view and returned.
+    fn load_props(&mut self, window: WindowId, index: bool) -> Result<(), String> {
+        use crate::props::{Kind, Props, data};
+        let Some(props) = self.window_of(window).and_then(Window::props) else {
+            return Err("no property view here".into());
+        };
+        let (buffer, kind, path) = (props.buffer, props.kind, props.path.clone());
+        let Some(entry) = self.buffers.iter().find(|b| b.id == buffer) else {
+            return Err("no buffer".into());
+        };
+        let (text, edits) = (entry.buffer.rope().to_string(), entry.buffer.edits());
+        let mut schema_path = None;
+        let mut schema_seen = None;
+        let schema = match kind {
+            Kind::Schema => None,
+            Kind::Data => Some(match Props::schema_needed(kind, &text) {
+                Err(e) => Err(e),
+                Ok(None) => Err("no $schema".into()),
+                Ok(Some(rel)) => match path.as_deref().and_then(|p| data::schema_path(p, &rel)) {
+                    None => Err(format!("$schema {rel}: no file name to resolve it against")),
+                    Some(spath) => {
+                        schema_path = Some(spath.clone());
+                        match self.buffer_at_path(&spath) {
+                            Some(id) => {
+                                let e = self.entry(id);
+                                schema_seen = Some(e.buffer.edits());
+                                Ok(e.buffer.rope().to_string())
+                            }
+                            None => std::fs::read_to_string(&spath)
+                                .map_err(|e| format!("$schema {rel}: {e}")),
+                        }
+                    }
+                },
+            }),
+        };
+        let index = match (&schema_path, index) {
+            (Some(spath), true) => Some(self.props_index(spath, path.as_deref())),
+            _ => None,
+        };
+        let Some(props) = self.window_mut_of(window).and_then(Window::props_mut) else {
+            return Err("no property view here".into());
+        };
+        props.schema_path = schema_path;
+        props.schema_seen = schema_seen;
+        props.seen = Some(edits);
+        let index = index.unwrap_or_else(|| props.index.clone());
+        props.load(&text, schema, index)
+    }
+
+    /// The open buffer at `path`, by canonical path.
+    fn buffer_at_path(&self, path: &Path) -> Option<BufferId> {
+        let wanted = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.buffers
+            .iter()
+            .find(|b| {
+                b.buffer.path.as_deref().is_some_and(|p| {
+                    p == path || std::fs::canonicalize(p).is_ok_and(|c| c == wanted)
+                })
+            })
+            .map(|b| b.id)
+    }
+
+    /// The index over the schema's other data files: the project's, read
+    /// from their buffers when open. See `docs/specs/props.md` §`:bi`.
+    fn props_index(&self, schema: &Path, except: Option<&Path>) -> crate::props::data::Index {
+        let root = self
+            .session
+            .tree_root
+            .clone()
+            .or_else(|| schema.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let files = crate::props::data::project_files(&root, schema, except);
+        let texts: Vec<(PathBuf, String)> = files
+            .into_iter()
+            .filter_map(|file| {
+                let text = match self.buffer_at_path(&file) {
+                    Some(id) => self.entry(id).buffer.rope().to_string(),
+                    None => std::fs::read_to_string(&file).ok()?,
+                };
+                Some((file, text))
+            })
+            .collect();
+        crate::props::data::Index::build(&texts)
+    }
+
+    /// After anything: a view whose buffer — or whose schema's buffer —
+    /// moved re-reads it. Cheap when nothing moved.
+    fn sync_props(&mut self) {
+        for id in self.window_ids() {
+            let Some(props) = self.window_of(id).and_then(Window::props) else { continue };
+            let Some(edits) = self.buffer_edits(props.buffer) else { continue };
+            let schema_edits = props
+                .schema_path
+                .as_deref()
+                .and_then(|p| self.buffer_at_path(p))
+                .and_then(|b| self.buffer_edits(b));
+            if props.seen == Some(edits) && props.schema_seen == schema_edits {
+                continue;
+            }
+            let was = props.error.clone();
+            let result = self.load_props(id, false);
+            if let Err(e) = result
+                && was.as_deref() != Some(e.as_str())
+            {
+                self.session.status = e;
+            }
+        }
+    }
+
+    /// The buffer's text replaced by `new` as one undo step, touching
+    /// only the part that differs so cursors elsewhere on the file stay.
+    fn splice_buffer(&mut self, buffer: BufferId, new: &str) {
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else { return };
+        let old = entry.buffer.rope().to_string();
+        if old == new {
+            return;
+        }
+        let old_chars: Vec<char> = old.chars().collect();
+        let new_chars: Vec<char> = new.chars().collect();
+        let prefix = old_chars.iter().zip(&new_chars).take_while(|(a, b)| a == b).count();
+        let suffix = old_chars[prefix..]
+            .iter()
+            .rev()
+            .zip(new_chars[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let middle: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+        let cursors = entry.last.clone();
+        entry.buffer.replace_range(prefix, old_chars.len() - suffix, &middle);
+        entry.buffer.commit_undo(cursors.clone(), cursors);
+    }
+
+    /// What an edit of the view asks for, done: the text into the buffer,
+    /// the prompt onto the ex line, the refactoring across the schema's
+    /// data files.
+    fn apply_props_edit(&mut self, window: WindowId, edit: crate::props::Edit) {
+        use crate::props::Edit;
+        let Some(props) = self.window_of(window).and_then(Window::props) else { return };
+        let buffer = props.buffer;
+        match edit {
+            Edit::Text(text) => self.splice_buffer(buffer, &text),
+            Edit::Prompt(line) => {
+                self.session.status.clear();
+                self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
+            }
+            Edit::Refactor { text, refactor } => {
+                let schema = props.schema.clone();
+                let files = match props.kind {
+                    crate::props::Kind::Data => props.index.files(),
+                    crate::props::Kind::Schema => props
+                        .path
+                        .as_deref()
+                        .map(|p| self.props_index(p, None).files())
+                        .unwrap_or_default(),
+                };
+                self.splice_buffer(buffer, &text);
+                let mut touched = 0;
+                for file in files {
+                    match self.buffer_at_path(&file) {
+                        Some(id) => {
+                            let old = self.entry(id).buffer.rope().to_string();
+                            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&old)
+                                && refactor.apply(&mut doc, &schema)
+                            {
+                                self.splice_buffer(id, &crate::props::write_data(&doc));
+                                touched += 1;
+                            }
+                        }
+                        None => {
+                            let Ok(old) = std::fs::read_to_string(&file) else { continue };
+                            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&old)
+                                && refactor.apply(&mut doc, &schema)
+                            {
+                                match std::fs::write(&file, crate::props::write_data(&doc)) {
+                                    Ok(()) => touched += 1,
+                                    Err(e) => {
+                                        self.session.status = format!("{}: {e}", file.display());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.session.status = match touched {
+                    0 => String::new(),
+                    1 => "renamed in 1 other file".into(),
+                    n => format!("renamed in {n} other files"),
+                };
+                let _ = self.load_props(window, true);
+            }
+        }
+    }
+
+    /// A key in the focused property view. See `docs/specs/props.md`.
+    fn run_props_cmd(&mut self, cmd: PropsCmd) {
+        let window = self.focus;
+        let height = self.window().height;
+        let Some(props) = self.window_mut().props_mut() else { return };
+        let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+        let result: Result<Option<crate::props::Edit>, String> = match cmd {
+            PropsCmd::Select { down, count } => {
+                props.select_by(if down { count as isize } else { -(count as isize) });
+                Ok(None)
+            }
+            PropsCmd::First => {
+                props.select(0);
+                Ok(None)
+            }
+            PropsCmd::Last => {
+                props.select(usize::MAX);
+                Ok(None)
+            }
+            PropsCmd::HalfPage { down } => {
+                let step = (height / 2).max(1) as isize;
+                props.select_by(if down { step } else { -step });
+                Ok(None)
+            }
+            PropsCmd::Expand => {
+                props.expand();
+                Ok(None)
+            }
+            PropsCmd::Collapse => {
+                props.collapse();
+                Ok(None)
+            }
+            PropsCmd::Enter => match props.edit_line(&key) {
+                Some(line) => Ok(Some(crate::props::Edit::Prompt(line))),
+                None => {
+                    props.toggle_expand();
+                    Ok(None)
+                }
+            },
+            PropsCmd::Toggle => props.turn(&key, 1, true).map(Some),
+            PropsCmd::Nudge(steps) => props.turn(&key, steps, false).map(Some),
+            PropsCmd::Add => props.add(&key).map(Some),
+            PropsCmd::Delete => props.delete(&key).map(Some),
+            PropsCmd::Goto => {
+                return self.props_goto();
+            }
+            PropsCmd::Undo | PropsCmd::Redo => {
+                return self.props_undo(cmd == PropsCmd::Redo);
+            }
+        };
+        match result {
+            Ok(Some(edit)) => self.apply_props_edit(window, edit),
+            Ok(None) => {}
+            Err(e) => self.session.status = e,
+        }
+        self.sync_tools();
+    }
+
+    /// `gd` on a ref: the target's row here, or its file opened on it.
+    fn props_goto(&mut self) {
+        let Some(props) = self.window().props() else { return };
+        let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+        let (ty, id) = match props.target(&key) {
+            Ok(target) => target,
+            Err(e) => {
+                self.session.status = e;
+                return;
+            }
+        };
+        let file = props.index.file_of(&ty, &id).map(Path::to_path_buf);
+        if let Some(props) = self.window_mut().props_mut()
+            && props.select_instance(&ty, &id)
+        {
+            return;
+        }
+        let Some(file) = file else {
+            self.session.status = format!("no {ty} {id}");
+            return;
+        };
+        self.edit_path(&file.to_string_lossy());
+        if let Some(props) = self.window_mut().props_mut() {
+            props.select_instance(&ty, &id);
+        }
+    }
+
+    /// `u` / `Ctrl-R` in the view: the buffer's history, the view following.
+    fn props_undo(&mut self, redo: bool) {
+        let Some(buffer) = self.window().props().map(|p| p.buffer) else { return };
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else { return };
+        let cursors = entry.last.clone();
+        let done = if redo {
+            entry.buffer.redo(cursors.clone(), cursors)
+        } else {
+            entry.buffer.undo(cursors.clone(), cursors)
+        };
+        if done.is_none() {
+            self.session.status =
+                if redo { "already at newest change" } else { "already at oldest change" }.into();
+        }
+        self.sync_tools();
+    }
+
+    /// `:w` from the view: normalised, then written. True when written.
+    fn write_props(&mut self, path: &str, force: bool) -> bool {
+        let window = self.focus;
+        let Some(props) = self.window().props() else { return false };
+        let buffer = props.buffer;
+        if props.error.is_none() {
+            let text = props.normalised_text();
+            self.splice_buffer(buffer, &text);
+        }
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else { return false };
+        let cursors = entry.last.clone();
+        let result = if path.is_empty() {
+            entry.buffer.save(cursors.clone(), cursors, force)
+        } else {
+            entry.buffer.save_as(cursors.clone(), cursors, path)
+        };
+        let written = match result {
+            Ok(()) => {
+                let name =
+                    entry.buffer.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                self.session.status = format!("\"{name}\" written");
+                self.session.pending_saves.push(buffer);
+                true
+            }
+            Err(e) => {
+                self.session.status = format!("error: {e:#}");
+                false
+            }
+        };
+        // The index is rebuilt on save, as the format says.
+        let _ = self.load_props(window, true);
+        written
+    }
+
+    /// The view's status row: the file's name and marker on the left,
+    /// the row, the warning count and the selected row's word on the
+    /// right.
+    pub fn props_status(&self, window: WindowId) -> Option<(String, String)> {
+        let props = self.window_of(window).and_then(Window::props)?;
+        let entry = self.buffers.iter().find(|b| b.id == props.buffer)?;
+        let mut name = entry
+            .buffer
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "[No Name]".into());
+        if entry.buffer.is_modified() {
+            name.push_str(" +");
+        }
+        let mut at = if props.error.is_some() {
+            "error".to_string()
+        } else {
+            format!("{}/{}", props.selected + 1, props.rows.len())
+        };
+        match props.warnings() {
+            0 => {}
+            1 => at.push_str("  1 warning"),
+            n => at.push_str(&format!("  {n} warnings")),
+        }
+        if let Some(row) = props.selected_row()
+            && let Some(word) = row.warning.as_deref().or(row.doc.as_deref())
+        {
+            at.push_str(&format!("  {word}"));
+        }
+        Some((name, at))
+    }
+
+    /// `:bi …` — the property view's ex surface. See `docs/specs/props.md`.
+    fn bi_command(&mut self, arg: &str) {
+        use crate::props::{Edit, Kind, Props, Refactor};
+        const WHAT: &str = "bi what? (set, new, delete, add, rename, remap, prune, migrate)";
+        let (what, rest) = match arg.trim().split_once(char::is_whitespace) {
+            Some((what, rest)) => (what, rest.trim()),
+            None => (arg.trim(), ""),
+        };
+        let window = self.focus;
+        if what == "migrate" {
+            let Some(buffer) = self.window().buffer() else {
+                self.session.status = "no buffer in this window".into();
+                return;
+            };
+            let kind = self.window().props().map(|p| p.kind).or_else(|| {
+                self.entry(buffer).buffer.path.as_deref().and_then(crate::props::kind_of)
+            });
+            let Some(kind) = kind else {
+                self.session.status = "not a .bidata or .bischema".into();
+                return;
+            };
+            let text = self.entry(buffer).buffer.rope().to_string();
+            match Props::migrate(&text, kind) {
+                Ok(new) => {
+                    self.splice_buffer(buffer, &new);
+                    self.session.status = format!("migrated to {}", crate::props::DIALECT);
+                    if self.window().props().is_none() {
+                        self.props_text.retain(|&b| b != buffer);
+                        self.auto_props(window);
+                    }
+                }
+                Err(e) => self.session.status = e,
+            }
+            self.sync_tools();
+            return;
+        }
+        let Some(props) = self.window().props() else {
+            self.session.status = if what.is_empty() {
+                WHAT.into()
+            } else {
+                "no property view here (:set editor bidata)".into()
+            };
+            return;
+        };
+        let args: Vec<&str> = rest.split('#').next().unwrap_or("").split_whitespace().collect();
+        let mut pruned = None;
+        let result: Result<Edit, String> = match what {
+            "" => Err(WHAT.into()),
+            "set" => match rest.split_once(char::is_whitespace) {
+                Some((path, value)) => props.set(path, value.trim()),
+                None if rest.is_empty() => Err("set what? (`:bi set <path> <value>`)".into()),
+                None => props.set(rest, ""),
+            },
+            "new" => match args.as_slice() {
+                [ty, id] => props.new_instance(ty, id),
+                _ => Err("new what? (`:bi new <Type> <id>`)".into()),
+            },
+            "delete" => match args.as_slice() {
+                [ty, id] => props.delete_instance(ty, id),
+                _ => Err("delete what? (`:bi delete <Type> <id>`)".into()),
+            },
+            "add" => props.add_to_schema(&args),
+            "rename" => match args.as_slice() {
+                [spec, new] => props.rename(spec, new),
+                _ => Err("rename what? (`:bi rename <Type>.<old> <new>`)".into()),
+            },
+            "remap" => match args.as_slice() {
+                [spec, new] if props.kind == Kind::Data => match spec.split_once('.') {
+                    Some((ty, old)) => {
+                        let refactor = Refactor::RenameField {
+                            ty: ty.into(),
+                            old: old.into(),
+                            new: (*new).into(),
+                        };
+                        let mut raw = props.raw.clone();
+                        refactor.apply(&mut raw, &props.schema);
+                        Ok(Edit::Refactor { text: crate::props::write_data(&raw), refactor })
+                    }
+                    None => Err("want <Type>.<old>".into()),
+                },
+                [_, _] => Err("remap is for a data file".into()),
+                _ => Err("remap what? (`:bi remap <Type>.<old> <new>`)".into()),
+            },
+            "prune" => props.prune().map(|(edit, n)| {
+                pruned = Some(n);
+                edit
+            }),
+            other => Err(format!(
+                "not a bi command: {other} (want set, new, delete, add, rename, remap, prune, migrate)"
+            )),
+        };
+        match result {
+            Ok(edit) => {
+                self.session.status = match pruned {
+                    None => String::new(),
+                    Some(0) => "nothing to prune".into(),
+                    Some(1) => "pruned 1 key".into(),
+                    Some(n) => format!("pruned {n} keys"),
+                };
+                self.apply_props_edit(window, edit);
+                self.sync_tools();
+                if what == "new"
+                    && let [ty, id] = args.as_slice()
+                    && let Some(props) = self.window_mut_of(window).and_then(Window::props_mut)
+                {
+                    props.select_instance(ty, id);
+                }
+            }
+            Err(e) => self.session.status = e,
+        }
+    }
+}
+
 /// A code actions answer, parked while its picker is up — what each row
 /// runs, and the context to run it in. See `docs/specs/code-actions.md`.
 struct PendingActions {
@@ -3049,6 +3653,10 @@ pub struct Editor {
     /// The tools open, one per source window: normal maps and curves. See
     /// `docs/specs/normalmap.md` and `docs/specs/curve.md`.
     tools: Vec<Tool>,
+    /// Buffers whose property view was put back to text with `:set editor
+    /// text`, so showing them again does not bring it back. See
+    /// `docs/specs/props.md`.
+    props_text: Vec<BufferId>,
     /// The area and chrome the frontend last laid out in.
     ///
     /// Splitting, resizing and directional switching are all geometry
@@ -3163,6 +3771,10 @@ pub enum Pane<'a> {
     Form {
         window: &'a Window,
         form: &'a crate::form::Form,
+    },
+    Props {
+        window: &'a Window,
+        props: &'a crate::props::Props,
     },
     Image {
         window: &'a Window,
@@ -3408,7 +4020,12 @@ impl Editor {
         // No session exists yet, so the detection list is the built-in one —
         // but the project's `.editorconfig` has its say from the first file.
         let how = open_how(&Session::default(), Some(path), None, None);
-        Ok(Self::with_buffer(Buffer::open_how(path, &how)?))
+        let mut editor = Self::with_buffer(Buffer::open_how(path, &how)?);
+        // A `.bidata` or `.bischema` opens in its property view, as an
+        // image opens as a picture. See `docs/specs/props.md`.
+        let focus = editor.focus;
+        editor.auto_props(focus);
+        Ok(editor)
     }
 
     /// Applies a config source, and remembers it for `:reload`.
@@ -3678,6 +4295,7 @@ impl Editor {
             next_window: 1,
             next_image: 1,
             tools: Vec::new(),
+            props_text: Vec::new(),
             area: Rect::default(),
             chrome: Chrome::default(),
             session: Session::default(),
@@ -3794,6 +4412,7 @@ impl Editor {
             Content::Results(results) => Pane::Results { window, results },
             Content::Image(img) => Pane::Image { window, img },
             Content::Form(form) => Pane::Form { window, form },
+            Content::Props(props) => Pane::Props { window, props },
             Content::DapStack(stack) => Pane::DapStack { window, stack },
             Content::DapConsole(console) => Pane::DapConsole { window, console },
             Content::DapVariables(vars) => Pane::DapVariables { window, vars },
@@ -4682,8 +5301,12 @@ impl Editor {
         }
         // A results pane about to be displaced is kept for `:results`.
         self.park_results(window);
+        let id = window;
         let window = self.window_mut_of(window).expect("checked above");
         window.show(Content::Text(text));
+        // A `.bidata` or `.bischema` shows as its property view, however
+        // it came to be shown. See `docs/specs/props.md`.
+        self.auto_props(id);
         self.sweep_scratch();
         // The buffer-switch checktime moment: the file may have moved on disk
         // while nothing was looking at it.
@@ -7665,6 +8288,7 @@ impl Editor {
             ExLine::Set(arg) => self.set_option(&arg),
             ExLine::Zoom(arg) => self.zoom(&arg),
             ExLine::Tool(arg) => self.tool(&arg),
+            ExLine::Bi(arg) => self.bi_command(&arg),
             ExLine::Name { scope, name } => {
                 // The capture the `"n` prompt is holding wins a bare
                 // `:yname` — that is the prompt flow. A range, a selection,
@@ -7749,7 +8373,11 @@ impl Editor {
             // The rest need the rope, and so need a view.
             ExLine::Write { path, force } => {
                 let Some(path) = self.expand_path(&path) else { return };
-                if let Some(source) = self.curve_source_of(self.focus) {
+                if self.window().props().is_some() {
+                    // The view normalises and writes its buffer. See
+                    // `docs/specs/props.md`.
+                    self.write_props(&path, force);
+                } else if let Some(source) = self.curve_source_of(self.focus) {
                     // The plot and the form are views of the code: `:w`
                     // there writes the code. See `docs/specs/curve.md`.
                     let back = self.focus;
@@ -7782,9 +8410,12 @@ impl Editor {
             }
             ExLine::WriteQuit { path, force } => {
                 let Some(path) = self.expand_path(&path) else { return };
-                let written = match self.window().img().is_some() {
-                    true => self.write_image(&path),
-                    false => self.in_view(|view| view.write(&path, force)) == Some(true),
+                let written = if self.window().props().is_some() {
+                    self.write_props(&path, force)
+                } else if self.window().img().is_some() {
+                    self.write_image(&path)
+                } else {
+                    self.in_view(|view| view.write(&path, force)) == Some(true)
                 };
                 if written {
                     self.quit(true);
@@ -8138,6 +8769,12 @@ impl Editor {
     fn set_editor(&mut self, value: &str) {
         let tool = self.tool_at(self.focus);
         if value.is_empty() {
+            if tool.is_none()
+                && let Some(props) = self.window().props()
+            {
+                self.session.status = format!("editor={}", props.kind.name());
+                return;
+            }
             self.session.status = match (tool, self.window().img()) {
                 (Some(index), _) => format!("editor={}", self.tools[index].name()),
                 (None, Some(img)) if img.tileset().is_some() => "editor=tileset".into(),
@@ -8151,6 +8788,12 @@ impl Editor {
         }
         if value == "curve" {
             return self.open_curve();
+        }
+        if let Some(kind) = crate::props::Kind::parse(value) {
+            return self.set_editor_props(kind);
+        }
+        if value == "text" && self.window().props().is_some() {
+            return self.props_to_text(self.focus);
         }
         if (value == "image" || value == "text")
             && let Some(index) = tool
@@ -8171,7 +8814,9 @@ impl Editor {
                 img.leave_tileset();
                 String::new()
             }
-            other => format!("not an editor: {other} (want tileset, normalmap, curve or image)"),
+            other => format!(
+                "not an editor: {other} (want tileset, normalmap, curve, bischema, bidata or image)"
+            ),
         };
     }
 
@@ -8259,6 +8904,7 @@ impl Editor {
     /// hand is forgotten; one whose form or source moved recomputes its
     /// result. Cheap when nothing moved — a few comparisons.
     fn sync_tools(&mut self) {
+        self.sync_props();
         let mut index = 0;
         while index < self.tools.len() {
             let keep = match &self.tools[index] {
@@ -8304,9 +8950,7 @@ impl Editor {
 
     /// The curve tool one of whose windows is `window`.
     fn curve_at(&self, window: WindowId) -> Option<usize> {
-        self.tools
-            .iter()
-            .position(|t| matches!(t, Tool::Curve(_)) && t.windows().contains(&window))
+        self.tools.iter().position(|t| matches!(t, Tool::Curve(_)) && t.windows().contains(&window))
     }
 
     /// The tool at `index`, when it is a curve.
@@ -8353,7 +8997,10 @@ impl Editor {
             let seed = crate::curve::initial_text(&text, open, close, &layout);
             let before = self.selections().map(|s| s.as_pairs()).unwrap_or_default();
             let entry = self.entry_mut(buffer);
-            let (s, e) = (entry.buffer.rope().byte_to_char(open + 1), entry.buffer.rope().byte_to_char(close));
+            let (s, e) = (
+                entry.buffer.rope().byte_to_char(open + 1),
+                entry.buffer.rope().byte_to_char(close),
+            );
             entry.buffer.replace_range(s, e, &seed);
             entry.buffer.commit_undo(before.clone(), before);
             let seeded = self.entry(buffer).buffer.rope().to_string();
@@ -8521,8 +9168,9 @@ impl Editor {
                 self.sync_tools();
             }
             other => {
-                self.session.status =
-                    format!("not a curve setting: {other} (want point, x, y, xstep, ystep, layout)");
+                self.session.status = format!(
+                    "not a curve setting: {other} (want point, x, y, xstep, ystep, layout)"
+                );
             }
         }
     }
@@ -8614,7 +9262,8 @@ impl Editor {
             _ if tool.lost => self.session.status = "curve lost".into(),
             Action::NextPoint { back } if n > 0 => {
                 let step = count % n;
-                let next = if *back { (tool.selected + n - step) % n } else { (tool.selected + step) % n };
+                let next =
+                    if *back { (tool.selected + n - step) % n } else { (tool.selected + step) % n };
                 self.curve_select(index, next)
             }
             Action::Move(Motion::FirstLine | Motion::LineStart | Motion::FirstNonBlank) => {
@@ -8798,7 +9447,10 @@ impl Editor {
     /// A byte range of the buffer's text.
     fn buffer_bytes(&self, id: BufferId, start: usize, end: usize) -> Option<String> {
         let rope = self.buffers.iter().find(|b| b.id == id)?.buffer.rope();
-        let (s, e) = (rope.byte_to_char(start.min(rope.len_bytes())), rope.byte_to_char(end.min(rope.len_bytes())));
+        let (s, e) = (
+            rope.byte_to_char(start.min(rope.len_bytes())),
+            rope.byte_to_char(end.min(rope.len_bytes())),
+        );
         Some(rope.slice(s..e).to_string())
     }
 
@@ -9305,6 +9957,7 @@ impl Editor {
             Action::Tree(tree_cmd) => self.run_tree_cmd(tree_cmd),
             Action::Debug(debug_cmd) => self.debug_command(debug_cmd),
             Action::Form(form_cmd) => self.run_form_cmd(form_cmd),
+            Action::Props(props_cmd) => self.run_props_cmd(props_cmd),
             Action::Shell(shell_cmd) => self.run_shell_cmd(shell_cmd),
             Action::Results(results_cmd) => {
                 self.run_results_cmd(results_cmd, cmd.count.max(1));
@@ -13525,8 +14178,9 @@ impl View<'_> {
             // Only ever produced in an image window, which `run_image_action`
             // answers before a view is looked for.
             Action::Turn(_) | Action::EditValue | Action::NextPoint { .. } => {}
-            // Only ever produced in a form window; answered in `Editor::apply`.
-            Action::Form(_) => {}
+            // Only ever produced in a form or property window; answered in
+            // `Editor::apply`.
+            Action::Form(_) | Action::Props(_) => {}
             Action::Move(m) => {
                 let Some(m) = self.resolve_find(*m) else { return };
                 // A far motion is a jump — `docs/specs/jumplist.md` §"What a
@@ -30497,6 +31151,371 @@ int main(void) {
         assert!(matches!(ed.session.mode, Mode::Command(_)));
     }
 
+    /// A `.bidata` or `.bischema` as a tree of rows over its buffer. See
+    /// `docs/specs/props.md`.
+    mod props_view {
+        use super::*;
+        use crate::props::fixtures::{DATA, SCHEMA};
+        use crate::props::{Kind, RowKind};
+
+        fn project(name: &str) -> ScratchDir {
+            ScratchDir::new(name).written("game.bischema", SCHEMA).written("level1.bidata", DATA)
+        }
+
+        fn open(d: &ScratchDir) -> Editor {
+            let mut ed = Editor::open(format!("{}/level1.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            ed
+        }
+
+        fn props(ed: &Editor) -> &crate::props::Props {
+            ed.window().props().expect("a property view")
+        }
+
+        fn key(ed: &Editor) -> String {
+            props(ed).selected_row().map(|r| r.key.clone()).unwrap_or_default()
+        }
+
+        fn text(ed: &Editor) -> String {
+            ed.buffer().unwrap().rope().to_string()
+        }
+
+        fn go(ed: &mut Editor, cmds: &[PropsCmd]) {
+            for &c in cmds {
+                ed.apply(cmd(Action::Props(c)));
+            }
+        }
+
+        const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+
+        #[test]
+        fn a_bidata_opens_in_the_view_and_a_broken_one_as_text() {
+            let d = project("open");
+            let ed = open(&d);
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            assert_eq!(props(&ed).kind, Kind::Data);
+            assert_eq!(props(&ed).rows.len(), 5);
+            assert_eq!(ed.props_status(ed.focus()), Some(("level1.bidata".into(), "1/5".into())));
+            assert!(ed.buffer().is_some(), "the buffer is the file's");
+
+            let d = ScratchDir::new("nodialect")
+                .written("game.bischema", SCHEMA)
+                .written("level1.bidata", &DATA.replace("\"$dialect\": \"bi/1\",\n", ""));
+            let ed = open(&d);
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            assert_eq!(ed.session.status, "no $dialect (want \"bi/1\")");
+
+            let d = ScratchDir::new("noschema").written("level1.bidata", DATA);
+            let ed = open(&d);
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            assert!(
+                ed.session.status.starts_with("$schema game.bischema: "),
+                "{}",
+                ed.session.status
+            );
+
+            let d = ScratchDir::new("schema").written("game.bischema", SCHEMA);
+            let ed = Editor::open(format!("{}/game.bischema", d.path())).unwrap();
+            assert_eq!(props(&ed).kind, Kind::Schema);
+            assert_eq!(props(&ed).rows.len(), 4);
+        }
+
+        #[test]
+        fn set_editor_text_and_back() {
+            let d = project("toggle");
+            let mut ed = open(&d);
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=bidata");
+            ed.run_ex("set editor text");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            let id = ed.buffer_ids()[0];
+            ed.run_ex("bn");
+            ed.run_ex("bp");
+            assert_eq!(ed.window().buffer(), Some(id));
+            assert_eq!(
+                ed.content_kind_of(ed.focus()),
+                Some(ContentKind::Text),
+                "asked for text, stays text"
+            );
+            ed.run_ex("set editor bidata");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            ed.run_ex("set editor bischema");
+            assert_eq!(
+                ed.content_kind_of(ed.focus()),
+                Some(ContentKind::Text),
+                "not a schema: refused back to text"
+            );
+            assert!(ed.session.status.contains("no types object"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn the_keys_edit_the_buffer_as_one_undo_step_and_the_view_follows() {
+            let d = project("keys");
+            let mut ed = open(&d);
+            go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN]);
+            assert_eq!(key(&ed), "inst:3/hp");
+            go(&mut ed, &[PropsCmd::Nudge(5)]);
+            assert!(text(&ed).contains("\"hp\": 45"));
+            assert_eq!(props(&ed).selected_row().unwrap().value, "45");
+            assert!(ed.buffer().unwrap().is_modified());
+            go(&mut ed, &[PropsCmd::Undo]);
+            assert!(text(&ed).contains("\"hp\": 40"));
+            assert_eq!(
+                props(&ed).selected_row().unwrap().value,
+                "40",
+                "the view re-read the buffer"
+            );
+            go(&mut ed, &[PropsCmd::Redo]);
+            assert_eq!(props(&ed).selected_row().unwrap().value, "45");
+            go(&mut ed, &[DOWN, DOWN, PropsCmd::Toggle]);
+            assert_eq!(key(&ed), "inst:3/weapon");
+            assert!(text(&ed).contains("\"weapon\": \"warhammer\""));
+            go(&mut ed, &[DOWN, PropsCmd::Add]);
+            assert!(text(&ed).contains("\"drops\": [\"rusty_sword\", \"dagger\", \"\"]"));
+            go(&mut ed, &[PropsCmd::Expand, DOWN, DOWN, DOWN, PropsCmd::Delete]);
+            assert!(
+                text(&ed).contains("\"drops\": [\"rusty_sword\", \"dagger\"]"),
+                "{}",
+                text(&ed)
+            );
+            assert_eq!(key(&ed), "inst:3/spawn", "the row that took the deleted one's place");
+            go(&mut ed, &[PropsCmd::Collapse]);
+            assert_eq!(key(&ed), "inst:3", "to the parent");
+            go(&mut ed, &[PropsCmd::Collapse]);
+            assert!(!props(&ed).selected_row().unwrap().expanded);
+            assert_eq!(ed.props_status(ed.focus()).unwrap().0, "level1.bidata +");
+        }
+
+        #[test]
+        fn enter_prefills_the_ex_line_and_bi_set_writes() {
+            let d = project("enter");
+            let mut ed = open(&d);
+            go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Enter]);
+            assert!(props(&ed).selected_row().unwrap().expanded, "Enter opens an instance");
+            go(&mut ed, &[DOWN, DOWN, PropsCmd::Enter]);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "bi set goblin.hp 40")
+            );
+            ed.apply(cmd(Action::EnterNormal));
+            ed.run_ex("bi set goblin.hp 41");
+            assert!(text(&ed).contains("\"hp\": 41"));
+            ed.run_ex("bi set goblin.hp");
+            assert_eq!(ed.session.status, "goblin.hp = 41");
+            ed.run_ex("bi set goblin.hp lots");
+            assert_eq!(ed.session.status, "goblin.hp wants a whole number");
+            ed.run_ex("bi set rusty_sword.name Iron Sword of Doom");
+            assert!(text(&ed).contains("\"name\": \"Iron Sword of Doom\""));
+            ed.run_ex("bi");
+            assert_eq!(
+                ed.session.status,
+                "bi what? (set, new, delete, add, rename, remap, prune, migrate)"
+            );
+            ed.run_ex("bi new Enemy orc");
+            assert!(text(&ed).contains("\"$id\": \"orc\""));
+            assert_eq!(key(&ed), "inst:5", "the new instance is selected");
+            assert!(props(&ed).selected_row().unwrap().expanded);
+            ed.run_ex("bi delete Enemy orc");
+            assert!(!text(&ed).contains("\"$id\": \"orc\""));
+        }
+
+        #[test]
+        fn dd_on_a_referenced_instance_asks_first() {
+            let d = project("dd");
+            let mut ed = open(&d);
+            go(&mut ed, &[PropsCmd::Delete]);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(line) if line.to_string().starts_with("bi delete Weapon rusty_sword"))
+            );
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(text(&ed).contains("rusty_sword"), "nothing happened yet");
+            ed.run_ex("bi delete Weapon rusty_sword  # referenced by Enemy goblin");
+            assert!(!text(&ed).contains("\"$id\": \"rusty_sword\""));
+            assert_eq!(props(&ed).warnings(), 2, "goblin's weapon and drops[0] dangle now");
+        }
+
+        #[test]
+        fn gd_jumps_to_the_target_here_or_in_another_file() {
+            let d = project("gd").written(
+                "level2.bidata",
+                r#"{"$dialect":"bi/1","$schema":"game.bischema","instances":[{"$type":"Weapon","$id":"axe","name":"Axe"}]}"#,
+            );
+            let mut ed = open(&d);
+            go(
+                &mut ed,
+                &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN, DOWN, DOWN, PropsCmd::Goto],
+            );
+            assert_eq!(key(&ed), "inst:0");
+            assert!(props(&ed).selected_row().unwrap().expanded);
+            ed.run_ex("bi set goblin.weapon axe");
+            assert_eq!(props(&ed).warnings(), 0, "axe is in the index");
+            ed.run_ex("set editor text");
+            ed.run_ex("set editor bidata");
+            go(&mut ed, &[PropsCmd::Last, PropsCmd::Collapse, PropsCmd::Collapse]);
+            assert!(ed.window_mut().props_mut().unwrap().select_instance("Enemy", "goblin"));
+            let hp = props(&ed).rows.iter().position(|r| r.key == "inst:3/weapon").unwrap();
+            ed.window_mut().props_mut().unwrap().select(hp);
+            go(&mut ed, &[PropsCmd::Goto]);
+            assert!(ed.buffer().unwrap().path.as_ref().unwrap().ends_with("level2.bidata"));
+            assert_eq!(key(&ed), "inst:0");
+            assert_eq!(props(&ed).selected_row().unwrap().label, "Weapon axe");
+        }
+
+        #[test]
+        fn a_rename_rewrites_the_other_data_files() {
+            let d = project("rename").written(
+                "level2.bidata",
+                &DATA
+                    .replace("level1", "level2")
+                    .replace("\"$id\": \"goblin\"", "\"$id\": \"hobgoblin\"")
+                    .replace("\"$id\": \"goblin_chief\"", "\"$id\": \"hob_chief\"")
+                    .replace("\"leader\": \"goblin_chief\"", "\"leader\": \"hob_chief\"")
+                    .replace("\"$id\": \"rusty_sword\"", "\"$id\": \"old_sword\"")
+                    .replace("\"$id\": \"dagger\"", "\"$id\": \"old_dagger\"")
+                    .replace("\"$id\": \"warhammer\"", "\"$id\": \"old_hammer\"")
+                    .replace("\"weapon\": \"warhammer\"", "\"weapon\": \"old_hammer\"")
+                    .replace("\"drops\": [\"warhammer\"]", "\"drops\": [\"old_hammer\"]")
+                    .replace(
+                        "\"drops\": [\"rusty_sword\", \"dagger\"]",
+                        "\"drops\": [\"rusty_sword\", \"old_dagger\"]",
+                    ),
+            );
+            let mut ed = open(&d);
+            ed.run_ex("bi rename Weapon.rusty_sword iron_sword");
+            assert_eq!(ed.session.status, "renamed in 1 other file");
+            assert!(text(&ed).contains("\"$id\": \"iron_sword\""));
+            let other = std::fs::read_to_string(format!("{}/level2.bidata", d.path())).unwrap();
+            assert!(other.contains("\"weapon\": \"iron_sword\""), "{other}");
+            assert!(!other.contains("rusty_sword"));
+            // The schema's own refactoring reaches the data files too.
+            ed.run_ex(&format!("e {}/game.bischema", d.path()));
+            assert_eq!(props(&ed).kind, Kind::Schema);
+            ed.run_ex("bi rename Weapon.damage dmg");
+            assert_eq!(ed.session.status, "renamed in 2 other files");
+            assert!(text(&ed).contains("\"name\": \"dmg\""));
+            let other = std::fs::read_to_string(format!("{}/level2.bidata", d.path())).unwrap();
+            assert!(other.contains("\"dmg\": 12"), "{other}");
+            ed.run_ex("bn");
+            assert_eq!(props(&ed).kind, Kind::Data);
+            assert!(text(&ed).contains("\"dmg\": 12"), "the open buffer was rewritten in place");
+            assert_eq!(props(&ed).warnings(), 0);
+        }
+
+        #[test]
+        fn w_normalises_and_writes_and_a_hand_edit_in_a_split_is_seen() {
+            let d = ScratchDir::new("write").written("game.bischema", SCHEMA).written(
+                "level1.bidata",
+                &DATA.replace("\"damage\": 12,", "\"damage\": 12,\n      \"rarity\": \"common\","),
+            );
+            let mut ed = open(&d);
+            assert!(text(&ed).contains("\"rarity\": \"common\""), "read as written");
+            ed.run_ex("w");
+            assert!(
+                ed.session.status.ends_with("level1.bidata\" written"),
+                "{}",
+                ed.session.status
+            );
+            assert!(!ed.buffer().unwrap().is_modified());
+            let disk = std::fs::read_to_string(format!("{}/level1.bidata", d.path())).unwrap();
+            assert_eq!(disk, DATA, "the default went, the layout is the editor's");
+
+            // The same buffer as text beside the view: a hand edit shows up.
+            ed.run_ex("vsplit");
+            ed.run_ex("set editor text");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            let at = text(&ed).find("\"hp\": 40").unwrap() + 6;
+            ed.set_cursor(Cursor::at(at));
+            ed.apply(operate(Operator::Delete, Motion::Right, 1));
+            type_str_norm(&mut ed, "9");
+            let view = ed
+                .window_ids()
+                .into_iter()
+                .find(|&w| ed.content_kind_of(w) == Some(ContentKind::Props))
+                .unwrap();
+            let props = ed.window_of(view).unwrap().props().unwrap();
+            assert_eq!(props.error, None);
+            assert!(
+                props.raw["instances"][3]["hp"] == serde_json::json!(90),
+                "{}",
+                props.raw["instances"][3]["hp"]
+            );
+            // And a broken text shows as the one error row until fixed.
+            let at = text(&ed).find("\"$type\"").unwrap();
+            ed.set_cursor(Cursor::at(at));
+            ed.apply(operate(Operator::Delete, Motion::Right, 1));
+            let props = ed.window_of(view).unwrap().props().unwrap();
+            assert!(props.error.is_some());
+            assert_eq!(props.rows[0].kind, RowKind::Error);
+            assert!(ed.session.status.starts_with("invalid JSON"), "{}", ed.session.status);
+            go_in_text(&mut ed, "\"");
+            let props = ed.window_of(view).unwrap().props().unwrap();
+            assert_eq!(props.error, None);
+        }
+
+        fn type_str_norm(ed: &mut Editor, text: &str) {
+            ed.apply(cmd(Action::EnterInsert));
+            type_str(ed, text);
+            ed.apply(cmd(Action::EnterNormal));
+        }
+
+        fn go_in_text(ed: &mut Editor, text: &str) {
+            type_str_norm(ed, text);
+        }
+
+        #[test]
+        fn a_schema_edit_in_a_buffer_updates_the_data_view() {
+            let d = project("schema-edit");
+            let mut ed = open(&d);
+            go(&mut ed, &[PropsCmd::Expand]);
+            let data = ed.focus();
+            ed.run_ex("vsplit");
+            ed.run_ex(&format!("e {}/game.bischema", d.path()));
+            assert_eq!(props(&ed).kind, Kind::Schema);
+            ed.run_ex("bi set Weapon.rarity.default epic");
+            let view = ed.window_of(data).unwrap().props().unwrap();
+            let rarity = view.rows.iter().find(|r| r.key == "inst:0/rarity").unwrap();
+            assert_eq!((rarity.value.as_str(), rarity.inherited), ("epic", true));
+            ed.run_ex("bi add Weapon speed f32");
+            let view = ed.window_of(data).unwrap().props().unwrap();
+            assert!(view.rows.iter().any(|r| r.key == "inst:0/speed"));
+            go(&mut ed, &[PropsCmd::Last, PropsCmd::Expand]);
+            assert_eq!(key(&ed), "type:Enemy");
+            go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN, PropsCmd::Nudge(1)]);
+            assert_eq!(key(&ed), "type:Enemy/field:hp/default");
+            assert!(text(&ed).contains("\"default\": 101"));
+            go(&mut ed, &[PropsCmd::Enter]);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "bi set Enemy.hp.default 101")
+            );
+        }
+
+        #[test]
+        fn migrate_prune_and_remap() {
+            let d = ScratchDir::new("migrate").written("game.bischema", SCHEMA).written(
+                "level1.bidata",
+                &DATA
+                    .replace("bi/1", "bi/0")
+                    .replace("\"hp\": 40,", "\"hp\": 40,\n      \"dmg\": 1,"),
+            );
+            let mut ed = open(&d);
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            assert_eq!(ed.session.status, "$dialect bi/0 is older than bi/1 (:bi migrate)");
+            ed.run_ex("bi migrate");
+            assert_eq!(ed.session.status, "migrated to bi/1");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            assert_eq!(props(&ed).warnings(), 1);
+            ed.run_ex("bi remap Enemy.dmg hp");
+            assert!(text(&ed).contains("\"dmg\": 1"), "hp exists, so the key stays: {}", text(&ed));
+            ed.run_ex("bi remap Enemy.dmg mana");
+            assert!(text(&ed).contains("\"mana\": 1"));
+            ed.run_ex("bi prune");
+            assert_eq!(ed.session.status, "pruned 1 key");
+            assert!(!text(&ed).contains("mana"));
+            assert_eq!(props(&ed).warnings(), 0);
+            go(&mut ed, &[PropsCmd::Undo]);
+            assert!(text(&ed).contains("\"mana\": 1"), "one undo step");
+        }
+    }
+
     /// `:set editor curve`: the point list under the cursor drawn beside
     /// the code, the keys rewriting it in place. See `docs/specs/curve.md`.
     mod curve_tool {
@@ -30676,7 +31695,11 @@ int main(void) {
             assert!(text(&ed).contains("{0.0f, 0.8f"), "and the previous: {}", text(&ed));
             key(&mut ed, Action::Move(Motion::FirstLine));
             key(&mut ed, Action::Move(Motion::Left));
-            assert!(text(&ed).starts_with(CPP.split("{0.5f").next().unwrap()), "the first point stays at 0: {}", text(&ed));
+            assert!(
+                text(&ed).starts_with(CPP.split("{0.5f").next().unwrap()),
+                "the first point stays at 0: {}",
+                text(&ed)
+            );
         }
 
         #[test]
@@ -30695,7 +31718,11 @@ int main(void) {
             );
             key(&mut ed, Action::Move(Motion::LastLine));
             key(&mut ed, Action::EnterInsertAfter);
-            assert!(text(&ed).contains("{0.875f, "), "from the last point, halfway back: {}", text(&ed));
+            assert!(
+                text(&ed).contains("{0.875f, "),
+                "from the last point, halfway back: {}",
+                text(&ed)
+            );
             assert!(ed.curve_status(plot).unwrap().starts_with("point 4 of 5  x 0.875"));
         }
 

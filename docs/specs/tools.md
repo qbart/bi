@@ -7,9 +7,10 @@ one observation that makes most of them cheap.
 
 ## Status
 
-**Ideas**, with four built since: whole-image operations
+**Ideas**, with five built since: whole-image operations
 (`image-ops.md`), the form any tool's knobs live in (`form.md`), the
-normal map generator (`normalmap.md`) and the curve editor (`curve.md`). Each entry that gets built gets its
+normal map generator (`normalmap.md`), the curve editor (`curve.md`) and
+the property view (`props.md`). Each entry that gets built gets its
 own spec, and this list points at it.
 
 ## The enabler
@@ -55,6 +56,10 @@ let the picture machinery show it".
   XP table as a graph, move bezier handles with the cursor, write the
   numbers back. Tuning is where designers spend hours in spreadsheets.
   Built, editing code in place — see `curve.md`.
+- **Property view.** Unity's inspector over a JSON dialect of typed
+  structs and instances: every field on a row, defaults dimmed, enums
+  cycled, refs followed across files, the schema edited the same way.
+  Built — see `props.md` and the format in `bi-format.md`.
 - **Table view** for CSV and TSV. Aligned columns, cell-wise navigation,
   sort and sum. Balance sheets and loot tables live in these files.
 - **Graph preview.** A state machine, behaviour tree or dialogue script

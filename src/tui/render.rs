@@ -1029,6 +1029,76 @@ fn render_form(
     None
 }
 
+/// A property view: one row per visible node — a marker for what opens,
+/// the label at its depth, the value in a column — an inherited value
+/// dim, a warning after `⚠`, the selected row in the selection colour.
+/// See docs/specs/props.md.
+fn render_props(
+    frame: &mut Frame,
+    props: &bi::props::Props,
+    area: Rect,
+    focused: bool,
+    ui: &Ui,
+) -> Option<(u16, u16)> {
+    use bi::props::RowKind;
+    let rows = &props.rows;
+    let height = area.height as usize;
+    let first =
+        if height == 0 || props.selected < height { 0 } else { props.selected + 1 - height };
+    let last = (first + height).min(rows.len());
+    let visible = &rows[first..last];
+    // The value column: past the widest label on screen, so values line
+    // up within a pane and move only when the screen's rows change.
+    let label_col =
+        visible.iter().map(|r| 2 * r.depth + 2 + r.label.chars().count()).max().unwrap_or(0) + 2;
+    let mut cursor_at = None;
+    let mut lines = Vec::with_capacity(height);
+
+    for (index, row) in rows.iter().enumerate().take(last).skip(first) {
+        let marker = match (row.expandable, row.expanded) {
+            (true, true) => '▾',
+            (true, false) => '▸',
+            (false, _) => ' ',
+        };
+        let head = format!("{}{marker} {}", "  ".repeat(row.depth), row.label);
+        let pad = label_col.saturating_sub(head.chars().count());
+        let head_style = match row.kind {
+            RowKind::Error => tui(ui.diag_error),
+            RowKind::Instance | RowKind::Type => {
+                tui(ThemeStyle { bold: true, ..ThemeStyle::default() })
+            }
+            RowKind::Unknown => tui(ui.diag_warning),
+            _ => Style::default(),
+        };
+        let value_style = match row.kind {
+            RowKind::Type | RowKind::FieldDef => tui(ui.status_muted),
+            _ if row.inherited => tui(ui.dim),
+            _ => Style::default(),
+        };
+        let mut spans = vec![
+            Span::styled(cells_at(&head, 8), head_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(cells_at(&row.value, 8), value_style),
+        ];
+        if let Some(warning) = &row.warning {
+            spans.push(Span::styled(cells_at(&format!("  ⚠ {warning}"), 8), tui(ui.diag_warning)));
+        }
+
+        if index != props.selected {
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
+        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        if focused {
+            cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    cursor_at
+}
+
 /// One window's image: a placement for the graphics module when the terminal
 /// draws pixels, a centered line about them when it does not.
 ///
@@ -1189,6 +1259,9 @@ fn render_window(
         }
         Pane::Form { form, .. } => {
             return render_form(frame, form, text_area, focused, &ed.theme().ui);
+        }
+        Pane::Props { props, .. } => {
+            return render_props(frame, props, text_area, focused, &ed.theme().ui);
         }
     };
     let (scroll, left, selections) = (text.scroll, text.left, &text.selections);
@@ -1802,11 +1875,18 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     // is the one mode a picture has, and says so.
     let (image, tileset) = match ed.pane(id) {
         Some(Pane::Image { img, .. }) => (true, img.tileset().is_some()),
-        // A form has no modes either.
-        Some(Pane::Form { .. }) => (true, false),
+        // A form has no modes either, nor a property view.
+        Some(Pane::Form { .. } | Pane::Props { .. }) => (true, false),
         _ => (false, false),
     };
+    // A property view says which kind it is where a text pane says its
+    // mode. See docs/specs/props.md.
+    let props = match ed.pane(id) {
+        Some(Pane::Props { props, .. }) => Some(props.kind.name().to_ascii_uppercase()),
+        _ => None,
+    };
     let right = match (focused, image, tileset) {
+        (true, true, _) if props.is_some() => format!(" {} ", props.clone().unwrap_or_default()),
         (true, true, _) if ed.is_curve_plot(id) => " CURVE ".to_string(),
         (true, true, true) => " TILESET ".to_string(),
         (true, false, _) => format!(" {} ", ed.session.mode.label()),
@@ -1840,7 +1920,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     let pad = (width as usize).saturating_sub(span_width(&left) + stats_width + span_width(&right));
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     spans.extend(stats);
-    if focused && (!image || tileset) {
+    if focused && (!image || tileset || props.is_some()) {
         spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }
     spans
@@ -1909,6 +1989,9 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         Some(Pane::Form { form, .. }) => {
             (form.title().to_string(), format!("{} fields", form.fields().len()))
         }
+        // The file's name and marker, as a text pane's; the row and the
+        // warning count where the position would be. See docs/specs/props.md.
+        Some(Pane::Props { .. }) => ed.props_status(id).unwrap_or_default(),
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
             // picker; a pane thirty columns wide has no room to say it twice.

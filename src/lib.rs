@@ -53,6 +53,7 @@ pub mod lsp;
 pub mod motion;
 pub mod normalmap;
 pub mod picker;
+pub mod props;
 pub mod range;
 pub mod reflow;
 pub mod region;

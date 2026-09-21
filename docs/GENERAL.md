@@ -33,6 +33,11 @@ the project's (`gh` in the tree shows everything anyway), and an image file
 opens as the picture it is where the terminal speaks the kitty graphics
 protocol — centered, scrolled with `hjkl`/`gg`/`G` when it does not fit, its
 size in the status row where `row:col` would be.
+A `.bischema` or `.bidata` — the bi property format, typed structs and
+sparse instances in plain JSON — opens as a property view: one row per
+field, defaults dimmed, `Space` cycles an enum or a ref, `Ctrl-A`/`Ctrl-X`
+turn a number, `dd` puts a value back to its default, `gd` follows a ref
+into another file, and `:bi rename` rewrites every data file of the schema.
 See [docs/specs](specs) for the designs behind each piece.
 
 ```sh
@@ -593,6 +598,13 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:set fileencoding {enc}` | this buffer's on-disk encoding — the next `:w` converts; bare, reports it |
 | `:set fileformat dos\|unix` | what ends a line on disk; `:set bom true\|false` the byte-order mark |
 | `:reload` | re-read the config, through the same path startup uses — different job from `:e`, which reverts the buffer |
+| `:set editor bidata\|bischema\|text` | the property view over this buffer, or the text back; bare, reports which is up |
+| `:bi set <path> [value]` | a value by path — `goblin.hp 40`, `dagger.offset.x 0.25`, `goblin.drops[1] axe`, `Weapon.damage.default 10` in a schema; bare, reports it |
+| `:bi new <Type> <id>` `:bi delete <Type> <id>` | an instance added at the end, or removed |
+| `:bi add <Type> <field> <type>` | a field on a struct; `:bi add <Enum> <value>` a value; `:bi add <Name> struct\|enum` a type |
+| `:bi rename <Type>.<old> <new>` | a field or enum value in a schema, an id in a data file — every data file of the schema rewritten |
+| `:bi remap <Type>.<old> <new>` | an unknown key renamed across the data files, after a rename made by hand |
+| `:bi prune` `:bi migrate` | every unknown key of this file removed; an older `$dialect` brought up to `bi/1` |
 | `:sp [path]` `:vs [path]` | split below / right; bare, the new window duplicates this one |
 | `:new` `:vnew` | split onto a new unnamed buffer, rather than a second view of this one |
 | `:enew` | an unnamed buffer in this window |
@@ -848,6 +860,32 @@ else too.
 The keymap is an allowlist, not normal mode minus the dangerous keys: anything
 it does not name does nothing, which is the safe failure for a pane sitting on a
 filesystem. Nothing in it enters insert mode, so a tree never can be.
+
+### The property view
+
+A `.bischema` or `.bidata` — the bi property format, see
+[docs/specs/bi-format.md](specs/bi-format.md) — opens as a tree of rows over
+its buffer instead of as text: one row per field of every instance, a set
+value plain and an inherited one dim, a warning after `⚠` on the row it is
+about. `:set editor bidata` or `:set editor bischema` does the same for a
+file without the extension, and `:set editor text` puts the text back. The
+file stays the file: `:w`, `:q`, `u` and the modified marker are the
+buffer's, and every key below is one edit of it and one undo step. See
+[docs/specs/props.md](specs/props.md).
+
+| Key | Does |
+|---|---|
+| `j` `k` `gg` `G` `Ctrl-D` `Ctrl-U` | pick a row, with a count |
+| `l` / `→` | open a struct, a list, a type or a field's attributes |
+| `h` / `←` | close it, or go to the parent row |
+| `Enter` `i` | open a row with children; on a value, edit it on the ex line — `:bi set goblin.hp 40` |
+| `Space` | flip a bool; cycle an enum, a ref through the ids of its type, an optional between `—` and a value |
+| `Ctrl-A` `Ctrl-X` | a number up or down by its step, clamped to `min..max`; an enum or a ref along; counts multiply |
+| `a` | add: an item to a list, an instance, a field, an enum value, a type — the ones that need a name prefill the ex line |
+| `dd` | remove: a set value goes back to its default, a list item, an unknown key or an instance goes; one other instances reference prefills `:bi delete` as the confirmation |
+| `gd` | on a ref, jump to its target — here, or in the data file that has it |
+| `u` `Ctrl-R` | undo, redo the buffer; the view follows |
+| `:` | the ex line |
 
 ### Status rows
 
