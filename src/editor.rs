@@ -6912,6 +6912,20 @@ impl Editor {
         }
     }
 
+    /// `:e` on an image: the file as it is on disk now. A dirty picture
+    /// needs `:e!`, as a dirty buffer does.
+    fn reload_image(&mut self, force: bool) {
+        let Some(img) = self.window_mut().img_mut() else { return };
+        if img.dirty && !force {
+            self.session.status = "unsaved changes (use `:e!` to discard)".into();
+            return;
+        }
+        self.session.status = match img.reload() {
+            Ok(()) => format!("\"{}\" {}×{}", image_name(img), img.width, img.height),
+            Err(e) => e,
+        };
+    }
+
     /// `:w` on an image: PNG to its path, or to `path`. See
     /// `docs/specs/tileset.md`.
     fn write_image(&mut self, path: &str) -> bool {
@@ -7607,6 +7621,9 @@ impl Editor {
                 }
             }
             ExLine::Revert { force, enc, ff } => {
+                if self.window().img().is_some() {
+                    return self.reload_image(force);
+                }
                 self.in_view(|view| view.edit(force, enc, ff));
                 // The file on disk moved under the buffer; its standing with
                 // the index may have moved the same way.
@@ -30087,6 +30104,49 @@ int main(void) {
             assert_eq!(ed.session.status, "10,10,20,20 runs past 20×20");
             ed.run_ex("tool image crop 1,2,3");
             assert_eq!(ed.session.status, "not a rectangle: 1,2,3 (want x,y,w,h)");
+        }
+
+        /// `:e` reloads a picture from disk the way it reloads a buffer: a
+        /// dirty one needs `:e!`, the reload is one undo step, and the
+        /// crop, zoom and grid settings stay.
+        #[test]
+        fn e_reloads_the_image_from_disk() {
+            let (d, mut ed) = photo("reload");
+            ed.run_ex("zoom 2");
+            ed.run_ex("tool tileset size 5");
+            ed.run_ex("tool image invert");
+            let generation = img(&ed).generation;
+            assert!(img(&ed).dirty);
+
+            ed.run_ex("e");
+            assert_eq!(ed.session.status, "unsaved changes (use `:e!` to discard)");
+            assert!(img(&ed).dirty, "nothing changed");
+
+            // Someone else rewrote the file meanwhile.
+            image::RgbaImage::from_pixel(50, 40, image::Rgba([1, 2, 3, 255]))
+                .save(d.0.join("photo.png"))
+                .unwrap();
+            ed.run_ex("e!");
+            let now = img(&ed);
+            assert_eq!(&now.rgba[0..4], &[1, 2, 3, 255], "what is on disk now");
+            assert!(!now.dirty);
+            assert!(now.generation > generation, "the frontend must hear");
+            assert_eq!(now.zoom(), 2.0, "zoom kept");
+            assert_eq!(now.tile_size(), (5, 5), "grid kept");
+            assert!(ed.session.status.contains("50×40"), "{}", ed.session.status);
+
+            ed.run_ex("e");
+            assert!(
+                ed.session.status.contains("50×40"),
+                "clean reloads without a bang: {}",
+                ed.session.status
+            );
+
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(&img(&ed).rgba[0..3], &[246, 246, 246], "the reload is one step back");
+            assert!(img(&ed).dirty, "and the picture differs from disk again");
+            ed.run_ex("e");
+            assert_eq!(ed.session.status, "unsaved changes (use `:e!` to discard)");
         }
 
         #[test]

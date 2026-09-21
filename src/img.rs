@@ -144,6 +144,31 @@ impl Img {
         Ok(())
     }
 
+    /// `:e!`: the pixels as they are on disk now, as one undo step, so
+    /// what was discarded is one `u` away — the rule a buffer's reload
+    /// follows. Crop, zoom, grid settings and format stay; a decode that
+    /// fails changes nothing.
+    pub fn reload(&mut self) -> std::result::Result<(), String> {
+        let decoded = image::ImageReader::open(&self.path)
+            .and_then(|r| r.with_guessed_format())
+            .map_err(|e| format!("reading {}: {e}", self.path.display()))?
+            .decode()
+            .map_err(|e| format!("decoding {}: {e}", self.path.display()))?
+            .to_rgba8();
+        let (w, h) = decoded.dimensions();
+        // Disk and memory agree: nothing to replace, and no undo step for
+        // a change that is not one.
+        if (w, h) == (self.width, self.height) && decoded.as_raw() == &self.rgba {
+            self.dirty = false;
+            return Ok(());
+        }
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.replace(&mut Sheet { rgba, width, height }, (w, h), decoded.into_raw());
+        self.resized();
+        self.dirty = false;
+        Ok(())
+    }
+
     /// `:tool image conv`: what `:w` writes from now on, and the path's
     /// extension to match, so PNG bytes never land in a `.jpg` name.
     pub fn set_format(&mut self, format: Format) {

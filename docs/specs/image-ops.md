@@ -59,6 +59,14 @@ jpg, webp, bmp)`, rather than written as PNG under the wrong name. JPEG
 has no alpha, so `--rgb` is implied for it; WebP is written lossless, the
 only kind the encoder knows, and `--quality` is ignored there with a note.
 
+## `:e` reloads
+
+`:e` on a picture is what it is on a buffer: the file as it is on disk
+now, refused on a dirty picture without the `!`. The reload is one undo
+step, so what `:e!` discarded is one `u` away, and the crop, zoom, grid
+settings and format all stay. A file that no longer decodes changes
+nothing and says why.
+
 ## In the core
 
 `src/imgops.rs` holds the operations as functions from pixels to pixels —
@@ -83,3 +91,5 @@ edit.
   with the list; `--quality 200` is refused.
 - Every operation is refused on a text window with `no image here`.
 - `u` after `resize` restores the dimensions and every pixel.
+- `:e` on a dirty picture is refused; `:e!` loads what is on disk, keeps
+  the zoom and grid, is one `u` away; a clean picture reloads on `:e`.
