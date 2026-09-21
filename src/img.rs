@@ -46,7 +46,14 @@ pub struct Img {
     /// Bumped by every edit. What a frontend that uploaded the pixels once
     /// reads, to know the upload is stale.
     pub generation: u64,
+    /// Display pixels per image pixel. The core holds everything else in
+    /// image pixels; the frontend divides the room it reports by this. See
+    /// `docs/specs/zoom.md`.
+    zoom: f32,
 }
+
+/// Below this a sheet is a dot; above it a pixel is a pane.
+pub const ZOOM_RANGE: (f32, f32) = (0.05, 32.0);
 
 /// Whether `path` is worth trying to decode at all.
 ///
@@ -92,7 +99,22 @@ impl Img {
             tile_kind: Kind::Tile,
             dirty: false,
             generation: 0,
+            zoom: 1.0,
         }
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// `:zoom 5`, `:zoom 0.1`, clamped to [`ZOOM_RANGE`].
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom.clamp(ZOOM_RANGE.0, ZOOM_RANGE.1);
+    }
+
+    /// `:zoom +` doubles, `:zoom -` halves.
+    pub fn zoom_step(&mut self, closer: bool) {
+        self.set_zoom(if closer { self.zoom * 2.0 } else { self.zoom / 2.0 });
     }
 
     /// Writes the pixels as PNG — to `path` when given, re-pointing the
@@ -438,5 +460,22 @@ mod tests {
         std::fs::write(&path, "not a png").unwrap();
         assert!(Img::open(&path, 8).is_err(), "corrupt bytes are an error, not a panic");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_clamps_doubles_halves_and_resets() {
+        let mut img = img(100, 100);
+        assert_eq!(img.zoom(), 1.0);
+        img.zoom_step(true);
+        img.zoom_step(true);
+        assert_eq!(img.zoom(), 4.0);
+        img.zoom_step(false);
+        assert_eq!(img.zoom(), 2.0);
+        img.set_zoom(1000.0);
+        assert_eq!(img.zoom(), 32.0, "clamped high");
+        img.set_zoom(0.0);
+        assert_eq!(img.zoom(), 0.05, "clamped low");
+        img.set_zoom(0.1);
+        assert_eq!(img.zoom(), 0.1);
     }
 }

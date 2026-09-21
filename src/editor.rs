@@ -1697,6 +1697,9 @@ enum ExLine {
     /// seen it, and typing the value both times is typing the wrong one.
     Whitespace(Option<bool>),
     Set(String),
+    /// `:zoom`, `:zoom 0`, `:zoom +`, `:zoom -`, `:zoom 5` — the image's
+    /// zoom. See `docs/specs/zoom.md`.
+    Zoom(String),
     /// `:yname <register>` — stores the capture waiting on a name. Typed by
     /// the prompt `"n` prefills far more often than by hand. With a range or
     /// a selection it is a scoped yank instead: the region goes straight into
@@ -2212,6 +2215,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         // buffer. The count in the status line is what a search owes you.
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
+        "zoom" => ExLine::Zoom(arg.into()),
         "themes" => ExLine::Themes,
         "yname" => match arg {
             "" => ExLine::Error("name it what? `:yname {register}`".into()),
@@ -7314,6 +7318,7 @@ impl Editor {
             ExLine::Highlight(on) => self.session.options.hlsearch = on,
             ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
+            ExLine::Zoom(arg) => self.zoom(&arg),
             ExLine::Name { scope, name } => {
                 // The capture the `"n` prompt is holding wins a bare
                 // `:yname` — that is the prompt flow. A range, a selection,
@@ -7746,6 +7751,26 @@ impl Editor {
                 _ => "bom takes true or false".into(),
             },
         };
+    }
+
+    /// `:zoom` on the focused window's image. See `docs/specs/zoom.md`.
+    fn zoom(&mut self, arg: &str) {
+        let Some(img) = self.window_mut().img_mut() else {
+            self.session.status = "no image here".into();
+            return;
+        };
+        match arg.trim() {
+            "" => self.session.status = format!("zoom={}x", img.zoom()),
+            "0" => img.set_zoom(1.0),
+            "+" => img.zoom_step(true),
+            "-" => img.zoom_step(false),
+            other => match other.parse::<f32>() {
+                Ok(zoom) if zoom > 0.0 && zoom.is_finite() => img.set_zoom(zoom),
+                _ => {
+                    self.session.status = format!("not a zoom: {other} (want a number, +, - or 0)");
+                }
+            },
+        }
     }
 
     /// `:set editor tilemap|image` and `:set tilemap size|kind …`, on the
@@ -29399,6 +29424,39 @@ int main(void) {
 
             ed.run_ex("q!");
             assert_eq!(ed.window_ids().len(), windows - 1);
+        }
+
+        #[test]
+        fn zoom_is_a_command_on_the_image() {
+            let mut ed = editor("text");
+            ed.run_ex("zoom 2");
+            assert_eq!(ed.session.status, "no image here");
+
+            let (_d, mut ed) = sheet("zoom");
+            let zoom = |ed: &Editor| ed.window().img().unwrap().zoom();
+            ed.run_ex("zoom");
+            assert_eq!(ed.session.status, "zoom=1x");
+            ed.run_ex("zoom 5");
+            assert_eq!(zoom(&ed), 5.0);
+            ed.run_ex("zoom");
+            assert_eq!(ed.session.status, "zoom=5x");
+            ed.run_ex("zoom +");
+            assert_eq!(zoom(&ed), 10.0);
+            ed.run_ex("zoom -");
+            ed.run_ex("zoom -");
+            assert_eq!(zoom(&ed), 2.5);
+            ed.run_ex("zoom");
+            assert_eq!(ed.session.status, "zoom=2.5x");
+            ed.run_ex("zoom 0.1");
+            assert_eq!(zoom(&ed), 0.1);
+            ed.run_ex("zoom 0");
+            assert_eq!(zoom(&ed), 1.0);
+
+            ed.run_ex("zoom x");
+            assert_eq!(ed.session.status, "not a zoom: x (want a number, +, - or 0)");
+            ed.run_ex("zoom -3");
+            assert_eq!(ed.session.status, "not a zoom: -3 (want a number, +, - or 0)");
+            assert_eq!(zoom(&ed), 1.0, "refused, unchanged");
         }
 
         #[test]

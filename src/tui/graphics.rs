@@ -57,9 +57,22 @@ pub struct Place {
     /// For the tile frame: the whole frame's size, which the crop may show
     /// only part of. Zero for a picture.
     pub frame: (u32, u32),
+    /// The zoom the uploaded pixels are scaled by — `f32` bits, so the
+    /// struct stays `Eq`. `1.0` for the original; the crisp path uploads a
+    /// scaled copy and says which. See `docs/specs/zoom.md`.
+    pub scale: u32,
+    /// Terminal-scaled: the crop is asked to fill `cols`×`rows` cells
+    /// (`c=`/`r=`) rather than drawn at native size. The path past the
+    /// budget.
+    pub fit: bool,
 }
 
 impl Place {
+    /// The zoom of the pixels this placement draws from.
+    pub fn zoom(&self) -> f32 {
+        f32::from_bits(self.scale)
+    }
+
     /// The tile frame's full size. The crop's width and height are the
     /// *visible* part, so the whole is kept beside them for the upload.
     pub fn frame_size(&self) -> (u32, u32) {
@@ -151,23 +164,37 @@ impl Graphics {
 
         for place in places {
             // The frame's "generation" is its size: a new tile size is a
-            // new picture under the old id.
-            let (pixels, generation): (std::borrow::Cow<[u8]>, u64) = if place.id == FRAME_ID {
-                let (w, h) = (place.frame_size().0, place.frame_size().1);
-                (frame_pixels(w, h).into(), ((w as u64) << 32) | h as u64)
-            } else {
-                let Some(img) = ed.image_with_id(place.id) else { continue };
-                ((&img.rgba).into(), img.generation)
+            // new picture under the old id. A picture's is its edit
+            // generation and the zoom its pixels were scaled by, so `:zoom`
+            // re-uploads and a cursor move does not.
+            let stamp = match place.id {
+                FRAME_ID => {
+                    let (w, h) = place.frame_size();
+                    ((w as u64) << 32) | h as u64
+                }
+                id => match ed.image_with_id(id) {
+                    Some(img) => (img.generation << 32) | place.scale as u64,
+                    None => continue,
+                },
             };
-            if self.needs_send(place.id, generation) {
-                let (w, h) = if place.id == FRAME_ID {
-                    place.frame_size()
-                } else {
-                    let img = ed.image_with_id(place.id).expect("looked up above");
-                    (img.width, img.height)
+            if self.needs_send(place.id, stamp) {
+                let (pixels, w, h): (std::borrow::Cow<[u8]>, u32, u32) = match place.id {
+                    FRAME_ID => {
+                        let (w, h) = place.frame_size();
+                        (frame_pixels(w, h).into(), w, h)
+                    }
+                    id => {
+                        let img = ed.image_with_id(id).expect("looked up above");
+                        if place.zoom() == 1.0 {
+                            ((&img.rgba).into(), img.width, img.height)
+                        } else {
+                            let (px, w, h) = scaled(&img.rgba, img.width, img.height, place.zoom());
+                            (px.into(), w, h)
+                        }
+                    }
                 };
                 self.transmit(&mut out, place.id, &pixels, w, h)?;
-                self.mark_sent(place.id, generation);
+                self.mark_sent(place.id, stamp);
                 // Re-sending replaces the pixels and the terminal forgets
                 // the placements with them: forget ours too, so they are
                 // re-emitted below.
@@ -186,8 +213,15 @@ impl Graphics {
             // picture under text glyphs and above background fills, so what
             // the renderer draws over these cells stays readable; the tile
             // frame rides at `z=0`, over the picture.
+            // `c=`/`r=` only on the terminal-scaled path: given, the
+            // terminal stretches the crop to those cells; absent, it draws
+            // the pixels at their size.
+            let fit = match place.fit {
+                true => format!(",c={},r={}", place.cols, place.rows),
+                false => String::new(),
+            };
             let seq = format!(
-                "\x1b7\x1b[{};{}H\x1b_Ga=p,i={},p={},x={x},y={y},w={w},h={h},X={ox},Y={oy},z={},C=1,q=2\x1b\\\x1b8",
+                "\x1b7\x1b[{};{}H\x1b_Ga=p,i={},p={},x={x},y={y},w={w},h={h},X={ox},Y={oy},z={}{fit},C=1,q=2\x1b\\\x1b8",
                 place.row + top + 1,
                 place.col + left + 1,
                 place.id,
@@ -296,6 +330,47 @@ impl Graphics {
         }
         Ok(())
     }
+}
+
+/// The most RGBA the crisp path will upload for one picture: 4096×4096.
+/// Past it the original goes up and the terminal scales. See
+/// `docs/specs/zoom.md`.
+pub const CRISP_BUDGET: u64 = 4096 * 4096 * 4;
+
+/// The size a `width`×`height` picture has at `zoom`, in display pixels —
+/// never less than one on a side.
+pub fn scaled_size(width: u32, height: u32, zoom: f32) -> (u32, u32) {
+    (
+        ((width as f64 * zoom as f64).round() as u32).max(1),
+        ((height as f64 * zoom as f64).round() as u32).max(1),
+    )
+}
+
+/// Whether a `width`×`height` picture at `zoom` fits the crisp budget.
+pub fn crisp(width: u32, height: u32, zoom: f32) -> bool {
+    let (w, h) = scaled_size(width, height, zoom);
+    w as u64 * h as u64 * 4 <= CRISP_BUDGET
+}
+
+/// `rgba` at `zoom`, nearest-neighbour: each display pixel is the source
+/// pixel under it, no blending. Pixel art stays pixel art; a photograph at
+/// a tenth drops rows, which is what a thumbnail does. Returns the pixels
+/// and their size.
+pub fn scaled(rgba: &[u8], width: u32, height: u32, zoom: f32) -> (Vec<u8>, u32, u32) {
+    let (w, h) = scaled_size(width, height, zoom);
+    if (w, h) == (width, height) {
+        return (rgba.to_vec(), w, h);
+    }
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let sy = ((y as f64 / zoom as f64) as u32).min(height - 1);
+        let row = &rgba[(sy * width * 4) as usize..((sy + 1) * width * 4) as usize];
+        for x in 0..w {
+            let sx = ((x as f64 / zoom as f64) as u32).min(width - 1);
+            out.extend_from_slice(&row[(sx * 4) as usize..(sx * 4 + 4) as usize]);
+        }
+    }
+    (out, w, h)
 }
 
 /// The tilemap cursor: a `width`×`height` RGBA frame, transparent inside,
@@ -451,5 +526,40 @@ mod tests {
         g.mark_sent(7, 0);
         assert!(!g.needs_send(7, 0));
         assert!(g.needs_send(7, 1), "an edit moved the generation");
+    }
+
+    /// Nearest-neighbour: each source pixel becomes a zoom×zoom block going
+    /// up, and every zoom-th pixel survives going down. No blending.
+    #[test]
+    fn scaling_is_nearest_neighbour_both_ways() {
+        let a = [1, 1, 1, 255];
+        let b = [2, 2, 2, 255];
+        let c = [3, 3, 3, 255];
+        let d = [4, 4, 4, 255];
+        let src: Vec<u8> = [a, b, c, d].concat();
+
+        let (up, w, h) = scaled(&src, 2, 2, 2.0);
+        assert_eq!((w, h), (4, 4));
+        let rows: Vec<Vec<u8>> = up.chunks(16).map(|r| r.to_vec()).collect();
+        assert_eq!(rows[0], [a, a, b, b].concat());
+        assert_eq!(rows[1], [a, a, b, b].concat());
+        assert_eq!(rows[2], [c, c, d, d].concat());
+        assert_eq!(rows[3], [c, c, d, d].concat());
+
+        let (down, w, h) = scaled(&src, 2, 2, 0.5);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(down, a, "the top-left survives");
+
+        let (same, w, h) = scaled(&src, 2, 2, 1.0);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(same, src);
+    }
+
+    #[test]
+    fn the_budget_decides_crisp_or_terminal_scaled() {
+        assert!(crisp(100, 100, 2.0));
+        assert!(crisp(4096, 4096, 1.0), "exactly the budget");
+        assert!(!crisp(4096, 4096, 2.0));
+        assert!(!crisp(200, 200, 32.0));
     }
 }

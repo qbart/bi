@@ -990,19 +990,42 @@ fn render_image(
     let Some(img) = ed.image_pane_mut(id) else { return };
     match cell {
         Some((cw, ch)) if cw > 0 && ch > 0 && area.width > 0 && area.height > 0 => {
-            let (vw, vh) = (area.width as u32 * cw as u32, area.height as u32 * ch as u32);
+            use crate::tui::graphics::{FRAME_ID, Place, crisp, scaled_size};
+            let zoom = img.zoom() as f64;
+            // Display pixels: the pane's. Image pixels: the pane's over the
+            // zoom, which is what the core hears — its scroll, clamp and
+            // tile cursor stay in the image's own pixels. See
+            // docs/specs/zoom.md.
+            let (pw, ph) = (area.width as u32 * cw as u32, area.height as u32 * ch as u32);
+            let (vw, vh) = (((pw as f64 / zoom) as u32).max(1), ((ph as f64 / zoom) as u32).max(1));
             // One step is one text row's worth in both directions, so "a
             // little" means the same distance it means in a file.
-            img.set_viewport(vw, vh, ch as u32);
+            img.set_viewport(vw, vh, ((ch as f64 / zoom).round() as u32).max(1));
             let (sx, sy) = img.scroll();
             let (w, h) = ((img.width - sx).min(vw), (img.height - sy).min(vh));
-            // Native size, never scaled: the crop occupies exactly the cells
-            // its pixels cover, centered along any axis with room to spare.
-            let cols = w.div_ceil(cw as u32).min(area.width as u32) as u16;
-            let rows = h.div_ceil(ch as u32).min(area.height as u32) as u16;
+            let disp = |n: u32| (n as f64 * zoom).round() as u32;
+            // The crop in display pixels: where the scaled picture's
+            // visible part starts and how much of it there is, capped at
+            // the pane.
+            let (dx, dy) = (disp(sx), disp(sy));
+            let (dw, dh) = (disp(w).clamp(1, pw), disp(h).clamp(1, ph));
+            // Crisp within the budget — a scaled copy, drawn at its size —
+            // else the original, stretched by the terminal into the cells.
+            let fit = !crisp(img.width, img.height, img.zoom());
+            let cols = dw.div_ceil(cw as u32).min(area.width as u32) as u16;
+            let rows = dh.div_ceil(ch as u32).min(area.height as u32) as u16;
             let col = area.x + (area.width - cols) / 2;
             let row = area.y + (area.height - rows) / 2;
-            places.push(crate::tui::graphics::Place {
+            let (crop, scale) = match fit {
+                false => {
+                    // The scaled copy is what is uploaded, and it may round
+                    // a pixel short of `dx + dw`: clamp the crop inside it.
+                    let (sw, sh) = scaled_size(img.width, img.height, img.zoom());
+                    ((dx, dy, dw.min(sw - dx), dh.min(sh - dy)), img.zoom().to_bits())
+                }
+                true => ((sx, sy, w, h), 1.0f32.to_bits()),
+            };
+            places.push(Place {
                 id: img.id,
                 // The window's, made nonzero — kitty reads `p=0` as "no
                 // placement id", and window ids start at zero.
@@ -1011,25 +1034,30 @@ fn render_image(
                 row,
                 cols,
                 rows,
-                crop: (sx, sy, w, h),
+                crop,
                 offset: (0, 0),
                 z: -1,
                 frame: (0, 0),
+                scale,
+                fit,
             });
             // The tilemap cursor: the frame image over the tile's cell, at
-            // `z=0`, cropped to what the pane shows of the tile. See
-            // docs/specs/tilemap.md.
+            // `z=0`, cropped to what the pane shows of the tile — all in
+            // display pixels, so the frame is built at tile size times zoom
+            // and its dashes stay one pixel wide. See docs/specs/tilemap.md.
             if let Some(map) = img.tilemap() {
                 let (cx, cy, fw, fh) = map.cursor_rect();
+                let (cx, cy) = (disp(cx), disp(cy));
+                let (fw, fh) = (disp(fw).max(1), disp(fh).max(1));
                 // The visible part of the tile: its rectangle meeting the crop.
-                let (vx0, vy0) = (cx.max(sx), cy.max(sy));
-                let (vx1, vy1) = ((cx + fw).min(sx + w), (cy + fh).min(sy + h));
+                let (vx0, vy0) = (cx.max(dx), cy.max(dy));
+                let (vx1, vy1) = ((cx + fw).min(dx + dw), (cy + fh).min(dy + dh));
                 if vx1 > vx0 && vy1 > vy0 {
-                    let (px, py) = (vx0 - sx, vy0 - sy);
+                    let (px, py) = (vx0 - dx, vy0 - dy);
                     let (ox, oy) = ((px % cw as u32) as u16, (py % ch as u32) as u16);
                     let (vw, vh) = (vx1 - vx0, vy1 - vy0);
-                    places.push(crate::tui::graphics::Place {
-                        id: crate::tui::graphics::FRAME_ID,
+                    places.push(Place {
+                        id: FRAME_ID,
                         pid: id.0 + 1,
                         col: col + (px / cw as u32) as u16,
                         row: row + (py / ch as u32) as u16,
@@ -1039,6 +1067,8 @@ fn render_image(
                         offset: (ox, oy),
                         z: 0,
                         frame: (fw, fh),
+                        scale: 1.0f32.to_bits(),
+                        fit: false,
                     });
                 }
             }
@@ -1779,6 +1809,9 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
                 name.push_str(" +");
             }
             let mut at = format!("{}×{}", img.width, img.height);
+            if img.zoom() != 1.0 {
+                at.push_str(&format!(" {}x", img.zoom()));
+            }
             if let Some(map) = img.tilemap() {
                 let (tw, th) = map.size();
                 let (c, r) = map.cursor();
@@ -3217,6 +3250,75 @@ int main(void) {
         let spans = window_status(&ed, ed.focus(), true, 60);
         let row: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(row.ends_with(" TILEMAP "), "{row:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// At 2x the picture is placed from its scaled pixels and covers twice
+    /// the cells; the tile frame is twice the tile. Over the budget the
+    /// placement crops the original and asks the terminal to fit it.
+    /// See docs/specs/zoom.md.
+    #[test]
+    fn zoom_scales_the_placement_and_the_frame() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("bi-render-zoom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atlas.png");
+        image::RgbaImage::from_pixel(32, 32, image::Rgba([1, 2, 3, 255])).save(&path).unwrap();
+
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", path.display()));
+        ed.run_ex("set tilemap size 8");
+        ed.run_ex("set editor tilemap");
+        ed.apply(bi::editor::Command {
+            count: 1,
+            action: bi::editor::Action::Move(bi::motion::Motion::Right),
+        });
+        ed.run_ex("zoom 2");
+        // 8×16 cells, 8 columns and 4 rows of pane: 64×64 display pixels,
+        // which the 32×32 sheet at 2x fills exactly.
+        let mut terminal = Terminal::new(TestBackend::new(8, 6)).unwrap();
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        assert_eq!(places.len(), 2, "{places:?}");
+        let atlas = places[0];
+        let frame = places[1];
+        assert_eq!(atlas.crop, (0, 0, 64, 64), "the scaled pixels, all of them");
+        assert_eq!((atlas.cols, atlas.rows), (8, 4));
+        assert_eq!(atlas.zoom(), 2.0, "the upload is the scaled copy");
+        assert!(!atlas.fit);
+        assert_eq!(frame.frame_size(), (16, 16), "twice the tile");
+        assert_eq!(
+            (frame.col, frame.row),
+            (atlas.col + 2, atlas.row),
+            "tile 1 is 16 display pixels in"
+        );
+        assert_eq!(frame.offset, (0, 0));
+        assert_eq!(frame.crop, (0, 0, 16, 16));
+
+        let text = window_status_text(&ed, ed.focus(), true);
+        assert!(text.contains("32×32 2x"), "{text}");
+
+        // Half the pane in image pixels: the viewport the core was told.
+        ed.run_ex("zoom 0");
+        let text = window_status_text(&ed, ed.focus(), true);
+        assert!(!text.contains("1x"), "{text}");
+
+        // 32x of 32×32 is 1024×1024 — fine. Make it too big: 32x of a sheet
+        // that would scale past 4096 on a side.
+        let big = dir.join("big.png");
+        image::RgbaImage::from_pixel(200, 200, image::Rgba([1, 2, 3, 255])).save(&big).unwrap();
+        ed.run_ex(&format!("e {}", big.display()));
+        ed.run_ex("zoom 32");
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        let atlas = places[0];
+        assert!(atlas.fit, "terminal-scaled: {atlas:?}");
+        assert_eq!(atlas.zoom(), 1.0, "the original is what is uploaded");
+        assert_eq!(atlas.crop, (0, 0, 2, 2), "64 display pixels is 2 image pixels at 32x");
+        assert_eq!((atlas.cols, atlas.rows), (8, 4), "fitted to the whole pane");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
