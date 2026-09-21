@@ -51,27 +51,43 @@ order once:
 whether the two tangents move together. A point with fewer numbers than
 the layout names has zero tangents that the tool does not touch.
 
+**An empty list is seeded.** `:set editor curve` with the cursor in `{}`
+writes the linear preset into it — `(0, 0)` with an out slope of 1 and
+`(1, 1)` with slopes of 1, both locked — spelled through the layout as
+`{0.0, 0.0, 1.0, 0.0, true}` and `{1.0, 1.0, 1.0, 1.0, true}`, one per
+line when the brackets are on different lines. That is one undo step,
+and from then on the list is a list like any other.
+
+**The square is fixed.** The plot is the `0,0` to `1,1` square at 512
+pixels a side, whatever the pane's size: a curve looks the same every
+time it is opened, and zoom is the zoom every picture has. A point past
+the square stretches the picture to take it in at the same scale, up to
+4096 pixels a side. A grid line every tenth, the whole numbers brighter,
+a label every fifth.
+
 ## The keys
 
 On the plot, read from the normal keymap the way the tileset reads its
-keys, so a rebound `j` still means down — except `H`, `L` and `Enter`,
-which nothing in the normal keymap claims for a picture and which the plot
-takes as its own:
+keys, so a rebound `j` still means down and the arrows move too — except
+`Tab` and `Enter`, which nothing in the normal keymap claims for a
+picture and which the plot takes as its own:
 
 ```
-h  l        previous, next point; counts multiply     0 ^ $  gg G   first, last
-j  k        y down, up by one y step; counts multiply
-H  L        x earlier, later by one x step, stopping at the neighbours
-a           add a point halfway to the next one, on the curve; after the last, one x step past it
-i           add one halfway to the previous; before the first, one x step before it
-x           delete the point; refused at two: "a curve keeps two points"
-u  Ctrl-R   undo, redo — the source buffer's
-Enter       the point on the ex line: `:tool curve y 0.8`
-Esc         back to the source, the plot stays
-:           the ex line
+Tab  Shift-Tab   next, previous point, wrapping; counts multiply    gg  G   first, last
+h  l  ← →        x earlier, later by one x step, a tenth; counts multiply
+j  k  ↓ ↑        y down, up by one y step, a tenth; counts multiply
+a                add a point halfway to the next one, on the curve, and select it
+x                delete the point; the first and last stay, and a curve keeps two
+u  Ctrl-R        undo, redo — the source buffer's
+Enter            the point on the ex line: `:tool curve y 0.8`
+Esc              back to the source, the plot stays
+:                the ex line
 ```
 
-A new point takes the curve's value and slope where it is added, so `a`
+`x` moves inside `0..1` and between the point's neighbours, which is the
+engine's own rule for time; `y` is free. From the last point, `a` adds
+halfway back to the previous one, since nothing comes after the last. A
+new point takes the curve's value and slope where it is added, so `a`
 never bends the curve — it gives you a handle where there was none. Its
 `locked` is `true` when the layout has one.
 
@@ -86,7 +102,7 @@ same history. There is no second undo stack anywhere in the tool.
 :tool curve point 3          select the third point; reports without a value
 :tool curve x 0.5            move the selected point in x; clamped to its neighbours
 :tool curve y 0.8            and in y
-:tool curve xstep 0.01       what H and L move by; ystep the same for j and k
+:tool curve xstep 0.1        what h and l move by; ystep the same for j and k
 :tool curve layout x,y,out,in,locked
 ```
 
@@ -132,10 +148,10 @@ lack the trailing fields.
 keeps its suffix and at least as many decimals as it had, and never fewer
 than the step needs, so `0.5f` moved by `0.01` becomes `0.51f` and `1`
 moved by `0.25` becomes `1.25`. A bool keeps its spelling, `true` or `1`.
-`a` and `i` copy the neighbouring point's text — its brackets, a name
-glued to them like `Point { … }`, the separator and whitespace before it —
-and put the new numbers in, so a one-per-line list stays one per line; `x` removes the group and one separator, the one
-after it or, for the last point, the one before.
+`a` copies the point's text — its brackets, a name glued to them like
+`Point { … }`, the separator after it — and puts the new numbers in, so a
+one-per-line list stays one per line; `x` removes the group and the
+separator after it.
 
 **The anchor.** The tool remembers the byte offset of the outer group's
 open bracket. After every change of the buffer it re-reads the group from
@@ -158,13 +174,16 @@ pub struct Literal { open: usize, close: usize, points: Vec<PointSpan> }
 pub struct PointSpan { start: usize, end: usize, tokens: Vec<Token> }   // start reaches back over a glued name
 
 pub fn find(text: &str, cursor: usize) -> Option<Literal>;
+pub fn find_empty(text: &str, cursor: usize) -> Option<(usize, usize)>;   // an empty list's brackets
+pub fn initial_text(text: &str, open: usize, close: usize, layout: &Layout) -> String;
+pub fn linear() -> Curve;
 pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve;
 pub fn rewrite(token: &str, value: f32, step: f32) -> String;
 pub fn eval(curve: &Curve, x: f32) -> f32;         // cubic hermite between neighbours
 pub fn slope(curve: &Curve, x: f32) -> f32;
 pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String;
-pub fn ranges(curve: &Curve, xstep: f32, ystep: f32) -> ((f32, f32), (f32, f32));
-pub fn render(curve: &Curve, selected: usize, xstep: f32, ystep: f32, width: u32, height: u32) -> Vec<u8>;
+pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32));   // the unit square, stretched to the points
+pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>);
 ```
 
 **Evaluation** is Unity's: between points `p` and `q` with `d = q.x - p.x`,
@@ -173,19 +192,19 @@ the hermite basis over `t = (x - p.x) / d` with tangents `p.out * d` and
 `locked` changes nothing in the evaluation — it is a promise about how
 the tangents move, which is not yet a thing that happens.
 
-**x stays sorted.** A point's x is clamped between its neighbours' x so
-the list the engine reads never needs sorting. Two points may share an x;
-the segment between them has zero length and is skipped.
+**x stays sorted.** A point's x is clamped between its neighbours' x and
+inside `0..1`, so the list the engine reads never needs sorting. Two
+points may share an x; the segment between them has zero length and is
+skipped.
 
-**The picture** is drawn into RGBA at the plot window's viewport size,
-so it fills the pane and redraws when the pane is resized; zoom is not
-read. The visible range is the points' extent on each axis, padded by a
-tenth, and never thinner than the x or y step, so a flat curve still has
-room. Axes with ticks and values, a faint grid, the curve, every point as
-a dot, the selected point larger with both tangents as short strokes at
-their slopes. The plot's `Img` is named after the source with a `.curve`
-extension so the status row says `damage.cpp.curve`, and it is never
-dirty: it is derived.
+**The picture** is drawn into RGBA at a fixed scale, 512 pixels per unit,
+the unit square plus margins for the labels; the picture machinery
+scrolls and zooms it like any other. The curve, every point as a dot, the
+selected point larger with both tangent handles drawn the engine's way —
+`normalize(1, slope) · 0.12` units from the anchor, out to the right and
+in to the left. The plot's `Img` is named after the source with a
+`.curve` extension so the status row says `damage.cpp.curve`, and it is
+never dirty: it is derived.
 
 ## The tool in the editor
 
@@ -196,7 +215,7 @@ struct CurveTool {
     anchor: usize,             // byte offset of the outer open bracket
     layout: Layout,
     selected: usize,
-    xstep: f32, ystep: f32,
+    xstep: f32, ystep: f32,    // a tenth each, by default
     seen: (u64, u64),          // buffer edits, form generation, the plot reflects
 }
 ```
@@ -256,13 +275,19 @@ sets, `map` for the normal map and `point` here, a small amendment to
   picture has no cursor in text — and so does a text cursor outside a
   list; on the sample it opens the plot right of the source, the form at
   the edge, and focuses the plot.
+- `:set editor curve` in an empty `{}` seeds the linear preset as one
+  undo step and opens on it.
 - `j` on the plot rewrites the selected point's `y` token in the buffer
-  by one y step and nothing else in the file changes; `5k` by five; `H`
-  stops at the previous point's x; `l` and `h` move the selection and the
-  status row; `Enter` prefills `:tool curve y 0.8`.
+  by a tenth and nothing else in the file changes; `5k` by five; `l` and
+  `h` move `x` by a tenth and stop at the neighbours and at `0` and `1`;
+  `Tab` and `Shift-Tab` cycle the selection and the status row follows;
+  `Enter` prefills `:tool curve y 0.8`.
 - `a` inserts a group shaped like its neighbour with the curve's value at
-  the midpoint; `i` before; `x` removes a group and one separator and is
-  refused at two points.
+  the midpoint and selects it; from the last point it goes halfway back;
+  `x` removes a group and the separator after it, is refused on the first
+  and last points and at two points.
+- `render` is the unit square at 512 a side plus margins; a point past
+  the square grows the picture at the same scale.
 - `u` on the plot restores the buffer's text and the plot redraws from it;
   editing a number by hand in the source redraws too.
 - `:w` on the plot writes the source's file; `:q` on the plot closes plot

@@ -379,10 +379,10 @@ pub enum Action {
     /// `Enter` in a curve's plot: the selected point's value on the ex
     /// line. See `docs/specs/curve.md`.
     EditValue,
-    /// `H` and `L` in a curve's plot: the selected point's x, earlier or
-    /// later, by the count's steps. See `docs/specs/curve.md`.
-    Slide {
-        right: bool,
+    /// `Tab` and `Shift-Tab` in a curve's plot: the next or previous
+    /// point, wrapping. See `docs/specs/curve.md`.
+    NextPoint {
+        back: bool,
     },
     /// A key in a form window. See `docs/specs/form.md`.
     Form(FormCmd),
@@ -714,17 +714,33 @@ fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f
     let n = curve.points.len();
     let p = curve.points.get(selected).copied().unwrap_or_default();
     form.push(Field::int("point", "Point", 1, n.max(1) as i64, 1, selected as i64 + 1));
-    let x_min = if selected > 0 { curve.points[selected - 1].x } else { p.x - 1.0 };
-    let x_max = if selected + 1 < n { curve.points[selected + 1].x } else { p.x + 1.0 };
-    let (_, (y0, y1)) = crate::curve::ranges(curve, xstep, ystep);
+    let (x_min, x_max) = curve_x_bounds(curve, selected);
+    let (_, (y0, y1)) = crate::curve::plot_range(curve);
+    // A list read through the wrong layout can put the bounds in any
+    // order; a slider wants them sorted and finite.
+    let sorted = |a: f32, b: f32| {
+        let (a, b) = (if a.is_finite() { a } else { 0.0 }, if b.is_finite() { b } else { 0.0 });
+        (a.min(b), a.max(b))
+    };
+    let (x_min, x_max) = sorted(x_min, x_max);
+    let (y0, y1) = sorted(y0, y1);
+    let (out, in_) = (sorted(p.out, p.out).0, sorted(p.in_, p.in_).0);
     form.push(Field::float("x", "X", x_min, x_max, xstep, p.x));
     form.push(Field::float("y", "Y", y0, y1, ystep, p.y));
-    form.push(Field::float("out", "Out", p.out, p.out, 0.1, p.out));
-    form.push(Field::float("in", "In", p.in_, p.in_, 0.1, p.in_));
+    form.push(Field::float("out", "Out", out, out, 0.1, out));
+    form.push(Field::float("in", "In", in_, in_, 0.1, in_));
     form.push(Field::bool("locked", "Locked", p.locked));
     form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, xstep));
     form.push(Field::float("ystep", "Y step", 0.001, 1.0, 0.001, ystep));
     form
+}
+
+/// Where the selected point's x may go: between its neighbours, and
+/// never outside the unit range — the engine clamps time to `0..1`.
+fn curve_x_bounds(curve: &crate::curve::Curve, selected: usize) -> (f32, f32) {
+    let lo = if selected > 0 { curve.points[selected - 1].x.max(0.0) } else { 0.0 };
+    let hi = curve.points.get(selected + 1).map_or(1.0, |q| q.x.min(1.0));
+    (lo, hi)
 }
 
 fn map_path(source: &Path, map: crate::normalmap::Map) -> PathBuf {
@@ -2837,8 +2853,8 @@ struct CurveTool {
     /// The list is gone from the text; the plot is blank until the next
     /// `:set editor curve`.
     lost: bool,
-    /// Buffer edits, form generation and plot viewport the plot reflects.
-    seen: Option<(u64, u64, u32, u32)>,
+    /// Buffer edits and form generation the plot reflects.
+    seen: Option<(u64, u64)>,
 }
 
 /// A tool on a source window: the normal map's or the curve's three
@@ -6562,7 +6578,7 @@ impl Editor {
             // A turn with no grid to turn on, a slide with no curve.
             // Swallowed rather than passed to a view this window does not
             // have.
-            Action::Turn(_) | Action::EditValue | Action::Slide { .. } => {}
+            Action::Turn(_) | Action::EditValue | Action::NextPoint { .. } => {}
             // The history is the image's, grid or no grid: `u` after a
             // `:tool image grayscale` brings the colours back either way.
             Action::Undo => {
@@ -8317,23 +8333,40 @@ impl Editor {
             self.set_focus(plot);
             return;
         }
-        let found = self.window().text().and_then(|text| {
-            let buffer = text.buffer;
-            let cursor = text.selections.primary().head.at;
-            let rope = self.entry(buffer).buffer.rope();
-            let at = rope.char_to_byte(cursor.min(rope.len_chars()));
-            let source = rope.to_string();
-            let lit = crate::curve::find(&source, at)?;
-            let selected = lit.points.iter().position(|p| p.start <= at && at < p.end).unwrap_or(0);
-            Some((buffer, source, lit, selected))
-        });
-        let Some((buffer, text, lit, selected)) = found else {
+        let layout = crate::curve::Layout::default();
+        let Some((buffer, cursor)) =
+            self.window().text().map(|t| (t.buffer, t.selections.primary().head.at))
+        else {
             self.session.status = "no curve under the cursor".into();
             return;
         };
-        let layout = crate::curve::Layout::default();
+        let (text, at) = {
+            let rope = self.entry(buffer).buffer.rope();
+            (rope.to_string(), rope.char_to_byte(cursor.min(rope.len_chars())))
+        };
+        let mut lit = crate::curve::find(&text, at);
+        if lit.is_none()
+            && let Some((open, close)) = crate::curve::find_empty(&text, at)
+        {
+            // An empty list is seeded with the linear preset, in the code,
+            // as one undo step; then it is a list like any other.
+            let seed = crate::curve::initial_text(&text, open, close, &layout);
+            let before = self.selections().map(|s| s.as_pairs()).unwrap_or_default();
+            let entry = self.entry_mut(buffer);
+            let (s, e) = (entry.buffer.rope().byte_to_char(open + 1), entry.buffer.rope().byte_to_char(close));
+            entry.buffer.replace_range(s, e, &seed);
+            entry.buffer.commit_undo(before.clone(), before);
+            let seeded = self.entry(buffer).buffer.rope().to_string();
+            lit = crate::curve::find(&seeded, open + 1);
+        }
+        let Some(lit) = lit else {
+            self.session.status = "no curve under the cursor".into();
+            return;
+        };
+        let text = self.entry(buffer).buffer.rope().to_string();
+        let selected = lit.points.iter().position(|p| p.start <= at && at < p.end).unwrap_or(0);
         let curve = crate::curve::read(&text, &lit, &layout);
-        let (xstep, ystep) = (0.01, 0.01);
+        let (xstep, ystep) = (0.1, 0.1);
         let source = self.focus;
         let name = self.name_of(buffer);
         let Some(plot) = self.split_focus(Dir::Vertical) else { return };
@@ -8388,9 +8421,7 @@ impl Editor {
         else {
             return false;
         };
-        let viewport = self.plot_size(tool.plot);
-        let stamp = (edits, form_generation, viewport.0, viewport.1);
-        if tool.seen == Some(stamp) {
+        if tool.seen == Some((edits, form_generation)) {
             return true;
         }
         if tool.seen.is_some_and(|seen| seen.1 != form_generation) {
@@ -8403,22 +8434,13 @@ impl Editor {
             .and_then(Window::form)
             .map_or(form_generation, Form::generation);
         if let Some(tool) = self.curve_mut(index) {
-            tool.seen = Some((edits, form_generation, viewport.0, viewport.1));
+            tool.seen = Some((edits, form_generation));
         }
         true
     }
 
     fn buffer_edits(&self, id: BufferId) -> Option<u64> {
         self.buffers.iter().find(|b| b.id == id).map(|b| b.buffer.edits())
-    }
-
-    /// The room the plot has: its viewport, or a default before the first
-    /// frame, so a test without a frontend still gets a picture.
-    fn plot_size(&self, plot: WindowId) -> (u32, u32) {
-        match self.window_of(plot).and_then(Window::img).map(Img::viewport) {
-            Some((w, h)) if w > 0 && h > 0 => (w, h),
-            _ => (512, 256),
-        }
     }
 
     /// The source of the curve tool whose plot or form is `window`.
@@ -8519,7 +8541,6 @@ impl Editor {
             let at = rope.char_to_byte(cursor.selections.primary().head.at.min(rope.len_chars()));
             lit = crate::curve::find(&text, at);
         }
-        let (w, h) = self.plot_size(tool.plot);
         let (curve, selected, lost) = match &lit {
             Some(lit) => {
                 let curve = crate::curve::read(&text, lit, &tool.layout);
@@ -8531,7 +8552,7 @@ impl Editor {
         if lost && !tool.lost {
             self.session.status = "curve lost".into();
         }
-        let pixels = crate::curve::render(&curve, selected, tool.xstep, tool.ystep, w, h);
+        let (w, h, pixels) = crate::curve::render(&curve, selected);
         if let Some(img) = self.window_mut_of(tool.plot).and_then(Window::img_mut) {
             img.rgba = pixels;
             img.width = w;
@@ -8585,15 +8606,17 @@ impl Editor {
         let Some(tool) = self.curve(index) else { return false };
         let last = tool.curve.points.len().saturating_sub(1);
         let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+        let n = last + 1;
         match &cmd.action {
             Action::Undo => self.curve_undo(index, false),
             Action::Redo => self.curve_undo(index, true),
             Action::EnterNormal => self.set_focus(tool.source),
             _ if tool.lost => self.session.status = "curve lost".into(),
-            Action::Move(Motion::Left) => {
-                self.curve_select(index, tool.selected.saturating_sub(count))
+            Action::NextPoint { back } if n > 0 => {
+                let step = count % n;
+                let next = if *back { (tool.selected + n - step) % n } else { (tool.selected + step) % n };
+                self.curve_select(index, next)
             }
-            Action::Move(Motion::Right) => self.curve_select(index, (tool.selected + count).min(last)),
             Action::Move(Motion::FirstLine | Motion::LineStart | Motion::FirstNonBlank) => {
                 self.curve_select(index, 0)
             }
@@ -8606,12 +8629,13 @@ impl Editor {
             Action::Move(Motion::Down) => {
                 self.curve_set(index, Field::Y, p.y - count as f32 * tool.ystep)
             }
-            Action::Slide { right } => {
-                let sign = if *right { 1.0 } else { -1.0 };
-                self.curve_set(index, Field::X, p.x + sign * count as f32 * tool.xstep)
+            Action::Move(Motion::Left) => {
+                self.curve_set(index, Field::X, p.x - count as f32 * tool.xstep)
             }
-            Action::EnterInsertAfter => self.curve_add(index, true),
-            Action::EnterInsert => self.curve_add(index, false),
+            Action::Move(Motion::Right) => {
+                self.curve_set(index, Field::X, p.x + count as f32 * tool.xstep)
+            }
+            Action::EnterInsertAfter => self.curve_add(index),
             Action::Operate { op: Operator::Delete, .. } => self.curve_delete(index),
             Action::EditValue => {
                 let line = format!("tool curve y {}", crate::form::compact(p.y));
@@ -8629,15 +8653,17 @@ impl Editor {
             | Action::ScrollHalfPage { .. }
             | Action::ScrollLine { .. }
             | Action::Operate { .. }
+            | Action::EnterInsert
             | Action::EnterInsertLineStart
             | Action::EnterInsertLineEnd
+            | Action::NextPoint { .. }
             | Action::Move(_) => {}
             _ => return false,
         }
         true
     }
 
-    /// `h`, `l`, `gg`, `G`: another point picked; the plot and the form
+    /// `Tab`, `gg`, `G`: another point picked; the plot and the form
     /// follow.
     fn curve_select(&mut self, index: usize, selected: usize) {
         if let Some(tool) = self.curve_mut(index) {
@@ -8664,9 +8690,7 @@ impl Editor {
         };
         let value = match field {
             Field::X => {
-                let pts = &tool.curve.points;
-                let lo = if tool.selected > 0 { pts[tool.selected - 1].x } else { f32::MIN };
-                let hi = pts.get(tool.selected + 1).map_or(f32::MAX, |q| q.x);
+                let (lo, hi) = curve_x_bounds(&tool.curve, tool.selected);
                 value.max(lo).min(hi)
             }
             _ => value,
@@ -8680,23 +8704,20 @@ impl Editor {
         self.curve_edit(index, vec![(token.start, token.end, new)]);
     }
 
-    /// `a` and `i`: a point on the curve halfway to the neighbour — or one
-    /// step past the end — shaped like the selected point's text.
-    fn curve_add(&mut self, index: usize, after: bool) {
+    /// `a`: a point on the curve halfway to the next one — from the last
+    /// point, halfway back to the previous — shaped like the selected
+    /// point's text, and selected.
+    fn curve_add(&mut self, index: usize) {
         use crate::curve::{Point, eval, point_text, slope};
         let Some(tool) = self.curve(index) else { return };
         let Some(lit) = tool.literal.as_ref() else { return };
-        let (sel, pts) = (tool.selected, &tool.curve.points);
-        let n = pts.len();
-        if n == 0 || lit.points.len() != n {
+        let (pts, n) = (&tool.curve.points, tool.curve.points.len());
+        if n < 2 || lit.points.len() != n {
             return;
         }
-        let x = match (after, sel + 1 < n, sel > 0) {
-            (true, true, _) => (pts[sel].x + pts[sel + 1].x) / 2.0,
-            (true, false, _) => pts[sel].x + tool.xstep,
-            (false, _, true) => (pts[sel - 1].x + pts[sel].x) / 2.0,
-            (false, _, false) => pts[sel].x - tool.xstep,
-        };
+        // The point the new one goes after.
+        let sel = if tool.selected + 1 < n { tool.selected } else { n - 2 };
+        let x = (pts[sel].x + pts[sel + 1].x) / 2.0;
         let m = slope(&tool.curve, x);
         let p = Point {
             x,
@@ -8719,26 +8740,19 @@ impl Editor {
         };
         let spans: Vec<_> = lit.points.iter().map(shift).collect();
         let between = |a: usize, b: usize| text[spans[a].end..spans[b].start].to_string();
-        let sep = match (after, sel + 1 < n, sel > 0) {
-            (_, true, _) if after => between(sel, sel + 1),
-            (_, _, true) if !after => between(sel - 1, sel),
-            (_, _, true) => between(sel - 1, sel),
-            (_, true, _) => between(sel, sel + 1),
-            _ => ", ".to_string(),
-        };
-        let new = point_text(&text, &spans[sel], &tool.layout, p, tool.xstep.min(tool.ystep));
-        let (at, insertion) = if after {
-            (lit.points[sel].end, format!("{sep}{new}"))
-        } else {
-            (lit.points[sel].start, format!("{new}{sep}"))
-        };
+        let sep = between(sel, sel + 1);
+        // A thousandth: the midpoint and the curve's value there are
+        // written exactly, not to the step's coarser decimals.
+        let new = point_text(&text, &spans[sel], &tool.layout, p, 0.001);
+        let at = lit.points[sel].end;
         if let Some(t) = self.curve_mut(index) {
-            t.selected = if after { sel + 1 } else { sel };
+            t.selected = sel + 1;
         }
-        self.curve_edit(index, vec![(at, at, insertion)]);
+        self.curve_edit(index, vec![(at, at, format!("{sep}{new}"))]);
     }
 
-    /// `x`: the selected point and one separator gone. A curve keeps two.
+    /// `x`: the selected point and the separator after it gone. The first
+    /// and last points are the curve's ends and stay.
     fn curve_delete(&mut self, index: usize) {
         let Some(tool) = self.curve(index) else { return };
         let Some(lit) = tool.literal.as_ref() else { return };
@@ -8747,11 +8761,11 @@ impl Editor {
             self.session.status = "a curve keeps two points".into();
             return;
         }
-        let (start, end) = if sel + 1 < n {
-            (lit.points[sel].start, lit.points[sel + 1].start)
-        } else {
-            (lit.points[sel - 1].end, lit.points[sel].end)
-        };
+        if sel == 0 || sel + 1 >= n {
+            self.session.status = "the first and last points stay".into();
+            return;
+        }
+        let (start, end) = (lit.points[sel].start, lit.points[sel + 1].start);
         self.curve_edit(index, vec![(start, end, String::new())]);
     }
 
@@ -13510,7 +13524,7 @@ impl View<'_> {
             Action::JumpBack { .. } | Action::JumpForward { .. } | Action::JumpLast => {}
             // Only ever produced in an image window, which `run_image_action`
             // answers before a view is looked for.
-            Action::Turn(_) | Action::EditValue | Action::Slide { .. } => {}
+            Action::Turn(_) | Action::EditValue | Action::NextPoint { .. } => {}
             // Only ever produced in a form window; answered in `Editor::apply`.
             Action::Form(_) => {}
             Action::Move(m) => {
@@ -30531,6 +30545,24 @@ int main(void) {
         }
 
         #[test]
+        fn an_empty_list_is_seeded_with_the_linear_preset() {
+            let src = "std::vector<Point> pts = {\n};\n";
+            let mut ed = editor(src);
+            sized(&mut ed);
+            ed.set_cursor(Cursor::at(src.find('{').unwrap() + 1));
+            let source = ed.focus();
+            ed.run_ex("set editor curve");
+            assert_eq!(
+                text(&ed),
+                "std::vector<Point> pts = {\n    {0.0, 0.0, 1.0, 0.0, true},\n    {1.0, 1.0, 1.0, 1.0, true},\n};\n"
+            );
+            let plot = plot_of(&ed, source);
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 2  x 0.000 y 0.000");
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), src, "one undo step");
+        }
+
+        #[test]
         fn opening_puts_the_plot_beside_the_source_the_form_at_the_edge_and_focuses_the_plot() {
             let (ed, source) = open();
             assert_eq!(ed.window_ids().len(), 3, "{:?}", ed.window_ids());
@@ -30548,7 +30580,7 @@ int main(void) {
             assert!(form.fields().iter().any(|f| f.name() == "point"));
             assert_eq!(form.get_f32("y"), 0.8);
             let img = ed.window_of(plot).unwrap().img().unwrap();
-            assert_eq!((img.width, img.height), (512, 256), "drawn at the default size");
+            assert_eq!((img.width, img.height), (552, 538), "the unit square at 512 a side");
             assert!(ed.is_curve_plot(plot));
             assert!(!ed.is_curve_plot(source));
         }
@@ -30605,44 +30637,50 @@ int main(void) {
         }
 
         #[test]
-        fn j_and_k_move_y_by_one_step_and_nothing_else_changes() {
+        fn j_and_k_move_y_by_a_tenth_and_nothing_else_changes() {
             let (mut ed, _s) = open();
             key(&mut ed, Action::Move(Motion::Up));
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
             keys(&mut ed, 5, Action::Move(Motion::Down));
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.76f"));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.4f"));
+            keys(&mut ed, 5, Action::Move(Motion::Down));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "-0.1f"), "y is free");
         }
 
         #[test]
-        fn h_and_l_pick_a_point_and_the_status_follows() {
+        fn tab_cycles_the_points_and_the_status_follows() {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
-            key(&mut ed, Action::Move(Motion::Right));
+            key(&mut ed, Action::NextPoint { back: false });
             assert_eq!(ed.curve_status(plot).unwrap(), "point 3 of 3  x 1.000 y 1.000");
-            keys(&mut ed, 2, Action::Move(Motion::Left));
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000");
-            key(&mut ed, Action::Move(Motion::LastLine));
-            assert!(ed.curve_status(plot).unwrap().starts_with("point 3"));
+            key(&mut ed, Action::NextPoint { back: false });
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000", "wraps");
+            key(&mut ed, Action::NextPoint { back: true });
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 3"), "and back");
             key(&mut ed, Action::Move(Motion::FirstLine));
             assert!(ed.curve_status(plot).unwrap().starts_with("point 1"));
+            key(&mut ed, Action::Move(Motion::LastLine));
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 3"));
             let form = ed.window_of(form_of(&ed)).unwrap().form().unwrap();
-            assert_eq!(form.get_i64("point"), 1, "the form follows");
+            assert_eq!(form.get_i64("point"), 3, "the form follows");
         }
 
         #[test]
-        fn capital_h_and_l_move_x_and_stop_at_the_neighbours() {
+        fn h_and_l_move_x_by_a_tenth_and_stop_at_the_neighbours_and_the_unit_range() {
             let (mut ed, _s) = open();
-            key(&mut ed, Action::Slide { right: true });
-            assert_eq!(text(&ed), CPP.replace("0.5f, 0.8f", "0.51f, 0.8f"));
-            keys(&mut ed, 100, Action::Slide { right: true });
-            // Two decimals now: a token keeps the decimals it has grown.
-            assert!(text(&ed).contains("{1.00f, 0.8f"), "clamped to the next point: {}", text(&ed));
-            keys(&mut ed, 100, Action::Slide { right: false });
-            assert!(text(&ed).contains("{0.00f, 0.8f"), "and the previous: {}", text(&ed));
+            key(&mut ed, Action::Move(Motion::Right));
+            assert_eq!(text(&ed), CPP.replace("0.5f, 0.8f", "0.6f, 0.8f"));
+            keys(&mut ed, 100, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("{1.0f, 0.8f"), "clamped to the next point: {}", text(&ed));
+            keys(&mut ed, 100, Action::Move(Motion::Left));
+            assert!(text(&ed).contains("{0.0f, 0.8f"), "and the previous: {}", text(&ed));
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(text(&ed).starts_with(CPP.split("{0.5f").next().unwrap()), "the first point stays at 0: {}", text(&ed));
         }
 
         #[test]
-        fn a_adds_a_point_on_the_curve_after_and_i_before() {
+        fn a_adds_a_point_on_the_curve_halfway_to_the_next() {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
             key(&mut ed, Action::EnterInsertAfter);
@@ -30655,41 +30693,30 @@ int main(void) {
                 "the new point is selected: {}",
                 ed.curve_status(plot).unwrap()
             );
-            key(&mut ed, Action::Move(Motion::Left));
-            key(&mut ed, Action::EnterInsert);
-            assert!(text(&ed).contains("false},\n    {0.25f, "), "{}", text(&ed));
-            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 5  x 0.250"));
-        }
-
-        #[test]
-        fn a_after_the_last_and_i_before_the_first_step_past_them() {
-            let (mut ed, _s) = open();
             key(&mut ed, Action::Move(Motion::LastLine));
             key(&mut ed, Action::EnterInsertAfter);
-            assert!(text(&ed).contains("false},\n    {1.01f, 1.0f"), "{}", text(&ed));
-            key(&mut ed, Action::Move(Motion::FirstLine));
-            key(&mut ed, Action::EnterInsert);
-            assert!(text(&ed).contains("= {\n    {-0.01f, 0.0f"), "{}", text(&ed));
+            assert!(text(&ed).contains("{0.875f, "), "from the last point, halfway back: {}", text(&ed));
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 4 of 5  x 0.875"));
         }
 
         #[test]
-        fn x_deletes_a_point_and_keeps_two() {
+        fn x_deletes_a_point_but_never_the_ends() {
             let (mut ed, _s) = open();
+            key(&mut ed, Action::EnterInsertAfter);
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(text(&ed), CPP, "the added point is gone again");
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(ed.session.status, "the first and last points stay");
+            key(&mut ed, Action::Move(Motion::LastLine));
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(ed.session.status, "the first and last points stay");
+            key(&mut ed, Action::NextPoint { back: true });
             key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
             assert_eq!(text(&ed), CPP.replace("    {0.5f, 0.8f, 0.0f, 0.0f, true},\n", ""));
+            key(&mut ed, Action::NextPoint { back: true });
             key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
             assert_eq!(ed.session.status, "a curve keeps two points");
-            assert_eq!(text(&ed).lines().count(), CPP.lines().count() - 1);
-        }
-
-        #[test]
-        fn x_on_the_last_point_takes_the_separator_before_it() {
-            let mut ed = editor("[(0.0, 0.0), (0.5, 0.8), (1.0, 1.0)]");
-            sized(&mut ed);
-            ed.set_cursor(Cursor::at(27));
-            ed.run_ex("set editor curve");
-            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
-            assert_eq!(text(&ed), "[(0.0, 0.0), (0.5, 0.8)]");
         }
 
         #[test]
@@ -30700,14 +30727,14 @@ int main(void) {
                 key(&mut ed, Action::Move(Motion::Up));
             }
             key(&mut ed, Action::Undo);
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.82f"), "one key, one step");
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.820");
+            assert_eq!(text(&ed), CPP.replace("0.8f", "1.0f"), "one key, one step");
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 1.000");
             key(&mut ed, Action::Undo);
             key(&mut ed, Action::Undo);
             assert_eq!(text(&ed), CPP);
             key(&mut ed, Action::Redo);
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.810");
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.900");
         }
 
         #[test]
@@ -30739,11 +30766,11 @@ int main(void) {
             assert!(ed.session.status.starts_with("y wants a number"), "{}", ed.session.status);
             ed.run_ex("tool curve");
             assert_eq!(ed.session.status, "curve what? (point, x, y, xstep, ystep, layout)");
-            ed.run_ex("tool curve ystep 0.1");
+            ed.run_ex("tool curve ystep 0.01");
             ed.run_ex("tool curve ystep");
-            assert_eq!(ed.session.status, "curve ystep=0.100");
+            assert_eq!(ed.session.status, "curve ystep=0.010");
             key(&mut ed, Action::Move(Motion::Up));
-            assert!(text(&ed).contains("{0.0f, 0.1f"), "the new step: {}", text(&ed));
+            assert!(text(&ed).contains("{0.0f, 0.01f"), "the new step: {}", text(&ed));
         }
 
         #[test]
@@ -30772,13 +30799,13 @@ int main(void) {
             ed.set_focus(form_of(&ed));
             ed.run_form_cmd(FormCmd::Select { down: true, count: 2 }); // point → x → y
             ed.run_form_cmd(FormCmd::Nudge(1));
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
             ed.run_form_cmd(FormCmd::CycleMap);
             assert!(ed.curve_status(plot).unwrap().starts_with("point 3 of 3"));
             ed.run_form_cmd(FormCmd::Undo);
             assert_eq!(text(&ed), CPP, "the form's u is the buffer's");
             ed.run_form_cmd(FormCmd::Redo);
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
         }
 
         #[test]
@@ -30796,7 +30823,7 @@ int main(void) {
             ed.run_ex("set editor curve");
             key(&mut ed, Action::Move(Motion::Up));
             ed.run_ex("w");
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), CPP.replace("0.8f", "0.81f"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), CPP.replace("0.8f", "0.9f"));
             assert!(ed.session.status.contains("written"), "{}", ed.session.status);
             assert_eq!(ed.focus(), plot_of(&ed, source), "still on the plot");
             ed.set_focus(form_of(&ed));

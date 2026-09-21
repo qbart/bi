@@ -1061,14 +1061,13 @@ impl Input {
             self.turn_pending = true;
             return None;
         }
-        // The curve's plot: `Enter` edits, `H` and `L` slide. Nothing in
-        // the normal keymap claims them for a picture. See
-        // `docs/specs/curve.md`.
+        // The curve's plot: `Enter` edits, `Tab` and `Shift-Tab` pick the
+        // next and previous point. Nothing in the normal keymap claims
+        // them for a picture. See `docs/specs/curve.md`.
         if !ctrl && !self.window_pending && !self.g_pending {
             match key.code {
                 KeyCode::Enter => return self.plain(Action::EditValue),
-                KeyCode::Char('H') => return self.plain(Action::Slide { right: false }),
-                KeyCode::Char('L') => return self.plain(Action::Slide { right: true }),
+                KeyCode::Tab => return self.plain(Action::NextPoint { back: key.mods.shift }),
                 _ => {}
             }
         }
@@ -3868,16 +3867,20 @@ leader = \" \"
         }
 
         #[test]
-        fn enter_h_and_l_are_the_plots_keys_in_an_image_window() {
+        fn enter_and_tab_are_the_plots_keys_in_an_image_window() {
             let mut input = Input::default();
-            assert_eq!(image(&mut input, "H").unwrap().action, Action::Slide { right: false });
-            let cmd = image(&mut input, "3L").unwrap();
-            assert_eq!((cmd.count, cmd.action), (3, Action::Slide { right: true }));
+            let tab = Key::new(KeyCode::Tab, crate::key::Mods::default());
+            let cmd = input.on_key(tab, &Mode::Normal, ContentKind::Image);
+            assert_eq!(cmd.unwrap().action, Action::NextPoint { back: false });
+            let back = Key::new(KeyCode::Tab, crate::key::Mods { shift: true, ..Default::default() });
+            image(&mut input, "3");
+            let cmd = input.on_key(back, &Mode::Normal, ContentKind::Image).unwrap();
+            assert_eq!((cmd.count, cmd.action), (3, Action::NextPoint { back: true }));
             let enter = Key::new(KeyCode::Enter, crate::key::Mods::default());
             let cmd = input.on_key(enter, &Mode::Normal, ContentKind::Image);
             assert_eq!(cmd.unwrap().action, Action::EditValue);
-            let text = feed(&mut input, "H", ContentKind::Text);
-            assert_ne!(text.map(|c| c.action), Some(Action::Slide { right: false }));
+            let text = input.on_key(tab, &Mode::Normal, ContentKind::Text);
+            assert_ne!(text.map(|c| c.action), Some(Action::NextPoint { back: false }));
         }
 
         #[test]

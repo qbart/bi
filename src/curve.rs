@@ -331,6 +331,66 @@ pub fn find(text: &str, cursor: usize) -> Option<Literal> {
     })
 }
 
+/// An empty list around byte `cursor`: the innermost group containing it
+/// that holds nothing at all. `(open, close)` of its brackets.
+pub fn find_empty(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let root = parse_groups(text);
+    let mut node = &root;
+    while let Some(child) = node.children.iter().find(|c| c.contains(cursor)) {
+        node = child;
+    }
+    let empty = !std::ptr::eq(node, &root)
+        && node.children.is_empty()
+        && node.tokens.is_empty()
+        && text[node.open + 1..node.close].trim().is_empty();
+    empty.then_some((node.open, node.close))
+}
+
+/// The linear preset: `(0, 0)` and `(1, 1)` with the slopes of the line,
+/// both locked. What an empty list is seeded with.
+pub fn linear() -> Curve {
+    Curve {
+        points: vec![
+            Point { x: 0.0, y: 0.0, out: 1.0, in_: 0.0, locked: true },
+            Point { x: 1.0, y: 1.0, out: 1.0, in_: 1.0, locked: true },
+        ],
+    }
+}
+
+/// The text that fills an empty list at `open..=close` with the linear
+/// preset, spelled through `layout`: `{0.0, 0.0, 1.0, 0.0, true}` and its
+/// partner, one per line when the brackets are on different lines,
+/// inline otherwise. Inner brackets are braces inside braces and
+/// parentheses inside anything else.
+pub fn initial_text(text: &str, open: usize, close: usize, layout: &Layout) -> String {
+    let (l, r) = if text.as_bytes()[open] == b'{' { ("{", "}") } else { ("(", ")") };
+    let point = |p: &Point| {
+        let fields: Vec<String> = layout
+            .0
+            .iter()
+            .map(|f| match f {
+                Field::X => format!("{:.1}", p.x),
+                Field::Y => format!("{:.1}", p.y),
+                Field::Out => format!("{:.1}", p.out),
+                Field::In => format!("{:.1}", p.in_),
+                Field::Locked => if p.locked { "true" } else { "false" }.to_string(),
+                Field::Skip => "0".to_string(),
+            })
+            .collect();
+        format!("{l}{}{r}", fields.join(", "))
+    };
+    let curve = linear();
+    let (a, b) = (point(&curve.points[0]), point(&curve.points[1]));
+    if text[open..close].contains('\n') {
+        let line_start = text[..open].rfind('\n').map_or(0, |i| i + 1);
+        let indent: String =
+            text[line_start..open].chars().take_while(|c| c.is_whitespace()).collect();
+        format!("\n{indent}    {a},\n{indent}    {b},\n{indent}")
+    } else {
+        format!("{a}, {b}")
+    }
+}
+
 /// Where a point's text starts: at its bracket, or at the name glued to
 /// the bracket — `Point { … }`, `Vec2(…)` — so a copy of it keeps the name.
 fn span_start(text: &str, open: usize) -> usize {
@@ -515,27 +575,19 @@ pub fn slope(curve: &Curve, x: f32) -> f32 {
     (h00 * p.y + h10 * d * p.out + h01 * q.y + h11 * d * q.in_) / d
 }
 
-/// The visible range on each axis: the points' extent, never thinner
-/// than the step, padded by a tenth.
-pub fn ranges(curve: &Curve, xstep: f32, ystep: f32) -> ((f32, f32), (f32, f32)) {
-    fn axis(values: impl Iterator<Item = f32>, step: f32) -> (f32, f32) {
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for v in values {
-            lo = lo.min(v);
-            hi = hi.max(v);
+/// The plot's range: the unit square, stretched to take in any point
+/// outside it.
+pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32)) {
+    let mut r = ((0.0f32, 1.0f32), (0.0f32, 1.0f32));
+    for p in &curve.points {
+        if p.x.is_finite() {
+            r.0 = (r.0.0.min(p.x), r.0.1.max(p.x));
         }
-        if !lo.is_finite() {
-            (lo, hi) = (0.0, 1.0);
+        if p.y.is_finite() {
+            r.1 = (r.1.0.min(p.y), r.1.1.max(p.y));
         }
-        let step = step.abs().max(1e-6);
-        if hi - lo < step {
-            let mid = (lo + hi) / 2.0;
-            (lo, hi) = (mid - step / 2.0, mid + step / 2.0);
-        }
-        let pad = (hi - lo) * 0.1;
-        (lo - pad, hi + pad)
     }
-    (axis(curve.points.iter().map(|p| p.x), xstep), axis(curve.points.iter().map(|p| p.y), ystep))
+    r
 }
 
 // ---- the picture ----------------------------------------------------------
@@ -547,14 +599,7 @@ const LABEL: [u8; 4] = [150, 150, 160, 255];
 const LINE: [u8; 4] = [110, 190, 255, 255];
 const DOT: [u8; 4] = [235, 235, 240, 255];
 const PICK: [u8; 4] = [255, 180, 60, 255];
-const HANDLE: [u8; 4] = [255, 210, 130, 255];
-
-/// A tick spacing that gives four to eight lines across `span`.
-fn nice_step(span: f32) -> f32 {
-    let raw = span / 5.0;
-    let mag = 10f32.powf(raw.abs().max(1e-9).log10().floor());
-    [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|&s| s >= raw).unwrap_or(mag)
-}
+const HANDLE_COLOR: [u8; 4] = [255, 210, 130, 255];
 
 /// Three-by-five glyphs for the tick labels: digits, minus, point.
 fn glyph(c: char) -> [u8; 5] {
@@ -652,62 +697,83 @@ const fn text_width(s: &str) -> i64 {
     s.len() as i64 * 4
 }
 
-/// The plot: axes, grid, the curve, every point, the selected one larger
-/// with its tangents as strokes. `width × height` RGBA.
-pub fn render(
-    curve: &Curve,
-    selected: usize,
-    xstep: f32,
-    ystep: f32,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let (width, height) = (width.max(1), height.max(1));
-    let mut cv = Canvas::new(width, height);
-    let ((x0, x1), (y0, y1)) = ranges(curve, xstep, ystep);
-    let ytick = nice_step(y1 - y0);
-    let xtick = nice_step(x1 - x0);
-    let ydec = decimals_for(ytick);
-    let xdec = decimals_for(xtick);
-    let label_w = text_width(&format!("{:.*}", ydec, y0.min(y1).abs().max(y1.abs())));
-    let (left, right, top, bottom) = (label_w + 6 + 4, 8i64, 6i64, 12i64);
-    let (w, h) = (width as i64, height as i64);
-    let (inner_l, inner_r) = (left.min(w - 2), (w - right).max(left.min(w - 2) + 1));
-    let (inner_t, inner_b) = (top.min(h - 2), (h - bottom).max(top.min(h - 2) + 1));
-    let (iw, ih) = ((inner_r - inner_l) as f32, (inner_b - inner_t) as f32);
-    let sx = |x: f32| inner_l as f32 + (x - x0) / (x1 - x0) * iw;
-    let sy = |y: f32| inner_b as f32 - (y - y0) / (y1 - y0) * ih;
+/// One grid line's drawing: the canvas, the value, its colour, whether
+/// it gets a label.
+type Tick<'a> = Box<dyn FnMut(&mut Canvas, f32, [u8; 4], bool) + 'a>;
 
-    // Grid and tick labels.
-    let mut t = (y0 / ytick).ceil() * ytick;
-    while t <= y1 {
-        let row = sy(t).round() as i64;
-        cv.line(inner_l, row, inner_r, row, GRID);
-        let label = format!("{:.*}", ydec, t);
-        let lw = text_width(&label);
-        cv.text(inner_l - 6 - lw, row - 2, &label, LABEL);
-        t += ytick;
-    }
-    let mut t = (x0 / xtick).ceil() * xtick;
-    while t <= x1 {
-        let col = sx(t).round() as i64;
-        cv.line(col, inner_t, col, inner_b, GRID);
-        let label = format!("{:.*}", xdec, t);
-        let lw = text_width(&label);
-        cv.text(col - lw / 2, inner_b + 4, &label, LABEL);
-        t += xtick;
-    }
-    // Axes: the zero lines when in view, else the frame's left and bottom.
-    let zero_row = if y0 <= 0.0 && 0.0 <= y1 { sy(0.0).round() as i64 } else { inner_b };
-    let zero_col = if x0 <= 0.0 && 0.0 <= x1 { sx(0.0).round() as i64 } else { inner_l };
-    cv.line(inner_l, zero_row, inner_r, zero_row, AXIS);
-    cv.line(zero_col, inner_t, zero_col, inner_b, AXIS);
+/// Pixels per unit: the `0,0` to `1,1` square is always this size.
+pub const UNIT: f32 = 512.0;
+/// The picture never grows past this on a side, however far a point runs.
+const MAX_SIDE: f32 = 4096.0;
+const MARGIN_LEFT: i64 = 30;
+const MARGIN_RIGHT: i64 = 10;
+const MARGIN_TOP: i64 = 10;
+const MARGIN_BOTTOM: i64 = 16;
+/// A tangent handle's length, in units — the engine's own.
+const HANDLE: f32 = 0.12;
+
+/// The plot: the unit square at `UNIT` pixels a side, stretched to take in
+/// any point outside it; a grid every tenth, labels every fifth, the
+/// curve, every point, the selected one larger with its tangents as the
+/// engine draws them. Returns `(width, height, rgba)`.
+pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>) {
+    let ((x0, x1), (y0, y1)) = plot_range(curve);
+    let scale_x = (UNIT).min(MAX_SIDE / (x1 - x0).max(1e-6));
+    let scale_y = (UNIT).min(MAX_SIDE / (y1 - y0).max(1e-6));
+    let iw = ((x1 - x0) * scale_x).round().max(1.0) as i64;
+    let ih = ((y1 - y0) * scale_y).round().max(1.0) as i64;
+    let (w, h) = (iw + MARGIN_LEFT + MARGIN_RIGHT, ih + MARGIN_TOP + MARGIN_BOTTOM);
+    let mut cv = Canvas::new(w as u32, h as u32);
+    let (inner_l, inner_r) = (MARGIN_LEFT, MARGIN_LEFT + iw);
+    let (inner_t, inner_b) = (MARGIN_TOP, MARGIN_TOP + ih);
+    let sx = |x: f32| inner_l as f32 + (x - x0) * scale_x;
+    let sy = |y: f32| inner_b as f32 - (y - y0) * scale_y;
+
+    // The grid: a line every tenth, the whole numbers and the square's
+    // edges brighter, a label every fifth.
+    let mut tick = |lo: f32, hi: f32, mut draw: Tick| {
+        let mut n = (lo * 10.0).floor() as i64;
+        while (n as f32) / 10.0 <= hi + 1e-4 {
+            let t = n as f32 / 10.0;
+            if t >= lo - 1e-4 {
+                let bright = n % 10 == 0;
+                draw(&mut cv, t, if bright { AXIS } else { GRID }, n % 2 == 0);
+            }
+            n += 1;
+        }
+    };
+    tick(
+        y0,
+        y1,
+        Box::new(move |cv, t, c, label| {
+            let row = sy(t).round() as i64;
+            cv.line(inner_l, row, inner_r, row, c);
+            if label {
+                let text = format!("{t:.1}");
+                let lw = text_width(&text);
+                cv.text(inner_l - 4 - lw, row - 2, &text, LABEL);
+            }
+        }),
+    );
+    tick(
+        x0,
+        x1,
+        Box::new(move |cv, t, c, label| {
+            let col = sx(t).round() as i64;
+            cv.line(col, inner_t, col, inner_b, c);
+            if label {
+                let text = format!("{t:.1}");
+                let lw = text_width(&text);
+                cv.text(col - lw / 2, inner_b + 4, &text, LABEL);
+            }
+        }),
+    );
 
     // The curve, one sample per column.
     if !curve.points.is_empty() {
         let mut prev: Option<(i64, i64)> = None;
         for col in inner_l..=inner_r {
-            let x = x0 + (col - inner_l) as f32 / iw * (x1 - x0);
+            let x = x0 + (col - inner_l) as f32 / scale_x;
             let row = sy(eval(curve, x)).round() as i64;
             if let Some((pc, pr)) = prev {
                 cv.line(pc, pr, col, row, LINE);
@@ -719,21 +785,23 @@ pub fn render(
     // Points, the selected one last so it sits on top.
     for (i, p) in curve.points.iter().enumerate() {
         if i != selected {
-            cv.disc(sx(p.x).round() as i64, sy(p.y).round() as i64, 2, DOT);
+            cv.disc(sx(p.x).round() as i64, sy(p.y).round() as i64, 3, DOT);
         }
     }
     if let Some(p) = curve.points.get(selected) {
         let (cx, cy) = (sx(p.x).round() as i64, sy(p.y).round() as i64);
+        // The engine's handles: `normalize(1, tangent) * 0.12` from the
+        // anchor, out to the right and in to the left.
         for (m, dir) in [(p.out, 1.0f32), (p.in_, -1.0f32)] {
-            let dx = iw / (x1 - x0);
-            let dy = -m * ih / (y1 - y0);
-            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let (ux, uy) = (dx / len * 24.0 * dir, dy / len * 24.0 * dir);
-            cv.line(cx, cy, cx + ux.round() as i64, cy + uy.round() as i64, HANDLE);
+            let len = (1.0 + m * m).sqrt();
+            let (hx, hy) = (p.x + dir * HANDLE / len, p.y + dir * m * HANDLE / len);
+            let (ex, ey) = (sx(hx).round() as i64, sy(hy).round() as i64);
+            cv.line(cx, cy, ex, ey, HANDLE_COLOR);
+            cv.disc(ex, ey, 2, HANDLE_COLOR);
         }
-        cv.disc(cx, cy, 4, PICK);
+        cv.disc(cx, cy, 5, PICK);
     }
-    cv.px
+    (w as u32, h as u32, cv.px)
 }
 
 #[cfg(test)]
@@ -916,22 +984,55 @@ mod tests {
     }
 
     #[test]
-    fn ranges_pad_and_never_collapse() {
+    fn plot_range_is_the_unit_square_stretched_to_the_points() {
         let curve = c(&[(0.0, 0.5, 0.0, 0.0), (1.0, 0.5, 0.0, 0.0)]);
-        let ((x0, x1), (y0, y1)) = ranges(&curve, 0.01, 0.01);
-        assert!(x0 < 0.0 && x1 > 1.0);
-        assert!(y1 - y0 >= 0.01 && y0 < 0.5 && y1 > 0.5);
-        assert_eq!(ranges(&Curve::default(), 0.01, 0.01).0, (-0.1, 1.1));
+        assert_eq!(plot_range(&curve), ((0.0, 1.0), (0.0, 1.0)));
+        let wide = c(&[(-0.5, 0.0, 0.0, 0.0), (1.0, 1.5, 0.0, 0.0)]);
+        assert_eq!(plot_range(&wide), ((-0.5, 1.0), (0.0, 1.5)));
+        assert_eq!(plot_range(&Curve::default()), ((0.0, 1.0), (0.0, 1.0)));
     }
 
     #[test]
-    fn render_fills_the_size_and_marks_the_selected_point() {
+    fn render_is_the_unit_square_at_a_fixed_size_and_marks_the_selected_point() {
         let curve = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
-        let px = render(&curve, 1, 0.01, 0.01, 64, 32);
-        assert_eq!(px.len(), 64 * 32 * 4);
-        let other = render(&curve, 0, 0.01, 0.01, 64, 32);
+        let (w, h, px) = render(&curve, 1);
+        assert_eq!((w, h), (512 + 40, 512 + 26));
+        assert_eq!(px.len(), (w * h * 4) as usize);
+        let (_, _, other) = render(&curve, 0);
         assert_ne!(px, other, "the selection shows");
-        assert_eq!(render(&curve, 0, 0.01, 0.01, 1, 1).len(), 4, "a tiny pane does not panic");
-        assert_eq!(render(&Curve::default(), 0, 0.01, 0.01, 300, 200).len(), 300 * 200 * 4);
+        let tall = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 2.0, 0.0, 0.0)]);
+        let (w2, h2, _) = render(&tall, 0);
+        assert_eq!((w2, h2), (w, 1024 + 26), "the square keeps its scale; the picture grows");
+        let (w3, h3, px3) = render(&Curve::default(), 0);
+        assert_eq!(px3.len(), (w3 * h3 * 4) as usize);
+        let far = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1e6, 0.0, 0.0)]);
+        let (_, h4, _) = render(&far, 0);
+        assert!(h4 <= 4096 + 26, "capped: {h4}");
+    }
+
+    #[test]
+    fn an_empty_list_is_found_and_seeded_with_the_linear_preset() {
+        let text = "std::vector<Point> pts = {};\n";
+        let at = text.find("{}").unwrap() + 1;
+        assert_eq!(find_empty(text, at), Some((at - 1, at)));
+        assert_eq!(find_empty(text, 3), None);
+        assert_eq!(find_empty("a = { {1, 2} }", 3), None, "not empty");
+        assert_eq!(
+            initial_text(text, at - 1, at, &Layout::default()),
+            "{0.0, 0.0, 1.0, 0.0, true}, {1.0, 1.0, 1.0, 1.0, true}"
+        );
+        let multi = "    std::vector<Point> pts = {\n    };\n";
+        let open = multi.find('{').unwrap();
+        let close = multi.find('}').unwrap();
+        assert_eq!(find_empty(multi, open + 1), Some((open, close)));
+        assert_eq!(
+            initial_text(multi, open, close, &Layout::default()),
+            "\n        {0.0, 0.0, 1.0, 0.0, true},\n        {1.0, 1.0, 1.0, 1.0, true},\n    "
+        );
+        let py = "pts = []";
+        assert_eq!(initial_text(py, 6, 7, &Layout::parse("x,y").unwrap()), "(0.0, 0.0), (1.0, 1.0)");
+        let seeded = format!("std::vector<Point> pts = {{{}}};", initial_text(text, at - 1, at, &Layout::default()));
+        let lit = find(&seeded, 30).unwrap();
+        assert_eq!(read(&seeded, &lit, &Layout::default()), linear());
     }
 }
