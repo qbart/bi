@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::tileset::{Kind, Tile, Tileset};
+use crate::tileset::{Kind, Tile, Tileset, Turn};
 
 #[derive(Debug, Clone)]
 pub struct Img {
@@ -280,6 +280,14 @@ impl Img {
     pub fn tile_paste(&mut self, tile: &Tile) -> std::result::Result<(), String> {
         let Some(map) = self.tileset.as_mut() else { return Err("no grid here".into()) };
         map.paste(&mut self.rgba, self.width, tile)?;
+        self.edited();
+        Ok(())
+    }
+
+    /// `r` and a direction.
+    pub fn tile_turn(&mut self, turn: Turn) -> std::result::Result<(), String> {
+        let Some(map) = self.tileset.as_mut() else { return Err("no grid here".into()) };
+        map.turn(&mut self.rgba, self.width, turn)?;
         self.edited();
         Ok(())
     }

@@ -61,6 +61,60 @@ pub fn parse_size(s: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+/// `r` and a direction: how a tile is turned in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// `rh` — a quarter turn counter-clockwise.
+    Left,
+    /// `rl` — a quarter turn clockwise.
+    Right,
+    /// `rj` — half way round.
+    Half,
+    /// `rx` — mirrored left to right.
+    MirrorX,
+    /// `rk`, `ry` — mirrored top to bottom, which is the half turn followed
+    /// by the left-right mirror.
+    MirrorY,
+}
+
+impl Turn {
+    pub fn from_key(ch: char) -> Option<Self> {
+        Some(match ch {
+            'h' => Self::Left,
+            'l' => Self::Right,
+            'j' => Self::Half,
+            'k' | 'y' => Self::MirrorY,
+            'x' => Self::MirrorX,
+            _ => return None,
+        })
+    }
+
+    /// `pixels` of a `w`×`h` tile, turned. A quarter turn of a tile that
+    /// is not square would not fit its cell, and is refused.
+    fn apply(self, pixels: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+        if matches!(self, Self::Left | Self::Right) && w != h {
+            return Err(format!("{w}×{h} does not turn"));
+        }
+        let at =
+            |x: u32, y: u32| &pixels[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
+        let mut out = Vec::with_capacity(pixels.len());
+        for y in 0..h {
+            for x in 0..w {
+                // Where the pixel landing at (x, y) comes from.
+                let (sx, sy) = match self {
+                    Self::Right => (y, h - 1 - x),
+                    Self::Left => (w - 1 - y, x),
+                    Self::Half => (w - 1 - x, h - 1 - y),
+                    Self::MirrorX => (w - 1 - x, y),
+                    Self::MirrorY => (x, h - 1 - y),
+                };
+                out.extend_from_slice(at(sx, sy));
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// One tile overwritten: where, and both versions of its pixels.
 #[derive(Debug, Clone)]
 struct Edit {
@@ -181,6 +235,18 @@ impl Tileset {
             return Err("no tile here".into());
         }
         self.apply(rgba, width, tile.rgba.clone());
+        Ok(())
+    }
+
+    /// `r` and a direction: the cursor's tile turned in place, one undo
+    /// step. Refused, and nothing recorded, for a quarter turn of a tile
+    /// that is not square.
+    pub fn turn(&mut self, rgba: &mut [u8], width: u32, turn: Turn) -> Result<(), String> {
+        if !self.in_sheet(rgba, width) {
+            return Err("no tile here".into());
+        }
+        let turned = turn.apply(&self.read(rgba, width), self.size.0, self.size.1)?;
+        self.apply(rgba, width, turned);
         Ok(())
     }
 
@@ -389,5 +455,87 @@ mod tests {
         let mut px = sheet(4, 4);
         assert!(map.yank(&px, 4).is_none());
         assert!(map.cut(&mut px, 4).is_none());
+    }
+
+    /// A 2×2 tile whose four pixels are all different, so every turn and
+    /// mirror lands somewhere it can be told apart.
+    fn abcd() -> Vec<u8> {
+        [[1, 0, 0, 255], [2, 0, 0, 255], [3, 0, 0, 255], [4, 0, 0, 255]].concat()
+    }
+
+    fn corners(px: &[u8]) -> [u8; 4] {
+        [px[0], px[4], px[8], px[12]]
+    }
+
+    #[test]
+    fn turns_and_mirrors_land_where_they_say() {
+        let mut map = Tileset::new((2, 2), Kind::Tile);
+        let mut px = abcd();
+        // a b      c a
+        // c d  ->  d b   (a quarter turn right)
+        map.turn(&mut px, 2, Turn::Right).unwrap();
+        assert_eq!(corners(&px), [3, 1, 4, 2]);
+        map.turn(&mut px, 2, Turn::Left).unwrap();
+        assert_eq!(corners(&px), [1, 2, 3, 4], "and back");
+        // a b      d c
+        // c d  ->  b a   (half way round)
+        map.turn(&mut px, 2, Turn::Half).unwrap();
+        assert_eq!(corners(&px), [4, 3, 2, 1]);
+        map.turn(&mut px, 2, Turn::Half).unwrap();
+        // a b      b a
+        // c d  ->  d c   (left-right mirror)
+        map.turn(&mut px, 2, Turn::MirrorX).unwrap();
+        assert_eq!(corners(&px), [2, 1, 4, 3]);
+        map.turn(&mut px, 2, Turn::MirrorX).unwrap();
+        // a b      c d
+        // c d  ->  a b   (top-bottom mirror)
+        map.turn(&mut px, 2, Turn::MirrorY).unwrap();
+        assert_eq!(corners(&px), [3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn four_quarter_turns_are_the_tile_it_was() {
+        let mut map = Tileset::new((2, 2), Kind::Tile);
+        let mut px = abcd();
+        for _ in 0..4 {
+            map.turn(&mut px, 2, Turn::Right).unwrap();
+        }
+        assert_eq!(px, abcd());
+    }
+
+    #[test]
+    fn a_turn_is_one_undo_step() {
+        let mut map = Tileset::new((2, 2), Kind::Tile);
+        let mut px = abcd();
+        map.turn(&mut px, 2, Turn::Half).unwrap();
+        map.turn(&mut px, 2, Turn::MirrorX).unwrap();
+        assert!(map.undo(&mut px, 2));
+        assert_eq!(corners(&px), [4, 3, 2, 1], "only the mirror came off");
+        assert!(map.undo(&mut px, 2));
+        assert_eq!(px, abcd());
+    }
+
+    #[test]
+    fn a_quarter_turn_needs_a_square_tile() {
+        let mut map = Tileset::new((2, 1), Kind::Tile);
+        let mut px = [[1, 0, 0, 255], [2, 0, 0, 255]].concat();
+        assert_eq!(map.turn(&mut px, 2, Turn::Right), Err("2×1 does not turn".to_string()));
+        assert_eq!(map.turn(&mut px, 2, Turn::Left), Err("2×1 does not turn".to_string()));
+        assert_eq!(px[0], 1, "unchanged");
+        map.turn(&mut px, 2, Turn::Half).unwrap();
+        assert_eq!((px[0], px[4]), (2, 1), "the half turn works at any size");
+        assert!(map.undo(&mut px, 2), "the half turn is one step");
+        assert!(!map.undo(&mut px, 2), "and the refusals recorded nothing");
+    }
+
+    #[test]
+    fn a_turn_direction_is_spelled_by_its_key() {
+        assert_eq!(Turn::from_key('h'), Some(Turn::Left));
+        assert_eq!(Turn::from_key('l'), Some(Turn::Right));
+        assert_eq!(Turn::from_key('j'), Some(Turn::Half));
+        assert_eq!(Turn::from_key('k'), Some(Turn::MirrorY));
+        assert_eq!(Turn::from_key('x'), Some(Turn::MirrorX));
+        assert_eq!(Turn::from_key('y'), Some(Turn::MirrorY));
+        assert_eq!(Turn::from_key('q'), None);
     }
 }

@@ -6351,6 +6351,12 @@ impl Editor {
                 None => Some("nothing to paste".to_string()),
                 Some(tile) => img.tile_paste(tile).err(),
             },
+            // `r{char}`: in a buffer the char replaces one under the
+            // cursor; here it is the direction the tile turns.
+            Action::ReplaceChar { ch, .. } => match crate::tileset::Turn::from_key(*ch) {
+                Some(turn) => img.tile_turn(turn).err(),
+                None => Some("rotate what? (r + h j k l x y)".to_string()),
+            },
             Action::Undo => (!img.tile_undo()).then(|| "already at oldest change".to_string()),
             Action::Redo => (!img.tile_redo()).then(|| "already at newest change".to_string()),
             Action::EnterNormal => {
@@ -29424,6 +29430,40 @@ int main(void) {
 
             ed.run_ex("q!");
             assert_eq!(ed.window_ids().len(), windows - 1);
+        }
+
+        #[test]
+        fn r_and_a_direction_turn_the_tile() {
+            let (_d, mut ed) = sheet("turn");
+            let turn = |ed: &mut Editor, ch: char| {
+                ed.apply(cmd(Action::ReplaceChar { ch, count: 1 }));
+            };
+            let img = ed.window_mut().img_mut().unwrap();
+            // Paint the cursor's tile so a turn is visible: one red pixel
+            // in its top-left corner.
+            img.rgba[0..4].copy_from_slice(&[255, 0, 0, 255]);
+            let before = img.rgba.clone();
+
+            turn(&mut ed, 'l');
+            let img = ed.window().img().unwrap();
+            assert!(img.dirty);
+            let tile = img.tile_yank().unwrap();
+            let at = |t: &crate::tileset::Tile, x: usize, y: usize| t.rgba[(y * 10 + x) * 4];
+            assert_eq!(at(&tile, 9, 0), 255, "a quarter turn right puts the corner top-right");
+            assert_eq!(at(&tile, 0, 0), 9);
+
+            turn(&mut ed, 'h');
+            assert_eq!(ed.window().img().unwrap().rgba, before, "and back");
+
+            turn(&mut ed, 'q');
+            assert_eq!(ed.session.status, "rotate what? (r + h j k l x y)");
+
+            ed.run_ex("set tileset size 10x5");
+            turn(&mut ed, 'l');
+            assert_eq!(ed.session.status, "10×5 does not turn");
+            turn(&mut ed, 'j');
+            let tile = ed.window().img().unwrap().tile_yank().unwrap();
+            assert_eq!(tile.rgba[(4 * 10 + 9) * 4], 255, "the half turn works: bottom-right");
         }
 
         #[test]
