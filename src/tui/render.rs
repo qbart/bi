@@ -1816,7 +1816,11 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
                 let (tw, th) = map.size();
                 let (c, r) = map.cursor();
                 let (cols, rows) = map.grid(img.width, img.height);
-                at.push_str(&format!("  {tw}×{th} tile {c},{r} of {cols}×{rows}"));
+                let sel = match map.select() {
+                    (1, 1) => String::new(),
+                    (w, h) => format!(" sel {w},{h}"),
+                };
+                at.push_str(&format!("  {tw}×{th} tile {c},{r}{sel} of {cols}×{rows}"));
             }
             (name, at)
         }
@@ -3203,7 +3207,7 @@ int main(void) {
         terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
         assert_eq!(places.len(), 1, "no grid, no frame: {places:?}");
 
-        ed.run_ex("set tileset size 12");
+        ed.run_ex("tool tileset size 12");
         ed.run_ex("set editor tileset");
         ed.apply(bi::editor::Command {
             count: 1,
@@ -3236,6 +3240,10 @@ int main(void) {
         let text = window_status_text(&ed, ed.focus(), true);
         assert!(text.contains("64×64  12×12 tile 1,1 of 5×5"), "{text}");
         assert!(!text.contains('+'), "{text}");
+        ed.run_ex("tool tileset select 2,2");
+        let text = window_status_text(&ed, ed.focus(), true);
+        assert!(text.contains("12×12 tile 1,1 sel 2,2 of 5×5"), "{text}");
+        ed.run_ex("tool tileset select 1");
         ed.apply(bi::editor::Command {
             count: 1,
             action: bi::editor::Action::Operate {
@@ -3270,7 +3278,7 @@ int main(void) {
 
         let mut ed = Editor::empty();
         ed.run_ex(&format!("e {}", path.display()));
-        ed.run_ex("set tileset size 8");
+        ed.run_ex("tool tileset size 8");
         ed.run_ex("set editor tileset");
         ed.apply(bi::editor::Command {
             count: 1,

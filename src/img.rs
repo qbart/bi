@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::tileset::{Kind, Tile, Tileset, Turn};
+use crate::tileset::{Kind, Sheet, Tile, Tileset, Turn};
 
 #[derive(Debug, Clone)]
 pub struct Img {
@@ -34,13 +34,13 @@ pub struct Img {
     /// Stable per opened image, for a frontend that uploads pixels to the
     /// terminal once and refers to them by number after.
     pub id: u64,
-    /// The grid, while `:set editor tileset` is on. See
-    /// `docs/specs/tileset.md`.
-    tileset: Option<Tileset>,
-    /// The tile size and kind outlive the grid: leaving and coming back
-    /// finds them where they were.
-    tile_size: (u32, u32),
-    tile_kind: Kind,
+    /// The grid: tile size, kind, selection, cursor and the undo history
+    /// of every edit. Always there, from the moment the image opens, so a
+    /// `:tool tileset` command has somewhere to land with the grid off and
+    /// `Esc` throws no history away. See `docs/specs/tileset.md`.
+    grid: Tileset,
+    /// Whether the grid is on screen — `:set editor tileset`.
+    grid_on: bool,
     /// Edited since it was read or written. What `:q` reads.
     pub dirty: bool,
     /// Bumped by every edit. What a frontend that uploaded the pixels once
@@ -94,9 +94,8 @@ impl Img {
             viewport: (0, 0),
             step: 1,
             id,
-            tileset: None,
-            tile_size: (16, 16),
-            tile_kind: Kind::Tile,
+            grid: Tileset::new((16, 16), Kind::Tile),
+            grid_on: false,
             dirty: false,
             generation: 0,
             zoom: 1.0,
@@ -145,101 +144,97 @@ impl Img {
 
     // ---- the tileset: see `docs/specs/tileset.md` ----
 
+    /// The grid, while it is on.
     pub fn tileset(&self) -> Option<&Tileset> {
-        self.tileset.as_ref()
+        self.grid_on.then_some(&self.grid)
     }
 
     pub fn tile_size(&self) -> (u32, u32) {
-        self.tile_size
+        self.grid.size()
     }
 
     pub fn tile_kind(&self) -> Kind {
-        self.tile_kind
+        self.grid.kind()
     }
 
-    /// A new tile size, kept whether or not the grid is on; the cursor is
-    /// re-clamped when it is.
+    pub fn tile_select(&self) -> (u32, u32) {
+        self.grid.select()
+    }
+
+    /// `size 16,16`, on or off; the selection and cursor re-clamp.
     pub fn set_tile_size(&mut self, size: (u32, u32)) {
-        self.tile_size = size;
-        if let Some(map) = &mut self.tileset {
-            map.set_size(size, self.width, self.height);
-        }
+        self.grid.set_size(size, self.width, self.height);
         self.follow_cursor();
     }
 
     pub fn set_tile_kind(&mut self, kind: Kind) {
-        self.tile_kind = kind;
-        if let Some(map) = &mut self.tileset {
-            map.set_kind(kind);
-        }
+        self.grid.set_kind(kind);
+    }
+
+    /// `select 3,3`, on or off.
+    pub fn set_tile_select(&mut self, select: (u32, u32)) {
+        self.grid.set_select(select, self.width, self.height);
+        self.follow_cursor();
     }
 
     /// `:set editor tileset`. A sheet too small for one tile has no grid
     /// to put a cursor on, and says so.
     pub fn enter_tileset(&mut self) -> std::result::Result<(), String> {
-        if self.tileset.is_some() {
-            return Ok(());
-        }
-        let map = Tileset::new(self.tile_size, self.tile_kind);
-        let (cols, rows) = map.grid(self.width, self.height);
+        let (cols, rows) = self.grid.grid(self.width, self.height);
         if cols == 0 || rows == 0 {
-            let (w, h) = self.tile_size;
+            let (w, h) = self.grid.size();
             return Err(format!("{}×{} holds no {w}×{h} tile", self.width, self.height));
         }
-        self.tileset = Some(map);
+        self.grid_on = true;
         self.follow_cursor();
         Ok(())
     }
 
-    /// `Esc`, or `:set editor image`. Size, kind and edits stay.
+    /// `Esc`, or `:set editor image`. The grid keeps everything it had.
     pub fn leave_tileset(&mut self) {
-        self.tileset = None;
+        self.grid_on = false;
     }
 
-    fn grid(&self) -> (u32, u32) {
-        self.tileset.as_ref().map(|m| m.grid(self.width, self.height)).unwrap_or((0, 0))
+    fn cells(&self) -> (u32, u32) {
+        self.grid.grid(self.width, self.height)
     }
 
     /// `hjkl` on the grid, counts multiplied in.
     pub fn tile_move(&mut self, dx: i64, dy: i64) {
-        let grid = self.grid();
-        if let Some(map) = &mut self.tileset {
-            map.move_by(dx, dy, grid);
-        }
+        let cells = self.cells();
+        self.grid.move_by(dx, dy, cells);
         self.follow_cursor();
     }
 
     /// `0` and `$`: a column, or the last.
     pub fn tile_to_col(&mut self, col: Option<u32>) {
-        let grid = self.grid();
-        if let Some(map) = &mut self.tileset {
-            map.to_col(col, grid);
-        }
+        let cells = self.cells();
+        self.grid.to_col(col, cells);
         self.follow_cursor();
     }
 
     /// `gg`, `G`, `5G`: a row, or the last.
     pub fn tile_to_row(&mut self, row: Option<u32>) {
-        let grid = self.grid();
-        if let Some(map) = &mut self.tileset {
-            map.to_row(row, grid);
-        }
+        let cells = self.cells();
+        self.grid.to_row(row, cells);
         self.follow_cursor();
     }
 
     /// `Ctrl-D` / `Ctrl-U`: half a viewport of rows, at least one.
     pub fn tile_half_page(&mut self, down: bool, count: usize) {
         let rows =
-            (self.viewport.1 / 2 / self.tile_size.1.max(1)).max(1) as i64 * count.max(1) as i64;
+            (self.viewport.1 / 2 / self.grid.size().1.max(1)).max(1) as i64 * count.max(1) as i64;
         self.tile_move(0, if down { rows } else { -rows });
     }
 
-    /// The least scroll that puts the cursor's tile wholly in the viewport;
-    /// none when it already is. A viewport smaller than a tile shows the
-    /// tile's top-left.
+    /// The least scroll that puts the selection wholly in the viewport;
+    /// none when it already is, and none with the grid off. A viewport
+    /// smaller than the selection shows its top-left.
     fn follow_cursor(&mut self) {
-        let Some(map) = &self.tileset else { return };
-        let (x, y, w, h) = map.cursor_rect();
+        if !self.grid_on {
+            return;
+        }
+        let (x, y, w, h) = self.grid.cursor_rect();
         let (vw, vh) = self.viewport;
         if vw == 0 || vh == 0 {
             return;
@@ -265,51 +260,75 @@ impl Img {
 
     /// `yy`.
     pub fn tile_yank(&self) -> Option<Tile> {
-        self.tileset.as_ref()?.yank(&self.rgba, self.width)
+        self.grid.yank(&self.rgba, self.width, self.height)
     }
 
-    /// `dd`: the tile, and transparent left behind.
+    /// `dd`: the selection, and transparent left behind.
     pub fn tile_cut(&mut self) -> Option<Tile> {
-        let map = self.tileset.as_mut()?;
-        let tile = map.cut(&mut self.rgba, self.width)?;
+        let Self { grid, rgba, width, height, .. } = self;
+        let tile = grid.cut(&mut Sheet { rgba, width, height })?;
         self.edited();
         Some(tile)
     }
 
     /// `p`.
     pub fn tile_paste(&mut self, tile: &Tile) -> std::result::Result<(), String> {
-        let Some(map) = self.tileset.as_mut() else { return Err("no grid here".into()) };
-        map.paste(&mut self.rgba, self.width, tile)?;
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.paste(&mut Sheet { rgba, width, height }, tile)?;
         self.edited();
         Ok(())
     }
 
     /// `r` and a direction.
     pub fn tile_turn(&mut self, turn: Turn) -> std::result::Result<(), String> {
-        let Some(map) = self.tileset.as_mut() else { return Err("no grid here".into()) };
-        map.turn(&mut self.rgba, self.width, turn)?;
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.turn(&mut Sheet { rgba, width, height }, turn)?;
         self.edited();
+        Ok(())
+    }
+
+    /// `image resize 32,32` — in tiles, on or off.
+    pub fn canvas_resize(&mut self, tiles: (u32, u32)) -> std::result::Result<(), String> {
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.resize(&mut Sheet { rgba, width, height }, tiles)?;
+        self.resized();
+        Ok(())
+    }
+
+    /// `image grow 1,1` — in tiles, negative to shrink, on or off.
+    pub fn canvas_grow(&mut self, delta: (i64, i64)) -> std::result::Result<(), String> {
+        let Self { grid, rgba, width, height, .. } = self;
+        grid.grow(&mut Sheet { rgba, width, height }, delta)?;
+        self.resized();
         Ok(())
     }
 
     /// `u`. False when there is nothing left to undo.
     pub fn tile_undo(&mut self) -> bool {
-        let Some(map) = self.tileset.as_mut() else { return false };
-        let done = map.undo(&mut self.rgba, self.width);
+        let Self { grid, rgba, width, height, .. } = self;
+        let done = grid.undo(&mut Sheet { rgba, width, height });
         if done {
-            self.edited();
+            self.resized();
         }
         done
     }
 
     /// `Ctrl-R`.
     pub fn tile_redo(&mut self) -> bool {
-        let Some(map) = self.tileset.as_mut() else { return false };
-        let done = map.redo(&mut self.rgba, self.width);
+        let Self { grid, rgba, width, height, .. } = self;
+        let done = grid.redo(&mut Sheet { rgba, width, height });
         if done {
-            self.edited();
+            self.resized();
         }
         done
+    }
+
+    /// After anything that may have changed the dimensions: the crop is
+    /// re-clamped to the sheet and the selection is brought back in view.
+    fn resized(&mut self) {
+        self.edited();
+        self.clamp();
+        self.follow_cursor();
     }
 
     fn edited(&mut self) {

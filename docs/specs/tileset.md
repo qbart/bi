@@ -28,28 +28,70 @@ because the mode lives on the image and focus moving off it changes nothing.
 :set editor image            and off again — what Esc does
 :set editor                  says which
 
-:set tileset size 16x16      one tile, in pixels; the default
-:set tileset size 16         square, same thing
-:set tileset size            says what it is
-:set tileset kind tile       the only kind that is built
-:set tileset kind hex        parses, and is refused: "hex is not built yet"
+:tool tileset size 16,16     one tile, in pixels; the default
+:tool tileset size 16        square, same thing
+:tool tileset kind tile      the only kind that is built
+:tool tileset kind hex       parses, and is refused: "hex is not built yet"
+:tool tileset select 3,3     the cursor is a block of tiles — see below
+:tool tileset image resize 32,32    the canvas, in tiles
+:tool tileset image grow 1,1        that many tiles more, in tiles
 ```
 
-These are spelled `:set` and are **not options**. Options resolve per
-buffer, and an image is a `Content` on a window, not a buffer — there is no
-`[options]` line, no `[filetype.png]`, no layer stack. `fileencoding` set
-the precedent: buffer-local facts handled in `set_option` before the option
-lookup. `editor` and `tileset` are handled the same way, on the focused
-window's image, and on any other kind of window say `no image here`.
+Each setting without its value reports it: `:tool tileset size` says
+`tileset size=16,16`.
 
-Size and kind stay on the image after `Esc`, so leaving and coming back
-finds the grid where it was. They can be set before the mode is entered or
-after; a size change re-clamps the cursor.
+**One `:set`, the rest `:tool`.** `:set editor` picks what the window is
+for, which is the kind of thing `:set` says. Everything about the grid
+itself — its size, its shape, how much the cursor selects, and the canvas
+commands that reshape the picture under it — is a tool being operated, not
+an option being set, and is spelled `:tool tileset …`. `:tool` alone says
+`tool what? (tileset)`; `:tool tileset` alone lists what it takes.
+
+None of these are **options**. Options resolve per buffer, and an image is
+a `Content` on a window, not a buffer — there is no `[options]` line, no
+`[filetype.png]`, no layer stack. `fileencoding` set the precedent:
+buffer-local facts handled in `set_option` before the option lookup.
+`editor` is handled the same way, on the focused window's image; `:tool`
+lands on the same image, and on any other kind of window both say `no
+image here`.
+
+**Pairs take a comma.** `16,16`, never `16x16`: the `x` reads as a
+letter in a number, and a comma is what a pair of numbers is spelled with
+everywhere else on the ex line. A bare `16` means both. `16x16` is refused
+with `not a pair: 16x16 (want 16 or 16,16)`. What bi *prints* keeps `×`
+for a dimension — `1920×1080` is a size, `tile 3,2` is a position — and
+echoes a setting the way it is typed: `tileset size=16,16`.
+
+**The grid is always there.** The image carries its tileset — size, kind,
+selection, cursor and the undo history — from the moment it opens;
+`:set editor tileset` only puts it on screen. That is what lets
+`:tool tileset size 8` be given before the grid is on, `image resize` work
+on a plain picture, and `Esc` throw no history away: `u` after coming
+back still undoes what was done before leaving.
+
+**The selection.** `select 3,3` makes the cursor a block three tiles wide
+and three tall. `yy`, `dd`, `p` and `r` act on the block — a 48×48 yank
+from 16-pixel tiles — while `hjkl` still step **one tile**, and the block
+stops where the grid does: on a 6×6 grid a 3×3 selection starts no further
+than column 3. The selection is clamped to the grid when set, never less
+than one, and re-clamped when the tile size or the canvas changes. `p`
+pastes whatever the slot holds with its top-left at the cursor, whatever
+the selection is now — a block yanked wide pastes wide — and is refused,
+not clipped, when it runs past the sheet: `48×48 does not fit at 5,5`.
+
+**The canvas.** `image resize 32,32` makes the picture thirty-two tiles a
+side: the pixels it had stay at the top-left, new room is transparent, and
+anything past the new edge is cropped away. `image grow 1,1` adds a tile
+to the right and one to the bottom of the size it has *in pixels*, so a
+sheet with a ragged edge keeps its ragged edge; negative shrinks, never
+below one tile. Both report the new size — `512×512` — and both are one
+undo step that brings every cropped pixel back. The frontend sees a new
+generation and re-uploads, as after any edit.
 
 **Whole tiles only.** A 100×100 sheet with 16-pixel tiles is a 6×6 grid; the
 four-pixel remainder is not a tile, the cursor never reaches it, and `:w`
-writes it back untouched. A sheet smaller than one tile has no grid, and
-entering the mode says so.
+writes it back untouched — `image grow` is how it becomes one. A sheet
+smaller than one tile has no grid, and entering the mode says so.
 
 ## The model
 
@@ -57,19 +99,24 @@ entering the mode says so.
 pub struct Tileset {
     size: (u32, u32),          // one tile, in pixels
     kind: Kind,                // Tile; Hex is parsed and refused
-    cursor: (u32, u32),        // column, row — in tiles
-    undo: Vec<Edit>,
+    cursor: (u32, u32),        // column, row — in tiles; the block's top-left
+    select: (u32, u32),        // columns, rows the cursor selects
+    undo: Vec<Edit>,           // Block { rect, before, after } | Canvas { .. }
     redo: Vec<Edit>,
 }
 
 pub struct Tile { pub width: u32, pub height: u32, pub rgba: Vec<u8> }
+
+/// The image's pixels and dimensions, lent for one operation.
+pub struct Sheet<'a> { rgba: &'a mut Vec<u8>, width: &'a mut u32, height: &'a mut u32 }
 ```
 
-`Img` gains three fields beside its pixels: `tileset: Option<Tileset>` —
-`Some` exactly while the mode is on — plus `dirty: bool` and
-`generation: u64`. The tileset's size and kind outlive the `Option`: they
-are kept on the image (`tile_size`, `tile_kind`) and the `Tileset` is built
-from them on entry. That is what "stays after Esc" is made of.
+`Img` gains `grid: Tileset` and `grid_on: bool` beside its pixels, plus
+`dirty: bool` and `generation: u64`. The tileset never owns pixels: the
+image lends them as a `Sheet` for each yank, cut, paste, turn, resize and
+undo, and a resize writes the new dimensions back through it. `Img::tileset()`
+answers `Some` only while the grid is on, which is what the renderer and
+the key handler ask.
 
 **One register slot.** `Session::tile: Option<Tile>` — shared by every
 image in the session, so a tile yanked from one sheet pastes into another.
@@ -79,9 +126,10 @@ misses it. Separate from the text ring on purpose: text and pixels do not
 paste into each other, so one ring for both would be two rings wearing one
 coat.
 
-**Undo is per image.** Each `dd` and `p` records the tile it overwrote —
-position and the pixels that were there — on the image's undo stack, and
-`u` puts them back, moving the edit to the redo stack for `Ctrl-R`. A fresh
+**Undo is per image.** Each `dd`, `p` and `r` records the block it
+overwrote — where, and the pixels that were there — and a resize records
+the whole sheet it replaced. `u` puts them back, moving the edit to the
+redo stack for `Ctrl-R`; redoing a resize is the resize again. A fresh
 edit clears redo, as text undo does. `dd` without undo is a scary key.
 
 **Dirty and generation.** Every edit sets `dirty` and bumps `generation`.
@@ -100,9 +148,9 @@ h j k l        one tile; counts multiply
 0  ^           first column          $  g_    last column
 gg             first row             G       last row;  5G  row 5
 Ctrl-D/U       half a viewport of rows, down / up
-dd             yank the tile into the slot, then clear it to transparent
-yy             yank the tile into the slot
-p  P           paste the slot over the tile under the cursor
+dd             yank the selection into the slot, then clear it to transparent
+yy             yank the selection into the slot
+p  P           paste the slot with its top-left at the cursor
 u  Ctrl-R      undo, redo
 rh  rl         turn the tile a quarter left, right
 rj             turn it half way round
@@ -114,10 +162,10 @@ Esc            leave the mode
 the operation a sheet most wants. Clear means transparent, `(0,0,0,0)`: the
 sheet is RGBA in memory whatever it was on disk, and PNG keeps the alpha.
 
-`p` with an empty slot says `nothing to paste`. `p` with a slot whose size
-is not the grid's says so — `tile is 16×16, grid is 32×32` — and does
-nothing; a clipped paste is a guess about which corner you meant. `p` and
-`P` are the same key: a tile has no before and after.
+`p` with an empty slot says `nothing to paste`. `p` with a block that runs
+past the sheet says so — `48×48 does not fit at 5,5` — and does nothing; a
+clipped paste is a guess about which corner you meant. `p` and `P` are the
+same key: a tile has no before and after.
 
 **`r` turns the tile in place.** In an image window `r` has no character
 to replace, so `Input` reads it as "turn", and the key after it is a fresh
@@ -129,10 +177,11 @@ turn, `rk` the half turn followed by a left-right mirror — which is a
 top-to-bottom mirror, and `ry` spells the same thing so the mirrors read as
 a pair with `rx`; `x` and `y` are the two keys that are not directions and
 are taken as themselves. Any other key says `rotate what? (r + h j k l x
-y)`. In a text buffer `r` is still replace. A quarter turn of a 16×8 tile is an
-8×16 tile that does not fit its cell, so `rh` and `rl` are refused on a
-tile that is not square — `16×8 does not turn` — while the half turn and
-the mirrors work at any size. Every turn is one undo step, like a paste.
+y)`. In a text buffer `r` is still replace. The whole selection turns as one
+block, and a quarter turn of a 16×8 block is an 8×16 block that does not
+fit where it came from, so `rh` and `rl` are refused on a block that is not
+square — `16×8 does not turn` — while the half turn and the mirrors work
+at any size. Two 8×16 tiles side by side are a square, and turn. Every turn is one undo step, like a paste.
 
 **The crop follows the cursor.** After every move the scroll shifts by the
 least that puts the cursor's tile fully inside the viewport — so `G` on a
@@ -196,7 +245,8 @@ what a test sees.
 ## The status row
 
 The left half of an image's row says `1920×1080`; with the tileset on it
-says `1920×1080  16×16 tile 3,2 of 6×6`, and a `+` after the name when the
+says `1920×1080  16×16 tile 3,2 of 6×6` — `sel 3,3` between, when the
+selection is more than one tile — and a `+` after the name when the
 image is dirty, as a buffer's row does. The right half — the mode segment
 the plain image omits because it has no modes — says `TILESET`, because
 this one does.
@@ -206,20 +256,31 @@ this one does.
 - `:set editor tileset` on a text buffer says `no image here`; on an image
   the tileset is on with the cursor at 0,0; `:set editor image` and `Esc`
   turn it off; `:set editor` reports.
-- `:set tileset size 16x16` and `16` are the same; `size` reports; a bad
-  size says so; `kind hex` is refused; `kind tile` is accepted.
+- `:tool tileset size 16,16` and `16` are the same; `size` reports
+  `tileset size=16,16`; `16x16` is refused as not a pair; `kind hex` is
+  refused; `kind tile` is accepted; `:tool` and `:tool lathe` say what
+  they want; `:set tileset` is an unknown option.
+- `select 2,2` makes `yy` take a block twice the tile and `hjkl` still
+  step one tile; the status row says `sel 2,2`; the block stops at the
+  grid's edge; a block pastes wherever it fits and is refused where it
+  does not; `select 1x1` is refused.
+- `image resize 3,2` on a 50×40 sheet of 10-pixel tiles makes it 30×20
+  and dirty; `image grow 1,1` makes that 40×30 with the new room clear;
+  two `u` bring the 50×40 and its pixels back; `grow -1x1` is refused.
+- `size`, `select` and `image resize` all work with the grid off, and the
+  grid comes on with what they set.
 - The grid is whole tiles: 100×100 at 16 is 6×6; the cursor clamps to it;
-  a size change re-clamps.
+  a size change re-clamps the cursor and the selection.
 - `hjkl` move by tiles and counts multiply; `0`/`$`/`gg`/`G` hit the grid's
   edges; `5G` goes to row 5.
 - The crop follows the cursor and stays put when it already contains it.
 - `yy` puts the tile's pixels in the slot; `dd` puts them there and leaves
   transparent behind; `p` writes the slot over the cursor's tile; the slot
   survives `Esc` and a second image.
-- `p` with an empty slot and `p` with a mismatched size are refused with a
-  message and change nothing.
+- `p` with an empty slot and `p` with a block that runs past the sheet are
+  refused with a message and change nothing.
 - `u` restores what `dd` cleared; `Ctrl-R` clears it again; a new edit
-  drops redo.
+  drops redo; a resize undoes as one step with every cropped pixel back.
 - `rl` then `rh` is the tile it was; four `rl` are too; `rj` is two `rl`;
   `rk` is `rj` then `rx`, and equals `ry`; each is one undo step.
 - `rl` on a 16×8 tile is refused with `16×8 does not turn` and changes

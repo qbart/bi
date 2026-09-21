@@ -1704,6 +1704,9 @@ enum ExLine {
     /// `:zoom`, `:zoom 0`, `:zoom +`, `:zoom -`, `:zoom 5` — the image's
     /// zoom. See `docs/specs/zoom.md`.
     Zoom(String),
+    /// `:tool tileset …` — the grid's settings and canvas commands. See
+    /// `docs/specs/tileset.md`.
+    Tool(String),
     /// `:yname <register>` — stores the capture waiting on a name. Typed by
     /// the prompt `"n` prefills far more often than by hand. With a range or
     /// a selection it is a scoped yank instead: the region goes straight into
@@ -2220,6 +2223,7 @@ fn parse_ex(line: &str) -> Option<ExLine> {
         "hls" | "hlsearch" => ExLine::Highlight(true),
         "set" => ExLine::Set(arg.into()),
         "zoom" => ExLine::Zoom(arg.into()),
+        "tool" => ExLine::Tool(arg.into()),
         "themes" => ExLine::Themes,
         "yname" => match arg {
             "" => ExLine::Error("name it what? `:yname {register}`".into()),
@@ -7328,6 +7332,7 @@ impl Editor {
             ExLine::Whitespace(on) => self.set_whitespace(on),
             ExLine::Set(arg) => self.set_option(&arg),
             ExLine::Zoom(arg) => self.zoom(&arg),
+            ExLine::Tool(arg) => self.tool(&arg),
             ExLine::Name { scope, name } => {
                 // The capture the `"n` prompt is holding wins a bare
                 // `:yname` — that is the prompt flow. A range, a selection,
@@ -7782,59 +7787,112 @@ impl Editor {
         }
     }
 
-    /// `:set editor tileset|image` and `:set tileset size|kind …`, on the
-    /// focused window's image.
-    fn set_image_setting(&mut self, name: &str, value: &str) {
+    /// `:set editor tileset|image`, on the focused window's image. The
+    /// one `:set` a picture has; everything else about the grid is
+    /// `:tool tileset`. See `docs/specs/tileset.md`.
+    fn set_editor(&mut self, value: &str) {
         let Some(img) = self.window_mut().img_mut() else {
             self.session.status = "no image here".into();
             return;
         };
-        let message = match name {
-            "editor" => match value {
-                "" => {
-                    format!("editor={}", if img.tileset().is_some() { "tileset" } else { "image" })
-                }
-                "tileset" => match img.enter_tileset() {
-                    Ok(()) => String::new(),
-                    Err(e) => e,
-                },
-                "image" => {
-                    img.leave_tileset();
+        self.session.status = match value {
+            "" => format!("editor={}", if img.tileset().is_some() { "tileset" } else { "image" }),
+            "tileset" => img.enter_tileset().err().unwrap_or_default(),
+            "image" => {
+                img.leave_tileset();
+                String::new()
+            }
+            other => format!("not an editor: {other} (want tileset or image)"),
+        };
+    }
+
+    /// `:tool tileset …` — the grid's settings and the canvas commands,
+    /// on the focused window's image, grid on or off:
+    ///
+    /// ```text
+    /// size 16,16      kind tile      select 3,3
+    /// image resize 32,32             image grow 1,1
+    /// ```
+    ///
+    /// Each without its value reports. Pairs take a comma, never an `x`.
+    fn tool(&mut self, arg: &str) {
+        let (tool, rest) = match arg.trim().split_once(char::is_whitespace) {
+            Some((tool, rest)) => (tool, rest.trim()),
+            None => (arg.trim(), ""),
+        };
+        match tool {
+            "" => self.session.status = "tool what? (tileset)".into(),
+            "tileset" => self.tileset_tool(rest),
+            other => self.session.status = format!("not a tool: {other} (want tileset)"),
+        }
+    }
+
+    fn tileset_tool(&mut self, arg: &str) {
+        use crate::tileset::{Kind, parse_delta, parse_pair};
+        let Some(img) = self.window_mut().img_mut() else {
+            self.session.status = "no image here".into();
+            return;
+        };
+        let (what, value) = match arg.split_once(char::is_whitespace) {
+            Some((what, value)) => (what, value.trim()),
+            None => (arg, ""),
+        };
+        let message = match (what, value) {
+            ("size", "") => {
+                let (w, h) = img.tile_size();
+                format!("tileset size={w},{h}")
+            }
+            ("size", value) => match parse_pair(value) {
+                Ok(size) => {
+                    img.set_tile_size(size);
                     String::new()
                 }
-                other => format!("not an editor: {other} (want tileset or image)"),
+                Err(e) => e,
             },
-            _ => {
-                let (what, value) = match value.split_once(' ') {
-                    Some((what, value)) => (what.trim(), value.trim()),
+            ("kind", "") => format!("tileset kind={}", img.tile_kind().as_str()),
+            ("kind", value) => match Kind::parse(value) {
+                Some(kind) => match kind.refusal() {
+                    Some(why) => why.into(),
+                    None => {
+                        img.set_tile_kind(kind);
+                        String::new()
+                    }
+                },
+                None => format!("not a tile kind: {value} (want tile)"),
+            },
+            ("select", "") => {
+                let (w, h) = img.tile_select();
+                format!("tileset select={w},{h}")
+            }
+            ("select", value) => match parse_pair(value) {
+                Ok(select) => {
+                    img.set_tile_select(select);
+                    String::new()
+                }
+                Err(e) => e,
+            },
+            ("image", value) => {
+                let (op, value) = match value.split_once(char::is_whitespace) {
+                    Some((op, value)) => (op, value.trim()),
                     None => (value, ""),
                 };
-                match (what, value) {
-                    ("size", "") => {
-                        let (w, h) = img.tile_size();
-                        format!("tileset size={w}×{h}")
+                let result = match (op, value) {
+                    ("resize", value) if !value.is_empty() => {
+                        parse_pair(value).and_then(|tiles| img.canvas_resize(tiles))
                     }
-                    ("size", value) => match crate::tileset::parse_size(value) {
-                        Ok(size) => {
-                            img.set_tile_size(size);
-                            String::new()
-                        }
-                        Err(e) => e,
-                    },
-                    ("kind", "") => format!("tileset kind={}", img.tile_kind().as_str()),
-                    ("kind", value) => match crate::tileset::Kind::parse(value) {
-                        Some(kind) => match kind.refusal() {
-                            Some(why) => why.into(),
-                            None => {
-                                img.set_tile_kind(kind);
-                                String::new()
-                            }
-                        },
-                        None => format!("not a tile kind: {value} (want tile)"),
-                    },
-                    _ => "set what? (tileset size 16x16, tileset kind tile)".into(),
+                    ("grow", value) if !value.is_empty() => {
+                        parse_delta(value).and_then(|delta| img.canvas_grow(delta))
+                    }
+                    _ => Err("image what? (resize 32,32, grow 1,1)".into()),
+                };
+                // A resize says what the canvas is now — the one number a
+                // resize is about.
+                match result {
+                    Ok(()) => format!("{}×{}", img.width, img.height),
+                    Err(e) => e,
                 }
             }
+            _ => "tileset what? (size, kind, select, image resize, image grow)".into(),
         };
         self.session.status = message;
     }
@@ -7860,8 +7918,8 @@ impl Editor {
         // The same again for a picture: `editor` and `tileset` are facts
         // about the image in the focused window, which no option layer can
         // hold because an image is not a buffer. See `docs/specs/tileset.md`.
-        if matches!(name, "editor" | "tileset") {
-            return self.set_image_setting(name, value);
+        if name == "editor" {
+            return self.set_editor(value);
         }
 
         if value.is_empty() {
@@ -29183,7 +29241,7 @@ int main(void) {
             let d = PngDir::new(tag);
             let mut ed = Editor::empty();
             ed.run_ex(&format!("e {}", d.png().display()));
-            ed.run_ex("set tileset size 10");
+            ed.run_ex("tool tileset size 10");
             ed.run_ex("set editor tileset");
             (d, ed)
         }
@@ -29227,23 +29285,121 @@ int main(void) {
         #[test]
         fn size_and_kind_are_set_reported_and_refused() {
             let (_d, mut ed) = sheet("size");
-            ed.run_ex("set tileset size");
-            assert_eq!(ed.session.status, "tileset size=10×10");
+            ed.run_ex("tool tileset size");
+            assert_eq!(ed.session.status, "tileset size=10,10");
 
-            ed.run_ex("set tileset size 8x16");
-            ed.run_ex("set tileset size");
-            assert_eq!(ed.session.status, "tileset size=8×16");
+            ed.run_ex("tool tileset size 8,16");
+            ed.run_ex("tool tileset size");
+            assert_eq!(ed.session.status, "tileset size=8,16");
 
-            ed.run_ex("set tileset size huge");
-            assert!(ed.session.status.contains("not a tile size"), "{}", ed.session.status);
+            ed.run_ex("tool tileset size 8x16");
+            assert_eq!(ed.session.status, "not a pair: 8x16 (want 16 or 16,16)");
+            ed.run_ex("tool tileset size huge");
+            assert!(ed.session.status.contains("not a pair"), "{}", ed.session.status);
 
-            ed.run_ex("set tileset kind hex");
+            ed.run_ex("tool tileset kind hex");
             assert_eq!(ed.session.status, "hex is not built yet");
-            ed.run_ex("set tileset kind");
+            ed.run_ex("tool tileset kind");
             assert_eq!(ed.session.status, "tileset kind=tile");
 
-            ed.run_ex("set tileset wat");
-            assert!(ed.session.status.contains("tileset size"), "{}", ed.session.status);
+            ed.run_ex("tool tileset wat");
+            assert_eq!(
+                ed.session.status,
+                "tileset what? (size, kind, select, image resize, image grow)"
+            );
+            ed.run_ex("tool");
+            assert_eq!(ed.session.status, "tool what? (tileset)");
+            ed.run_ex("tool lathe");
+            assert_eq!(ed.session.status, "not a tool: lathe (want tileset)");
+
+            ed.run_ex("set tileset size 8");
+            assert_eq!(ed.session.status, "unknown option: tileset", "no longer a :set");
+        }
+
+        #[test]
+        fn the_tool_needs_an_image() {
+            let mut ed = editor("text");
+            ed.run_ex("tool tileset size 8");
+            assert_eq!(ed.session.status, "no image here");
+        }
+
+        /// `select 3,3` makes the cursor a block of tiles: yank, cut, paste
+        /// and turn act on the block; `hjkl` still step one tile.
+        #[test]
+        fn select_widens_what_the_keys_act_on_but_not_the_step() {
+            let (_d, mut ed) = sheet("select");
+            ed.run_ex("tool tileset select 2,2");
+            ed.run_ex("tool tileset select");
+            assert_eq!(ed.session.status, "tileset select=2,2");
+            let img = ed.window().img().unwrap();
+            assert_eq!(img.tileset().unwrap().cursor_rect(), (0, 0, 20, 20));
+
+            ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
+            let block = ed.session.tile.clone().unwrap();
+            assert_eq!((block.width, block.height), (20, 20));
+
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            assert_eq!(cursor(&ed), (1, 0), "one tile, not one selection");
+            assert_eq!(ed.window().img().unwrap().tileset().unwrap().cursor_rect().0, 10);
+
+            ed.run_ex("tool tileset select 1,1");
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            ed.apply(paste(false, 1));
+            assert_eq!(ed.session.status, "", "a 20×20 block pastes at 3,0 on a 50-wide sheet");
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            ed.apply(paste(false, 1));
+            assert_eq!(ed.session.status, "20×20 does not fit at 4,0");
+
+            ed.run_ex("tool tileset select 1x1");
+            assert_eq!(ed.session.status, "not a pair: 1x1 (want 16 or 16,16)");
+        }
+
+        /// `image resize 32,32` and `image grow 1,1` are in tiles, change the
+        /// image's size, mark it dirty, and undo as one step.
+        #[test]
+        fn resize_and_grow_change_the_canvas_in_tiles() {
+            let (_d, mut ed) = sheet("canvas");
+            ed.run_ex("tool tileset image resize 3,2");
+            let img = ed.window().img().unwrap();
+            assert_eq!((img.width, img.height), (30, 20));
+            assert!(img.dirty);
+            assert_eq!(img.rgba.len(), 30 * 20 * 4);
+            assert_eq!(ed.session.status, "30×20");
+
+            ed.run_ex("tool tileset image grow 1,1");
+            let img = ed.window().img().unwrap();
+            assert_eq!((img.width, img.height), (40, 30));
+            assert_eq!(&img.rgba[(29 * 40 + 39) * 4..], &[0, 0, 0, 0], "new room is clear");
+
+            ed.apply(cmd(Action::Undo));
+            ed.apply(cmd(Action::Undo));
+            let img = ed.window().img().unwrap();
+            assert_eq!((img.width, img.height), (50, 40), "both steps came back");
+            assert_eq!(img.rgba[3], 255, "and the photo with them");
+
+            ed.run_ex("tool tileset image grow -1x1");
+            assert!(ed.session.status.starts_with("not a change"), "{}", ed.session.status);
+            ed.run_ex("tool tileset image resize 0,1");
+            assert_eq!(ed.session.status, "not a pair: 0,1 (want 16 or 16,16)");
+            ed.run_ex("tool tileset image");
+            assert_eq!(ed.session.status, "image what? (resize 32,32, grow 1,1)");
+        }
+
+        /// The tool works with the grid off too: size and selection are the
+        /// image's, and a resize is a resize.
+        #[test]
+        fn the_tool_works_before_the_grid_is_on() {
+            let d = PngDir::new("early");
+            let mut ed = Editor::empty();
+            ed.run_ex(&format!("e {}", d.png().display()));
+            ed.run_ex("tool tileset size 5");
+            ed.run_ex("tool tileset select 2,2");
+            ed.run_ex("tool tileset image resize 4,4");
+            let img = ed.window().img().unwrap();
+            assert_eq!((img.width, img.height), (20, 20));
+            ed.run_ex("set editor tileset");
+            assert_eq!(ed.window().img().unwrap().tileset().unwrap().select(), (2, 2));
         }
 
         #[test]
@@ -29253,7 +29409,7 @@ int main(void) {
             ed.apply(cmd(Action::Move(Motion::LastLine)));
             assert_eq!(cursor(&ed), (4, 3));
 
-            ed.run_ex("set tileset size 25x20");
+            ed.run_ex("tool tileset size 25,20");
             assert_eq!(cursor(&ed), (1, 1), "re-clamped to the 2×2 grid");
 
             ed.apply(cmd(Action::EnterNormal));
@@ -29303,7 +29459,7 @@ int main(void) {
         fn yank_cut_and_paste_move_a_tile_through_the_slot() {
             let (_d, mut ed) = sheet("cut");
             let img = ed.window().img().unwrap();
-            let painted = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
+            let painted = img.tileset().unwrap().yank(&img.rgba, img.width, img.height).unwrap();
 
             ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
             assert_eq!(ed.session.tile.as_ref(), Some(&painted));
@@ -29312,13 +29468,16 @@ int main(void) {
             ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
             let img = ed.window().img().unwrap();
             assert!(img.dirty);
-            let cleared = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
+            let cleared = img.tileset().unwrap().yank(&img.rgba, img.width, img.height).unwrap();
             assert!(cleared.rgba.iter().all(|&b| b == 0), "transparent");
 
             ed.apply(cmd(Action::Move(Motion::Right)));
             ed.apply(paste(false, 1));
             let img = ed.window().img().unwrap();
-            assert_eq!(img.tileset().unwrap().yank(&img.rgba, img.width).unwrap(), painted);
+            assert_eq!(
+                img.tileset().unwrap().yank(&img.rgba, img.width, img.height).unwrap(),
+                painted
+            );
         }
 
         #[test]
@@ -29331,11 +29490,11 @@ int main(void) {
             let other = d.0.join("other.png");
             image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0])).save(&other).unwrap();
             ed.run_ex(&format!("e {}", other.display()));
-            ed.run_ex("set tileset size 10");
+            ed.run_ex("tool tileset size 10");
             ed.run_ex("set editor tileset");
             ed.apply(paste(false, 1));
             let img = ed.window().img().unwrap();
-            let pasted = img.tileset().unwrap().yank(&img.rgba, img.width).unwrap();
+            let pasted = img.tileset().unwrap().yank(&img.rgba, img.width, img.height).unwrap();
             assert_eq!(pasted.rgba[3], 255, "the photo's opaque pixels landed");
         }
 
@@ -29345,9 +29504,11 @@ int main(void) {
             ed.apply(paste(false, 1));
             assert_eq!(ed.session.status, "nothing to paste");
 
-            ed.session.tile = Some(Tile { width: 4, height: 4, rgba: vec![0; 64] });
+            // Any block that fits pastes; one that runs past the sheet
+            // does not — the 50-wide sheet holds no 60-wide block.
+            ed.session.tile = Some(Tile { width: 60, height: 4, rgba: vec![0; 60 * 4 * 4] });
             ed.apply(paste(true, 1));
-            assert_eq!(ed.session.status, "tile is 4×4, grid is 10×10");
+            assert_eq!(ed.session.status, "60×4 does not fit at 0,0");
             let img = ed.window().img().unwrap();
             assert!(!img.dirty);
         }
@@ -29465,7 +29626,7 @@ int main(void) {
             turn(&mut ed, None);
             assert_eq!(ed.session.status, "rotate what? (r + h j k l x y)");
 
-            ed.run_ex("set tileset size 10x5");
+            ed.run_ex("tool tileset size 10,5");
             turn(&mut ed, Some(Turn::Right));
             assert_eq!(ed.session.status, "10×5 does not turn");
             turn(&mut ed, Some(Turn::Half));
@@ -29511,7 +29672,7 @@ int main(void) {
             let d = PngDir::new("tiny");
             let mut ed = Editor::empty();
             ed.run_ex(&format!("e {}", d.png().display()));
-            ed.run_ex("set tileset size 64");
+            ed.run_ex("tool tileset size 64");
             ed.run_ex("set editor tileset");
             assert!(!on(&ed));
             assert_eq!(ed.session.status, "50×40 holds no 64×64 tile");
