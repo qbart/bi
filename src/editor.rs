@@ -6166,6 +6166,13 @@ impl Editor {
 
         match cmd {
             WindowCmd::Split { dir, path } => {
+                let path = match path {
+                    Some(path) => match self.expand_path(&path) {
+                        Some(path) => Some(path),
+                        None => return,
+                    },
+                    None => None,
+                };
                 // The content first: a failure to open must not leave a split
                 // showing the wrong thing. `None` means a bare split, which
                 // duplicates whatever this window holds rather than naming
@@ -7480,7 +7487,10 @@ impl Editor {
         match parsed {
             ExLine::Window(cmd) => self.run_window_cmd(cmd),
             ExLine::Buffer(cmd) => self.run_buffer_cmd(cmd),
-            ExLine::Edit { path, enc, ff, force } => self.edit_path_how(&path, enc, ff, force),
+            ExLine::Edit { path, enc, ff, force } => {
+                let Some(path) = self.expand_path(&path) else { return };
+                self.edit_path_how(&path, enc, ff, force)
+            }
             ExLine::Quit { force } => self.quit(force),
             ExLine::QuitAll { force } => self.quit_all(force),
             ExLine::WriteAll { force } => self.write_all(force),
@@ -7578,6 +7588,7 @@ impl Editor {
 
             // The rest need the rope, and so need a view.
             ExLine::Write { path, force } => {
+                let Some(path) = self.expand_path(&path) else { return };
                 if self.window().img().is_some() {
                     self.write_image(&path);
                 } else {
@@ -7600,6 +7611,7 @@ impl Editor {
                 self.in_view(|view| view.goto(address));
             }
             ExLine::WriteQuit { path, force } => {
+                let Some(path) = self.expand_path(&path) else { return };
                 let written = match self.window().img().is_some() {
                     true => self.write_image(&path),
                     false => self.in_view(|view| view.write(&path, force)) == Some(true),
@@ -9595,15 +9607,41 @@ impl Editor {
         // that file, so it is the window's alternate. A log has no path of
         // its own to offer, and "no file name" would make `:!!` from the
         // log a different command from the one it repeats.
-        let (current, alternate) = match self.window().buffer() {
-            Some(id) if self.entry(id).buffer.is_transient() => (self.window().alt_buffer(), None),
-            current => (current, self.window().alt_buffer()),
-        };
-        let current = current.and_then(|id| self.entry(id).buffer.path.clone());
-        let alternate = alternate.and_then(|id| self.entry(id).buffer.path.clone());
-        let current = current.map(|p| p.display().to_string());
-        let alternate = alternate.map(|p| p.display().to_string());
+        let (current, alternate) = self.file_names();
         shell::expand(cmd, current.as_deref(), alternate.as_deref())
+    }
+
+    /// What `%` and `#` mean in the focused window: its file, buffer or
+    /// picture, and its alternate's. From a `:!` log, the file the command
+    /// was run from — the log's alternate — and no alternate.
+    fn file_names(&self) -> (Option<String>, Option<String>) {
+        let window = self.window();
+        let of = |content: &Content| -> Option<String> {
+            match content {
+                Content::Text(text) => self.entry(text.buffer).buffer.path.clone(),
+                Content::Image(img) => Some(img.path.clone()),
+                _ => None,
+            }
+            .map(|p| p.display().to_string())
+        };
+        let transient = window.buffer().is_some_and(|id| self.entry(id).buffer.is_transient());
+        if transient {
+            return (window.alt.as_ref().and_then(of), None);
+        }
+        (of(&window.content), window.alt.as_ref().and_then(of))
+    }
+
+    /// A path off the ex line with its placeholders expanded, or the
+    /// refusal in the status row. See `docs/specs/filenames.md`.
+    fn expand_path(&mut self, path: &str) -> Option<String> {
+        let (current, alternate) = self.file_names();
+        match crate::fname::expand(path, current.as_deref(), alternate.as_deref()) {
+            Ok(expanded) => Some(expanded),
+            Err(e) => {
+                self.session.status = e;
+                None
+            }
+        }
     }
 
     /// Whether a `:!` job is still running — and if it is, says so, in the
@@ -29871,6 +29909,54 @@ int main(void) {
             ed.set_focus(source);
             ed.run_ex("tool normalmap strength 3");
             assert_eq!(ed.session.status, "no normal map here (:set editor normalmap)");
+        }
+    }
+
+    /// `%`, `#` and their parts on every path the ex line takes. See
+    /// `docs/specs/filenames.md`.
+    mod filenames {
+        use super::*;
+
+        #[test]
+        fn w_on_an_image_writes_beside_it_and_repoints() {
+            let d = PngDir::new("fname");
+            let mut ed = Editor::empty();
+            ed.run_ex(&format!("e {}", d.png().display()));
+            ed.run_ex("w %:r.normal.%:e");
+            let want = d.0.join("photo.normal.png");
+            assert!(want.exists(), "{}", ed.session.status);
+            assert_eq!(ed.window().img().unwrap().path, want);
+            ed.run_ex("w $dir/flat.png");
+            assert!(d.0.join("flat.png").exists(), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn e_and_vs_take_the_placeholders_too() {
+            let d = PngDir::new("fname-e");
+            let src = d.0.join("notes.md");
+            std::fs::write(&src, "hello").unwrap();
+            let mut ed = Editor::empty();
+            sized(&mut ed);
+            ed.run_ex(&format!("e {}", src.display()));
+            ed.run_ex("e %:r.txt");
+            assert_eq!(ed.buffer().unwrap().path.as_deref(), Some(d.0.join("notes.txt").as_path()));
+            ed.run_ex("vs #:h/other.rs");
+            assert_eq!(ed.window_ids().len(), 2);
+            assert_eq!(ed.buffer().unwrap().path.as_deref(), Some(d.0.join("other.rs").as_path()));
+        }
+
+        #[test]
+        fn no_file_is_refused_and_a_literal_stays() {
+            let mut ed = Editor::empty();
+            ed.run_ex("w %:r.txt");
+            assert_eq!(ed.session.status, "no file name for %");
+            let mut ed = editor("x");
+            ed.run_ex("e $HOME/nope");
+            assert!(
+                ed.session.status.is_empty() || !ed.session.status.contains("no file name"),
+                "{}",
+                ed.session.status
+            );
         }
     }
 

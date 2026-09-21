@@ -498,20 +498,11 @@ pub struct Job {
 /// `%` expands to `current`, `#` to `alternate`; `\%` and `\#` are the
 /// literal characters. `!` is untouched — bi drops vim's "expands to the
 /// previous command" rule (see `docs/specs/shell.md`, "Resolved decisions").
+///
+/// The modifiers and `$` aliases arrived with `docs/specs/filenames.md`;
+/// this is `fname::expand` under the name the shell spec gave it.
 pub fn expand(cmd: &str, current: Option<&str>, alternate: Option<&str>) -> Result<String, String> {
-    let mut out = String::with_capacity(cmd.len());
-    let mut chars = cmd.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if matches!(chars.peek(), Some('%') | Some('#')) => {
-                out.push(chars.next().expect("peeked Some above"));
-            }
-            '%' => out.push_str(current.ok_or("no file name for %")?),
-            '#' => out.push_str(alternate.ok_or("no alternate file for #")?),
-            other => out.push(other),
-        }
-    }
-    Ok(out)
+    crate::fname::expand(cmd, current, alternate)
 }
 
 /// A job's line as a terminal would have *shown* it, minus the colours.
@@ -601,7 +592,10 @@ pub mod fake {
             slot: Slot,
             _wake: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Box<dyn Handle>, String> {
-            self.spawned.lock().expect("spawned list poisoned").push((cmd.to_string(), slot.clone()));
+            self.spawned
+                .lock()
+                .expect("spawned list poisoned")
+                .push((cmd.to_string(), slot.clone()));
             Ok(Box::new(FakeHandle { killed: self.killed.clone(), running: true, slot }))
         }
     }
@@ -695,7 +689,10 @@ mod tests {
         s.push(Line::Out("a".into()));
         s.push(Line::Err("b".into()));
         s.finish(Exit::Code(0));
-        assert_eq!(s.drain(), (vec![Line::Out("a".into()), Line::Err("b".into())], Some(Exit::Code(0))));
+        assert_eq!(
+            s.drain(),
+            (vec![Line::Out("a".into()), Line::Err("b".into())], Some(Exit::Code(0)))
+        );
         assert_eq!(s.drain(), (vec![], None), "drained means drained");
     }
 
@@ -789,7 +786,11 @@ mod tests {
 
         let start = Instant::now();
         handle.kill();
-        assert!(start.elapsed() < Duration::from_millis(50), "kill blocked for {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "kill blocked for {:?}",
+            start.elapsed()
+        );
 
         let (_, exit) = run_to_exit(&slot, &rx, Duration::from_secs(5));
         assert_eq!(exit, Exit::Killed);
@@ -818,8 +819,7 @@ mod tests {
     /// the grandchild's proof of life.
     #[test]
     fn kill_reaches_the_whole_process_group() {
-        let marker =
-            std::env::temp_dir().join(format!("bi-shell-group-{}", std::process::id()));
+        let marker = std::env::temp_dir().join(format!("bi-shell-group-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let cmd = format!("(sleep 1; echo alive > {}) & wait", marker.display());
 
@@ -853,6 +853,10 @@ mod tests {
         let (lines, exit) = run_to_exit(&slot, &rx, Duration::from_secs(3));
         assert_eq!(exit, Exit::Code(0));
         assert!(lines.contains(&Line::Out("started".to_string())), "{lines:?}");
-        assert!(start.elapsed() < Duration::from_secs(4), "waited on the grandchild: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "waited on the grandchild: {:?}",
+            start.elapsed()
+        );
     }
 }

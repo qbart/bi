@@ -182,6 +182,7 @@ const LIB_MODULES: &[&str] = &[
     "files.rs",
     "find_in_files.rs",
     "fmt.rs",
+    "fname.rs",
     "form.rs",
     "generate.rs",
     "git.rs",
