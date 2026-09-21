@@ -6153,7 +6153,7 @@ impl Editor {
             }
             FormCmd::CycleMap => {
                 if !form.cycle_map() {
-                    status = Some("nothing to cycle: no map field");
+                    status = Some("nothing to cycle");
                 }
             }
             FormCmd::Edit => {

@@ -196,7 +196,7 @@ impl Field {
 }
 
 /// `20` for `20.0`, `0.1` for `0.1`: a range end written the short way.
-fn compact(v: f32) -> String {
+pub fn compact(v: f32) -> String {
     if v.fract() == 0.0 { format!("{}", v as i64) } else { v.to_string() }
 }
 
@@ -209,6 +209,9 @@ pub struct Form {
     undo: Vec<(usize, Value)>,
     redo: Vec<(usize, Value)>,
     generation: u64,
+    /// The field `Tab` turns, named by the owner: `map` for the normal
+    /// map, `point` for the curve. None cycles nothing.
+    cycle: Option<String>,
 }
 
 impl Form {
@@ -221,11 +224,32 @@ impl Form {
             undo: Vec::new(),
             redo: Vec::new(),
             generation: 0,
+            cycle: None,
         }
+    }
+
+    /// A form whose `Tab` turns the field named `cycle`.
+    pub fn with_cycle(tool: &str, title: &str, cycle: &str) -> Self {
+        let mut form = Self::new(tool, title);
+        form.cycle = Some(cycle.into());
+        form
     }
 
     pub fn push(&mut self, field: Field) {
         self.fields.push(field);
+    }
+
+    /// New fields in place of the old: for a form that mirrors something
+    /// else and is rebuilt from it. The selection follows its field's
+    /// name where it can; no undo entry and no generation bump, since
+    /// nothing the owner needs to hear about happened.
+    pub fn replace_fields(&mut self, fields: Vec<Field>) {
+        let name = self.fields.get(self.selected).map(|f| f.name.clone());
+        self.fields = fields;
+        self.selected = name
+            .and_then(|name| self.fields.iter().position(|f| f.name == name))
+            .unwrap_or(self.selected)
+            .min(self.fields.len().saturating_sub(1));
     }
 
     /// The `:tool <name>` that owns this form.
@@ -285,10 +309,11 @@ impl Form {
         self.change(self.selected, value);
     }
 
-    /// `Tab`: the field named `map`, when there is one, advanced — from
+    /// `Tab`: the form's cycle field, when it names one, advanced — from
     /// anywhere, without moving the selection.
     pub fn cycle_map(&mut self) -> bool {
-        let Some(index) = self.fields.iter().position(|f| f.name == "map") else { return false };
+        let Some(cycle) = self.cycle.as_deref() else { return false };
+        let Some(index) = self.fields.iter().position(|f| f.name == cycle) else { return false };
         let value = self.fields[index].nudged(1);
         self.change(index, value);
         true
@@ -375,7 +400,7 @@ mod tests {
     use super::*;
 
     fn form() -> Form {
-        let mut form = Form::new("normalmap", "Normal map");
+        let mut form = Form::with_cycle("normalmap", "Normal map", "map");
         form.push(Field::choice("map", "Map", &["normal", "displacement"], 0));
         form.push(Field::float("strength", "Strength", 0.1, 20.0, 0.1, 2.5));
         form.push(Field::int("blur", "Blur", 0, 32, 1, 0));
@@ -506,5 +531,34 @@ mod tests {
         assert!((f.fields()[1].fraction().unwrap() - (2.4 / 19.9)).abs() < 1e-5);
         assert_eq!(f.fields()[3].fraction(), None, "a bool has no slider");
         assert_eq!(f.value_text("strength"), Some("2.5".to_string()));
+    }
+
+    #[test]
+    fn tab_cycles_the_named_field_and_nothing_without_one() {
+        let mut form = Form::with_cycle("curve", "Curve", "point");
+        form.push(Field::int("point", "Point", 1, 3, 1, 1));
+        assert!(form.cycle_map());
+        assert_eq!(form.get_i64("point"), 2);
+        let mut plain = Form::new("t", "T");
+        plain.push(Field::int("point", "Point", 1, 3, 1, 1));
+        assert!(!plain.cycle_map());
+    }
+
+    #[test]
+    fn replace_fields_keeps_the_selection_by_name_and_moves_no_generation() {
+        let mut form = Form::new("t", "T");
+        form.push(Field::float("a", "A", 0.0, 1.0, 0.1, 0.5));
+        form.push(Field::float("b", "B", 0.0, 1.0, 0.1, 0.5));
+        form.select(1);
+        let g = form.generation();
+        form.replace_fields(vec![
+            Field::float("b", "B", 0.0, 2.0, 0.1, 1.5),
+            Field::float("a", "A", 0.0, 1.0, 0.1, 0.5),
+        ]);
+        assert_eq!(form.selected(), 0, "b moved to the front and stayed selected");
+        assert_eq!(form.generation(), g);
+        assert_eq!(form.get_f32("b"), 1.5);
+        form.replace_fields(vec![Field::float("c", "C", 0.0, 1.0, 0.1, 0.5)]);
+        assert_eq!(form.selected(), 0, "clamped when the name is gone");
     }
 }

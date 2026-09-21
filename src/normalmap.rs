@@ -143,7 +143,7 @@ impl Params {
 /// with `map` first so `Tab` has something to cycle.
 pub fn form() -> Form {
     let d = Params::default();
-    let mut form = Form::new("normalmap", "Normal map");
+    let mut form = Form::with_cycle("normalmap", "Normal map", "map");
     form.push(Field::choice("map", "Map", &Map::NAMES, 0));
     form.push(Field::float("strength", "Strength", 0.1, 20.0, 0.1, d.strength));
     form.push(Field::float("level", "Level", 0.1, 10.0, 0.1, d.level));

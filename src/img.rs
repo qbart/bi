@@ -411,6 +411,12 @@ impl Img {
         self.scroll
     }
 
+    /// The room the frontend last reported, in pixels; `(0, 0)` before the
+    /// first frame.
+    pub fn viewport(&self) -> (u32, u32) {
+        self.viewport
+    }
+
     /// The room the frontend gave this pane, in pixels, and the size of one
     /// step. Re-clamps, so shrinking a window never leaves the crop pointing
     /// past the edge.
