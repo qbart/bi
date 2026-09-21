@@ -15,7 +15,7 @@ pub enum Field {
 }
 
 impl Field {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Field::X => "x",
             Field::Y => "y",

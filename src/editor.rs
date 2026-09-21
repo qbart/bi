@@ -376,6 +376,14 @@ pub enum Action {
     /// cursor, turned. `None` is a key that named no turn, and asks what.
     /// See `docs/specs/tileset.md`.
     Turn(Option<crate::tileset::Turn>),
+    /// `Enter` in a curve's plot: the selected point's value on the ex
+    /// line. See `docs/specs/curve.md`.
+    EditValue,
+    /// `H` and `L` in a curve's plot: the selected point's x, earlier or
+    /// later, by the count's steps. See `docs/specs/curve.md`.
+    Slide {
+        right: bool,
+    },
     /// A key in a form window. See `docs/specs/form.md`.
     Form(FormCmd),
     /// `~`
@@ -6515,6 +6523,13 @@ impl Editor {
     fn run_image_action(&mut self, cmd: &Command) -> bool {
         let count = cmd.count.max(1);
         let steps = count as i64;
+        // A curve's plot reads the keys as points before anything else.
+        // See `docs/specs/curve.md`.
+        if let Some(index) =
+            self.curve_at(self.focus).filter(|&i| self.tools[i].result() == self.focus)
+        {
+            return self.run_curve_action(index, cmd);
+        }
         let Some(img) = self.window_mut().img_mut() else { return false };
         if img.tileset().is_some() {
             return self.run_tileset_action(cmd);
@@ -6537,9 +6552,10 @@ impl Editor {
             | Action::SearchWord { .. }
             | Action::ShowScopes
             | Action::EnterVisual(_) => {}
-            // A turn with no grid to turn on. Swallowed rather than passed to
-            // a view this window does not have.
-            Action::Turn(_) => {}
+            // A turn with no grid to turn on, a slide with no curve.
+            // Swallowed rather than passed to a view this window does not
+            // have.
+            Action::Turn(_) | Action::EditValue | Action::Slide { .. } => {}
             // The history is the image's, grid or no grid: `u` after a
             // `:tool image grayscale` brings the colours back either way.
             Action::Undo => {
@@ -8460,6 +8476,241 @@ impl Editor {
             p.x,
             p.y
         ))
+    }
+
+    /// The normal keymap read as points, in a curve's plot. See
+    /// `docs/specs/curve.md` §The keys.
+    fn run_curve_action(&mut self, index: usize, cmd: &Command) -> bool {
+        use crate::curve::Field;
+        let count = cmd.count.max(1);
+        let Some(tool) = self.curve(index) else { return false };
+        let last = tool.curve.points.len().saturating_sub(1);
+        let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+        match &cmd.action {
+            Action::Undo => self.curve_undo(index, false),
+            Action::Redo => self.curve_undo(index, true),
+            Action::EnterNormal => self.set_focus(tool.source),
+            _ if tool.lost => self.session.status = "curve lost".into(),
+            Action::Move(Motion::Left) => {
+                self.curve_select(index, tool.selected.saturating_sub(count))
+            }
+            Action::Move(Motion::Right) => self.curve_select(index, (tool.selected + count).min(last)),
+            Action::Move(Motion::FirstLine | Motion::LineStart | Motion::FirstNonBlank) => {
+                self.curve_select(index, 0)
+            }
+            Action::Move(
+                Motion::LastLine | Motion::Line(_) | Motion::LineEnd | Motion::LastNonBlank,
+            ) => self.curve_select(index, last),
+            Action::Move(Motion::Up) => {
+                self.curve_set(index, Field::Y, p.y + count as f32 * tool.ystep)
+            }
+            Action::Move(Motion::Down) => {
+                self.curve_set(index, Field::Y, p.y - count as f32 * tool.ystep)
+            }
+            Action::Slide { right } => {
+                let sign = if *right { 1.0 } else { -1.0 };
+                self.curve_set(index, Field::X, p.x + sign * count as f32 * tool.xstep)
+            }
+            Action::EnterInsertAfter => self.curve_add(index, true),
+            Action::EnterInsert => self.curve_add(index, false),
+            Action::Operate { op: Operator::Delete, .. } => self.curve_delete(index),
+            Action::EditValue => {
+                let line = format!("tool curve y {}", crate::form::compact(p.y));
+                self.session.status.clear();
+                self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
+            }
+            // Swallowed: each would move the session into a mode that reads
+            // a buffer this window does not have, or is nothing to a plot.
+            Action::EnterFind
+            | Action::EnterSearch { .. }
+            | Action::SearchWord { .. }
+            | Action::ShowScopes
+            | Action::EnterVisual(_)
+            | Action::Turn(_)
+            | Action::ScrollHalfPage { .. }
+            | Action::ScrollLine { .. }
+            | Action::Operate { .. }
+            | Action::EnterInsertLineStart
+            | Action::EnterInsertLineEnd
+            | Action::Move(_) => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// `h`, `l`, `gg`, `G`: another point picked; the plot and the form
+    /// follow.
+    fn curve_select(&mut self, index: usize, selected: usize) {
+        if let Some(tool) = self.curve_mut(index) {
+            tool.selected = selected;
+        }
+        self.curve_reread(index);
+    }
+
+    /// The selected point's `field` set to `value` in the text: one token
+    /// rewritten, one undo step. `x` stops at the neighbours.
+    fn curve_set(&mut self, index: usize, field: crate::curve::Field, value: f32) {
+        use crate::curve::Field;
+        let Some(tool) = self.curve(index) else { return };
+        let Some(span) = tool.literal.as_ref().and_then(|l| l.points.get(tool.selected)) else {
+            return;
+        };
+        let Some(slot) = tool.layout.index_of(field) else {
+            self.session.status = format!("the layout has no {}", field.name());
+            return;
+        };
+        let Some(token) = span.tokens.get(slot) else {
+            self.session.status = format!("point {} has no {}", tool.selected + 1, field.name());
+            return;
+        };
+        let value = match field {
+            Field::X => {
+                let pts = &tool.curve.points;
+                let lo = if tool.selected > 0 { pts[tool.selected - 1].x } else { f32::MIN };
+                let hi = pts.get(tool.selected + 1).map_or(f32::MAX, |q| q.x);
+                value.max(lo).min(hi)
+            }
+            _ => value,
+        };
+        let step = if field == Field::X { tool.xstep } else { tool.ystep };
+        let Some(old) = self.buffer_bytes(tool.buffer, token.start, token.end) else { return };
+        let new = crate::curve::rewrite(&old, value, step);
+        if new == old {
+            return;
+        }
+        self.curve_edit(index, vec![(token.start, token.end, new)]);
+    }
+
+    /// `a` and `i`: a point on the curve halfway to the neighbour — or one
+    /// step past the end — shaped like the selected point's text.
+    fn curve_add(&mut self, index: usize, after: bool) {
+        use crate::curve::{Point, eval, point_text, slope};
+        let Some(tool) = self.curve(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let (sel, pts) = (tool.selected, &tool.curve.points);
+        let n = pts.len();
+        if n == 0 || lit.points.len() != n {
+            return;
+        }
+        let x = match (after, sel + 1 < n, sel > 0) {
+            (true, true, _) => (pts[sel].x + pts[sel + 1].x) / 2.0,
+            (true, false, _) => pts[sel].x + tool.xstep,
+            (false, _, true) => (pts[sel - 1].x + pts[sel].x) / 2.0,
+            (false, _, false) => pts[sel].x - tool.xstep,
+        };
+        let m = slope(&tool.curve, x);
+        let p = Point {
+            x,
+            y: eval(&tool.curve, x),
+            out: m,
+            in_: m,
+            locked: tool.layout.index_of(crate::curve::Field::Locked).is_some(),
+        };
+        let Some(text) = self.buffer_bytes(tool.buffer, lit.open, lit.close + 1) else { return };
+        // `point_text` and the separators read the whole text's offsets;
+        // the slice starts at the list's bracket, so shift a span back.
+        let shift = |span: &crate::curve::PointSpan| crate::curve::PointSpan {
+            start: span.start - lit.open,
+            end: span.end - lit.open,
+            tokens: span
+                .tokens
+                .iter()
+                .map(|t| crate::curve::Token { start: t.start - lit.open, end: t.end - lit.open })
+                .collect(),
+        };
+        let spans: Vec<_> = lit.points.iter().map(shift).collect();
+        let between = |a: usize, b: usize| text[spans[a].end..spans[b].start].to_string();
+        let sep = match (after, sel + 1 < n, sel > 0) {
+            (_, true, _) if after => between(sel, sel + 1),
+            (_, _, true) if !after => between(sel - 1, sel),
+            (_, _, true) => between(sel - 1, sel),
+            (_, true, _) => between(sel, sel + 1),
+            _ => ", ".to_string(),
+        };
+        let new = point_text(&text, &spans[sel], &tool.layout, p, tool.xstep.min(tool.ystep));
+        let (at, insertion) = if after {
+            (lit.points[sel].end, format!("{sep}{new}"))
+        } else {
+            (lit.points[sel].start, format!("{new}{sep}"))
+        };
+        if let Some(t) = self.curve_mut(index) {
+            t.selected = if after { sel + 1 } else { sel };
+        }
+        self.curve_edit(index, vec![(at, at, insertion)]);
+    }
+
+    /// `x`: the selected point and one separator gone. A curve keeps two.
+    fn curve_delete(&mut self, index: usize) {
+        let Some(tool) = self.curve(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let (sel, n) = (tool.selected, lit.points.len());
+        if n <= 2 {
+            self.session.status = "a curve keeps two points".into();
+            return;
+        }
+        let (start, end) = if sel + 1 < n {
+            (lit.points[sel].start, lit.points[sel + 1].start)
+        } else {
+            (lit.points[sel - 1].end, lit.points[sel].end)
+        };
+        self.curve_edit(index, vec![(start, end, String::new())]);
+    }
+
+    /// `u` and `Ctrl-R` on the plot or in the form: the source buffer's
+    /// history, through the source window's view so the cursor follows.
+    fn curve_undo(&mut self, index: usize, redo: bool) {
+        let Some(tool) = self.curve(index) else { return };
+        let action = if redo { Action::Redo } else { Action::Undo };
+        match self.view(tool.source) {
+            Some(mut view) => view.apply(Command { count: 1, action }),
+            None => {
+                let Some(entry) = self.buffers.iter_mut().find(|b| b.id == tool.buffer) else {
+                    return;
+                };
+                let done = if redo {
+                    entry.buffer.redo(Vec::new(), Vec::new())
+                } else {
+                    entry.buffer.undo(Vec::new(), Vec::new())
+                };
+                if done.is_none() {
+                    self.session.status =
+                        if redo { "already at newest change" } else { "already at oldest change" }
+                            .into();
+                }
+            }
+        }
+        self.sync_tools();
+    }
+
+    /// A byte range of the buffer's text.
+    fn buffer_bytes(&self, id: BufferId, start: usize, end: usize) -> Option<String> {
+        let rope = self.buffers.iter().find(|b| b.id == id)?.buffer.rope();
+        let (s, e) = (rope.byte_to_char(start.min(rope.len_bytes())), rope.byte_to_char(end.min(rope.len_bytes())));
+        Some(rope.slice(s..e).to_string())
+    }
+
+    /// The one place the tool writes the buffer: byte-ranged replacements,
+    /// applied last to first, one undo revision with the source window's
+    /// cursors on both sides. The sync after re-reads everything.
+    fn curve_edit(&mut self, index: usize, mut edits: Vec<(usize, usize, String)>) {
+        let Some(tool) = self.curve(index) else { return };
+        let before = self
+            .window_of(tool.source)
+            .and_then(Window::text)
+            .map(|t| t.selections.as_pairs())
+            .unwrap_or_default();
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == tool.buffer) else { return };
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+        for (start, end, text) in edits {
+            let rope = entry.buffer.rope();
+            let (s, e) = (
+                rope.byte_to_char(start.min(rope.len_bytes())),
+                rope.byte_to_char(end.min(rope.len_bytes())),
+            );
+            entry.buffer.replace_range(s, e, &text);
+        }
+        entry.buffer.commit_undo(before.clone(), before);
+        self.sync_tools();
     }
 
     /// The result's pixels and name from the source and the form, now.
@@ -13159,7 +13410,7 @@ impl View<'_> {
             Action::JumpBack { .. } | Action::JumpForward { .. } | Action::JumpLast => {}
             // Only ever produced in an image window, which `run_image_action`
             // answers before a view is looked for.
-            Action::Turn(_) => {}
+            Action::Turn(_) | Action::EditValue | Action::Slide { .. } => {}
             // Only ever produced in a form window; answered in `Editor::apply`.
             Action::Form(_) => {}
             Action::Move(m) => {
@@ -30243,6 +30494,135 @@ int main(void) {
             assert_eq!(ed.session.status, "curve lost");
             assert!(ed.curve_status(plot).is_none());
             assert_eq!(ed.window_ids().len(), 3, "the windows stay");
+        }
+
+        fn key(ed: &mut Editor, action: Action) {
+            ed.apply(cmd(action));
+        }
+
+        fn keys(ed: &mut Editor, count: usize, action: Action) {
+            ed.apply(Command { count, action });
+        }
+
+        #[test]
+        fn j_and_k_move_y_by_one_step_and_nothing_else_changes() {
+            let (mut ed, _s) = open();
+            key(&mut ed, Action::Move(Motion::Up));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            keys(&mut ed, 5, Action::Move(Motion::Down));
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.76f"));
+        }
+
+        #[test]
+        fn h_and_l_pick_a_point_and_the_status_follows() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 3 of 3  x 1.000 y 1.000");
+            keys(&mut ed, 2, Action::Move(Motion::Left));
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000");
+            key(&mut ed, Action::Move(Motion::LastLine));
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 3"));
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 1"));
+            let form = ed.window_of(form_of(&ed)).unwrap().form().unwrap();
+            assert_eq!(form.get_i64("point"), 1, "the form follows");
+        }
+
+        #[test]
+        fn capital_h_and_l_move_x_and_stop_at_the_neighbours() {
+            let (mut ed, _s) = open();
+            key(&mut ed, Action::Slide { right: true });
+            assert_eq!(text(&ed), CPP.replace("0.5f, 0.8f", "0.51f, 0.8f"));
+            keys(&mut ed, 100, Action::Slide { right: true });
+            // Two decimals now: a token keeps the decimals it has grown.
+            assert!(text(&ed).contains("{1.00f, 0.8f"), "clamped to the next point: {}", text(&ed));
+            keys(&mut ed, 100, Action::Slide { right: false });
+            assert!(text(&ed).contains("{0.00f, 0.8f"), "and the previous: {}", text(&ed));
+        }
+
+        #[test]
+        fn a_adds_a_point_on_the_curve_after_and_i_before() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            key(&mut ed, Action::EnterInsertAfter);
+            let t = text(&ed);
+            assert_eq!(t.lines().count(), CPP.lines().count() + 1);
+            assert!(t.contains("true},\n    {0.75f, "), "shaped like its neighbour: {t}");
+            assert!(t.ends_with("false},\n};\n"), "the tail is untouched: {t}");
+            assert!(
+                ed.curve_status(plot).unwrap().starts_with("point 3 of 4  x 0.750"),
+                "the new point is selected: {}",
+                ed.curve_status(plot).unwrap()
+            );
+            key(&mut ed, Action::Move(Motion::Left));
+            key(&mut ed, Action::EnterInsert);
+            assert!(text(&ed).contains("false},\n    {0.25f, "), "{}", text(&ed));
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 5  x 0.250"));
+        }
+
+        #[test]
+        fn a_after_the_last_and_i_before_the_first_step_past_them() {
+            let (mut ed, _s) = open();
+            key(&mut ed, Action::Move(Motion::LastLine));
+            key(&mut ed, Action::EnterInsertAfter);
+            assert!(text(&ed).contains("false},\n    {1.01f, 1.0f"), "{}", text(&ed));
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            key(&mut ed, Action::EnterInsert);
+            assert!(text(&ed).contains("= {\n    {-0.01f, 0.0f"), "{}", text(&ed));
+        }
+
+        #[test]
+        fn x_deletes_a_point_and_keeps_two() {
+            let (mut ed, _s) = open();
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(text(&ed), CPP.replace("    {0.5f, 0.8f, 0.0f, 0.0f, true},\n", ""));
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(ed.session.status, "a curve keeps two points");
+            assert_eq!(text(&ed).lines().count(), CPP.lines().count() - 1);
+        }
+
+        #[test]
+        fn x_on_the_last_point_takes_the_separator_before_it() {
+            let mut ed = editor("[(0.0, 0.0), (0.5, 0.8), (1.0, 1.0)]");
+            sized(&mut ed);
+            ed.set_cursor(Cursor::at(27));
+            ed.run_ex("set editor curve");
+            key(&mut ed, operate(Operator::Delete, Motion::Right, 1).action);
+            assert_eq!(text(&ed), "[(0.0, 0.0), (0.5, 0.8)]");
+        }
+
+        #[test]
+        fn u_undoes_the_buffer_and_the_plot_follows() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            for _ in 0..3 {
+                key(&mut ed, Action::Move(Motion::Up));
+            }
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.82f"), "one key, one step");
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.820");
+            key(&mut ed, Action::Undo);
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), CPP);
+            key(&mut ed, Action::Redo);
+            assert_eq!(text(&ed), CPP.replace("0.8f", "0.81f"));
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.810");
+        }
+
+        #[test]
+        fn enter_prefills_the_ex_line_and_esc_goes_home() {
+            let (mut ed, source) = open();
+            key(&mut ed, Action::EditValue);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(c) if c.to_string() == "tool curve y 0.8"),
+                "{:?}",
+                ed.session.mode
+            );
+            ed.session.mode = Mode::Normal;
+            key(&mut ed, Action::EnterNormal);
+            assert_eq!(ed.focus(), source);
+            assert_eq!(ed.window_ids().len(), 3, "the tool stays open");
         }
 
         #[test]

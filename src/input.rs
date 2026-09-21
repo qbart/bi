@@ -1061,6 +1061,17 @@ impl Input {
             self.turn_pending = true;
             return None;
         }
+        // The curve's plot: `Enter` edits, `H` and `L` slide. Nothing in
+        // the normal keymap claims them for a picture. See
+        // `docs/specs/curve.md`.
+        if !ctrl && !self.window_pending && !self.g_pending {
+            match key.code {
+                KeyCode::Enter => return self.plain(Action::EditValue),
+                KeyCode::Char('H') => return self.plain(Action::Slide { right: false }),
+                KeyCode::Char('L') => return self.plain(Action::Slide { right: true }),
+                _ => {}
+            }
+        }
         self.normal(key)
     }
 
@@ -3854,6 +3865,19 @@ leader = \" \"
 
         fn image(input: &mut Input, keys: &str) -> Option<Command> {
             feed(input, keys, ContentKind::Image)
+        }
+
+        #[test]
+        fn enter_h_and_l_are_the_plots_keys_in_an_image_window() {
+            let mut input = Input::default();
+            assert_eq!(image(&mut input, "H").unwrap().action, Action::Slide { right: false });
+            let cmd = image(&mut input, "3L").unwrap();
+            assert_eq!((cmd.count, cmd.action), (3, Action::Slide { right: true }));
+            let enter = Key::new(KeyCode::Enter, crate::key::Mods::default());
+            let cmd = input.on_key(enter, &Mode::Normal, ContentKind::Image);
+            assert_eq!(cmd.unwrap().action, Action::EditValue);
+            let text = feed(&mut input, "H", ContentKind::Text);
+            assert_ne!(text.map(|c| c.action), Some(Action::Slide { right: false }));
         }
 
         #[test]
