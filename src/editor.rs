@@ -2785,6 +2785,76 @@ struct NormalMapTool {
     seen_source: (u64, u64, u32, u32),
 }
 
+/// One `:set editor curve`: the three windows, the buffer the curve lives
+/// in and where, and what the plot was last drawn from. The text is the
+/// truth: every key edits the buffer and the plot is rebuilt from it. See
+/// `docs/specs/curve.md`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct CurveTool {
+    source: WindowId,
+    plot: WindowId,
+    form: WindowId,
+    buffer: BufferId,
+    /// Byte offset of the list's opening bracket.
+    anchor: usize,
+    layout: crate::curve::Layout,
+    selected: usize,
+    xstep: f32,
+    ystep: f32,
+    /// What the buffer last said, and where.
+    curve: crate::curve::Curve,
+    literal: Option<crate::curve::Literal>,
+    /// The list is gone from the text; the plot is blank until the next
+    /// `:set editor curve`.
+    lost: bool,
+    /// Buffer edits, form generation and plot viewport the plot reflects.
+    seen: Option<(u64, u64, u32, u32)>,
+}
+
+/// A tool on a source window: the normal map's or the curve's three
+/// windows. One list, so closing and syncing are one path each.
+#[derive(Debug, Clone)]
+enum Tool {
+    NormalMap(NormalMapTool),
+    Curve(CurveTool),
+}
+
+impl Tool {
+    fn source(&self) -> WindowId {
+        match self {
+            Tool::NormalMap(t) => t.source,
+            Tool::Curve(t) => t.source,
+        }
+    }
+
+    /// The derived picture: the map, or the plot.
+    fn result(&self) -> WindowId {
+        match self {
+            Tool::NormalMap(t) => t.result,
+            Tool::Curve(t) => t.plot,
+        }
+    }
+
+    fn form(&self) -> WindowId {
+        match self {
+            Tool::NormalMap(t) => t.form,
+            Tool::Curve(t) => t.form,
+        }
+    }
+
+    fn windows(&self) -> [WindowId; 3] {
+        [self.source(), self.result(), self.form()]
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Tool::NormalMap(_) => "normalmap",
+            Tool::Curve(_) => "curve",
+        }
+    }
+}
+
 /// What a key in a form window asks for. See `docs/specs/form.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormCmd {
@@ -2931,9 +3001,9 @@ pub struct Editor {
     /// Counts opened images, so each carries a stable id a frontend can
     /// upload pixels under once. See `docs/specs/images.md`.
     next_image: u64,
-    /// The normal map tools open, one per source window. See
-    /// `docs/specs/normalmap.md`.
-    tools: Vec<NormalMapTool>,
+    /// The tools open, one per source window: normal maps and curves. See
+    /// `docs/specs/normalmap.md` and `docs/specs/curve.md`.
+    tools: Vec<Tool>,
     /// The area and chrome the frontend last laid out in.
     ///
     /// Splitting, resizing and directional switching are all geometry
@@ -6116,7 +6186,7 @@ impl Editor {
     /// A key in the focused form window. See `docs/specs/form.md`.
     fn run_form_cmd(&mut self, cmd: FormCmd) {
         if cmd == FormCmd::Close {
-            match self.tools.iter().position(|t| t.form == self.focus) {
+            match self.tools.iter().position(|t| t.form() == self.focus) {
                 Some(index) => self.close_tool(index),
                 None => {
                     self.close_window(self.focus);
@@ -7997,7 +8067,7 @@ impl Editor {
         let tool = self.tool_at(self.focus);
         if value.is_empty() {
             self.session.status = match (tool, self.window().img()) {
-                (Some(_), _) => "editor=normalmap".into(),
+                (Some(index), _) => format!("editor={}", self.tools[index].name()),
                 (None, Some(img)) if img.tileset().is_some() => "editor=tileset".into(),
                 (None, Some(_)) => "editor=image".into(),
                 (None, None) => "no image here".into(),
@@ -8009,7 +8079,7 @@ impl Editor {
         }
         if value == "image"
             && let Some(index) = tool
-            && self.tools[index].source == self.focus
+            && self.tools[index].source() == self.focus
         {
             return self.close_tool(index);
         }
@@ -8031,7 +8101,22 @@ impl Editor {
 
     /// The tool one of whose three windows is `window`.
     fn tool_at(&self, window: WindowId) -> Option<usize> {
-        self.tools.iter().position(|t| t.source == window || t.result == window || t.form == window)
+        self.tools.iter().position(|t| t.windows().contains(&window))
+    }
+
+    /// The normal map tool one of whose windows is `window`.
+    fn normalmap_at(&self, window: WindowId) -> Option<usize> {
+        self.tools
+            .iter()
+            .position(|t| matches!(t, Tool::NormalMap(_)) && t.windows().contains(&window))
+    }
+
+    /// The tool at `index`, when it is a normal map.
+    fn normalmap(&self, index: usize) -> Option<NormalMapTool> {
+        match self.tools.get(index) {
+            Some(Tool::NormalMap(t)) => Some(t.clone()),
+            _ => None,
+        }
     }
 
     /// `:set editor normalmap`: the result split to the right of the
@@ -8039,7 +8124,7 @@ impl Editor {
     /// window that already has the tool, just the focus.
     fn open_normalmap(&mut self) {
         if let Some(index) = self.tool_at(self.focus) {
-            let form = self.tools[index].form;
+            let form = self.tools[index].form();
             self.set_focus(form);
             return;
         }
@@ -8063,13 +8148,13 @@ impl Editor {
             self.set_focus(source);
             return;
         };
-        self.tools.push(NormalMapTool {
+        self.tools.push(Tool::NormalMap(NormalMapTool {
             source,
             result,
             form,
             seen_form: None,
             seen_source: (0, 0, 0, 0),
-        });
+        }));
         self.sync_tools();
     }
 
@@ -8077,19 +8162,19 @@ impl Editor {
     /// the tool is forgotten.
     fn close_tool(&mut self, index: usize) {
         let tool = self.tools.remove(index);
-        for id in [tool.form, tool.result] {
+        for id in [tool.form(), tool.result()] {
             if self.window_of(id).is_some() {
                 self.close_window(id);
             }
         }
-        if self.window_of(tool.source).is_some() {
-            self.set_focus(tool.source);
+        if self.window_of(tool.source()).is_some() {
+            self.set_focus(tool.source());
         }
     }
 
     /// The window a form belongs to: its tool's source.
     fn form_home(&self, form: WindowId) -> Option<WindowId> {
-        self.tools.iter().find(|t| t.form == form).map(|t| t.source)
+        self.tools.iter().find(|t| t.form() == form).map(Tool::source)
     }
 
     /// After anything: a tool whose form or result window was closed by
@@ -8098,36 +8183,53 @@ impl Editor {
     fn sync_tools(&mut self) {
         let mut index = 0;
         while index < self.tools.len() {
-            let tool = self.tools[index].clone();
-            let alive = |ed: &Self, id: WindowId| ed.window_of(id).is_some();
-            if !alive(self, tool.form) || !alive(self, tool.result) {
-                self.tools.remove(index);
-                continue;
-            }
-            let form_generation =
-                self.window_of(tool.form).and_then(Window::form).map(Form::generation);
-            let source = self.window_of(tool.source).and_then(Window::img);
-            let (Some(form_generation), Some(src)) = (form_generation, source) else {
-                // The source is gone or no longer a picture: the result
-                // stays as the plain picture it is, and the tool is done.
-                self.tools.remove(index);
-                continue;
+            let keep = match &self.tools[index] {
+                Tool::NormalMap(_) => self.sync_normalmap(index),
+                Tool::Curve(_) => self.sync_curve(index),
             };
-            let source_stamp = (src.id, src.generation, src.width, src.height);
-            if tool.seen_form == Some(form_generation) && tool.seen_source == source_stamp {
+            if keep {
                 index += 1;
-                continue;
+            } else {
+                self.tools.remove(index);
             }
-            self.recompute_tool(index);
-            self.tools[index].seen_form = Some(form_generation);
-            self.tools[index].seen_source = source_stamp;
-            index += 1;
         }
+    }
+
+    /// One normal map's sync. False when the tool is done and should go.
+    fn sync_normalmap(&mut self, index: usize) -> bool {
+        let Some(tool) = self.normalmap(index) else { return true };
+        let alive = |ed: &Self, id: WindowId| ed.window_of(id).is_some();
+        if !alive(self, tool.form) || !alive(self, tool.result) {
+            return false;
+        }
+        let form_generation =
+            self.window_of(tool.form).and_then(Window::form).map(Form::generation);
+        let source = self.window_of(tool.source).and_then(Window::img);
+        let (Some(form_generation), Some(src)) = (form_generation, source) else {
+            // The source is gone or no longer a picture: the result
+            // stays as the plain picture it is, and the tool is done.
+            return false;
+        };
+        let source_stamp = (src.id, src.generation, src.width, src.height);
+        if tool.seen_form == Some(form_generation) && tool.seen_source == source_stamp {
+            return true;
+        }
+        self.recompute_tool(index);
+        if let Some(Tool::NormalMap(t)) = self.tools.get_mut(index) {
+            t.seen_form = Some(form_generation);
+            t.seen_source = source_stamp;
+        }
+        true
+    }
+
+    /// One curve's sync. False when the tool is done and should go.
+    fn sync_curve(&mut self, _index: usize) -> bool {
+        true
     }
 
     /// The result's pixels and name from the source and the form, now.
     fn recompute_tool(&mut self, index: usize) {
-        let tool = self.tools[index].clone();
+        let Some(tool) = self.normalmap(index) else { return };
         let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
         let (params, map) =
             (crate::normalmap::Params::from_form(form), crate::normalmap::Map::from_form(form));
@@ -8148,7 +8250,7 @@ impl Editor {
     /// `:tool normalmap <field> [value]` and `:tool normalmap write [all]`,
     /// from any of the tool's three windows.
     fn normalmap_tool(&mut self, arg: &str) {
-        let Some(index) = self.tool_at(self.focus) else {
+        let Some(index) = self.normalmap_at(self.focus) else {
             self.session.status = "no normal map here (:set editor normalmap)".into();
             return;
         };
@@ -8159,7 +8261,7 @@ impl Editor {
         if what == "write" {
             return self.write_maps(index, value);
         }
-        let tool = self.tools[index].clone();
+        let Some(tool) = self.normalmap(index) else { return };
         let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else { return };
         if what.is_empty() {
             let names: Vec<&str> = form.fields().iter().map(|f| f.name()).collect();
@@ -8180,7 +8282,7 @@ impl Editor {
     /// `write` — the map shown — or `write all`, beside the source.
     fn write_maps(&mut self, index: usize, which: &str) {
         use crate::normalmap::{Map, Params, render};
-        let tool = self.tools[index].clone();
+        let Some(tool) = self.normalmap(index) else { return };
         let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
         let (params, shown) = (Params::from_form(form), Map::from_form(form));
         let maps: Vec<Map> = match which {
