@@ -35,6 +35,7 @@ pub mod files;
 pub mod find_in_files;
 pub mod fmt;
 pub mod fname;
+pub mod curve;
 pub mod form;
 pub mod generate;
 pub mod git;
