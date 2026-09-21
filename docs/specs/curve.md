@@ -10,7 +10,7 @@ picture is a view of it.
 
 ## Status
 
-**Designed.** Points move; tangents are read, drawn and evaluated but not
+**Built.** Points move; tangents are read, drawn and evaluated but not
 yet edited — tangent rotation and the lock toggle come next and slot into
 the same keys.
 
@@ -54,7 +54,9 @@ the layout names has zero tangents that the tool does not touch.
 ## The keys
 
 On the plot, read from the normal keymap the way the tileset reads its
-keys, so a rebound `j` still means down:
+keys, so a rebound `j` still means down — except `H`, `L` and `Enter`,
+which nothing in the normal keymap claims for a picture and which the plot
+takes as its own:
 
 ```
 h  l        previous, next point; counts multiply     0 ^ $  gg G   first, last
@@ -130,9 +132,9 @@ lack the trailing fields.
 keeps its suffix and at least as many decimals as it had, and never fewer
 than the step needs, so `0.5f` moved by `0.01` becomes `0.51f` and `1`
 moved by `0.25` becomes `1.25`. A bool keeps its spelling, `true` or `1`.
-`a` and `i` copy the neighbouring point's text — its brackets, separators,
-the whitespace before it — and put the new numbers in, so a one-per-line
-list stays one per line; `x` removes the group and one separator, the one
+`a` and `i` copy the neighbouring point's text — its brackets, a name
+glued to them like `Point { … }`, the separator and whitespace before it —
+and put the new numbers in, so a one-per-line list stays one per line; `x` removes the group and one separator, the one
 after it or, for the last point, the one before.
 
 **The anchor.** The tool remembers the byte offset of the outer group's
@@ -153,14 +155,16 @@ pub struct Curve { pub points: Vec<Point> }        // sorted by x
 
 /// Where each point's tokens sit in the text, so a move rewrites in place.
 pub struct Literal { open: usize, close: usize, points: Vec<PointSpan> }
-pub struct PointSpan { start: usize, end: usize, tokens: Vec<(usize, usize)> }
+pub struct PointSpan { start: usize, end: usize, tokens: Vec<Token> }   // start reaches back over a glued name
 
 pub fn find(text: &str, cursor: usize) -> Option<Literal>;
 pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve;
 pub fn rewrite(token: &str, value: f32, step: f32) -> String;
 pub fn eval(curve: &Curve, x: f32) -> f32;         // cubic hermite between neighbours
 pub fn slope(curve: &Curve, x: f32) -> f32;
-pub fn render(curve: &Curve, selected: usize, width: u32, height: u32) -> Vec<u8>;
+pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String;
+pub fn ranges(curve: &Curve, xstep: f32, ystep: f32) -> ((f32, f32), (f32, f32));
+pub fn render(curve: &Curve, selected: usize, xstep: f32, ystep: f32, width: u32, height: u32) -> Vec<u8>;
 ```
 
 **Evaluation** is Unity's: between points `p` and `q` with `d = q.x - p.x`,

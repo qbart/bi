@@ -7,9 +7,9 @@ one observation that makes most of them cheap.
 
 ## Status
 
-**Ideas**, with three built since: whole-image operations
-(`image-ops.md`), the form any tool's knobs live in (`form.md`), and the
-normal map generator (`normalmap.md`). Each entry that gets built gets its
+**Ideas**, with four built since: whole-image operations
+(`image-ops.md`), the form any tool's knobs live in (`form.md`), the
+normal map generator (`normalmap.md`) and the curve editor (`curve.md`). Each entry that gets built gets its
 own spec, and this list points at it.
 
 ## The enabler
@@ -54,7 +54,7 @@ let the picture machinery show it".
 - **Curve and plot tool.** Render an easing curve, a damage formula or an
   XP table as a graph, move bezier handles with the cursor, write the
   numbers back. Tuning is where designers spend hours in spreadsheets.
-  Designed, editing code in place — see `curve.md`.
+  Built, editing code in place — see `curve.md`.
 - **Table view** for CSV and TSV. Aligned columns, cell-wise navigation,
   sort and sum. Balance sheets and loot tables live in these files.
 - **Graph preview.** A state machine, behaviour tree or dialogue script
