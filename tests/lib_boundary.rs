@@ -204,6 +204,7 @@ const LIB_MODULES: &[&str] = &[
     "lsp/transport.rs",
     "lsp/types.rs",
     "motion.rs",
+    "normalmap.rs",
     "picker.rs",
     "range.rs",
     "reflow.rs",

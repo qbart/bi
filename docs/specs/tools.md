@@ -7,8 +7,10 @@ one observation that makes most of them cheap.
 
 ## Status
 
-**Ideas.** Nothing here is built; each entry that gets built gets its own
-spec, and this list points at it.
+**Ideas**, with three built since: whole-image operations
+(`image-ops.md`), the form any tool's knobs live in (`form.md`), and the
+normal map generator (`normalmap.md`). Each entry that gets built gets its
+own spec, and this list points at it.
 
 ## The enabler
 

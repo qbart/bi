@@ -16,6 +16,7 @@ use crate::cmdline::CmdLine;
 use crate::config::{Config, ConfigSource, Diagnostic, OptionPatch, OptionValue, Options};
 use crate::dap;
 use crate::encoding::{FileFormat, OpenHow};
+use crate::form::Form;
 use crate::history::Cursors;
 use crate::img::Img;
 use crate::jumps::Jump;
@@ -694,6 +695,12 @@ fn split_flags(arg: &str) -> std::result::Result<(Vec<String>, Vec<(String, Stri
         }
     }
     Ok((args, flags))
+}
+
+/// `atlas.png` → `atlas_normal.png`, beside it.
+fn map_path(source: &Path, map: crate::normalmap::Map) -> PathBuf {
+    let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    source.with_file_name(format!("{stem}_{}.png", map.suffix()))
 }
 
 /// An image's file name, for the status row — the path when there is no
@@ -2765,6 +2772,19 @@ pub enum ResultsCmd {
     Remove,
 }
 
+/// One `:set editor normalmap`: the three windows, and what the result
+/// was last computed from. See `docs/specs/normalmap.md`.
+#[derive(Debug, Clone)]
+struct NormalMapTool {
+    source: WindowId,
+    result: WindowId,
+    form: WindowId,
+    /// The form generation the result reflects; `None` before the first.
+    seen_form: Option<u64>,
+    /// The source image the result reflects: id, generation, size.
+    seen_source: (u64, u64, u32, u32),
+}
+
 /// What a key in a form window asks for. See `docs/specs/form.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormCmd {
@@ -2909,6 +2929,9 @@ pub struct Editor {
     /// Counts opened images, so each carries a stable id a frontend can
     /// upload pixels under once. See `docs/specs/images.md`.
     next_image: u64,
+    /// The normal map tools open, one per source window. See
+    /// `docs/specs/normalmap.md`.
+    tools: Vec<NormalMapTool>,
     /// The area and chrome the frontend last laid out in.
     ///
     /// Splitting, resizing and directional switching are all geometry
@@ -3537,6 +3560,7 @@ impl Editor {
             next_buffer: 1,
             next_window: 1,
             next_image: 1,
+            tools: Vec::new(),
             area: Rect::default(),
             chrome: Chrome::default(),
             session: Session::default(),
@@ -6136,15 +6160,6 @@ impl Editor {
         self.sync_tools();
     }
 
-    /// The window a form belongs to, when a tool owns it — none yet.
-    fn form_home(&self, _form: WindowId) -> Option<WindowId> {
-        None
-    }
-
-    /// After a form moved: every tool whose form's generation changed
-    /// recomputes what depends on it. Nothing to sync yet.
-    fn sync_tools(&mut self) {}
-
     fn run_window_cmd(&mut self, cmd: WindowCmd) {
         let focus = self.focus;
         let (area, chrome) = (self.area, self.chrome);
@@ -7594,6 +7609,7 @@ impl Editor {
                 }
             }
         }
+        self.sync_tools();
     }
 
     /// `:s` and the `&` family both end here: run it, and remember what ran.
@@ -7934,22 +7950,228 @@ impl Editor {
         }
     }
 
-    /// `:set editor tileset|image`, on the focused window's image. The
-    /// one `:set` a picture has; everything else about the grid is
-    /// `:tool tileset`. See `docs/specs/tileset.md`.
+    /// `:set editor tileset|normalmap|image`, on the focused window's
+    /// image. The one `:set` a picture has; everything else about a tool
+    /// is `:tool …`. See `docs/specs/tileset.md` and `normalmap.md`.
     fn set_editor(&mut self, value: &str) {
+        let tool = self.tool_at(self.focus);
+        if value.is_empty() {
+            self.session.status = match (tool, self.window().img()) {
+                (Some(_), _) => "editor=normalmap".into(),
+                (None, Some(img)) if img.tileset().is_some() => "editor=tileset".into(),
+                (None, Some(_)) => "editor=image".into(),
+                (None, None) => "no image here".into(),
+            };
+            return;
+        }
+        if value == "normalmap" {
+            return self.open_normalmap();
+        }
+        if value == "image"
+            && let Some(index) = tool
+            && self.tools[index].source == self.focus
+        {
+            return self.close_tool(index);
+        }
         let Some(img) = self.window_mut().img_mut() else {
             self.session.status = "no image here".into();
             return;
         };
         self.session.status = match value {
-            "" => format!("editor={}", if img.tileset().is_some() { "tileset" } else { "image" }),
             "tileset" => img.enter_tileset().err().unwrap_or_default(),
             "image" => {
                 img.leave_tileset();
                 String::new()
             }
-            other => format!("not an editor: {other} (want tileset or image)"),
+            other => format!("not an editor: {other} (want tileset, normalmap or image)"),
+        };
+    }
+
+    // ---- the normal map tool: see `docs/specs/normalmap.md` ----
+
+    /// The tool one of whose three windows is `window`.
+    fn tool_at(&self, window: WindowId) -> Option<usize> {
+        self.tools.iter().position(|t| t.source == window || t.result == window || t.form == window)
+    }
+
+    /// `:set editor normalmap`: the result split to the right of the
+    /// source, the form down the right edge, focus on the form. On a
+    /// window that already has the tool, just the focus.
+    fn open_normalmap(&mut self) {
+        if let Some(index) = self.tool_at(self.focus) {
+            let form = self.tools[index].form;
+            self.set_focus(form);
+            return;
+        }
+        let Some(src) = self.window().img() else {
+            self.session.status = "no image here".into();
+            return;
+        };
+        let (path, zoom, w, h) = (src.path.clone(), src.zoom(), src.width, src.height);
+        let source = self.focus;
+        let Some(result) = self.split_focus(Dir::Vertical) else { return };
+        let mut derived =
+            Img::from_pixels(path, w, h, vec![0; (w * h * 4) as usize], self.next_image);
+        self.next_image += 1;
+        derived.set_zoom(zoom);
+        if let Some(window) = self.window_mut_of(result) {
+            window.content = Content::Image(derived);
+            window.alt = None;
+        }
+        let Some(form) = self.open_form_sidebar(crate::normalmap::form()) else {
+            self.close_window(result);
+            self.set_focus(source);
+            return;
+        };
+        self.tools.push(NormalMapTool {
+            source,
+            result,
+            form,
+            seen_form: None,
+            seen_source: (0, 0, 0, 0),
+        });
+        self.sync_tools();
+    }
+
+    /// `:set editor image` on the source: the result and the form go, and
+    /// the tool is forgotten.
+    fn close_tool(&mut self, index: usize) {
+        let tool = self.tools.remove(index);
+        for id in [tool.form, tool.result] {
+            if self.window_of(id).is_some() {
+                self.close_window(id);
+            }
+        }
+        if self.window_of(tool.source).is_some() {
+            self.set_focus(tool.source);
+        }
+    }
+
+    /// The window a form belongs to: its tool's source.
+    fn form_home(&self, form: WindowId) -> Option<WindowId> {
+        self.tools.iter().find(|t| t.form == form).map(|t| t.source)
+    }
+
+    /// After anything: a tool whose form or result window was closed by
+    /// hand is forgotten; one whose form or source moved recomputes its
+    /// result. Cheap when nothing moved — a few comparisons.
+    fn sync_tools(&mut self) {
+        let mut index = 0;
+        while index < self.tools.len() {
+            let tool = self.tools[index].clone();
+            let alive = |ed: &Self, id: WindowId| ed.window_of(id).is_some();
+            if !alive(self, tool.form) || !alive(self, tool.result) {
+                self.tools.remove(index);
+                continue;
+            }
+            let form_generation =
+                self.window_of(tool.form).and_then(Window::form).map(Form::generation);
+            let source = self.window_of(tool.source).and_then(Window::img);
+            let (Some(form_generation), Some(src)) = (form_generation, source) else {
+                // The source is gone or no longer a picture: the result
+                // stays as the plain picture it is, and the tool is done.
+                self.tools.remove(index);
+                continue;
+            };
+            let source_stamp = (src.id, src.generation, src.width, src.height);
+            if tool.seen_form == Some(form_generation) && tool.seen_source == source_stamp {
+                index += 1;
+                continue;
+            }
+            self.recompute_tool(index);
+            self.tools[index].seen_form = Some(form_generation);
+            self.tools[index].seen_source = source_stamp;
+            index += 1;
+        }
+    }
+
+    /// The result's pixels and name from the source and the form, now.
+    fn recompute_tool(&mut self, index: usize) {
+        let tool = self.tools[index].clone();
+        let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
+        let (params, map) =
+            (crate::normalmap::Params::from_form(form), crate::normalmap::Map::from_form(form));
+        let Some(src) = self.window_of(tool.source).and_then(Window::img) else { return };
+        let (rgba, w, h, path) = (src.rgba.clone(), src.width, src.height, src.path.clone());
+        let pixels = crate::normalmap::render(map, &rgba, w, h, &params);
+        let Some(result) = self.window_mut_of(tool.result).and_then(Window::img_mut) else {
+            return;
+        };
+        result.rgba = pixels;
+        result.width = w;
+        result.height = h;
+        result.path = map_path(&path, map);
+        result.generation += 1;
+        result.dirty = false;
+    }
+
+    /// `:tool normalmap <field> [value]` and `:tool normalmap write [all]`,
+    /// from any of the tool's three windows.
+    fn normalmap_tool(&mut self, arg: &str) {
+        let Some(index) = self.tool_at(self.focus) else {
+            self.session.status = "no normal map here (:set editor normalmap)".into();
+            return;
+        };
+        let (what, value) = match arg.split_once(char::is_whitespace) {
+            Some((what, value)) => (what, value.trim()),
+            None => (arg, ""),
+        };
+        if what == "write" {
+            return self.write_maps(index, value);
+        }
+        let tool = self.tools[index].clone();
+        let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else { return };
+        if what.is_empty() {
+            let names: Vec<&str> = form.fields().iter().map(|f| f.name()).collect();
+            self.session.status = format!("normalmap what? ({}, write)", names.join(", "));
+            return;
+        }
+        self.session.status = if value.is_empty() {
+            match form.value_text(what) {
+                Some(text) => format!("normalmap {what}={text}"),
+                None => form.set(what, "").err().unwrap_or_default(),
+            }
+        } else {
+            form.set(what, value).err().unwrap_or_default()
+        };
+        self.sync_tools();
+    }
+
+    /// `write` — the map shown — or `write all`, beside the source.
+    fn write_maps(&mut self, index: usize, which: &str) {
+        use crate::normalmap::{Map, Params, render};
+        let tool = self.tools[index].clone();
+        let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
+        let (params, shown) = (Params::from_form(form), Map::from_form(form));
+        let maps: Vec<Map> = match which {
+            "" => vec![shown],
+            "all" => Map::ALL.to_vec(),
+            _ => {
+                self.session.status = "write what? (write, write all)".into();
+                return;
+            }
+        };
+        let Some(src) = self.window_of(tool.source).and_then(Window::img) else {
+            self.session.status = "the source is gone".into();
+            return;
+        };
+        let (rgba, w, h, path) = (src.rgba.clone(), src.width, src.height, src.path.clone());
+        let mut written = Vec::new();
+        for map in maps {
+            let out = map_path(&path, map);
+            let pixels = render(map, &rgba, w, h, &params);
+            if let Err(e) = crate::imgops::Format::default().write(&out, &pixels, w, h) {
+                self.session.status = e;
+                return;
+            }
+            written.push(out);
+        }
+        self.session.status = match written.as_slice() {
+            [one] => format!(
+                "wrote {}",
+                one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            many => format!("wrote {} maps", many.len()),
         };
     }
 
@@ -7968,10 +8190,14 @@ impl Editor {
             None => (arg.trim(), ""),
         };
         match tool {
-            "" => self.session.status = "tool what? (tileset, image)".into(),
+            "" => self.session.status = "tool what? (tileset, image, normalmap)".into(),
             "tileset" => self.tileset_tool(rest),
             "image" => self.image_tool(rest),
-            other => self.session.status = format!("not a tool: {other} (want tileset or image)"),
+            "normalmap" => self.normalmap_tool(rest),
+            other => {
+                self.session.status =
+                    format!("not a tool: {other} (want tileset, image or normalmap)")
+            }
         }
     }
 
@@ -8363,6 +8589,7 @@ impl Editor {
         // behind — the char is in, the cursor has moved.
         self.sync_completion(&action);
         self.sync_signature(&action);
+        self.sync_tools();
 
         // A capture waiting on its name gets the prompt now, after the whole
         // command has settled its modes — a visual operator ends visual mode
@@ -29502,6 +29729,151 @@ int main(void) {
         assert!(matches!(ed.session.mode, Mode::Command(_)));
     }
 
+    /// `:set editor normalmap`: a result beside the source, a form at the
+    /// right edge, and the result following the form. See
+    /// `docs/specs/normalmap.md`.
+    mod normalmap_tool {
+        use super::*;
+
+        fn open(tag: &str) -> (PngDir, Editor, WindowId) {
+            let d = PngDir::new(tag);
+            let mut ed = Editor::empty();
+            sized(&mut ed);
+            ed.run_ex(&format!("e {}", d.png().display()));
+            let source = ed.focus();
+            ed.run_ex("set editor normalmap");
+            (d, ed, source)
+        }
+
+        fn rect(ed: &Editor, id: WindowId) -> Rect {
+            ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap()
+        }
+
+        fn result_of(ed: &Editor, source: WindowId) -> WindowId {
+            ed.window_ids()
+                .into_iter()
+                .find(|&w| w != source && ed.window_of(w).and_then(Window::img).is_some())
+                .expect("a result window")
+        }
+
+        #[test]
+        fn the_tool_needs_an_image() {
+            let mut ed = editor("text");
+            ed.run_ex("set editor normalmap");
+            assert_eq!(ed.session.status, "no image here");
+        }
+
+        #[test]
+        fn opening_puts_the_result_beside_the_source_and_the_form_at_the_edge() {
+            let (_d, ed, source) = open("open");
+            assert_eq!(ed.window_ids().len(), 3, "{:?}", ed.window_ids());
+            let form = ed.focus();
+            assert!(ed.window_of(form).unwrap().form().is_some(), "focus is on the form");
+            let result = result_of(&ed, source);
+            let (s, r, f) = (rect(&ed, source), rect(&ed, result), rect(&ed, form));
+            assert_eq!(s.y, r.y, "side by side");
+            assert!(r.x > s.x, "result to the right of the source");
+            assert!(f.x > r.x, "the form at the right edge");
+            assert_eq!(f.height, ed.area.height, "full height");
+
+            let img = ed.window_of(result).unwrap().img().unwrap();
+            assert!(img.path.ends_with("photo_normal.png"), "{}", img.path.display());
+            assert_eq!((img.width, img.height), (50, 40));
+            assert_eq!(&img.rgba[0..4], &[128, 128, 255, 255], "a flat photo is a flat map");
+            assert!(!img.dirty, "derived, never dirty");
+
+            let mut ed = ed;
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=normalmap", "asked of the form");
+        }
+
+        #[test]
+        fn turning_a_knob_recomputes_the_result() {
+            let (d, mut ed, source) = open("knob");
+            // A ramp so strength has something to change.
+            let path = d.0.join("ramp.png");
+            let mut ramp = image::RgbaImage::new(8, 4);
+            for (x, _, p) in ramp.enumerate_pixels_mut() {
+                let v = (x * 255 / 7) as u8;
+                *p = image::Rgba([v, v, v, 255]);
+            }
+            ramp.save(&path).unwrap();
+            ed.set_focus(source);
+            ed.run_ex(&format!("e {}", path.display()));
+            let result = result_of(&ed, source);
+            let before = ed.window_of(result).unwrap().img().unwrap().rgba.clone();
+            let generation = ed.window_of(result).unwrap().img().unwrap().generation;
+
+            ed.run_ex("tool normalmap strength 8");
+            let img = ed.window_of(result).unwrap().img().unwrap();
+            assert_ne!(img.rgba, before, "steeper");
+            assert!(img.generation > generation);
+
+            ed.run_ex("tool normalmap strength");
+            assert_eq!(ed.session.status, "normalmap strength=8.0");
+            ed.run_ex("tool normalmap strength wide");
+            assert_eq!(ed.session.status, "strength wants a number 0.1..20");
+            ed.run_ex("tool normalmap gain 1");
+            assert!(ed.session.status.starts_with("no field gain"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn the_form_keys_drive_it_and_tab_swaps_the_map() {
+            let (_d, mut ed, source) = open("keys");
+            let result = result_of(&ed, source);
+            let generation = ed.window_of(result).unwrap().img().unwrap().generation;
+
+            ed.apply(cmd(Action::Form(FormCmd::Select { down: true, count: 1 })));
+            ed.apply(cmd(Action::Form(FormCmd::Nudge(5))));
+            let img = ed.window_of(result).unwrap().img().unwrap();
+            assert!(img.generation > generation, "the picture followed the knob");
+
+            ed.apply(cmd(Action::Form(FormCmd::CycleMap)));
+            let img = ed.window_of(result).unwrap().img().unwrap();
+            assert!(img.path.ends_with("photo_disp.png"), "{}", img.path.display());
+            assert_eq!(&img.rgba[0..3], &[9, 9, 9], "the height itself");
+
+            ed.apply(cmd(Action::Form(FormCmd::Leave)));
+            assert_eq!(ed.focus(), source, "Esc goes home");
+            ed.run_ex("set editor normalmap");
+            assert!(ed.window().form().is_some(), "and again focuses the form");
+            assert_eq!(ed.window_ids().len(), 3, "without opening more");
+        }
+
+        #[test]
+        fn write_puts_the_maps_beside_the_source() {
+            let (d, mut ed, _source) = open("write");
+            ed.run_ex("tool normalmap write");
+            assert_eq!(ed.session.status, "wrote photo_normal.png");
+            assert!(d.0.join("photo_normal.png").exists());
+            ed.run_ex("tool normalmap write all");
+            assert_eq!(ed.session.status, "wrote 2 maps");
+            assert!(d.0.join("photo_disp.png").exists());
+            ed.run_ex("tool normalmap write some");
+            assert_eq!(ed.session.status, "write what? (write, write all)");
+        }
+
+        #[test]
+        fn leaving_closes_the_result_and_the_form() {
+            let (_d, mut ed, source) = open("leave");
+            ed.set_focus(source);
+            ed.run_ex("set editor image");
+            assert_eq!(ed.window_ids(), vec![source]);
+            ed.run_ex("tool normalmap strength 3");
+            assert_eq!(ed.session.status, "no normal map here (:set editor normalmap)");
+        }
+
+        #[test]
+        fn closing_the_form_by_hand_drops_the_tool() {
+            let (_d, mut ed, source) = open("close");
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids().len(), 2);
+            ed.set_focus(source);
+            ed.run_ex("tool normalmap strength 3");
+            assert_eq!(ed.session.status, "no normal map here (:set editor normalmap)");
+        }
+    }
+
     /// `:tool image …` — whole-image operations, each one undo step, and
     /// `conv` deciding what `:w` writes. See `docs/specs/image-ops.md`.
     mod image_ops {
@@ -29709,9 +30081,9 @@ int main(void) {
                 "tileset what? (size, kind, select, image resize, image grow)"
             );
             ed.run_ex("tool");
-            assert_eq!(ed.session.status, "tool what? (tileset, image)");
+            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap)");
             ed.run_ex("tool lathe");
-            assert_eq!(ed.session.status, "not a tool: lathe (want tileset or image)");
+            assert_eq!(ed.session.status, "not a tool: lathe (want tileset, image or normalmap)");
 
             ed.run_ex("set tileset size 8");
             assert_eq!(ed.session.status, "unknown option: tileset", "no longer a :set");
