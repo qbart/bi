@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::tilemap::{Kind, Tile, Tilemap};
+
 #[derive(Debug, Clone)]
 pub struct Img {
     pub path: PathBuf,
@@ -32,6 +34,18 @@ pub struct Img {
     /// Stable per opened image, for a frontend that uploads pixels to the
     /// terminal once and refers to them by number after.
     pub id: u64,
+    /// The grid, while `:set editor tilemap` is on. See
+    /// `docs/specs/tilemap.md`.
+    tilemap: Option<Tilemap>,
+    /// The tile size and kind outlive the grid: leaving and coming back
+    /// finds them where they were.
+    tile_size: (u32, u32),
+    tile_kind: Kind,
+    /// Edited since it was read or written. What `:q` reads.
+    pub dirty: bool,
+    /// Bumped by every edit. What a frontend that uploaded the pixels once
+    /// reads, to know the upload is stale.
+    pub generation: u64,
 }
 
 /// Whether `path` is worth trying to decode at all.
@@ -64,7 +78,213 @@ impl Img {
     /// The constructor the decode feeds, and the one a test can feed pixels
     /// to without a file.
     pub fn from_pixels(path: PathBuf, width: u32, height: u32, rgba: Vec<u8>, id: u64) -> Self {
-        Self { path, width, height, rgba, scroll: (0, 0), viewport: (0, 0), step: 1, id }
+        Self {
+            path,
+            width,
+            height,
+            rgba,
+            scroll: (0, 0),
+            viewport: (0, 0),
+            step: 1,
+            id,
+            tilemap: None,
+            tile_size: (16, 16),
+            tile_kind: Kind::Tile,
+            dirty: false,
+            generation: 0,
+        }
+    }
+
+    /// Writes the pixels as PNG — to `path` when given, re-pointing the
+    /// image at it the way `:w other.rs` re-points a buffer, else to its
+    /// own. Any other extension is refused rather than writing PNG bytes
+    /// under a `.jpg` name.
+    pub fn save(&mut self, path: Option<&Path>) -> std::result::Result<(), String> {
+        let target = path.unwrap_or(&self.path).to_path_buf();
+        let png = target
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+        if !png {
+            return Err("only png".into());
+        }
+        image::save_buffer(
+            &target,
+            &self.rgba,
+            self.width,
+            self.height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("error: {e}"))?;
+        self.path = target;
+        self.dirty = false;
+        Ok(())
+    }
+
+    // ---- the tilemap: see `docs/specs/tilemap.md` ----
+
+    pub fn tilemap(&self) -> Option<&Tilemap> {
+        self.tilemap.as_ref()
+    }
+
+    pub fn tile_size(&self) -> (u32, u32) {
+        self.tile_size
+    }
+
+    pub fn tile_kind(&self) -> Kind {
+        self.tile_kind
+    }
+
+    /// A new tile size, kept whether or not the grid is on; the cursor is
+    /// re-clamped when it is.
+    pub fn set_tile_size(&mut self, size: (u32, u32)) {
+        self.tile_size = size;
+        if let Some(map) = &mut self.tilemap {
+            map.set_size(size, self.width, self.height);
+        }
+        self.follow_cursor();
+    }
+
+    pub fn set_tile_kind(&mut self, kind: Kind) {
+        self.tile_kind = kind;
+        if let Some(map) = &mut self.tilemap {
+            map.set_kind(kind);
+        }
+    }
+
+    /// `:set editor tilemap`. A sheet too small for one tile has no grid
+    /// to put a cursor on, and says so.
+    pub fn enter_tilemap(&mut self) -> std::result::Result<(), String> {
+        if self.tilemap.is_some() {
+            return Ok(());
+        }
+        let map = Tilemap::new(self.tile_size, self.tile_kind);
+        let (cols, rows) = map.grid(self.width, self.height);
+        if cols == 0 || rows == 0 {
+            let (w, h) = self.tile_size;
+            return Err(format!("{}×{} holds no {w}×{h} tile", self.width, self.height));
+        }
+        self.tilemap = Some(map);
+        self.follow_cursor();
+        Ok(())
+    }
+
+    /// `Esc`, or `:set editor image`. Size, kind and edits stay.
+    pub fn leave_tilemap(&mut self) {
+        self.tilemap = None;
+    }
+
+    fn grid(&self) -> (u32, u32) {
+        self.tilemap.as_ref().map(|m| m.grid(self.width, self.height)).unwrap_or((0, 0))
+    }
+
+    /// `hjkl` on the grid, counts multiplied in.
+    pub fn tile_move(&mut self, dx: i64, dy: i64) {
+        let grid = self.grid();
+        if let Some(map) = &mut self.tilemap {
+            map.move_by(dx, dy, grid);
+        }
+        self.follow_cursor();
+    }
+
+    /// `0` and `$`: a column, or the last.
+    pub fn tile_to_col(&mut self, col: Option<u32>) {
+        let grid = self.grid();
+        if let Some(map) = &mut self.tilemap {
+            map.to_col(col, grid);
+        }
+        self.follow_cursor();
+    }
+
+    /// `gg`, `G`, `5G`: a row, or the last.
+    pub fn tile_to_row(&mut self, row: Option<u32>) {
+        let grid = self.grid();
+        if let Some(map) = &mut self.tilemap {
+            map.to_row(row, grid);
+        }
+        self.follow_cursor();
+    }
+
+    /// `Ctrl-D` / `Ctrl-U`: half a viewport of rows, at least one.
+    pub fn tile_half_page(&mut self, down: bool, count: usize) {
+        let rows =
+            (self.viewport.1 / 2 / self.tile_size.1.max(1)).max(1) as i64 * count.max(1) as i64;
+        self.tile_move(0, if down { rows } else { -rows });
+    }
+
+    /// The least scroll that puts the cursor's tile wholly in the viewport;
+    /// none when it already is. A viewport smaller than a tile shows the
+    /// tile's top-left.
+    fn follow_cursor(&mut self) {
+        let Some(map) = &self.tilemap else { return };
+        let (x, y, w, h) = map.cursor_rect();
+        let (vw, vh) = self.viewport;
+        if vw == 0 || vh == 0 {
+            return;
+        }
+        let (sx, sy) = self.scroll;
+        let sx = if x < sx {
+            x
+        } else if x + w > sx + vw {
+            (x + w).saturating_sub(vw).min(x)
+        } else {
+            sx
+        };
+        let sy = if y < sy {
+            y
+        } else if y + h > sy + vh {
+            (y + h).saturating_sub(vh).min(y)
+        } else {
+            sy
+        };
+        self.scroll = (sx, sy);
+        self.clamp();
+    }
+
+    /// `yy`.
+    pub fn tile_yank(&self) -> Option<Tile> {
+        self.tilemap.as_ref()?.yank(&self.rgba, self.width)
+    }
+
+    /// `dd`: the tile, and transparent left behind.
+    pub fn tile_cut(&mut self) -> Option<Tile> {
+        let map = self.tilemap.as_mut()?;
+        let tile = map.cut(&mut self.rgba, self.width)?;
+        self.edited();
+        Some(tile)
+    }
+
+    /// `p`.
+    pub fn tile_paste(&mut self, tile: &Tile) -> std::result::Result<(), String> {
+        let Some(map) = self.tilemap.as_mut() else { return Err("no grid here".into()) };
+        map.paste(&mut self.rgba, self.width, tile)?;
+        self.edited();
+        Ok(())
+    }
+
+    /// `u`. False when there is nothing left to undo.
+    pub fn tile_undo(&mut self) -> bool {
+        let Some(map) = self.tilemap.as_mut() else { return false };
+        let done = map.undo(&mut self.rgba, self.width);
+        if done {
+            self.edited();
+        }
+        done
+    }
+
+    /// `Ctrl-R`.
+    pub fn tile_redo(&mut self) -> bool {
+        let Some(map) = self.tilemap.as_mut() else { return false };
+        let done = map.redo(&mut self.rgba, self.width);
+        if done {
+            self.edited();
+        }
+        done
+    }
+
+    fn edited(&mut self) {
+        self.dirty = true;
+        self.generation += 1;
     }
 
     pub fn scroll(&self) -> (u32, u32) {
@@ -78,6 +298,7 @@ impl Img {
         self.viewport = (width, height);
         self.step = step.max(1);
         self.clamp();
+        self.follow_cursor();
     }
 
     /// `hjkl` and `Ctrl-E`/`Ctrl-Y` — by whole steps, counts multiplied in.

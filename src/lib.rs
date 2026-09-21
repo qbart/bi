@@ -61,6 +61,7 @@ pub mod substitute;
 pub mod surround;
 pub mod syntax;
 pub mod theme;
+pub mod tilemap;
 pub mod todo;
 pub mod transform;
 pub mod tree;

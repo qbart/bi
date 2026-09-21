@@ -826,7 +826,8 @@ fn render_stack(
     ui: &Ui,
 ) -> Option<(u16, u16)> {
     let height = area.height as usize;
-    let first = if height == 0 || stack.selected < height { 0 } else { stack.selected + 1 - height };
+    let first =
+        if height == 0 || stack.selected < height { 0 } else { stack.selected + 1 - height };
     let last = (first + height).min(stack.frames.len());
     let mut cursor_at = None;
     let mut lines = Vec::with_capacity(height);
@@ -1011,7 +1012,36 @@ fn render_image(
                 cols,
                 rows,
                 crop: (sx, sy, w, h),
+                offset: (0, 0),
+                z: -1,
+                frame: (0, 0),
             });
+            // The tilemap cursor: the frame image over the tile's cell, at
+            // `z=0`, cropped to what the pane shows of the tile. See
+            // docs/specs/tilemap.md.
+            if let Some(map) = img.tilemap() {
+                let (cx, cy, fw, fh) = map.cursor_rect();
+                // The visible part of the tile: its rectangle meeting the crop.
+                let (vx0, vy0) = (cx.max(sx), cy.max(sy));
+                let (vx1, vy1) = ((cx + fw).min(sx + w), (cy + fh).min(sy + h));
+                if vx1 > vx0 && vy1 > vy0 {
+                    let (px, py) = (vx0 - sx, vy0 - sy);
+                    let (ox, oy) = ((px % cw as u32) as u16, (py % ch as u32) as u16);
+                    let (vw, vh) = (vx1 - vx0, vy1 - vy0);
+                    places.push(crate::tui::graphics::Place {
+                        id: crate::tui::graphics::FRAME_ID,
+                        pid: id.0 + 1,
+                        col: col + (px / cw as u32) as u16,
+                        row: row + (py / ch as u32) as u16,
+                        cols: (ox as u32 + vw).div_ceil(cw as u32) as u16,
+                        rows: (oy as u32 + vh).div_ceil(ch as u32) as u16,
+                        crop: (vx0 - cx, vy0 - cy, vw, vh),
+                        offset: (ox, oy),
+                        z: 0,
+                        frame: (fw, fh),
+                    });
+                }
+            }
         }
         _ => {
             // No pixels to draw with. The placeholder still says what this
@@ -1679,10 +1709,17 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     // like any other foreign text.
     let left = cells_at(&window_status_text(ed, id, focused), 8);
     // An image pane has no mode segment: modes do not exist there, and the
-    // row should not claim otherwise. See docs/specs/images.md.
-    let image = matches!(ed.pane(id), Some(Pane::Image { .. }));
-    let right =
-        if focused && !image { format!(" {} ", ed.session.mode.label()) } else { String::new() };
+    // row should not claim otherwise. See docs/specs/images.md. The tilemap
+    // is the one mode a picture has, and says so.
+    let (image, tilemap) = match ed.pane(id) {
+        Some(Pane::Image { img, .. }) => (true, img.tilemap().is_some()),
+        _ => (false, false),
+    };
+    let right = match (focused, image, tilemap) {
+        (true, true, true) => " TILEMAP ".to_string(),
+        (true, false, _) => format!(" {} ", ed.session.mode.label()),
+        _ => String::new(),
+    };
 
     // The numstat, to the left of the mode: each part in its sign's colour on
     // the row's own background, absent at zero, so a clean file's status row
@@ -1711,7 +1748,7 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     let pad = (width as usize).saturating_sub(span_width(&left) + stats_width + span_width(&right));
     let mut spans = vec![Span::styled(left, row), Span::styled(" ".repeat(pad), row)];
     spans.extend(stats);
-    if focused && !image {
+    if focused && (!image || tilemap) {
         spans.push(Span::styled(right, mode_style(&ed.session.mode, &ed.theme().ui)));
     }
     spans
@@ -1734,25 +1771,37 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
         }
         // An image says how big it is where a text pane says where you are —
         // the size is the fact about a picture that position was about text.
+        // With the tilemap on, the tile size, the cursor and the grid ride
+        // beside it, and a `+` marks edits the way a buffer's row does.
         Some(Pane::Image { img, .. }) => {
-            let name = img
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| img.path.display().to_string());
-            (name, format!("{}×{}", img.width, img.height))
+            let mut name = bi::editor::image_name(img);
+            if img.dirty {
+                name.push_str(" +");
+            }
+            let mut at = format!("{}×{}", img.width, img.height);
+            if let Some(map) = img.tilemap() {
+                let (tw, th) = map.size();
+                let (c, r) = map.cursor();
+                let (cols, rows) = map.grid(img.width, img.height);
+                at.push_str(&format!("  {tw}×{th} tile {c},{r} of {cols}×{rows}"));
+            }
+            (name, at)
         }
         // Stack and Console say what they are and how much they hold — the
         // same shape as the results pane's row, since neither has a text
         // cursor position to report either.
-        Some(Pane::DapStack { stack, .. }) => ("Stack".into(), format!("{} frames", stack.frames.len())),
+        Some(Pane::DapStack { stack, .. }) => {
+            ("Stack".into(), format!("{} frames", stack.frames.len()))
+        }
         Some(Pane::DapConsole { console, .. }) => {
             ("Console".into(), format!("{} lines", console.lines.len()))
         }
         Some(Pane::DapVariables { vars, .. }) => {
             ("Variables".into(), format!("{} rows", vars.visible().len()))
         }
-        Some(Pane::DapWatches { list, .. }) => ("Watches".into(), format!("{} watches", list.len())),
+        Some(Pane::DapWatches { list, .. }) => {
+            ("Watches".into(), format!("{} watches", list.len()))
+        }
         Some(Pane::Text { text, buffer, .. }) => {
             // The file name, not the path. Which `main.rs` it is belongs to the
             // picker; a pane thirty columns wide has no room to say it twice.
@@ -2356,10 +2405,7 @@ mod tests {
             // No language, so the fenced block takes the fallback branch —
             // the other path this covers.
             language: None,
-            lines: vec![
-                HoverLine::Text("t\x1b[31mx".into()),
-                HoverLine::Code("c\x1b[31my".into()),
-            ],
+            lines: vec![HoverLine::Text("t\x1b[31mx".into()), HoverLine::Code("c\x1b[31my".into())],
         });
         terminal.draw(|frame| render(frame, &mut ed, "", None, &mut Vec::new())).unwrap();
 
@@ -2601,7 +2647,11 @@ mod tests {
         let selection = Some(color(ed.theme().ui.selection.bg.unwrap()));
 
         // The pane that pressed `V` paints its whole line...
-        assert_eq!(bg(focused_rect.x + 3, focused_rect.y), selection, "the focused pane is selected");
+        assert_eq!(
+            bg(focused_rect.x + 3, focused_rect.y),
+            selection,
+            "the focused pane is selected"
+        );
         // ...and the other pane, whose cursor is collapsed, paints nothing as
         // selected — a cursor there is a cursor, not a line about to go.
         for x in other_rect.x..other_rect.x + other_rect.width {
@@ -3094,6 +3144,79 @@ int main(void) {
         let mut places = Vec::new();
         terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
         assert!(places.is_empty(), "covered by the picker: {places:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tilemap cursor is a second placement — the frame image over the
+    /// tile's cell, at `z=0`, with the pixel remainder in the offset — and
+    /// none at all when the grid is off. See docs/specs/tilemap.md.
+    #[test]
+    fn the_tilemap_cursor_is_a_frame_placement_over_the_tile() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("bi-render-tile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atlas.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([1, 2, 3, 255])).save(&path).unwrap();
+
+        let mut ed = Editor::empty();
+        ed.run_ex(&format!("e {}", path.display()));
+        // 8×16 cells, an 8-column pane: the 64-pixel sheet is exactly 8 cells
+        // wide and 4 tall, so nothing is centered away from the origin.
+        let mut terminal = Terminal::new(TestBackend::new(8, 6)).unwrap();
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        assert_eq!(places.len(), 1, "no grid, no frame: {places:?}");
+
+        ed.run_ex("set tilemap size 12");
+        ed.run_ex("set editor tilemap");
+        ed.apply(bi::editor::Command {
+            count: 1,
+            action: bi::editor::Action::Move(bi::motion::Motion::Right),
+        });
+        ed.apply(bi::editor::Command {
+            count: 1,
+            action: bi::editor::Action::Move(bi::motion::Motion::Down),
+        });
+        let mut places = Vec::new();
+        terminal.draw(|frame| render(frame, &mut ed, "", Some((8, 16)), &mut places)).unwrap();
+        assert_eq!(places.len(), 2, "{places:?}");
+        let atlas = places[0];
+        let frame = places[1];
+        assert_eq!(atlas.z, -1);
+        assert_eq!(frame.z, 0);
+        assert_eq!(frame.id, crate::tui::graphics::FRAME_ID);
+        assert_eq!(frame.pid, atlas.pid, "the window's, like the atlas's");
+        // The tile at 12,12: cell column 1 with 4 pixels over, cell row 0
+        // with 12 pixels down.
+        assert_eq!((frame.col, frame.row), (atlas.col + 1, atlas.row));
+        assert_eq!(frame.offset, (4, 12));
+        assert_eq!(frame.crop, (0, 0, 12, 12), "the whole frame is in view");
+        assert_eq!(
+            (frame.cols, frame.rows),
+            (2, 2),
+            "4+12 pixels over two 8-wide cells, 12+12 over two 16-tall rows"
+        );
+
+        let text = window_status_text(&ed, ed.focus(), true);
+        assert!(text.contains("64×64  12×12 tile 1,1 of 5×5"), "{text}");
+        assert!(!text.contains('+'), "{text}");
+        ed.apply(bi::editor::Command {
+            count: 1,
+            action: bi::editor::Action::Operate {
+                op: bi::motion::Operator::Delete,
+                target: bi::motion::Target::Motion(bi::motion::Motion::CurrentLine),
+                count: 1,
+                sink: bi::registers::Sink::Ring,
+            },
+        });
+        let text = window_status_text(&ed, ed.focus(), true);
+        assert!(text.contains("atlas.png +"), "{text}");
+        let spans = window_status(&ed, ed.focus(), true, 60);
+        let row: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(row.ends_with(" TILEMAP "), "{row:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -13,6 +13,11 @@ use std::io::{Read, Write};
 use base64::Engine as _;
 use bi::editor::Editor;
 
+/// The id the tilemap's cursor frame is uploaded under — the frontend's
+/// own, and one the core's counter, which starts at one and climbs, never
+/// reaches. See `docs/specs/tilemap.md`.
+pub const FRAME_ID: u64 = u64::MAX;
+
 /// How, if at all, pixels reach the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
@@ -42,9 +47,25 @@ pub struct Place {
     pub rows: u16,
     /// x, y, width, height of the source rectangle, in pixels.
     pub crop: (u32, u32, u32, u32),
+    /// Pixel offset of the crop's top-left within the destination cell —
+    /// the protocol's `X`/`Y`. Zero for an image, which starts on a cell;
+    /// the tile frame lands wherever the tile does.
+    pub offset: (u16, u16),
+    /// `-1` for a picture, under text glyphs and above background fills;
+    /// `0` for the frame that rides over the picture.
+    pub z: i32,
+    /// For the tile frame: the whole frame's size, which the crop may show
+    /// only part of. Zero for a picture.
+    pub frame: (u32, u32),
 }
 
 impl Place {
+    /// The tile frame's full size. The crop's width and height are the
+    /// *visible* part, so the whole is kept beside them for the upload.
+    pub fn frame_size(&self) -> (u32, u32) {
+        self.frame
+    }
+
     /// Whether any of this placement's cells fall inside `x, y, w, h`.
     pub fn intersects(&self, x: u16, y: u16, w: u16, h: u16) -> bool {
         self.col < x + w && x < self.col + self.cols && self.row < y + h && y < self.row + self.rows
@@ -54,9 +75,11 @@ impl Place {
 /// What the terminal is currently showing, and what it already holds.
 pub struct Graphics {
     support: Support,
-    /// Ids whose pixels the terminal has been sent. Pixels go up once; every
-    /// frame after moves a placement, which is metadata.
-    sent: HashSet<u64>,
+    /// Ids whose pixels the terminal has been sent, and at which generation.
+    /// Pixels go up once per generation; every frame after moves a
+    /// placement, which is metadata. An edit moves the generation, and the
+    /// pixels go up again under the same id.
+    sent: HashMap<u64, u64>,
     /// The placements on screen, by image and placement id. Re-creating a
     /// placement under the same placement id replaces it atomically, so only
     /// what moved is ever rewritten — which is what keeps scrolling
@@ -79,7 +102,7 @@ impl Graphics {
             }
             _ => None,
         };
-        Self { support, sent: HashSet::new(), placed: HashMap::new(), tmux_cell }
+        Self { support, sent: HashMap::new(), placed: HashMap::new(), tmux_cell }
     }
 
     /// One cell's size in pixels, when the terminal both draws images and
@@ -127,10 +150,28 @@ impl Graphics {
         let mut offset: Option<(u16, u16)> = None;
 
         for place in places {
-            if !self.sent.contains(&place.id) {
+            // The frame's "generation" is its size: a new tile size is a
+            // new picture under the old id.
+            let (pixels, generation): (std::borrow::Cow<[u8]>, u64) = if place.id == FRAME_ID {
+                let (w, h) = (place.frame_size().0, place.frame_size().1);
+                (frame_pixels(w, h).into(), ((w as u64) << 32) | h as u64)
+            } else {
                 let Some(img) = ed.image_with_id(place.id) else { continue };
-                self.transmit(&mut out, img)?;
-                self.sent.insert(place.id);
+                ((&img.rgba).into(), img.generation)
+            };
+            if self.needs_send(place.id, generation) {
+                let (w, h) = if place.id == FRAME_ID {
+                    place.frame_size()
+                } else {
+                    let img = ed.image_with_id(place.id).expect("looked up above");
+                    (img.width, img.height)
+                };
+                self.transmit(&mut out, place.id, &pixels, w, h)?;
+                self.mark_sent(place.id, generation);
+                // Re-sending replaces the pixels and the terminal forgets
+                // the placements with them: forget ours too, so they are
+                // re-emitted below.
+                self.placed.retain(|&(id, _), _| id != place.id);
                 wrote = true;
             }
             if self.placed.get(&(place.id, place.pid)) == Some(place) {
@@ -138,17 +179,20 @@ impl Graphics {
             }
             let (top, left) = *offset.get_or_insert_with(|| self.pane_offset());
             let (x, y, w, h) = place.crop;
+            let (ox, oy) = place.offset;
             // Save the cursor, move to the cell, place without moving the
             // cursor (`C=1`), come back. `q=2` everywhere: nothing here reads
             // responses once the event thread owns stdin. `z=-1` keeps the
             // picture under text glyphs and above background fills, so what
-            // the renderer draws over these cells stays readable.
+            // the renderer draws over these cells stays readable; the tile
+            // frame rides at `z=0`, over the picture.
             let seq = format!(
-                "\x1b7\x1b[{};{}H\x1b_Ga=p,i={},p={},x={x},y={y},w={w},h={h},z=-1,C=1,q=2\x1b\\\x1b8",
+                "\x1b7\x1b[{};{}H\x1b_Ga=p,i={},p={},x={x},y={y},w={w},h={h},X={ox},Y={oy},z={},C=1,q=2\x1b\\\x1b8",
                 place.row + top + 1,
                 place.col + left + 1,
                 place.id,
                 place.pid,
+                place.z,
             );
             self.write_seq(&mut out, &seq)?;
             self.placed.insert((place.id, place.pid), *place);
@@ -172,7 +216,7 @@ impl Graphics {
             return Ok(());
         }
         let mut out = std::io::stdout().lock();
-        let ids: Vec<u64> = self.sent.drain().collect();
+        let ids: Vec<u64> = self.sent.drain().map(|(id, _)| id).collect();
         for id in ids {
             self.write_seq(&mut out, &format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"))?;
         }
@@ -203,20 +247,36 @@ impl Graphics {
         }
     }
 
+    /// Whether `id`'s pixels at `generation` have yet to go up.
+    fn needs_send(&self, id: u64, generation: u64) -> bool {
+        self.sent.get(&id) != Some(&generation)
+    }
+
+    fn mark_sent(&mut self, id: u64, generation: u64) {
+        self.sent.insert(id, generation);
+    }
+
     /// Uploads one image's pixels, PNG on the wire.
     ///
     /// `f=100` rather than raw RGBA: a fraction of the bytes — this may be
     /// crossing an SSH connection — and the terminal decodes natively.
     /// Encoded from the core's RGBA once, here, because the core's job ended
     /// at pixels.
-    fn transmit(&self, out: &mut impl Write, img: &bi::img::Img) -> std::io::Result<()> {
+    fn transmit(
+        &self,
+        out: &mut impl Write,
+        id: u64,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> std::io::Result<()> {
         let mut png = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png);
         image::ImageEncoder::write_image(
             encoder,
-            &img.rgba,
-            img.width,
-            img.height,
+            rgba,
+            width,
+            height,
             image::ExtendedColorType::Rgba8,
         )
         .map_err(std::io::Error::other)?;
@@ -227,7 +287,7 @@ impl Graphics {
         while let Some(chunk) = chunks.next() {
             let more = if chunks.peek().is_some() { 1 } else { 0 };
             let head = match first {
-                true => format!("\x1b_Ga=t,f=100,t=d,i={},q=2,m={more};", img.id),
+                true => format!("\x1b_Ga=t,f=100,t=d,i={id},q=2,m={more};"),
                 false => format!("\x1b_Gm={more};"),
             };
             first = false;
@@ -236,6 +296,27 @@ impl Graphics {
         }
         Ok(())
     }
+}
+
+/// The tilemap cursor: a `width`×`height` RGBA frame, transparent inside,
+/// with a one-pixel border whose colour alternates white and black every
+/// three pixels — a dash that reads on any tile, light or dark.
+pub fn frame_pixels(width: u32, height: u32) -> Vec<u8> {
+    let mut px = vec![0u8; (width * height * 4) as usize];
+    let mut paint = |x: u32, y: u32, along: u32| {
+        let v = if (along / 3) % 2 == 0 { 255 } else { 0 };
+        let i = ((y * width + x) * 4) as usize;
+        px[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+    };
+    for x in 0..width {
+        paint(x, 0, x);
+        paint(x, height - 1, x);
+    }
+    for y in 0..height {
+        paint(0, y, y);
+        paint(width - 1, y, y);
+    }
+    px
 }
 
 /// Whether, and how, the terminal can draw pixels.
@@ -337,4 +418,38 @@ fn parse_pair(s: &str) -> Option<(u16, u16)> {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame is transparent inside, and its border alternates black and
+    /// white in three-pixel runs so it reads on any tile.
+    #[test]
+    fn the_frame_is_a_dashed_ring_around_nothing() {
+        let (w, h) = (8, 6);
+        let px = frame_pixels(w, h);
+        assert_eq!(px.len(), (w * h * 4) as usize);
+        let at = |x: u32, y: u32| &px[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
+        assert_eq!(at(3, 2), &[0, 0, 0, 0], "inside is clear");
+        assert_eq!(at(0, 0), &[255, 255, 255, 255]);
+        assert_eq!(at(2, 0), &[255, 255, 255, 255]);
+        assert_eq!(at(3, 0), &[0, 0, 0, 255], "the run switches after three");
+        assert_eq!(at(6, 0)[3], 255, "every border pixel is opaque");
+        assert_eq!(at(0, 5)[3], 255);
+        assert_eq!(at(7, 3)[3], 255);
+        assert_eq!(at(0, 3)[3], 255);
+    }
+
+    /// A placement of a stale generation goes back up under the same id and
+    /// its placement is re-emitted; a frame of a new size the same way.
+    #[test]
+    fn stale_pixels_are_sent_again() {
+        let mut g = Graphics::new(Support::None);
+        assert!(g.needs_send(7, 0));
+        g.mark_sent(7, 0);
+        assert!(!g.needs_send(7, 0));
+        assert!(g.needs_send(7, 1), "an edit moved the generation");
+    }
 }

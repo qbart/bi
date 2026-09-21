@@ -667,6 +667,15 @@ pub struct Pasting {
 /// any one view of it — what a single keyboard has, regardless of what it is
 /// pointed at.
 ///
+/// An image's file name, for the status row — the path when there is no
+/// name, which a path always has.
+pub fn image_name(img: &Img) -> String {
+    img.path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| img.path.display().to_string())
+}
+
 /// A struct rather than a spray of fields on [`Editor`] so that [`View`] can
 /// borrow all of it at once, disjointly from the buffer and the window it is
 /// also holding. See `docs/specs/windows.md`.
@@ -681,6 +690,10 @@ pub struct Session {
     pub clipboard: Clipboard,
     /// A paste waiting on a name for the file it stopped at.
     pub pasting: Option<Pasting>,
+    /// The one tile slot — `yy`/`dd` fill it, `p` reads it, on any image
+    /// in the session. Separate from the text ring: text and pixels do not
+    /// paste into each other. See `docs/specs/tilemap.md`.
+    pub tile: Option<crate::tilemap::Tile>,
     /// A capture waiting on its register name — the text `"n{operator}` took,
     /// held while the `:yname ` prompt is up. Never survives leaving the
     /// prompt: `:yname` consumes it, anything else sends it to the ring.
@@ -4612,6 +4625,9 @@ impl Editor {
                     // exactly the detached feeling docs/specs/images.md exists
                     // to avoid. Discarded rather than parked — that is what
                     // delete means; `Ctrl-^` is the key that parks.
+                    None if self.window().img().is_some_and(|img| img.dirty) && !force => {
+                        self.session.status = "unsaved changes (use `:bd!` to discard)".into();
+                    }
                     None if self.window().img().is_some() => self.dismiss_image(focus),
                     // A tree pane shows no buffer, so there is nothing here to
                     // delete — unlike `:bn`, which is a request to show one.
@@ -6229,6 +6245,9 @@ impl Editor {
         let count = cmd.count.max(1);
         let steps = count as i64;
         let Some(img) = self.window_mut().img_mut() else { return false };
+        if img.tilemap().is_some() {
+            return self.run_tilemap_action(cmd);
+        }
         match &cmd.action {
             Action::Move(Motion::Left) => img.step_by(-steps, 0),
             Action::Move(Motion::Right) => img.step_by(steps, 0),
@@ -6248,6 +6267,108 @@ impl Editor {
             | Action::ShowScopes
             | Action::EnterVisual(_) => {}
             _ => return false,
+        }
+        true
+    }
+
+    /// The same keys, read as tiles while the grid is on. Everything the
+    /// plain image swallows is swallowed here too. See `docs/specs/tilemap.md`.
+    fn run_tilemap_action(&mut self, cmd: &Command) -> bool {
+        let count = cmd.count.max(1);
+        let steps = count as i64;
+        // Read before the window is borrowed: the slot and the image are
+        // both the editor's, and the borrow checker cannot see they are
+        // disjoint through `window_mut`.
+        let slot = self.session.tile.clone();
+        let mut captured = None;
+        let Some(img) = self.window_mut().img_mut() else { return false };
+        let status = match &cmd.action {
+            Action::Move(Motion::Left) => {
+                img.tile_move(-steps, 0);
+                None
+            }
+            Action::Move(Motion::Right) => {
+                img.tile_move(steps, 0);
+                None
+            }
+            Action::Move(Motion::Up) => {
+                img.tile_move(0, -steps);
+                None
+            }
+            Action::Move(Motion::Down) => {
+                img.tile_move(0, steps);
+                None
+            }
+            Action::Move(Motion::FirstLine) => {
+                img.tile_to_row(Some(0));
+                None
+            }
+            Action::Move(Motion::LastLine) => {
+                img.tile_to_row(None);
+                None
+            }
+            Action::Move(Motion::Line(n)) => {
+                img.tile_to_row(Some((*n).saturating_sub(1) as u32));
+                None
+            }
+            Action::Move(Motion::LineStart | Motion::FirstNonBlank) => {
+                img.tile_to_col(Some(0));
+                None
+            }
+            Action::Move(Motion::LineEnd | Motion::LastNonBlank) => {
+                img.tile_to_col(None);
+                None
+            }
+            Action::ScrollHalfPage { down } => {
+                img.tile_half_page(*down, count);
+                None
+            }
+            Action::ScrollLine { down } => {
+                img.tile_move(0, if *down { steps } else { -steps });
+                None
+            }
+            Action::Operate {
+                op: Operator::Yank,
+                target: Target::Motion(Motion::CurrentLine),
+                ..
+            } => {
+                captured = img.tile_yank();
+                None
+            }
+            Action::Operate {
+                op: Operator::Delete,
+                target: Target::Motion(Motion::CurrentLine),
+                ..
+            } => {
+                captured = img.tile_cut();
+                None
+            }
+            Action::Paste { .. } => match &slot {
+                None => Some("nothing to paste".to_string()),
+                Some(tile) => img.tile_paste(tile).err(),
+            },
+            Action::Undo => (!img.tile_undo()).then(|| "already at oldest change".to_string()),
+            Action::Redo => (!img.tile_redo()).then(|| "already at newest change".to_string()),
+            Action::EnterNormal => {
+                img.leave_tilemap();
+                None
+            }
+            // Swallowed, as the plain image swallows them: each would move
+            // the session into a mode that reads a buffer this window does
+            // not have. The rest of the operator family is nothing here.
+            Action::EnterFind
+            | Action::EnterSearch { .. }
+            | Action::SearchWord { .. }
+            | Action::ShowScopes
+            | Action::EnterVisual(_)
+            | Action::Operate { .. } => None,
+            _ => return false,
+        };
+        if let Some(tile) = captured {
+            self.session.tile = Some(tile);
+        }
+        if let Some(status) = status {
+            self.session.status = status;
         }
         true
     }
@@ -6558,7 +6679,11 @@ impl Editor {
     /// last — which is what vim does, and what makes `:qa` mean something
     /// different from `:q`.
     fn quit(&mut self, force: bool) {
-        if self.windows.len() > 1 {
+        // Before the window count: closing an image window discards the
+        // image, split or not — no buffer list holds it.
+        if self.window().img().is_some_and(|img| img.dirty) && !force {
+            self.session.status = "unsaved changes (use `:q!` to discard)".into();
+        } else if self.windows.len() > 1 {
             self.close_window(self.focus);
         } else if self.buffer().is_some_and(|b| b.is_modified() && !b.is_transient()) && !force {
             self.session.status = "unsaved changes (use `:q!` to discard)".into();
@@ -6576,12 +6701,34 @@ impl Editor {
             .iter()
             .find(|b| b.buffer.is_modified() && !b.buffer.is_transient())
             .map(|b| b.id);
-        match unsaved {
-            Some(id) if !force => {
+        let dirty_image = self.windows.iter().find_map(|w| w.img().filter(|img| img.dirty));
+        match (unsaved, dirty_image) {
+            (Some(id), _) if !force => {
                 self.session.status =
                     format!("\"{}\" has unsaved changes (use `:qa!`)", self.name_of(id));
             }
+            (_, Some(img)) if !force => {
+                self.session.status =
+                    format!("\"{}\" has unsaved changes (use `:qa!`)", image_name(img));
+            }
             _ => self.session.quit = true,
+        }
+    }
+
+    /// `:w` on an image: PNG to its path, or to `path`. See
+    /// `docs/specs/tilemap.md`.
+    fn write_image(&mut self, path: &str) -> bool {
+        let Some(img) = self.window_mut().img_mut() else { return false };
+        let target = (!path.is_empty()).then(|| PathBuf::from(path));
+        match img.save(target.as_deref()) {
+            Ok(()) => {
+                self.session.status = format!("\"{}\" written", image_name(img));
+                true
+            }
+            Err(e) => {
+                self.session.status = e;
+                false
+            }
         }
     }
 
@@ -7250,7 +7397,11 @@ impl Editor {
 
             // The rest need the rope, and so need a view.
             ExLine::Write { path, force } => {
-                self.in_view(|view| view.write(&path, force));
+                if self.window().img().is_some() {
+                    self.write_image(&path);
+                } else {
+                    self.in_view(|view| view.write(&path, force));
+                }
             }
             ExLine::Revert { force, enc, ff } => {
                 self.in_view(|view| view.edit(force, enc, ff));
@@ -7268,7 +7419,11 @@ impl Editor {
                 self.in_view(|view| view.goto(address));
             }
             ExLine::WriteQuit { path, force } => {
-                if self.in_view(|view| view.write(&path, force)) == Some(true) {
+                let written = match self.window().img().is_some() {
+                    true => self.write_image(&path),
+                    false => self.in_view(|view| view.write(&path, force)) == Some(true),
+                };
+                if written {
                     self.quit(true);
                 }
             }
@@ -7593,6 +7748,63 @@ impl Editor {
         };
     }
 
+    /// `:set editor tilemap|image` and `:set tilemap size|kind …`, on the
+    /// focused window's image.
+    fn set_image_setting(&mut self, name: &str, value: &str) {
+        let Some(img) = self.window_mut().img_mut() else {
+            self.session.status = "no image here".into();
+            return;
+        };
+        let message = match name {
+            "editor" => match value {
+                "" => {
+                    format!("editor={}", if img.tilemap().is_some() { "tilemap" } else { "image" })
+                }
+                "tilemap" => match img.enter_tilemap() {
+                    Ok(()) => String::new(),
+                    Err(e) => e,
+                },
+                "image" => {
+                    img.leave_tilemap();
+                    String::new()
+                }
+                other => format!("not an editor: {other} (want tilemap or image)"),
+            },
+            _ => {
+                let (what, value) = match value.split_once(' ') {
+                    Some((what, value)) => (what.trim(), value.trim()),
+                    None => (value, ""),
+                };
+                match (what, value) {
+                    ("size", "") => {
+                        let (w, h) = img.tile_size();
+                        format!("tilemap size={w}×{h}")
+                    }
+                    ("size", value) => match crate::tilemap::parse_size(value) {
+                        Ok(size) => {
+                            img.set_tile_size(size);
+                            String::new()
+                        }
+                        Err(e) => e,
+                    },
+                    ("kind", "") => format!("tilemap kind={}", img.tile_kind().as_str()),
+                    ("kind", value) => match crate::tilemap::Kind::parse(value) {
+                        Some(kind) => match kind.refusal() {
+                            Some(why) => why.into(),
+                            None => {
+                                img.set_tile_kind(kind);
+                                String::new()
+                            }
+                        },
+                        None => format!("not a tile kind: {value} (want tile)"),
+                    },
+                    _ => "set what? (tilemap size 16x16, tilemap kind tile)".into(),
+                }
+            }
+        };
+        self.session.status = message;
+    }
+
     fn set_option(&mut self, arg: &str) {
         let (name, value) = match arg.split_once(['=', ' ']) {
             Some((name, value)) => (name.trim(), value.trim()),
@@ -7610,6 +7822,12 @@ impl Editor {
         // See `docs/specs/encoding.md`.
         if matches!(name, "fileencoding" | "fileformat" | "bom") {
             return self.set_storage(name, value);
+        }
+        // The same again for a picture: `editor` and `tilemap` are facts
+        // about the image in the focused window, which no option layer can
+        // hold because an image is not a buffer. See `docs/specs/tilemap.md`.
+        if matches!(name, "editor" | "tilemap") {
+            return self.set_image_setting(name, value);
         }
 
         if value.is_empty() {
@@ -28914,6 +29132,285 @@ int main(void) {
         ed.apply(cmd(Action::EnterCommandMode));
 
         assert!(matches!(ed.session.mode, Mode::Command(_)));
+    }
+
+    /// `:set editor tilemap` and the keys it re-reads as tiles. The mode is
+    /// the image's, the register slot is the session's, and `:w` writes PNG.
+    /// See `docs/specs/tilemap.md`.
+    mod tilemap {
+        use super::*;
+        use crate::tilemap::Tile;
+
+        /// A 50×40 sheet in tilemap mode with 10-pixel tiles: a 5×4 grid.
+        fn sheet(tag: &str) -> (PngDir, Editor) {
+            let d = PngDir::new(tag);
+            let mut ed = Editor::empty();
+            ed.run_ex(&format!("e {}", d.png().display()));
+            ed.run_ex("set tilemap size 10");
+            ed.run_ex("set editor tilemap");
+            (d, ed)
+        }
+
+        fn cursor(ed: &Editor) -> (u32, u32) {
+            ed.window().img().unwrap().tilemap().unwrap().cursor()
+        }
+
+        fn on(ed: &Editor) -> bool {
+            ed.window().img().unwrap().tilemap().is_some()
+        }
+
+        #[test]
+        fn the_editor_setting_needs_an_image() {
+            let mut ed = editor("text");
+            ed.run_ex("set editor tilemap");
+            assert_eq!(ed.session.status, "no image here");
+        }
+
+        #[test]
+        fn the_grid_goes_on_and_off() {
+            let (_d, mut ed) = sheet("onoff");
+            assert!(on(&ed));
+            assert_eq!(cursor(&ed), (0, 0));
+
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=tilemap");
+
+            ed.run_ex("set editor image");
+            assert!(!on(&ed));
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=image");
+
+            ed.run_ex("set editor tilemap");
+            assert!(on(&ed));
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(!on(&ed), "Esc is the way out");
+            assert_eq!(ed.session.mode, Mode::Normal);
+        }
+
+        #[test]
+        fn size_and_kind_are_set_reported_and_refused() {
+            let (_d, mut ed) = sheet("size");
+            ed.run_ex("set tilemap size");
+            assert_eq!(ed.session.status, "tilemap size=10×10");
+
+            ed.run_ex("set tilemap size 8x16");
+            ed.run_ex("set tilemap size");
+            assert_eq!(ed.session.status, "tilemap size=8×16");
+
+            ed.run_ex("set tilemap size huge");
+            assert!(ed.session.status.contains("not a tile size"), "{}", ed.session.status);
+
+            ed.run_ex("set tilemap kind hex");
+            assert_eq!(ed.session.status, "hex is not built yet");
+            ed.run_ex("set tilemap kind");
+            assert_eq!(ed.session.status, "tilemap kind=tile");
+
+            ed.run_ex("set tilemap wat");
+            assert!(ed.session.status.contains("tilemap size"), "{}", ed.session.status);
+        }
+
+        #[test]
+        fn size_survives_leaving_and_reclamps_the_cursor() {
+            let (_d, mut ed) = sheet("survive");
+            ed.apply(cmd(Action::Move(Motion::LineEnd)));
+            ed.apply(cmd(Action::Move(Motion::LastLine)));
+            assert_eq!(cursor(&ed), (4, 3));
+
+            ed.run_ex("set tilemap size 25x20");
+            assert_eq!(cursor(&ed), (1, 1), "re-clamped to the 2×2 grid");
+
+            ed.apply(cmd(Action::EnterNormal));
+            ed.run_ex("set editor tilemap");
+            assert_eq!(ed.window().img().unwrap().tilemap().unwrap().size(), (25, 20));
+        }
+
+        #[test]
+        fn motions_move_by_tiles_and_counts_multiply() {
+            let (_d, mut ed) = sheet("move");
+            ed.apply(Command { count: 2, action: Action::Move(Motion::Right) });
+            ed.apply(cmd(Action::Move(Motion::Down)));
+            assert_eq!(cursor(&ed), (2, 1));
+
+            ed.apply(cmd(Action::Move(Motion::LineStart)));
+            ed.apply(cmd(Action::Move(Motion::FirstLine)));
+            assert_eq!(cursor(&ed), (0, 0));
+
+            ed.apply(cmd(Action::Move(Motion::Line(3))));
+            assert_eq!(cursor(&ed), (0, 2), "3G is row 3");
+
+            ed.apply(Command { count: 9, action: Action::Move(Motion::Left) });
+            assert_eq!(cursor(&ed), (0, 2), "clamped");
+        }
+
+        #[test]
+        fn the_crop_follows_the_cursor() {
+            let (_d, mut ed) = sheet("follow");
+            let focus = ed.focus();
+            ed.image_pane_mut(focus).unwrap().set_viewport(20, 20, 5);
+
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            assert_eq!(ed.window().img().unwrap().scroll(), (0, 0), "still in view");
+
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            assert_eq!(ed.window().img().unwrap().scroll(), (10, 0), "the least that shows it");
+
+            ed.apply(cmd(Action::Move(Motion::LastLine)));
+            assert_eq!(ed.window().img().unwrap().scroll(), (10, 20));
+
+            ed.apply(cmd(Action::Move(Motion::LineStart)));
+            ed.apply(cmd(Action::Move(Motion::FirstLine)));
+            assert_eq!(ed.window().img().unwrap().scroll(), (0, 0));
+        }
+
+        #[test]
+        fn yank_cut_and_paste_move_a_tile_through_the_slot() {
+            let (_d, mut ed) = sheet("cut");
+            let img = ed.window().img().unwrap();
+            let painted = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+
+            ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
+            assert_eq!(ed.session.tile.as_ref(), Some(&painted));
+            assert!(!ed.window().img().unwrap().dirty, "a yank changes nothing");
+
+            ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+            let img = ed.window().img().unwrap();
+            assert!(img.dirty);
+            let cleared = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+            assert!(cleared.rgba.iter().all(|&b| b == 0), "transparent");
+
+            ed.apply(cmd(Action::Move(Motion::Right)));
+            ed.apply(paste(false, 1));
+            let img = ed.window().img().unwrap();
+            assert_eq!(img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap(), painted);
+        }
+
+        #[test]
+        fn the_slot_outlives_the_mode_and_the_image() {
+            let (d, mut ed) = sheet("slot");
+            ed.apply(operate(Operator::Yank, Motion::CurrentLine, 1));
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(ed.session.tile.is_some());
+
+            let other = d.0.join("other.png");
+            image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0])).save(&other).unwrap();
+            ed.run_ex(&format!("e {}", other.display()));
+            ed.run_ex("set tilemap size 10");
+            ed.run_ex("set editor tilemap");
+            ed.apply(paste(false, 1));
+            let img = ed.window().img().unwrap();
+            let pasted = img.tilemap().unwrap().yank(&img.rgba, img.width).unwrap();
+            assert_eq!(pasted.rgba[3], 255, "the photo's opaque pixels landed");
+        }
+
+        #[test]
+        fn a_paste_with_nothing_or_the_wrong_size_is_refused() {
+            let (_d, mut ed) = sheet("refuse");
+            ed.apply(paste(false, 1));
+            assert_eq!(ed.session.status, "nothing to paste");
+
+            ed.session.tile = Some(Tile { width: 4, height: 4, rgba: vec![0; 64] });
+            ed.apply(paste(true, 1));
+            assert_eq!(ed.session.status, "tile is 4×4, grid is 10×10");
+            let img = ed.window().img().unwrap();
+            assert!(!img.dirty);
+        }
+
+        #[test]
+        fn undo_and_redo_walk_the_edits() {
+            let (_d, mut ed) = sheet("undo");
+            let before = ed.window().img().unwrap().rgba.clone();
+            ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+            let generation = ed.window().img().unwrap().generation;
+
+            ed.apply(cmd(Action::Undo));
+            let img = ed.window().img().unwrap();
+            assert_eq!(img.rgba, before);
+            assert!(img.generation > generation, "the frontend has to hear about it");
+
+            ed.apply(cmd(Action::Redo));
+            assert_ne!(ed.window().img().unwrap().rgba, before);
+
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(ed.session.status, "");
+            ed.apply(cmd(Action::Undo));
+            assert_eq!(ed.session.status, "already at oldest change");
+        }
+
+        #[test]
+        fn write_round_trips_the_pixels_and_clears_dirty() {
+            let (d, mut ed) = sheet("write");
+            ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+            let edited = ed.window().img().unwrap().rgba.clone();
+
+            ed.run_ex("w");
+            assert_eq!(ed.session.status, "\"photo.png\" written");
+            assert!(!ed.window().img().unwrap().dirty);
+
+            // Not `d.png()`: that helper writes a fresh file every call.
+            let back = image::open(d.0.join("photo.png")).unwrap().to_rgba8();
+            assert_eq!(back.as_raw(), &edited);
+
+            ed.run_ex("w other.jpg");
+            assert_eq!(ed.session.status, "only png");
+
+            let copy = d.0.join("copy.png");
+            ed.run_ex(&format!("w {}", copy.display()));
+            assert!(copy.exists());
+            assert_eq!(ed.window().img().unwrap().path, copy, "re-pointed, as :w other.rs is");
+        }
+
+        #[test]
+        fn quitting_a_dirty_image_needs_a_bang() {
+            let (_d, mut ed) = sheet("quit");
+            ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+
+            ed.run_ex("q");
+            assert!(!ed.session.quit);
+            assert_eq!(ed.session.status, "unsaved changes (use `:q!` to discard)");
+
+            ed.run_ex("qa");
+            assert!(!ed.session.quit);
+            assert!(
+                ed.session.status.contains("\"photo.png\" has unsaved changes"),
+                "{}",
+                ed.session.status
+            );
+
+            ed.run_ex("bd");
+            assert_eq!(ed.content_kind(), ContentKind::Image);
+            assert_eq!(ed.session.status, "unsaved changes (use `:bd!` to discard)");
+
+            ed.run_ex("q!");
+            assert!(ed.session.quit);
+        }
+
+        #[test]
+        fn a_dirty_image_in_a_split_still_refuses_q() {
+            let (_d, mut ed) = sheet("split");
+            ed.apply(operate(Operator::Delete, Motion::CurrentLine, 1));
+            sized(&mut ed);
+            ed.run_ex("vs");
+            let windows = ed.window_ids().len();
+            assert_eq!(windows, 2);
+
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids().len(), windows, "closing discards the image");
+            assert_eq!(ed.session.status, "unsaved changes (use `:q!` to discard)");
+
+            ed.run_ex("q!");
+            assert_eq!(ed.window_ids().len(), windows - 1);
+        }
+
+        #[test]
+        fn a_sheet_too_small_for_a_tile_says_so() {
+            let d = PngDir::new("tiny");
+            let mut ed = Editor::empty();
+            ed.run_ex(&format!("e {}", d.png().display()));
+            ed.run_ex("set tilemap size 64");
+            ed.run_ex("set editor tilemap");
+            assert!(!on(&ed));
+            assert_eq!(ed.session.status, "50×40 holds no 64×64 tile");
+        }
     }
 
     /// The editor surface over `buffer::Kind::Transient` — finding/creating
