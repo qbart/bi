@@ -6,7 +6,7 @@
 pub const SCHEMA_NAME: &str = "game.bischema";
 pub const DATA_NAME: &str = "level1.bidata";
 
-pub const SCHEMA: &str = r#"{
+pub const SCHEMA: &str = r##"{
   "$dialect": "bi/1",
   "types": {
     "Rarity": {
@@ -47,6 +47,9 @@ pub const SCHEMA: &str = r#"{
         { "name": "rarity", "type": "Rarity", "default": "common" },
         { "name": "two_handed", "type": "bool", "default": false },
         { "name": "tags", "type": "list<string>" },
+        { "name": "tint", "type": "rgb", "default": "#c8c8c8", "doc": "The sprite's colour" },
+        { "name": "glow", "type": "rgba", "group": "Advanced" },
+        { "name": "falloff", "type": "curve", "group": "Combat", "doc": "Damage over the swing, 0..1" },
         { "name": "offset", "type": "Vec2", "default": { "x": 0.5 }, "group": "Advanced", "widget": "inline" },
         { "name": "id_hash", "type": "u32", "group": "Advanced", "readonly": true, "doc": "Assigned by the build" },
         { "name": "notes", "type": "optional<string>", "group": "Advanced" }
@@ -68,9 +71,9 @@ pub const SCHEMA: &str = r#"{
     }
   }
 }
-"#;
+"##;
 
-pub const DATA: &str = r#"{
+pub const DATA: &str = r##"{
   "$dialect": "bi/1",
   "$schema": "game.bischema",
   "instances": [
@@ -103,6 +106,9 @@ pub const DATA: &str = r#"{
       "crit_chance": 0,
       "rarity": "epic",
       "two_handed": true,
+      "tint": "#7fd4ff",
+      "glow": "#7fd4ff80",
+      "falloff": [[0, 0.2, 0, 0, false], [0.6, 1, 0, 0, true], [1, 0.4, -1.5, -1.5, true]],
       "id_hash": 1618,
       "notes": "Slows on hit; see the status effects table"
     },
@@ -130,7 +136,7 @@ pub const DATA: &str = r#"{
     }
   ]
 }
-"#;
+"##;
 
 #[cfg(test)]
 mod tests {

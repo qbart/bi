@@ -2851,6 +2851,9 @@ struct CurveTool {
     buffer: BufferId,
     /// Byte offset of the list's opening bracket.
     anchor: usize,
+    /// Opened from the property view: the value's path there, which is
+    /// how the literal is found again when the view rewrites the file.
+    path: Option<String>,
     layout: crate::curve::Layout,
     selected: usize,
     xstep: f32,
@@ -3366,6 +3369,16 @@ impl Editor {
         let Some(props) = self.window_mut().props_mut() else { return };
         let (key, turnable) =
             props.selected_row().map(|r| (r.key.clone(), r.turnable)).unwrap_or_default();
+        if cmd == PropsCmd::Enter {
+            match props.curve_target(&key) {
+                Ok(Some((path, edit))) => return self.open_curve_from_props(window, path, edit),
+                Ok(None) => {}
+                Err(e) => {
+                    self.session.status = e;
+                    return;
+                }
+            }
+        }
         let mut select_after = None;
         let result: Result<Option<crate::props::Edit>, String> = match cmd {
             PropsCmd::Select { down, count } => {
@@ -9111,17 +9124,73 @@ impl Editor {
             self.set_focus(plot);
             return;
         }
-        let layout = crate::curve::Layout::default();
+        if let Some(props) = self.window().props() {
+            // The view: the selected row's curve, as `Enter` opens it.
+            let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+            match props.curve_target(&key) {
+                Ok(Some((path, edit))) => self.open_curve_from_props(self.focus, path, edit),
+                Ok(None) => self.session.status = "no curve on this row".into(),
+                Err(e) => self.session.status = e,
+            }
+            return;
+        }
         let Some((buffer, cursor)) =
             self.window().text().map(|t| (t.buffer, t.selections.primary().head.at))
         else {
             self.session.status = "no curve under the cursor".into();
             return;
         };
-        let (text, at) = {
+        let at = {
             let rope = self.entry(buffer).buffer.rope();
-            (rope.to_string(), rope.char_to_byte(cursor.min(rope.len_chars())))
+            rope.char_to_byte(cursor.min(rope.len_chars()))
         };
+        self.open_curve_at(buffer, at, self.focus, None);
+    }
+
+    /// `Enter` on a curve row of the property view: the curve written
+    /// into the instance first when it was inherited, then the tool over
+    /// its literal, the view as the source. A tool already on this row
+    /// is focused; one on another row of the view is replaced.
+    fn open_curve_from_props(
+        &mut self,
+        window: WindowId,
+        path: String,
+        edit: Option<crate::props::Edit>,
+    ) {
+        if let Some(index) = self.curve_at(window) {
+            if self.curve(index).and_then(|t| t.path) == Some(path.clone()) {
+                let plot = self.tools[index].result();
+                self.set_focus(plot);
+                return;
+            }
+            self.close_tool(index);
+        }
+        if let Some(edit) = edit {
+            self.apply_props_edit(window, edit);
+            self.sync_tools();
+        }
+        let Some(props) = self.window_of(window).and_then(Window::props) else { return };
+        let buffer = props.buffer;
+        let text = self.entry(buffer).buffer.rope().to_string();
+        let Some((open, _)) = props.locate(&text, &path) else {
+            self.session.status = format!("no curve at {path}");
+            return;
+        };
+        self.set_focus(window);
+        self.open_curve_at(buffer, open + 1, window, Some(path));
+    }
+
+    /// The tool over the list around byte `at` of `buffer`, `source` the
+    /// window it was asked from.
+    fn open_curve_at(
+        &mut self,
+        buffer: BufferId,
+        at: usize,
+        source: WindowId,
+        path: Option<String>,
+    ) {
+        let layout = crate::curve::Layout::default();
+        let text = self.entry(buffer).buffer.rope().to_string();
         let mut lit = crate::curve::find(&text, at);
         if lit.is_none()
             && let Some((open, close)) = crate::curve::find_empty(&text, at)
@@ -9148,7 +9217,6 @@ impl Editor {
         let selected = lit.points.iter().position(|p| p.start <= at && at < p.end).unwrap_or(0);
         let curve = crate::curve::read(&text, &lit, &layout);
         let (xstep, ystep) = (0.1, 0.1);
-        let source = self.focus;
         let name = self.name_of(buffer);
         let Some(plot) = self.split_focus(Dir::Vertical) else { return };
         let img = Img::from_pixels(
@@ -9175,6 +9243,7 @@ impl Editor {
             form,
             buffer,
             anchor: lit.open,
+            path,
             layout,
             selected,
             xstep,
@@ -9340,7 +9409,15 @@ impl Editor {
         let Some(entry) = self.buffers.iter().find(|b| b.id == tool.buffer) else { return };
         let rope = entry.buffer.rope();
         let text = rope.to_string();
-        let mut lit = crate::curve::find(&text, tool.anchor).filter(|l| l.open == tool.anchor);
+        // From the view, the path is the truth and the anchor a guess:
+        // an edit above the curve moves every byte after it.
+        let by_path = tool.path.as_deref().and_then(|path| {
+            let props = self.window_of(tool.source).and_then(Window::props)?;
+            let (open, _) = props.locate(&text, path)?;
+            crate::curve::find(&text, open + 1).filter(|l| l.open == open)
+        });
+        let mut lit = by_path
+            .or_else(|| crate::curve::find(&text, tool.anchor).filter(|l| l.open == tool.anchor));
         if lit.is_none()
             && let Some(cursor) = self.window_of(tool.source).and_then(Window::text)
         {
@@ -31923,6 +32000,108 @@ int main(void) {
 
         fn keys(ed: &mut Editor, count: usize, action: Action) {
             ed.apply(Command { count, action });
+        }
+
+        /// `Enter` on a curve row of the property view. See
+        /// `docs/specs/props.md` §Colours and curves.
+        #[test]
+        fn enter_on_a_props_curve_row_opens_the_tool_over_the_json() {
+            const SCHEMA: &str = r##"{"$dialect":"bi/1","types":{"Fx":{"kind":"struct","fields":[
+                {"name":"hp","type":"i32","default":10},
+                {"name":"tint","type":"rgb"},
+                {"name":"falloff","type":"curve"}]}}}"##;
+            const DATA: &str = "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"fx.bischema\",\n  \"instances\": [\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"fire\",\n      \"falloff\": [[0, 0], [0.5, 0.8, 0, 0, true], [1, 1]]\n    },\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"ice\"\n    }\n  ]\n}\n";
+            let d = ScratchDir::new("propscurve")
+                .written("fx.bischema", SCHEMA)
+                .written("fx.bidata", DATA);
+            let mut ed = Editor::open(format!("{}/fx.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            let view = ed.focus();
+            let go = |ed: &mut Editor, c: PropsCmd| ed.apply(cmd(Action::Props(c)));
+            let row = |ed: &Editor| {
+                ed.window_of(view).unwrap().props().unwrap().selected_row().unwrap().clone()
+            };
+            const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            assert_eq!(row(&ed).key, "inst:0/falloff");
+            go(&mut ed, PropsCmd::Enter);
+            assert_eq!(
+                ed.window_ids().len(),
+                3,
+                "plot and form: {:?} {}",
+                ed.window_ids(),
+                ed.session.status
+            );
+            let plot = plot_of(&ed, view);
+            assert_eq!(ed.focus(), plot);
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000");
+            assert_eq!(text(&ed), DATA, "opening a stored curve writes nothing");
+
+            key(&mut ed, Action::NextPoint { back: false });
+            key(&mut ed, Action::Move(Motion::Up));
+            assert_eq!(text(&ed), DATA.replace("0.8", "0.9"), "one number in the JSON");
+            let crate::props::RowWidget::Curve(after) = row(&ed).widget else {
+                panic!("a curve row")
+            };
+            assert!(after.iter().any(|&s| s > 0), "the view re-read: {after:?}");
+
+            // An edit made in the view above the curve moves its bytes; the
+            // tool finds it again by path.
+            ed.set_focus(view);
+            ed.run_ex("bi set fire.hp 12345");
+            assert!(text(&ed).contains("\"hp\": 12345"));
+            assert_ne!(ed.session.status, "curve lost");
+            ed.set_focus(plot);
+            key(&mut ed, Action::Move(Motion::Up));
+            assert!(text(&ed).contains("[0.5, 1.0, 0, 0, true]"), "{}", text(&ed));
+
+            // Enter on the same row focuses the plot; `:q` there closes the
+            // tool and comes back to the view.
+            ed.set_focus(view);
+            go(&mut ed, PropsCmd::Enter);
+            assert_eq!(ed.focus(), plot);
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids().len(), 1);
+            assert_eq!(ed.focus(), view);
+
+            // An inherited curve is written into the instance first, as its
+            // own undo step, and the tool opens over that.
+            go(&mut ed, PropsCmd::NextSection { back: false });
+            go(&mut ed, PropsCmd::Expand);
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            assert_eq!(row(&ed).key, "inst:1/falloff");
+            assert!(row(&ed).inherited);
+            go(&mut ed, PropsCmd::Enter);
+            assert_eq!(ed.window_ids().len(), 3, "{} | {}", ed.session.status, text(&ed));
+            assert!(
+                text(&ed).contains(
+                    "\"$id\": \"ice\",\n      \"falloff\": [[0, 0, 1, 0, true], [1, 1, 1, 1, true]]"
+                ),
+                "{}",
+                text(&ed)
+            );
+            let plot = plot_of(&ed, view);
+            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 2  x 0.000 y 0.000");
+            key(&mut ed, Action::Move(Motion::Up));
+            assert!(text(&ed).contains("[[0, 0.1, 1, 0, true]"), "{}", text(&ed));
+            key(&mut ed, Action::Undo);
+            key(&mut ed, Action::Undo);
+            assert!(!text(&ed).contains("\"$id\": \"ice\",\n      \"falloff\""), "two steps back");
+
+            // A colour row is not a curve: Enter prefills the hex.
+            ed.run_ex("q");
+            go(&mut ed, PropsCmd::Select { down: false, count: 1 });
+            assert_eq!(row(&ed).key, "inst:1/tint");
+            go(&mut ed, PropsCmd::Enter);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(c) if c == "bi set ice.tint #000000"),
+                "{:?}",
+                ed.session.mode
+            );
         }
 
         #[test]

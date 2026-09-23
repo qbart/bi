@@ -142,7 +142,7 @@ type      := primitive | name | generic
 generic   := ( "list" | "optional" | "ref" ) "<" type ">"
 name      := identifier             (a key of `types`)
 primitive := "bool" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-           | "f32" | "f64" | "string"
+           | "f32" | "f64" | "string" | "rgb" | "rgba" | "curve"
 ```
 
 Parse every type string once at schema load into a tree and validate each
@@ -156,6 +156,9 @@ is a schema error.
 | `u8`, `u16`, `u32`, `u64` | unsigned integer            | JSON number without fraction, within the width | `0`   |
 | `f32`, `f64`     | float                                | JSON number                      | `0`              |
 | `string`         | UTF-8 text                           | JSON string                      | `""`             |
+| `rgb`            | a colour, 8 bits a channel           | JSON string `"#rrggbb"`          | `"#000000"`      |
+| `rgba`           | a colour with alpha                  | JSON string `"#rrggbbaa"`        | `"#000000ff"`    |
+| `curve`          | a tuning curve over `0..1`           | JSON array of points, each `[x, y, out, in, locked]` | the linear curve: `[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]` |
 | `E` (enum name)  | one of `E.values`                    | JSON string equal to a value     | first value      |
 | `S` (struct name)| embedded value, owned by the parent  | JSON object with `S`'s fields    | object of `S`'s defaults |
 | `list<T>`        | ordered sequence                     | JSON array of `T` encodings      | `[]`             |
@@ -176,6 +179,30 @@ flagged until set. Make it `optional<ref<S>>` when absence is legitimate.
 
 A default for a struct-typed field is a partial object: keys it omits fall
 back to the struct's own defaults.
+
+**Colours** are hex strings, `#` then six or eight lowercase hex digits,
+which is what a designer reads and what `git diff` shows in one line.
+Upper case reads; the editor writes lower. An `rgba` written with six
+digits reads as opaque and is written back with eight.
+
+**Curves** are the curve editor's shape (`curve.md`): a point is an array
+of `x`, `y`, the out and in tangents as slopes, and whether the two are
+locked, in that order — `[0.5, 0.8, 0, 0, true]`. A point may stop short,
+down to `[x, y]`; the missing tangents are `0` and `locked` is `false`.
+Points are sorted by `x`, which stays inside `0..1`; a value that breaks
+either is an error. The editor keeps both rules for you and writes every
+point whole.
+
+**Gradient — not in bi/1.** The shape it would take: a `gradient` type
+encoded as an array of stops, each `[t, "#rrggbbaa"]`, sorted by `t` in
+`0..1`, with at least two stops and the linear black-to-white ramp as its
+implicit default — the curve's rules with a colour where the curve has a
+`y`. In the view a stop row would carry a `t` slider clamped between its
+neighbours and a colour brick, `a` adding a stop halfway with the
+interpolated colour, and the field row a bar of bricks sampled across the
+row. A user-defined `list<Stop>` struct gives the storage but not the bar,
+the clamping or the fixed shape an engine wants, which is why it would be
+built in.
 
 ## Data file (`.bidata`)
 
@@ -263,7 +290,7 @@ or saving.
 | `default` not encodable as the field's type; `min`/`max`/`step` on a non-numeric field | schema | error |
 | `$type` not a struct in the schema; `$id` missing or not an identifier  | data   | error   |
 | Duplicate `($type, $id)` across the project                             | data   | error   |
-| Value not encodable as the field's type (string in an `i32`, `300` in a `u8`, unknown enum value) | data | error |
+| Value not encodable as the field's type (string in an `i32`, `300` in a `u8`, unknown enum value, `"red"` in an `rgb`, a curve point with `x` out of `0..1` or out of order) | data | error |
 | `show_if`/`hide_if` naming no sibling; `widget` on a type it does not fit | schema | error |
 | Number outside `min`/`max`                                              | data   | warning |
 | ref to an id that does not exist for that type                          | data   | warning (dangling ref) |

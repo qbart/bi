@@ -62,6 +62,10 @@ pub enum RowWidget {
     Toggle,
     /// A string.
     Text,
+    /// A colour: a brick painted these bytes, `r g b a`.
+    Color([u8; 4]),
+    /// A curve: sixteen samples across `0..1`, each `0..=7` of the way up.
+    Curve([u8; 16]),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,7 +147,7 @@ impl Refactor {
 
 /// One path segment below an instance or a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Seg {
+pub enum Seg {
     Key(String),
     Index(usize),
 }
@@ -622,6 +626,17 @@ impl Props {
                 }
             }
             TypeExpr::Str => RowWidget::Text,
+            TypeExpr::Rgb | TypeExpr::Rgba => {
+                let alpha = *ty == TypeExpr::Rgba;
+                match value.as_str().and_then(|s| super::color::parse(s, alpha)) {
+                    Some(c) => RowWidget::Color(c),
+                    None => RowWidget::Plain,
+                }
+            }
+            TypeExpr::Curve => match super::schema::curve_of(value) {
+                Ok(curve) => RowWidget::Curve(sparkline(&curve)),
+                Err(_) => RowWidget::Plain,
+            },
             TypeExpr::Named(n) if self.schema.enum_values(n).is_some() => {
                 if field.is_some_and(|f| f.widget == Some(Widget::Toggle)) {
                     RowWidget::Toggle
@@ -751,6 +766,11 @@ impl Props {
             }
             (TypeExpr::Optional(inner), v) => self.value_text(inner, v),
             (TypeExpr::Str, Value::String(s)) => format!("{s:?}"),
+            (TypeExpr::Rgb, Value::String(s)) | (TypeExpr::Rgba, Value::String(s)) => s.clone(),
+            (TypeExpr::Curve, Value::Array(items)) => match items.len() {
+                1 => "1 point".into(),
+                n => format!("{n} points"),
+            },
             (TypeExpr::Named(_), Value::String(s)) => s.clone(),
             (TypeExpr::List(inner), Value::Array(items)) => {
                 if items.is_empty() {
@@ -806,6 +826,7 @@ impl Props {
         match (ty, value) {
             (_, Value::Null) => String::new(),
             (TypeExpr::Optional(inner), v) => self.edit_text(inner, v),
+            (TypeExpr::Rgb, Value::String(s)) | (TypeExpr::Rgba, Value::String(s)) => s.clone(),
             (TypeExpr::Str, Value::String(s))
             | (TypeExpr::Ref(_), Value::String(s))
             | (TypeExpr::Named(_), Value::String(s)) => {
@@ -1371,8 +1392,95 @@ impl Props {
                 }
             }
             TypeExpr::Str => Err("a string: Enter edits it".into()),
+            TypeExpr::Rgb | TypeExpr::Rgba => Err("a colour: Enter edits it".into()),
+            TypeExpr::Curve => Err("a curve: Enter opens it".into()),
             TypeExpr::List(_) => Err("a list: open it, or `a` adds an item".into()),
         }
+    }
+
+    /// `Enter` on a curve row: the row's path, and the edit that writes
+    /// an inherited curve into the instance first so there is a literal
+    /// to edit. `None` on any other row; a read-only curve refuses.
+    pub fn curve_target(&self, key: &str) -> Result<Option<(String, Option<Edit>)>, String> {
+        if self.kind != Kind::Data {
+            return Ok(None);
+        }
+        let Some(row) = self.rows.iter().find(|r| r.key == key) else { return Ok(None) };
+        if !matches!(row.kind, RowKind::Field | RowKind::Item) {
+            return Ok(None);
+        }
+        let (index, segs) = parse_data_key(key)?;
+        let inst = self.data.as_ref().ok_or("not a data file")?.instances.get(index);
+        let Some(inst) = inst else { return Ok(None) };
+        let (ty, _, readonly) = self.walk(&inst.ty, &segs)?;
+        let (ty, optional) = match ty {
+            TypeExpr::Optional(inner) => (*inner, true),
+            other => (other, false),
+        };
+        if ty != TypeExpr::Curve {
+            return Ok(None);
+        }
+        if readonly {
+            return Err("read-only".into());
+        }
+        let path = self.path_of(key).ok_or("no path")?;
+        let (resolved, stored) = self.resolved_at(index, &segs)?;
+        if optional && resolved.is_null() {
+            // Absent: `Space` turns it on; Enter edits the ex line as ever.
+            return Ok(None);
+        }
+        let edit = if stored && resolved.as_array().is_some_and(|a| !a.is_empty()) {
+            None
+        } else {
+            // Inherited, absent or empty: the resolved curve — the linear
+            // preset for an empty one — written whole, as one undo step.
+            let value = if resolved.as_array().is_none_or(Vec::is_empty) {
+                super::schema::curve_value(&crate::curve::linear())
+            } else {
+                resolved
+            };
+            let mut raw = self.raw.clone();
+            self.assign_at(&mut raw, index, &segs, value.clone())?;
+            // Sparse storage drops a value equal to its default, and the
+            // curve being written usually is the default; this one leaf
+            // is stored anyway, so the tool has bytes to move.
+            let mut at = raw
+                .get_mut("instances")
+                .and_then(Value::as_array_mut)
+                .and_then(|a| a.get_mut(index))
+                .ok_or("no instance")?;
+            for (i, seg) in segs.iter().enumerate() {
+                let last = i + 1 == segs.len();
+                at = match seg {
+                    Seg::Key(k) => {
+                        let map = at.as_object_mut().ok_or("not a struct")?;
+                        if last {
+                            map.insert(k.clone(), value.clone());
+                        } else if !map.get(k).is_some_and(Value::is_object) {
+                            map.insert(k.clone(), Value::Object(Map::new()));
+                        }
+                        map.get_mut(k).ok_or("no field")?
+                    }
+                    Seg::Index(n) => {
+                        let items = at.as_array_mut().ok_or("not a list")?;
+                        let item = items.get_mut(*n).ok_or("no item")?;
+                        if last {
+                            *item = value.clone();
+                        }
+                        item
+                    }
+                };
+            }
+            Some(Edit::Text(write_kind(self.kind, &raw)))
+        };
+        Ok(Some((path, edit)))
+    }
+
+    /// The byte span of the value at `path` in `text`, the buffer's text
+    /// as it is now — where the curve tool anchors.
+    pub fn locate(&self, text: &str, path: &str) -> Option<(usize, usize)> {
+        let (index, segs) = self.parse_data_path(path).ok()?;
+        super::locate::value_span(text, index, &segs)
     }
 
     /// Every id of struct `ty` — this file's and the index's, sorted.
@@ -2197,6 +2305,18 @@ impl Props {
     }
 }
 
+/// A curve across sixteen cells: `y` at the middle of each, clamped to
+/// the unit square, as eighths.
+fn sparkline(curve: &crate::curve::Curve) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, cell) in out.iter_mut().enumerate() {
+        let x = (i as f32 + 0.5) / 16.0;
+        let y = crate::curve::eval(curve, x).clamp(0.0, 1.0);
+        *cell = (y * 7.0).round() as u8;
+    }
+    out
+}
+
 /// Whether `h` and `l` turn a value of this type.
 fn turnable(ty: &TypeExpr, value: &Value) -> bool {
     match ty {
@@ -2545,6 +2665,92 @@ mod tests {
         assert_eq!(p.selected_row().unwrap().key, "inst:1");
         p.next_section(true);
         assert_eq!(p.selected_row().unwrap().key, "inst:0");
+    }
+
+    const PAINT: &str = r##"{"$dialect":"bi/1","types":{
+        "Fx":{"kind":"struct","fields":[
+            {"name":"tint","type":"rgb","default":"#c83c1e"},
+            {"name":"glow","type":"rgba"},
+            {"name":"falloff","type":"curve"},
+            {"name":"fixed","type":"curve","readonly":true},
+            {"name":"maybe","type":"optional<curve>"}]}}}"##;
+    const PAINT_DATA: &str = r##"{"$dialect":"bi/1","$schema":"paint.bischema","instances":[
+        {"$type":"Fx","$id":"fire","glow":"#ff880080",
+         "falloff":[[0, 0], [0.5, 1, 0, 0, true], [1, 0]]},
+        {"$type":"Fx","$id":"plain","tint":"#FFFFFF","falloff":[]}]}"##;
+
+    fn paint_view() -> Props {
+        let mut p = Props::new(Kind::Data, BufferId(1), Some(PathBuf::from("/p/fx.bidata")));
+        p.load(PAINT_DATA, Some(Ok(PAINT.into())), Index::default()).unwrap();
+        p
+    }
+
+    #[test]
+    fn colour_and_curve_rows_draw_a_brick_and_a_sparkline_and_never_turn() {
+        let mut p = paint_view();
+        open(&mut p, "inst:0");
+        let row = |p: &Props, key: &str| p.rows.iter().find(|r| r.key == key).unwrap().clone();
+        let tint = row(&p, "inst:0/tint");
+        assert_eq!(tint.widget, RowWidget::Color([0xc8, 0x3c, 0x1e, 0xff]));
+        assert_eq!(tint.value, "#c83c1e");
+        assert!(tint.inherited && !tint.turnable && !tint.expandable);
+        let glow = row(&p, "inst:0/glow");
+        assert_eq!(glow.widget, RowWidget::Color([0xff, 0x88, 0x00, 0x80]));
+        let falloff = row(&p, "inst:0/falloff");
+        assert_eq!(falloff.value, "3 points");
+        let RowWidget::Curve(samples) = falloff.widget else { panic!("{:?}", falloff.widget) };
+        assert_eq!(samples[0], 0, "starts at 0");
+        assert_eq!(samples[7].max(samples[8]), 7, "peaks at the middle");
+        assert!(samples[3] > samples[0] && samples[3] < samples[7], "rises between");
+        assert!(!falloff.turnable && !falloff.expandable);
+        let linear = row(&p, "inst:0/fixed");
+        assert_eq!(linear.value, "2 points");
+        assert!(linear.readonly && linear.inherited);
+        assert_eq!(row(&p, "inst:0/maybe").widget, RowWidget::Choice, "an absent optional");
+
+        assert_eq!(p.turn("inst:0/tint", 1, false), Err("a colour: Enter edits it".into()));
+        assert_eq!(p.turn("inst:0/falloff", 1, false), Err("a curve: Enter opens it".into()));
+        assert_eq!(p.edit_line("inst:0/tint"), Some("bi set fire.tint #c83c1e".into()));
+        assert_eq!(
+            p.edit_line("inst:0/falloff"),
+            Some("bi set fire.falloff [[0,0],[0.5,1,0,0,true],[1,0]]".into())
+        );
+        let text = text_of(p.set("fire.tint", "0080ff"));
+        assert!(text.contains("\"tint\": \"#0080ff\""), "{text}");
+        assert_eq!(p.set("fire.glow", "blue"), Err("fire.glow wants a colour as #rrggbbaa".into()));
+        let text = text_of(p.set("fire.falloff", "[[0, 1], [1, 0]]"));
+        assert!(text.contains("\"falloff\": [[0, 1], [1, 0]]"), "{text}");
+        let text = text_of(p.delete("inst:0/glow"));
+        assert!(!text.contains("glow"), "back to the default: {text}");
+    }
+
+    #[test]
+    fn enter_on_a_curve_names_its_path_and_materialises_an_inherited_one() {
+        let mut p = paint_view();
+        open(&mut p, "inst:0");
+        open(&mut p, "inst:1");
+        assert_eq!(p.curve_target("inst:0/tint"), Ok(None), "a colour is not a curve");
+        assert_eq!(p.curve_target("inst:0"), Ok(None));
+        assert_eq!(p.curve_target("inst:0/falloff"), Ok(Some(("fire.falloff".into(), None))));
+        assert_eq!(p.curve_target("inst:0/fixed"), Err("read-only".into()));
+        assert_eq!(p.curve_target("inst:0/maybe"), Ok(None), "absent: nothing to open");
+        let (path, edit) = p.curve_target("inst:1/falloff").unwrap().unwrap();
+        assert_eq!(path, "plain.falloff");
+        let Some(Edit::Text(text)) = edit else { panic!("an empty curve is seeded: {edit:?}") };
+        assert!(
+            text.contains("\"falloff\": [[0, 0, 1, 0, true], [1, 1, 1, 1, true]]"),
+            "the linear preset: {text}"
+        );
+        p.load(&text, Some(Ok(PAINT.into())), Index::default()).unwrap();
+        assert_eq!(
+            p.curve_target("inst:1/falloff"),
+            Ok(Some(("plain.falloff".into(), None))),
+            "stored now"
+        );
+        let (s, e) = p.locate(&text, "plain.falloff").expect("located");
+        assert_eq!(&text[s..e], "[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]");
+        assert_eq!(p.locate(&text, "plain.nothing"), None);
+        assert_eq!(p.locate(&text, "plain.tint").map(|(s, e)| &text[s..e]), Some("\"#ffffff\""));
     }
 
     const LAYOUT: &str = r#"{"$dialect":"bi/1","types":{
@@ -3130,8 +3336,13 @@ mod tests {
         );
         let text = text_of(p.turn("type:Weapon/field:name/type", 1, false));
         assert!(
+            text.contains("{ \"name\": \"name\", \"type\": \"rgb\" }"),
+            "string → the next primitive: {text}"
+        );
+        let text = text_of(p.turn("type:Weapon/field:name/type", 4, false));
+        assert!(
             text.contains("{ \"name\": \"name\", \"type\": \"Rarity\" }"),
-            "string → the first type after the primitives: {text}"
+            "past the primitives, the first type: {text}"
         );
         let text = text_of(p.turn("type:Weapon/field:name/type", -1, false));
         assert!(text.contains("{ \"name\": \"name\", \"type\": \"f64\" }"), "{text}");

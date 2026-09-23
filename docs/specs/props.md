@@ -41,12 +41,16 @@ row. The data view:
       [0]       ‹ rusty_sword → Weapon ›
       [1]       ‹ dagger → Weapon ›
     leader      ‹ goblin_chief → Enemy ›  ⚠ no Enemy goblin_chief
+    tint        ██ #c83c1e
+    falloff     ▁▂▃▅▆▇██▇▆▅▃▂▁▁▁  5 points
     damage      99                        ⚠ unknown key
 ```
 
 A number with both `min` and `max` is a slider; a bool a checkbox; an
 enum, a ref or an optional a choice turned with `h` and `l`; a string its
-text; a struct or a list a fold. A set value is drawn plainly, an inherited
+text; a struct or a list a fold; an `rgb` or `rgba` a brick painted its
+colour beside the hex; a `curve` a sparkline of its shape beside its point
+count. A set value is drawn plainly, an inherited
 one dim, a read-only one muted; a warning rides on its row after `⚠`. A
 row's `doc` — the schema's — shows in the status row while it is selected.
 
@@ -113,6 +117,7 @@ h  ←         on a value: turn it down; otherwise close it, or go to the parent
 H  L         ten steps
 Backspace    the parent row
 Enter  i     on a value: edit it on the ex line — `:bi set goblin.hp 40`
+             on a curve: the curve editor over it — see below
              otherwise open or close the row
 Space        flip a bool, cycle an enum or a ref, an optional between — and
              the inner value's default; a number one step up
@@ -136,6 +141,27 @@ Every key that changes something is one edit of the buffer and one undo
 step of it; the view re-reads the buffer after, so there is one direction
 of data flow and no second history. A read-only field (the schema's
 `readonly`) answers every one of these with `read-only`.
+
+## Colours and curves
+
+An `rgb` or `rgba` row draws a brick — two cells painted the colour, an
+`rgba` blended over the pane's background by its alpha — and the hex after
+it. Nothing turns it: `Enter` puts the hex on the ex line, `dd` puts the
+default back.
+
+A `curve` row draws a sparkline, the curve sampled across sixteen cells
+with `y` clamped to `0..1`, and says how many points it has. `Enter` on it
+opens the curve editor (`curve.md`) on that value: the plot splits to the
+right of the view, the form down the edge, focus on the plot, and the keys
+there move the points by rewriting the numbers in this buffer. The view
+re-reads after every one, so the sparkline follows the plot. An inherited
+curve is written into the instance first, as its own undo step, so there
+is a literal to edit; a read-only one refuses with `read-only`. `:set
+editor curve` on the view does the same as `Enter`. `Esc` on the plot
+comes back to the view with the tool open, `:q` closes it. When an edit
+made in the view moves the literal, the tool finds it again by its path
+rather than by its bytes, so editing `goblin.hp` above the curve does not
+lose the plot.
 
 ## Layout
 
@@ -195,7 +221,8 @@ type cannot carry, rather than refusing.
 `false`; a number, whole and within its width for the integer types; a
 string as typed, quotes optional and JSON escapes honoured inside them; an
 enum by name; a ref by id; `null`, `none` or `-` for an absent optional;
-a list or a struct as JSON. A value that does not parse is refused naming
+a colour as hex with or without the `#`, six digits or eight; a list, a
+struct or a curve as JSON. A value that does not parse is refused naming
 what the field takes; a number outside `min..max` is written and warned
 about, as the format says. `:bi set <path>` with no value reports it, and
 `Enter` on an unset attribute or an absent optional prefills nothing, so
@@ -306,12 +333,27 @@ pub fn project_files(root: &Path, schema: &Path) -> Vec<PathBuf>;
 // view.rs
 pub struct Props { kind, buffer, path, schema_path, raw: Value, schema, data,
                    diagnostics, index, rows: Vec<Row>, selected, expanded, collapsed, error, seen }
-pub enum RowWidget { Plain, Header, Group, Fold, Slider(f32), Check(bool), Choice, Toggle, Text }
+pub enum RowWidget { Plain, Header, Group, Fold, Slider(f32), Check(bool), Choice, Toggle, Text,
+                     Color([u8; 4]), Curve([u8; 16]) }   // the brick's rgba; sixteen samples, 0..=7
 pub struct Row { pub key, pub depth, pub label, pub value, pub kind: RowKind, pub widget,
                  pub inherited, pub readonly, pub turnable, pub warning, pub doc,
                  pub expandable, pub expanded }
 pub enum Edit { Text(String), Prompt(String), Refactor { text, refactor } }
+impl Props {
+    pub fn curve_target(&self, key: &str) -> Result<Option<(String, Option<Edit>)>, String>;
+                                                       // a curve row: its path, and the edit that materialises it
+    pub fn locate(&self, text: &str, path: &str) -> Option<(usize, usize)>;   // the value's bytes in the text
+}
+
+// locate.rs
+pub fn value_span(text: &str, index: usize, segs: &[Seg]) -> Option<(usize, usize)>;
 ```
+
+`locate` is a small JSON walker over the buffer's text: down `instances`
+to the instance, then key by key and index by index to the value, giving
+the byte span of the value as written, whatever the layout. It is what
+opens the curve tool on the right bracket and what finds the literal again
+after the view rewrites the file.
 
 The raw `Value` — `serde_json` with `preserve_order` — is the document;
 the parsed `Schema` and `DataFile` are read from it for validation and
@@ -358,7 +400,16 @@ props window whose buffer's edit counter moved.
   orders keys, keeps unknown keys after.
 - `write_data` on the example round-trips its layout byte for byte;
   `write_schema` the same.
-- Rows: the example expands to the tree above with the right widgets;
+- `rgb`, `rgba` and `curve` parse as types; a colour reads six or eight
+  hex digits with or without the `#` and refuses `red`; an `rgba` given
+  six digits gets `ff`; a curve refuses a point with `x` outside `0..1`,
+  out of order, or a non-number; the defaults are black, opaque black and
+  the linear curve.
+- `value_span` finds a field, a nested field and a list item in a
+  hand-laid-out file and in the writer's layout.
+- Rows: the example expands to the tree above with the right widgets; a
+  colour row is `Color` with its bytes, a curve row `Curve` with sixteen
+  samples of the shape, neither turnable;
   inherited rows are dimmed; a dangling ref carries its warning; the
   `expanded` set survives a rebuild; groups nest and start collapsed when
   told; `order` sorts; `show_if` and `hide_if` follow the values; `label`
@@ -373,6 +424,12 @@ props window whose buffer's edit counter moved.
   fields, `rename` of a field, a value, an id and a type, `remap`,
   `prune` each as one undo step; a read-only field refuses; a bad value
   is refused naming the type.
+- Enter on a curve row opens the plot to the right and the form at the
+  edge with the props window as the source; `j` on the plot rewrites one
+  number in the JSON and the view's sparkline follows; an inherited curve
+  is written into the instance first; a read-only one refuses; editing
+  another field in the view keeps the plot on its curve; `:q` on the plot
+  focuses the view again.
 - Opening: a `.bidata` opens in the view with the first instance open; a
   missing `$dialect` opens as text with the error; `:set editor bidata`
   on an empty buffer writes the skeleton, on a broken one keeps the view

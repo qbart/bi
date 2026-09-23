@@ -4,7 +4,9 @@
 //! new text for the buffer to hold. See `docs/specs/bi-format.md` for the
 //! format and `docs/specs/props.md` for the view.
 
+pub mod color;
 pub mod data;
+pub mod locate;
 pub mod sample;
 pub mod schema;
 pub mod view;

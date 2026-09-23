@@ -1134,6 +1134,30 @@ fn render_props(
                             value_style,
                         ));
                     }
+                    RowWidget::Color(c) => {
+                        // A brick painted the colour, an alpha blended over
+                        // the pane's ground; the hex after it.
+                        let ground = match ui.background {
+                            Some(ThemeColor::Rgb(r, g, b)) => [r, g, b],
+                            _ => [0, 0, 0],
+                        };
+                        let mix = |i: usize| {
+                            let a = c[3] as f32 / 255.0;
+                            (c[i] as f32 * a + ground[i] as f32 * (1.0 - a)).round() as u8
+                        };
+                        let paint = Color::Rgb(mix(0), mix(1), mix(2));
+                        spans.push(Span::styled("██", Style::default().fg(paint)));
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(cells_at(&row.value, 8), value_style));
+                    }
+                    RowWidget::Curve(samples) => {
+                        const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+                        let bar: String =
+                            samples.iter().map(|&s| LEVELS[(s as usize).min(7)]).collect();
+                        spans.push(Span::styled(bar, value_style));
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(cells_at(&row.value, 8), value_style));
+                    }
                     _ => spans.push(Span::styled(cells_at(&row.value, 8), value_style)),
                 }
                 spans

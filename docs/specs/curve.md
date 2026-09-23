@@ -116,6 +116,17 @@ cursor back in the code. `Esc` is the softer way out — focus to the
 source, the tool still open, `Ctrl-W` back into it. `:set editor curve`
 on a source that already has the tool focuses its plot.
 
+## From the property view
+
+A `curve` field of a `.bidata` (`bi-format.md`) is this literal spelled in
+JSON — `[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]` — and `Enter` on its row
+in the property view (`props.md`) opens the tool on it, the view standing
+where the source window stands: the plot splits to its right, the form
+down the edge, the buffer is the data file's. The view hands the tool the
+byte of the value's open bracket, found by path rather than by cursor,
+since the view has no text cursor. When the anchor is lost the tool asks
+the view for the path again before it says `curve lost`.
+
 ## Finding the literal
 
 A bracket scan, no tree-sitter, so it works in any language that spells a

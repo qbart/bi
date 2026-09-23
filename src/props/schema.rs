@@ -7,8 +7,10 @@ use serde_json::{Map, Number, Value};
 
 use super::{Diagnostic, check_dialect, is_identifier, json_eq};
 
-pub const PRIMITIVES: [&str; 12] =
-    ["bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "string"];
+pub const PRIMITIVES: [&str; 15] = [
+    "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "string", "rgb",
+    "rgba", "curve",
+];
 pub const GENERICS: [&str; 3] = ["list", "optional", "ref"];
 
 /// The integer widths, signed and unsigned.
@@ -78,6 +80,11 @@ pub enum TypeExpr {
     F32,
     F64,
     Str,
+    /// `#rrggbb`, `#rrggbbaa`.
+    Rgb,
+    Rgba,
+    /// The curve editor's list of points, in JSON.
+    Curve,
     /// A key of `types`: a struct or an enum.
     Named(String),
     List(Box<TypeExpr>),
@@ -121,6 +128,9 @@ impl TypeExpr {
             "f32" => TypeExpr::F32,
             "f64" => TypeExpr::F64,
             "string" => TypeExpr::Str,
+            "rgb" => TypeExpr::Rgb,
+            "rgba" => TypeExpr::Rgba,
+            "curve" => TypeExpr::Curve,
             name if is_identifier(name) => TypeExpr::Named(name.into()),
             _ => return Err(format!("type {text:?} does not parse")),
         })
@@ -134,6 +144,9 @@ impl TypeExpr {
             TypeExpr::F32 => "f32".into(),
             TypeExpr::F64 => "f64".into(),
             TypeExpr::Str => "string".into(),
+            TypeExpr::Rgb => "rgb".into(),
+            TypeExpr::Rgba => "rgba".into(),
+            TypeExpr::Curve => "curve".into(),
             TypeExpr::Named(n) => n.clone(),
             TypeExpr::List(t) => format!("list<{}>", t.text()),
             TypeExpr::Optional(t) => format!("optional<{}>", t.text()),
@@ -593,6 +606,9 @@ impl Schema {
             TypeExpr::Bool => Value::Bool(false),
             TypeExpr::Int(_) | TypeExpr::F32 | TypeExpr::F64 => Value::from(0),
             TypeExpr::Str => Value::String(String::new()),
+            TypeExpr::Rgb => Value::String("#000000".into()),
+            TypeExpr::Rgba => Value::String("#000000ff".into()),
+            TypeExpr::Curve => curve_value(&crate::curve::linear()),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => {
                     Value::String(values.first().cloned().unwrap_or_default())
@@ -649,6 +665,9 @@ impl Schema {
                 Value::Array(items.iter().map(|v| self.resolve(inner, v)).collect())
             }
             (TypeExpr::Optional(inner), v) if !v.is_null() => self.resolve(inner, v),
+            (TypeExpr::Rgb, Value::String(s)) | (TypeExpr::Rgba, Value::String(s)) => {
+                canonical_colour(ty, s).unwrap_or_else(|| value.clone())
+            }
             _ => value.clone(),
         }
     }
@@ -677,6 +696,9 @@ impl Schema {
                 _ => value.clone(),
             },
             (TypeExpr::Optional(inner), v) if !v.is_null() => self.sparse(inner, v),
+            (TypeExpr::Rgb, Value::String(s)) | (TypeExpr::Rgba, Value::String(s)) => {
+                canonical_colour(ty, s).unwrap_or_else(|| value.clone())
+            }
             _ => value.clone(),
         }
     }
@@ -725,6 +747,17 @@ impl Schema {
             TypeExpr::Str => {
                 if !value.is_string() {
                     wrong(out);
+                }
+            }
+            TypeExpr::Rgb | TypeExpr::Rgba => {
+                let alpha = *ty == TypeExpr::Rgba;
+                if value.as_str().is_none_or(|s| super::color::parse(s, alpha).is_none()) {
+                    wrong(out);
+                }
+            }
+            TypeExpr::Curve => {
+                if let Err(e) = curve_of(value) {
+                    out.push(Diagnostic::error(Some(at), e));
                 }
             }
             TypeExpr::Named(name) => match self.get(name) {
@@ -818,6 +851,9 @@ impl Schema {
             }
             TypeExpr::F32 | TypeExpr::F64 => "a number".into(),
             TypeExpr::Str => "a string".into(),
+            TypeExpr::Rgb => "a colour as #rrggbb".into(),
+            TypeExpr::Rgba => "a colour as #rrggbbaa".into(),
+            TypeExpr::Curve => "a curve as JSON: [[x, y, out, in, locked], …]".into(),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => format!("one of {}", values.join(", ")),
                 _ => format!("a {name} as JSON"),
@@ -850,6 +886,17 @@ impl Schema {
                 _ => return refuse(),
             },
             TypeExpr::Str => Value::String(unquote(text)),
+            TypeExpr::Rgb | TypeExpr::Rgba => {
+                let alpha = *ty == TypeExpr::Rgba;
+                match super::color::parse(&unquote(text), alpha) {
+                    Some(c) => Value::String(super::color::text(c, alpha)),
+                    None => return refuse(),
+                }
+            }
+            TypeExpr::Curve => match serde_json::from_str::<Value>(text) {
+                Ok(v) if v.is_array() => v,
+                _ => return refuse(),
+            },
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { .. }) => Value::String(unquote(text)),
                 _ => match serde_json::from_str::<Value>(text) {
@@ -876,6 +923,75 @@ impl Schema {
         self.check(ty, &value).map_err(|_| format!("wants {}", self.wants(ty)))?;
         Ok(value)
     }
+}
+
+/// A colour as the editor writes it — lowercase, eight digits for an
+/// `rgba` — when the text reads as one.
+fn canonical_colour(ty: &TypeExpr, text: &str) -> Option<Value> {
+    let alpha = *ty == TypeExpr::Rgba;
+    super::color::parse(text, alpha).map(|c| Value::String(super::color::text(c, alpha)))
+}
+
+/// A `curve` value as the curve module holds it: every point an array of
+/// `x`, `y`, `out`, `in`, `locked`, the tail optional; sorted by `x`
+/// inside `0..1`. What is wrong with it, otherwise.
+pub fn curve_of(value: &Value) -> Result<crate::curve::Curve, String> {
+    let Some(items) = value.as_array() else {
+        return Err("a curve is an array of points".into());
+    };
+    let mut points = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Some(parts) = item.as_array() else {
+            return Err(format!("point [{i}] is not an array"));
+        };
+        if parts.len() < 2 || parts.len() > 5 {
+            return Err(format!("point [{i}] wants 2 to 5 entries: [x, y, out, in, locked]"));
+        }
+        let num = |n: usize| -> Result<f32, String> {
+            match parts.get(n) {
+                None => Ok(0.0),
+                Some(v) => v
+                    .as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| format!("point [{i}] entry {n} is not a number")),
+            }
+        };
+        let locked = match parts.get(4) {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("point [{i}] locked is not true or false")),
+        };
+        let p = crate::curve::Point { x: num(0)?, y: num(1)?, out: num(2)?, in_: num(3)?, locked };
+        if !(0.0..=1.0).contains(&p.x) {
+            return Err(format!("point [{i}] x {} is outside 0..1", p.x));
+        }
+        if let Some(prev) = points.last().map(|q: &crate::curve::Point| q.x)
+            && p.x < prev
+        {
+            return Err(format!("point [{i}] x {} is before the point ahead of it", p.x));
+        }
+        points.push(p);
+    }
+    Ok(crate::curve::Curve { points })
+}
+
+/// The curve as the format writes it.
+pub fn curve_value(curve: &crate::curve::Curve) -> Value {
+    Value::Array(
+        curve
+            .points
+            .iter()
+            .map(|p| {
+                Value::Array(vec![
+                    number(p.x as f64),
+                    number(p.y as f64),
+                    number(p.out as f64),
+                    number(p.in_ as f64),
+                    Value::Bool(p.locked),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// `ref<T>`'s `T`, through an optional or a list.
@@ -1379,6 +1495,74 @@ mod tests {
         assert!(Cond::parse("1x").is_err());
         assert!(Cond::parse("hp > big").is_err());
         assert!(Cond::parse("").is_err());
+    }
+
+    #[test]
+    fn colours_and_curves_parse_check_and_default() {
+        use super::super::color;
+        let s = schema();
+        assert_eq!(TypeExpr::parse("rgb"), Ok(TypeExpr::Rgb));
+        assert_eq!(TypeExpr::parse("rgba"), Ok(TypeExpr::Rgba));
+        assert_eq!(TypeExpr::parse("curve"), Ok(TypeExpr::Curve));
+        assert_eq!(TypeExpr::parse("list<rgba>").unwrap().text(), "list<rgba>");
+        assert_eq!(s.default_of(&TypeExpr::Rgb), serde_json::json!("#000000"));
+        assert_eq!(s.default_of(&TypeExpr::Rgba), serde_json::json!("#000000ff"));
+        assert_eq!(
+            s.default_of(&TypeExpr::Curve),
+            serde_json::json!([[0, 0, 1, 0, true], [1, 1, 1, 1, true]]),
+            "whole numbers written whole"
+        );
+        assert_eq!(s.parse_value(&TypeExpr::Rgb, "C83C1E"), Ok(serde_json::json!("#c83c1e")));
+        assert_eq!(s.parse_value(&TypeExpr::Rgba, "#c83c1e"), Ok(serde_json::json!("#c83c1eff")));
+        assert_eq!(s.parse_value(&TypeExpr::Rgb, "red"), Err("wants a colour as #rrggbb".into()));
+        assert_eq!(
+            s.parse_value(&TypeExpr::Rgb, "#c83c1e80"),
+            Err("wants a colour as #rrggbb".into())
+        );
+        assert!(s.check(&TypeExpr::Rgb, &serde_json::json!("#C83C1E")).is_ok(), "upper case reads");
+        assert!(s.check(&TypeExpr::Rgba, &serde_json::json!("#c83c1e")).is_ok());
+        assert!(s.check(&TypeExpr::Rgb, &serde_json::json!(0xc83c1e)).is_err());
+        assert_eq!(color::parse("#c83c1e80", true), Some([0xc8, 0x3c, 0x1e, 0x80]));
+
+        let curve = |t: &str| s.check(&TypeExpr::Curve, &serde_json::from_str(t).unwrap());
+        assert_eq!(curve("[[0, 0], [0.5, 0.8, 0, 0, true], [1, 1, 1, 1, true]]"), Ok(()));
+        assert_eq!(curve("[]"), Ok(()));
+        assert_eq!(curve("[[0, 0], [1.5, 1]]"), Err("point [1] x 1.5 is outside 0..1".into()));
+        assert_eq!(
+            curve("[[0.5, 0], [0.2, 1]]"),
+            Err("point [1] x 0.2 is before the point ahead of it".into())
+        );
+        assert_eq!(curve("[[0, \"a\"]]"), Err("point [0] entry 1 is not a number".into()));
+        assert_eq!(curve("[[0, 0, 0, 0, 1]]"), Err("point [0] locked is not true or false".into()));
+        assert_eq!(
+            curve("[[0]]"),
+            Err("point [0] wants 2 to 5 entries: [x, y, out, in, locked]".into())
+        );
+        assert_eq!(curve("[0, 1]"), Err("point [0] is not an array".into()));
+        assert_eq!(curve("{}"), Err("a curve is an array of points".into()));
+        let read = curve_of(&serde_json::json!([[0, 0], [1, 1, 2, 3, true]])).unwrap();
+        assert_eq!(
+            read.points[0],
+            crate::curve::Point { x: 0.0, y: 0.0, out: 0.0, in_: 0.0, locked: false }
+        );
+        assert_eq!(
+            read.points[1],
+            crate::curve::Point { x: 1.0, y: 1.0, out: 2.0, in_: 3.0, locked: true }
+        );
+        assert_eq!(
+            s.parse_value(&TypeExpr::Curve, "[[0, 0], [1, 1]]"),
+            Ok(serde_json::json!([[0, 0], [1, 1]]))
+        );
+        assert_eq!(
+            s.parse_value(&TypeExpr::Curve, "[[2, 0]]"),
+            Err("wants a curve as JSON: [[x, y, out, in, locked], …]".into())
+        );
+        assert_eq!(
+            one(
+                r##"{"A":{"kind":"struct","fields":[{"name":"c","type":"rgb","default":"red"},{"name":"k","type":"curve","min":0}]}}"##
+            ),
+            ["A.c: default \"red\" is not a colour as #rrggbb", "A.k: min/max/step on a curve"]
+        );
     }
 
     #[test]
