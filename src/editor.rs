@@ -7165,6 +7165,21 @@ impl Editor {
         Some(new)
     }
 
+    /// A form stacked under another in the sidebar column — the picker's
+    /// under the gradient's — focused. `None` when the column has no room
+    /// for two.
+    fn open_form_under(&mut self, above: WindowId, form: crate::form::Form) -> Option<WindowId> {
+        let (area, chrome) = (self.area, self.chrome);
+        let new = self.fresh_window_id();
+        if !self.layout.split(above, new, Dir::Horizontal, Place::After, area, &chrome) {
+            self.next_window -= 1;
+            return None;
+        }
+        self.windows.push(Window::showing(new, Content::Form(form)));
+        self.set_focus(new);
+        Some(new)
+    }
+
     /// A key in the focused form window. See `docs/specs/form.md`.
     fn run_form_cmd(&mut self, cmd: FormCmd) {
         if cmd == FormCmd::Close {
@@ -9884,7 +9899,13 @@ impl Editor {
         let state = State::of(color, Mode::Hsv);
         let step = 0.02;
         let name = self.name_of(buffer);
-        self.set_focus(source);
+        // From the gradient's bar the picker joins that tool's arrangement:
+        // the picture beside the bar, the form under the gradient's form.
+        // See `docs/specs/color-picker.md` §What it looks like.
+        let beside = back.filter(|&b| self.window_of(b).is_some());
+        let above =
+            beside.and_then(|b| self.tools.iter().find(|t| t.result() == b).map(Tool::form));
+        self.set_focus(beside.unwrap_or(source));
         let Some(picture) = self.split_focus(Dir::Vertical) else { return };
         let img = Img::from_pixels(
             PathBuf::from(format!("{name}.color")),
@@ -9899,7 +9920,13 @@ impl Editor {
             window.alt = None;
         }
         let form = color_form(&state, lit.alpha, step);
-        let Some(form) = self.open_form_sidebar(form) else {
+        let form = match above {
+            Some(above) => {
+                self.open_form_under(above, form.clone()).or_else(|| self.open_form_sidebar(form))
+            }
+            None => self.open_form_sidebar(form),
+        };
+        let Some(form) = form else {
             self.close_window(picture);
             self.set_focus(source);
             return;
@@ -34660,6 +34687,22 @@ int main(void) {
             assert_eq!(ed.window_ids().len(), 5, "{:?}", ed.window_ids());
             let picker = ed.focus();
             assert!(ed.is_color_picture(picker));
+            // The picker joins the gradient's arrangement: its picture right
+            // of the bar, its form under the gradient's.
+            let rect =
+                |ed: &Editor, id: WindowId| ed.layout.rect_of(id, ed.area, &ed.chrome).unwrap();
+            let (s, b, p) = (rect(&ed, source), rect(&ed, bar), rect(&ed, picker));
+            assert!(b.x > s.x && p.x > b.x && p.y == b.y, "{s:?} {b:?} {p:?}");
+            let forms: Vec<_> = ed
+                .window_ids()
+                .into_iter()
+                .filter(|&w| ed.window_of(w).unwrap().form().is_some())
+                .map(|w| rect(&ed, w))
+                .collect();
+            assert_eq!(forms.len(), 2);
+            assert_eq!(forms[0].x, forms[1].x, "the forms stack at the edge: {forms:?}");
+            assert!(forms[1].y > forms[0].y, "{forms:?}");
+            assert!(forms.iter().all(|f| f.x > p.x), "{forms:?} {p:?}");
             assert_eq!(ed.color_status(picker).unwrap(), "#ff8800  h 32 s 100 v 100");
             key(&mut ed, Action::Move(Motion::Left));
             assert!(text(&ed).contains("{0.5f, \"#ff8a05\"}"), "{}", text(&ed));

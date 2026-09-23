@@ -20,6 +20,13 @@ Three windows, the curve's arrangement: the **source**, the **picker**
 split to its right, the **form** down the edge. Focus lands on the
 picker.
 
+Opened from the gradient's bar (`gradient.md`), the picker joins that
+arrangement rather than starting one: the picture splits the **bar**,
+not the source — source, bar, picker in a row, the thing you came from
+beside the thing you are in — and its form goes **under the gradient's
+form** in the sidebar column, the two forms stacked at the edge. Closing
+the picker gives the bar and the gradient's form their space back.
+
 ```
 ┌──────────────────────────────────┐
 │                                  │   the square: saturation left to right,

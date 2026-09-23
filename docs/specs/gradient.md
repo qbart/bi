@@ -51,8 +51,10 @@ list an engine reads is always sorted, and the editor never asks you to
 keep it so. From the last stop, `a` adds halfway back to the previous
 one.
 
-`c` opens the picker with the bar as the window to come back to: `Esc`
-or `:q` in the picker lands on the bar, and while the picker is open
+`c` opens the picker with the bar as the window to come back to — its
+picture split to the right of the bar, its form under the gradient's
+form, so the two pictures sit side by side and the two forms stack at
+the edge: `Esc` or `:q` in the picker lands on the bar, and while the picker is open
 every step it takes redraws the ramp, since both are views of one buffer.
 Every key that changes something is one edit of the source buffer and one
 undo step of it.
