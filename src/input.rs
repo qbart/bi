@@ -400,7 +400,10 @@ impl Input {
             Mode::Normal if content == ContentKind::Props => self.props(key),
             // A picture reads the normal grammar, with one key of its own:
             // `r` has no character to replace, so it turns the tile.
-            Mode::Normal if content == ContentKind::Image => self.image(key),
+            Mode::Normal if content == ContentKind::Image => self.image(key, false),
+            // A curve's plot: the picture's grammar, with `r` and `s` the
+            // curve's own. See `docs/specs/curve.md`.
+            Mode::Normal if content == ContentKind::Plot => self.image(key, true),
             Mode::Normal => self.normal(key),
             // Visual shares normal's grammar: the same motions, counts and
             // text objects, differing only in what an operator applies to.
@@ -1111,9 +1114,17 @@ impl Input {
     /// An image window: normal's grammar, except that `r` waits for a
     /// direction rather than a character. The direction is whatever the
     /// keymap makes of the next key — arrows included — and `x`/`y` are the
-    /// mirrors, since neither is a direction.
-    fn image(&mut self, key: Key) -> Option<Command> {
+    /// mirrors, since neither is a direction. On a curve's `plot`, `r` is
+    /// the rotation mode and `s` splits the tangents instead.
+    fn image(&mut self, key: Key, plot: bool) -> Option<Command> {
         let ctrl = key.mods.ctrl;
+        if plot && !ctrl && !self.window_pending && !self.g_pending && !self.mid_command() {
+            match key.code {
+                KeyCode::Char('r') => return self.plain(Action::Rotate),
+                KeyCode::Char('s') => return self.plain(Action::Split),
+                _ => {}
+            }
+        }
         if self.turn_pending {
             self.reset();
             let turn = match key.code {
@@ -3978,6 +3989,19 @@ leader = \" \"
 
         fn image(input: &mut Input, keys: &str) -> Option<Command> {
             feed(input, keys, ContentKind::Image)
+        }
+
+        #[test]
+        fn r_and_s_are_the_curves_keys_on_a_plot_and_the_tilesets_on_a_picture() {
+            let mut input = Input::default();
+            let cmd = feed(&mut input, "r", ContentKind::Plot).unwrap();
+            assert_eq!(cmd.action, Action::Rotate);
+            let cmd = feed(&mut input, "s", ContentKind::Plot).unwrap();
+            assert_eq!(cmd.action, Action::Split);
+            let cmd = feed(&mut input, "3l", ContentKind::Plot).unwrap();
+            assert_eq!((cmd.count, cmd.action), (3, Action::Move(Motion::Right)));
+            let cmd = feed(&mut input, "rl", ContentKind::Image).unwrap();
+            assert_eq!(cmd.action, Action::Turn(Some(Turn::Right)));
         }
 
         #[test]

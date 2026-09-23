@@ -131,6 +131,18 @@ impl Canvas {
         }
     }
 
+    /// A one-pixel ring of radius `r` around `cx, cy`.
+    pub fn ring(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
+        for y in -r..=r {
+            for x in -r..=r {
+                let d = x * x + y * y;
+                if d <= r * r && d > (r - 1) * (r - 1) {
+                    self.put(cx + x, cy + y, c);
+                }
+            }
+        }
+    }
+
     /// `text` in the tiny font with its top-left at `x, y`; four pixels
     /// per glyph. Returns the width drawn.
     pub fn text(&mut self, x: i64, y: i64, text: &str, c: [u8; 4]) -> i64 {

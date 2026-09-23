@@ -10,9 +10,8 @@ picture is a view of it.
 
 ## Status
 
-**Built.** Points move; tangents are read, drawn and evaluated but not
-yet edited — tangent rotation and the lock toggle come next and slot into
-the same keys.
+**Built.** Points move, tangents rotate — `r` for the rotation mode, `s`
+to split and join them — and the lock is the point's own `locked` field.
 
 ## What it looks like
 
@@ -78,11 +77,60 @@ h  l  ← →        x earlier, later by one x step, a tenth; counts multiply
 j  k  ↓ ↑        y down, up by one y step, a tenth; counts multiply
 a                add a point halfway to the next one, on the curve, and select it
 x                delete the point; the first and last stay, and a curve keeps two
+r                rotation mode on, and off again — see below
+s                split the point's tangents, and join them again
 u  Ctrl-R        undo, redo — the source buffer's
 Enter            the point on the ex line: `:tool curve y 0.8`
-Esc              back to the source, the plot stays
+Esc              back to the source, the plot stays; in rotation mode, out of it
 :                the ex line
 ```
+
+The plot is `ContentKind::Plot` to the keymap — the picture's grammar,
+except that `r` and `s` are the curve's rather than the tileset's turn
+and the find. Any other picture stays `ContentKind::Image`.
+
+### Tangents
+
+A point's tangents are slopes, and a slope is an angle. **`r` turns the
+plot into a dial**: while rotation is on, the keys that moved the point
+turn its tangent instead, by one angle step — five degrees, `Angle step`
+in the form — per press, counts multiplying:
+
+```
+h  ←  k  ↑       counter-clockwise: the out handle rises, the in handle drops
+l  →  j  ↓       clockwise
+Tab  Shift-Tab   on a split point: the other tangent; on a joined one, the next point
+r  Esc           rotation off; `r` again is the same key
+```
+
+A slope is clamped to the angles between `-89°` and `89°` — the engine's
+tangent is `dy/dx`, and a vertical one is not a number. The rotated
+value is written to the tangent's token with three decimals, one undo
+step, the same path every other key takes. A point whose layout names no
+`out` or `in`, or whose text is too short to have them, says so and turns
+nothing.
+
+**Joined and split.** `locked` is the point's own field and the tool's
+truth about it: a joined point (`locked` true) turns both tangents to the
+same slope with every press — the out's, so a joined point whose file
+disagreed between the two heals into a straight line on the first turn.
+A split point turns one, the one `Tab` picked; the out tangent is
+picked when rotation begins. **`s` flips `locked`**: on a joined point it
+writes `false` and says `tangents split`; on a split point it writes
+`true`, copies the out slope into the in, and says `tangents joined` —
+one edit of two or three tokens. A layout without `locked` has no lock
+to flip and `s` says `the layout has no locked`.
+
+**What it looks like.** The selected point's two handles are one straight
+stroke through the anchor when joined and two strokes of a second colour
+when split, so the state reads off the picture before any key is
+pressed. In rotation mode a ring is drawn around the anchor and the
+turning handle — both, when joined — is drawn in the selection's colour
+and longer, a fifth of a unit rather than the engine's twelfth. The
+status row's label says `ROTATE` instead of `CURVE`, and the status text
+carries the slopes: `point 2 of 3  x 0.500 y 0.800  out 1.000 in 1.000`,
+with `split` after them when they are, and the turning tangent in
+brackets — `[out 1.000]` — while rotating.
 
 `x` moves inside `0..1` and between the point's neighbours, which is the
 engine's own rule for time; `y` is free. From the last point, `a` adds
@@ -102,7 +150,10 @@ same history. There is no second undo stack anywhere in the tool.
 :tool curve point 3          select the third point; reports without a value
 :tool curve x 0.5            move the selected point in x; clamped to its neighbours
 :tool curve y 0.8            and in y
+:tool curve out 1.5          the out tangent's slope; `in` the same
+:tool curve locked off       split; `on` joins, copying out into in
 :tool curve xstep 0.1        what h and l move by; ystep the same for j and k
+:tool curve astep 5          degrees per press while rotating
 :tool curve layout x,y,out,in,locked
 ```
 
@@ -197,14 +248,17 @@ pub fn eval(curve: &Curve, x: f32) -> f32;         // cubic hermite between neig
 pub fn slope(curve: &Curve, x: f32) -> f32;
 pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String;
 pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32));   // the unit square, stretched to the points
-pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>);
+pub enum Tangent { Out, In }
+pub struct Mark { pub rotate: bool, pub tangent: Tangent }      // how the selected point is drawn
+pub fn rotated(slope: f32, degrees: f32) -> f32;                // the slope turned, clamped to ±89°
+pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>);
 ```
 
 **Evaluation** is Unity's: between points `p` and `q` with `d = q.x - p.x`,
 the hermite basis over `t = (x - p.x) / d` with tangents `p.out * d` and
 `q.in * d`; before the first point and after the last, the curve is flat.
 `locked` changes nothing in the evaluation — it is a promise about how
-the tangents move, which is not yet a thing that happens.
+the tangents move, kept by the rotation keys.
 
 **x stays sorted.** A point's x is clamped between its neighbours' x and
 inside `0..1`, so the list the engine reads never needs sorting. Two
@@ -230,6 +284,9 @@ struct CurveTool {
     layout: Layout,
     selected: usize,
     xstep: f32, ystep: f32,    // a tenth each, by default
+    astep: f32,                // degrees per rotation press, five by default
+    rotate: bool,              // `r`: the keys turn the tangent
+    tangent: Tangent,          // which one, on a split point
     seen: (u64, u64),          // buffer edits, form generation, the plot reflects
 }
 ```
@@ -262,15 +319,17 @@ In        0.000
 Locked    on
 X step    ━●━━━━━━━━   0.010
 Y step    ━●━━━━━━━━   0.010
+Angle     ━●━━━━━━━━   5
 ```
 
 `Point`, `X`, `Y`, `Out`, `In` and `Locked` are **read-only**: they
 mirror the selected point and nothing in the form turns them. A point
 has rules — sorted `x`, clamped to its neighbours, two points at least —
 that the plot's keys keep and a freely turned slider could break, so the
-form shows and the plot moves. Only `X step` and `Y step` turn, with `h`
-and `l` or `:tool curve xstep 0.05`; `:tool curve x 0.5` is refused as
-read-only, `:tool curve x` still reports. `u` in the form undoes the
+form shows and the plot moves. Only the steps — `X step`, `Y step` and
+`Angle`, the degrees a rotation press turns — turn, with `h` and `l` or
+`:tool curve xstep 0.05`; `:tool curve x 0.5` is refused as read-only,
+`:tool curve x` still reports. `u` in the form undoes the
 source buffer, as on the plot. `Enter` on a step prefills `:tool curve
 xstep <value>`; `Tab` cycles nothing here — the plot's `Tab` picks the
 point.
@@ -314,6 +373,23 @@ point.
 - `:tool curve x 0.5` moves the selected point and clamps to its
   neighbours; `:tool curve layout x,y` re-reads; `:tool curve point`
   reports `curve point=2`.
+- `r` on the plot turns rotation on, the label says `ROTATE`, and `l`
+  rewrites the selected point's `out` and `in` tokens — both, since the
+  point is locked — to the slope five degrees clockwise; `2h` turns ten
+  back; `r` again turns it off and `l` moves x once more; `Esc` while
+  rotating leaves rotation, not the plot.
+- `s` on a locked point writes `false` and says `tangents split`; `l`
+  while rotating then moves only the out token, `Tab` picks the in and
+  `l` moves only that; `s` again writes `true`, copies out into in and
+  says `tangents joined`. `s` with a layout of `x,y` says `the layout has
+  no locked`.
+- `rotated(1.0, 45.0)` is vertical enough to clamp at `tan 89°`;
+  `rotated(0.0, -45.0)` is `-1`.
+- `render` differs between a joined and a split point, and between
+  rotating and not.
+- `:tool curve out 2` rewrites the out token; `:tool curve locked off`
+  splits; `:tool curve astep 10` sets the angle step.
 - Deleting the list by hand says `curve lost`.
 - The plot's pixels change and its generation moves after any edit; the
-  status row says `point 2 of 3  x 0.500 y 0.800` and `CURVE`.
+  status row says `point 2 of 3  x 0.500 y 0.800  out 0.000 in 0.000`
+  and `CURVE`.

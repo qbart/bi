@@ -589,6 +589,51 @@ pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32)) {
     r
 }
 
+/// The slope turned by `degrees`, counter-clockwise when positive, and
+/// clamped to the angles between -89° and 89°: the engine's tangent is
+/// `dy/dx`, and a vertical one is not a number.
+pub fn rotated(slope: f32, degrees: f32) -> f32 {
+    const LIMIT: f32 = 89.0;
+    let angle = (slope.atan().to_degrees() + degrees).clamp(-LIMIT, LIMIT);
+    angle.to_radians().tan()
+}
+
+/// One of a point's two tangents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tangent {
+    #[default]
+    Out,
+    In,
+}
+
+impl Tangent {
+    pub fn other(self) -> Tangent {
+        match self {
+            Tangent::Out => Tangent::In,
+            Tangent::In => Tangent::Out,
+        }
+    }
+
+    pub fn field(self) -> Field {
+        match self {
+            Tangent::Out => Field::Out,
+            Tangent::In => Field::In,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.field().name()
+    }
+}
+
+/// How the selected point is drawn: whether the plot is a dial right
+/// now, and which tangent it turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mark {
+    pub rotate: bool,
+    pub tangent: Tangent,
+}
+
 // ---- the picture ----------------------------------------------------------
 
 const GRID: [u8; 4] = [44, 44, 52, 255];
@@ -598,6 +643,9 @@ const LINE: [u8; 4] = [110, 190, 255, 255];
 const DOT: [u8; 4] = [235, 235, 240, 255];
 const PICK: [u8; 4] = [255, 180, 60, 255];
 const HANDLE_COLOR: [u8; 4] = [255, 210, 130, 255];
+/// A split point's handles: they no longer make one line, and the
+/// colour says so.
+const SPLIT_COLOR: [u8; 4] = [190, 140, 255, 255];
 
 /// One grid line's drawing: the canvas, the value, its colour, whether
 /// it gets a label.
@@ -613,12 +661,18 @@ const MARGIN_TOP: i64 = 10;
 const MARGIN_BOTTOM: i64 = 16;
 /// A tangent handle's length, in units — the engine's own.
 const HANDLE: f32 = 0.12;
+/// The turning handle's length while rotating: longer, so the angle reads.
+const HANDLE_TURNING: f32 = 0.2;
+/// The ring around the anchor while rotating, in pixels.
+const RING: i64 = 9;
 
 /// The plot: the unit square at `UNIT` pixels a side, stretched to take in
 /// any point outside it; a grid every tenth, labels every fifth, the
 /// curve, every point, the selected one larger with its tangents as the
-/// engine draws them. Returns `(width, height, rgba)`.
-pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>) {
+/// engine draws them — one stroke through the anchor when joined, two of
+/// another colour when split, the turning one longer and brighter inside
+/// a ring while rotating. Returns `(width, height, rgba)`.
+pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>) {
     let ((x0, x1), (y0, y1)) = plot_range(curve);
     let scale_x = (UNIT).min(MAX_SIDE / (x1 - x0).max(1e-6));
     let scale_y = (UNIT).min(MAX_SIDE / (y1 - y0).max(1e-6));
@@ -693,13 +747,28 @@ pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>) {
     if let Some(p) = curve.points.get(selected) {
         let (cx, cy) = (sx(p.x).round() as i64, sy(p.y).round() as i64);
         // The engine's handles: `normalize(1, tangent) * 0.12` from the
-        // anchor, out to the right and in to the left.
-        for (m, dir) in [(p.out, 1.0f32), (p.in_, -1.0f32)] {
+        // anchor, out to the right and in to the left. A joined point
+        // draws both to the out slope, which is what the keys keep them at.
+        let resting = if p.locked { HANDLE_COLOR } else { SPLIT_COLOR };
+        for (tangent, dir) in [(Tangent::Out, 1.0f32), (Tangent::In, -1.0f32)] {
+            let m = match tangent {
+                Tangent::Out => p.out,
+                Tangent::In if p.locked => p.out,
+                Tangent::In => p.in_,
+            };
+            let turning = mark.rotate && (p.locked || mark.tangent == tangent);
+            let (reach, color) = if turning { (HANDLE_TURNING, PICK) } else { (HANDLE, resting) };
             let len = (1.0 + m * m).sqrt();
-            let (hx, hy) = (p.x + dir * HANDLE / len, p.y + dir * m * HANDLE / len);
+            let (hx, hy) = (p.x + dir * reach / len, p.y + dir * m * reach / len);
             let (ex, ey) = (sx(hx).round() as i64, sy(hy).round() as i64);
-            cv.line(cx, cy, ex, ey, HANDLE_COLOR);
-            cv.disc(ex, ey, 2, HANDLE_COLOR);
+            cv.line(cx, cy, ex, ey, color);
+            if turning {
+                cv.line(cx, cy + 1, ex, ey + 1, color);
+            }
+            cv.disc(ex, ey, if turning { 3 } else { 2 }, color);
+        }
+        if mark.rotate {
+            cv.ring(cx, cy, RING, PICK);
         }
         cv.disc(cx, cy, 5, PICK);
     }
@@ -897,19 +966,48 @@ mod tests {
     #[test]
     fn render_is_the_unit_square_at_a_fixed_size_and_marks_the_selected_point() {
         let curve = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
-        let (w, h, px) = render(&curve, 1);
+        let plain = Mark::default();
+        let (w, h, px) = render(&curve, 1, plain);
         assert_eq!((w, h), (512 + 40, 512 + 26));
         assert_eq!(px.len(), (w * h * 4) as usize);
-        let (_, _, other) = render(&curve, 0);
+        let (_, _, other) = render(&curve, 0, plain);
         assert_ne!(px, other, "the selection shows");
         let tall = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 2.0, 0.0, 0.0)]);
-        let (w2, h2, _) = render(&tall, 0);
+        let (w2, h2, _) = render(&tall, 0, plain);
         assert_eq!((w2, h2), (w, 1024 + 26), "the square keeps its scale; the picture grows");
-        let (w3, h3, px3) = render(&Curve::default(), 0);
+        let (w3, h3, px3) = render(&Curve::default(), 0, plain);
         assert_eq!(px3.len(), (w3 * h3 * 4) as usize);
         let far = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1e6, 0.0, 0.0)]);
-        let (_, h4, _) = render(&far, 0);
+        let (_, h4, _) = render(&far, 0, plain);
         assert!(h4 <= 4096 + 26, "capped: {h4}");
+    }
+
+    #[test]
+    fn render_shows_the_lock_and_the_rotation() {
+        let mut curve = c(&[(0.0, 0.0, 1.0, 1.0), (0.5, 0.5, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0)]);
+        let plain = Mark::default();
+        let (_, _, split) = render(&curve, 1, plain);
+        curve.points[1].locked = true;
+        let (_, _, joined) = render(&curve, 1, plain);
+        assert_ne!(split, joined, "a joined point draws one stroke, a split one two");
+        let (_, _, turning) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out });
+        assert_ne!(joined, turning, "the ring and the longer handle show");
+        curve.points[1].locked = false;
+        let (_, _, out) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out });
+        let (_, _, in_) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::In });
+        assert_ne!(out, in_, "the turning tangent is the bright one");
+    }
+
+    #[test]
+    fn rotated_turns_the_slope_by_degrees_and_clamps_near_vertical() {
+        assert!((rotated(0.0, 45.0) - 1.0).abs() < 1e-5);
+        assert!((rotated(0.0, -45.0) + 1.0).abs() < 1e-5);
+        assert!((rotated(1.0, -45.0)).abs() < 1e-5);
+        let steep = rotated(1.0, 45.0);
+        assert!((steep - 89f32.to_radians().tan()).abs() < 1e-2, "clamped: {steep}");
+        assert_eq!(rotated(steep, 10.0), steep, "stays at the limit");
+        assert_eq!(Tangent::Out.other(), Tangent::In);
+        assert_eq!(Tangent::In.field(), Field::In);
     }
 
     #[test]

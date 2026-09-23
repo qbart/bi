@@ -392,6 +392,10 @@ pub enum Action {
     NextPoint {
         back: bool,
     },
+    /// `r` on a curve's plot: rotation mode on, and off again.
+    Rotate,
+    /// `s` on a curve's plot: the tangents split, and joined again.
+    Split,
     /// A key in a form window. See `docs/specs/form.md`.
     Form(FormCmd),
     /// A key in a property view. See `docs/specs/props.md`.
@@ -718,11 +722,12 @@ fn split_flags(arg: &str) -> std::result::Result<(Vec<String>, Vec<(String, Stri
 /// `atlas.png` → `atlas_normal.png`, beside it.
 /// The curve tool's form: the selected point mirrored, then the steps.
 /// See `docs/specs/curve.md` §The form.
-fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f32) -> Form {
+fn curve_form(curve: &crate::curve::Curve, selected: usize, steps: (f32, f32, f32)) -> Form {
     use crate::form::Field;
     // The point's fields are a readout: the plot's keys move a point by
     // the curve's rules (sorted x, clamped to the neighbours), and a form
     // that turned them freely could break those. Only the steps turn.
+    let (xstep, ystep, astep) = steps;
     let mut form = Form::new("curve", "Curve");
     let n = curve.points.len();
     let p = curve.points.get(selected).copied().unwrap_or_default();
@@ -745,6 +750,7 @@ fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f
     form.push(Field::bool("locked", "Locked", p.locked).readonly());
     form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, xstep));
     form.push(Field::float("ystep", "Y step", 0.001, 1.0, 0.001, ystep));
+    form.push(Field::float("astep", "Angle", 1.0, 45.0, 1.0, astep));
     form
 }
 
@@ -2908,6 +2914,12 @@ struct CurveTool {
     selected: usize,
     xstep: f32,
     ystep: f32,
+    /// Degrees per press while rotating.
+    astep: f32,
+    /// `r`: the keys turn the selected point's tangent.
+    rotate: bool,
+    /// Which tangent, on a split point.
+    tangent: crate::curve::Tangent,
     /// What the buffer last said, and where.
     curve: crate::curve::Curve,
     literal: Option<crate::curve::Literal>,
@@ -3031,6 +3043,7 @@ impl Tool {
     fn label(&self) -> &'static str {
         match self {
             Tool::NormalMap(_) => "NORMALMAP",
+            Tool::Curve(c) if c.rotate => "ROTATE",
             Tool::Curve(_) => "CURVE",
             Tool::Color(_) => "COLOR",
             Tool::Gradient(_) => "GRADIENT",
@@ -4615,6 +4628,9 @@ impl Editor {
     /// Which keymap the focused window wants. The frontend passes this back
     /// into `Input::on_key`.
     pub fn content_kind(&self) -> ContentKind {
+        if self.is_curve_plot(self.focus) {
+            return ContentKind::Plot;
+        }
         self.window().content.kind()
     }
 
@@ -7490,6 +7506,8 @@ impl Editor {
             Action::Turn(_)
             | Action::EditValue
             | Action::NextPoint { .. }
+            | Action::Rotate
+            | Action::Split
             | Action::YankColor(_)
             | Action::ToggleMode
             | Action::PickColor => {}
@@ -9421,7 +9439,7 @@ impl Editor {
             window.content = Content::Image(img);
             window.alt = None;
         }
-        let form = curve_form(&curve, selected, xstep, ystep);
+        let form = curve_form(&curve, selected, (xstep, ystep, 5.0));
         let Some(form) = self.open_form_sidebar(form) else {
             self.close_window(plot);
             self.set_focus(source);
@@ -9438,6 +9456,9 @@ impl Editor {
             selected,
             xstep,
             ystep,
+            astep: 5.0,
+            rotate: false,
+            tangent: crate::curve::Tangent::Out,
             curve,
             literal: Some(lit),
             lost: false,
@@ -9503,12 +9524,16 @@ impl Editor {
         let point = form.get_i64("point").max(1) as usize - 1;
         let (x, y) = (form.get_f32("x"), form.get_f32("y"));
         let (xstep, ystep) = (form.get_f32("xstep"), form.get_f32("ystep"));
+        let astep = form.get_f32("astep");
         if let Some(t) = self.curve_mut(index) {
             if xstep > 0.0 {
                 t.xstep = xstep;
             }
             if ystep > 0.0 {
                 t.ystep = ystep;
+            }
+            if astep > 0.0 {
+                t.astep = astep;
             }
         }
         if point != tool.selected {
@@ -9535,7 +9560,9 @@ impl Editor {
         let Some(tool) = self.curve(index) else { return };
         match what {
             "" => {
-                self.session.status = "curve what? (point, x, y, xstep, ystep, layout)".into();
+                self.session.status =
+                    "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, layout)"
+                        .into();
             }
             "layout" if value.is_empty() => {
                 self.session.status = format!("curve layout={}", tool.layout.text());
@@ -9553,7 +9580,7 @@ impl Editor {
             },
             // The point's fields are read-only in the form; the ex forms
             // move the point by the curve's own rules instead.
-            "point" | "x" | "y" if !value.is_empty() => {
+            "point" | "x" | "y" | "out" | "in" | "locked" if !value.is_empty() => {
                 let n = tool.curve.points.len();
                 self.session.status = match what {
                     "point" => match value.parse::<usize>() {
@@ -9563,9 +9590,19 @@ impl Editor {
                         }
                         _ => format!("point wants a whole number 1..{n}"),
                     },
+                    "locked" => match value {
+                        "on" | "true" | "1" => self.curve_lock(index, true),
+                        "off" | "false" | "0" => self.curve_lock(index, false),
+                        _ => "locked wants on or off".into(),
+                    },
                     field => match value.parse::<f32>() {
                         Ok(v) if v.is_finite() => {
-                            let field = if field == "x" { Field::X } else { Field::Y };
+                            let field = match field {
+                                "x" => Field::X,
+                                "y" => Field::Y,
+                                "out" => Field::Out,
+                                _ => Field::In,
+                            };
                             self.curve_set(index, field, v);
                             String::new()
                         }
@@ -9574,7 +9611,7 @@ impl Editor {
                 };
                 self.sync_tools();
             }
-            "point" | "x" | "y" | "xstep" | "ystep" => {
+            "point" | "x" | "y" | "out" | "in" | "locked" | "xstep" | "ystep" | "astep" => {
                 let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else {
                     return;
                 };
@@ -9587,7 +9624,7 @@ impl Editor {
             }
             other => {
                 self.session.status = format!(
-                    "not a curve setting: {other} (want point, x, y, xstep, ystep, layout)"
+                    "not a curve setting: {other} (want point, x, y, out, in, locked, xstep, ystep, astep, layout)"
                 );
             }
         }
@@ -9626,7 +9663,8 @@ impl Editor {
         if lost && !tool.lost {
             self.session.status = "curve lost".into();
         }
-        let (w, h, pixels) = crate::curve::render(&curve, selected);
+        let mark = crate::curve::Mark { rotate: tool.rotate, tangent: tool.tangent };
+        let (w, h, pixels) = crate::curve::render(&curve, selected, mark);
         if let Some(img) = self.window_mut_of(tool.plot).and_then(Window::img_mut) {
             img.rgba = pixels;
             img.width = w;
@@ -9637,7 +9675,7 @@ impl Editor {
         let fields = if lost {
             Vec::new()
         } else {
-            curve_form(&curve, selected, tool.xstep, tool.ystep).fields().to_vec()
+            curve_form(&curve, selected, (tool.xstep, tool.ystep, tool.astep)).fields().to_vec()
         };
         if let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) {
             form.replace_fields(fields);
@@ -10778,12 +10816,20 @@ impl Editor {
             _ => None,
         })?;
         let p = tool.curve.points.get(tool.selected)?;
+        use crate::curve::Tangent;
+        let slope = |t: Tangent, m: f32| {
+            let text = format!("{} {m:.3}", t.name());
+            if tool.rotate && (p.locked || tool.tangent == t) { format!("[{text}]") } else { text }
+        };
         Some(format!(
-            "point {} of {}  x {:.3} y {:.3}",
+            "point {} of {}  x {:.3} y {:.3}  {} {}{}",
             tool.selected + 1,
             tool.curve.points.len(),
             p.x,
-            p.y
+            p.y,
+            slope(Tangent::Out, p.out),
+            slope(Tangent::In, p.in_),
+            if p.locked { "" } else { " split" }
         ))
     }
 
@@ -10796,11 +10842,30 @@ impl Editor {
         let last = tool.curve.points.len().saturating_sub(1);
         let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
         let n = last + 1;
+        let turn = count as f32 * tool.astep;
         match &cmd.action {
             Action::Undo => self.curve_undo(index, false),
             Action::Redo => self.curve_undo(index, true),
+            // `Esc` while rotating leaves the rotation, not the plot.
+            Action::EnterNormal if tool.rotate => self.curve_set_rotate(index, false),
             Action::EnterNormal => self.set_focus(tool.source),
             _ if tool.lost => self.session.status = "curve lost".into(),
+            Action::Rotate => self.curve_set_rotate(index, !tool.rotate),
+            Action::Split => self.curve_split(index),
+            // The dial: on a split point `Tab` picks the tangent, and the
+            // moves turn it. See `docs/specs/curve.md` §Tangents.
+            Action::NextPoint { .. } if tool.rotate && !p.locked => {
+                if let Some(t) = self.curve_mut(index) {
+                    t.tangent = t.tangent.other();
+                }
+                self.curve_reread(index);
+            }
+            Action::Move(Motion::Left | Motion::Up) if tool.rotate => {
+                self.curve_rotate(index, turn)
+            }
+            Action::Move(Motion::Right | Motion::Down) if tool.rotate => {
+                self.curve_rotate(index, -turn)
+            }
             Action::NextPoint { back } if n > 0 => {
                 let step = count % n;
                 let next =
@@ -10856,6 +10921,18 @@ impl Editor {
         true
     }
 
+    /// `r`: rotation on or off; the plot redraws its handles and the
+    /// label follows.
+    fn curve_set_rotate(&mut self, index: usize, on: bool) {
+        if let Some(tool) = self.curve_mut(index) {
+            tool.rotate = on;
+            tool.tangent = crate::curve::Tangent::Out;
+        }
+        self.session.status =
+            if on { "rotating: h l turn, Tab picks the tangent, r done" } else { "" }.into();
+        self.curve_reread(index);
+    }
+
     /// `Tab`, `gg`, `G`: another point picked; the plot and the form
     /// follow.
     fn curve_select(&mut self, index: usize, selected: usize) {
@@ -10888,13 +10965,117 @@ impl Editor {
             }
             _ => value,
         };
-        let step = if field == Field::X { tool.xstep } else { tool.ystep };
+        let step = match field {
+            Field::X => tool.xstep,
+            Field::Y => tool.ystep,
+            _ => 0.001,
+        };
         let Some(old) = self.buffer_bytes(tool.buffer, token.start, token.end) else { return };
         let new = crate::curve::rewrite(&old, value, step);
         if new == old {
             return;
         }
         self.curve_edit(index, vec![(token.start, token.end, new)]);
+    }
+
+    /// The selected point's tangent tokens — the out's, the in's, or
+    /// both — as byte spans with their text, or why not.
+    fn curve_tangent_tokens(
+        &self,
+        tool: &CurveTool,
+        which: &[crate::curve::Tangent],
+    ) -> Result<Vec<(crate::curve::Tangent, usize, usize, String)>, String> {
+        let span =
+            tool.literal.as_ref().and_then(|l| l.points.get(tool.selected)).ok_or("curve lost")?;
+        let mut out = Vec::new();
+        for &t in which {
+            let field = t.field();
+            let slot = tool
+                .layout
+                .index_of(field)
+                .ok_or_else(|| format!("the layout has no {}", field.name()))?;
+            let token = span
+                .tokens
+                .get(slot)
+                .ok_or_else(|| format!("point {} has no {}", tool.selected + 1, field.name()))?;
+            let text =
+                self.buffer_bytes(tool.buffer, token.start, token.end).ok_or("curve lost")?;
+            out.push((t, token.start, token.end, text));
+        }
+        Ok(out)
+    }
+
+    /// `h` and `l` while rotating: the tangent turned by `degrees` — both
+    /// tangents to the out's new slope on a joined point, the picked one
+    /// on a split point — written as one edit.
+    fn curve_rotate(&mut self, index: usize, degrees: f32) {
+        use crate::curve::{Tangent, rewrite, rotated};
+        let Some(tool) = self.curve(index) else { return };
+        let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+        let which: &[Tangent] = if p.locked {
+            &[Tangent::Out, Tangent::In]
+        } else {
+            std::slice::from_ref(&tool.tangent)
+        };
+        let tokens = match self.curve_tangent_tokens(&tool, which) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                self.session.status = e;
+                return;
+            }
+        };
+        let from = if p.locked || tool.tangent == Tangent::Out { p.out } else { p.in_ };
+        let slope = rotated(from, degrees);
+        let edits: Vec<_> = tokens
+            .into_iter()
+            .map(|(_, start, end, old)| (start, end, rewrite(&old, slope, 0.001)))
+            .collect();
+        self.curve_edit(index, edits);
+    }
+
+    /// `s`: the tangents split or joined again — `locked` flipped, and a
+    /// join copies the out slope into the in so the point is one line.
+    fn curve_split(&mut self, index: usize) {
+        let Some(tool) = self.curve(index) else { return };
+        let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+        let status = self.curve_lock(index, !p.locked);
+        if !status.is_empty() {
+            self.session.status = status;
+        }
+    }
+
+    /// The selected point's `locked` written as `locked`, a join copying
+    /// out into in. The status to show — `tangents split`, `tangents
+    /// joined`, or why not.
+    fn curve_lock(&mut self, index: usize, locked: bool) -> String {
+        use crate::curve::{Field, Tangent, rewrite, rewrite_bool};
+        let Some(tool) = self.curve(index) else { return String::new() };
+        let Some(span) = tool.literal.as_ref().and_then(|l| l.points.get(tool.selected)) else {
+            return "curve lost".into();
+        };
+        let Some(slot) = tool.layout.index_of(Field::Locked) else {
+            return "the layout has no locked".into();
+        };
+        let Some(token) = span.tokens.get(slot) else {
+            return format!("point {} has no locked", tool.selected + 1);
+        };
+        let Some(old) = self.buffer_bytes(tool.buffer, token.start, token.end) else {
+            return "curve lost".into();
+        };
+        let mut edits = vec![(token.start, token.end, rewrite_bool(&old, locked))];
+        if locked {
+            let p = tool.curve.points.get(tool.selected).copied().unwrap_or_default();
+            if let Ok(tokens) = self.curve_tangent_tokens(&tool, &[Tangent::In]) {
+                for (_, start, end, old) in tokens {
+                    edits.push((start, end, rewrite(&old, p.out, 0.001)));
+                }
+            }
+        }
+        if let Some(t) = self.curve_mut(index) {
+            t.tangent = Tangent::Out;
+        }
+        self.curve_edit(index, edits);
+        if locked { "tangents joined" } else { "tangents split" }.into()
     }
 
     /// `a`: a point on the curve halfway to the next one — from the last
@@ -15747,6 +15928,8 @@ impl View<'_> {
             Action::Turn(_)
             | Action::EditValue
             | Action::NextPoint { .. }
+            | Action::Rotate
+            | Action::Split
             | Action::YankColor(_)
             | Action::ToggleMode
             | Action::PickColor => {}
@@ -33260,7 +33443,10 @@ int main(void) {
                 "std::vector<Point> pts = {\n    {0.0, 0.0, 1.0, 0.0, true},\n    {1.0, 1.0, 1.0, 1.0, true},\n};\n"
             );
             let plot = plot_of(&ed, source);
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 2  x 0.000 y 0.000");
+            assert_eq!(
+                ed.curve_status(plot).unwrap(),
+                "point 1 of 2  x 0.000 y 0.000  out 1.000 in 0.000"
+            );
             key(&mut ed, Action::Undo);
             assert_eq!(text(&ed), src, "one undo step");
         }
@@ -33276,7 +33462,7 @@ int main(void) {
             assert!(p.x > s.x && f.x > p.x, "{s:?} {p:?} {f:?}");
             assert_eq!(
                 ed.curve_status(plot).unwrap(),
-                "point 2 of 3  x 0.500 y 0.800",
+                "point 2 of 3  x 0.500 y 0.800  out 0.000 in 0.000",
                 "the cursor's point is selected"
             );
             let form = ed.window_of(form).unwrap().form().unwrap();
@@ -33312,7 +33498,7 @@ int main(void) {
             let start = CPP[..at].chars().count();
             ed.buffer_mut().unwrap().replace_range(start, start + 4, "0.2f");
             ed.apply(cmd(Action::Move(Motion::Left)));
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.200");
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 3  x 0.500 y 0.200"));
             assert!(ed.window_of(plot).unwrap().img().unwrap().generation > before);
             let form = ed.window_of(form_of(&ed)).unwrap().form().unwrap();
             assert_eq!(form.get_f32("y"), 0.2, "the form mirrors the text");
@@ -33373,7 +33559,7 @@ int main(void) {
             );
             let plot = plot_of(&ed, view);
             assert_eq!(ed.focus(), plot);
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000");
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 1 of 3  x 0.000 y 0.000"));
             assert_eq!(text(&ed), DATA, "opening a stored curve writes nothing");
 
             key(&mut ed, Action::NextPoint { back: false });
@@ -33422,7 +33608,10 @@ int main(void) {
                 text(&ed)
             );
             let plot = plot_of(&ed, view);
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 2  x 0.000 y 0.000");
+            assert_eq!(
+                ed.curve_status(plot).unwrap(),
+                "point 1 of 2  x 0.000 y 0.000  out 1.000 in 0.000"
+            );
             key(&mut ed, Action::Move(Motion::Up));
             assert!(text(&ed).contains("[[0, 0.1, 1, 0, true]"), "{}", text(&ed));
             key(&mut ed, Action::Undo);
@@ -33456,9 +33645,15 @@ int main(void) {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
             key(&mut ed, Action::NextPoint { back: false });
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 3 of 3  x 1.000 y 1.000");
+            assert_eq!(
+                ed.curve_status(plot).unwrap(),
+                "point 3 of 3  x 1.000 y 1.000  out 1.000 in 1.000 split"
+            );
             key(&mut ed, Action::NextPoint { back: false });
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 1 of 3  x 0.000 y 0.000", "wraps");
+            assert!(
+                ed.curve_status(plot).unwrap().starts_with("point 1 of 3  x 0.000 y 0.000"),
+                "wraps"
+            );
             key(&mut ed, Action::NextPoint { back: true });
             assert!(ed.curve_status(plot).unwrap().starts_with("point 3"), "and back");
             key(&mut ed, Action::Move(Motion::FirstLine));
@@ -33485,6 +33680,97 @@ int main(void) {
                 "the first point stays at 0: {}",
                 text(&ed)
             );
+        }
+
+        #[test]
+        fn r_turns_the_tangents_and_r_again_moves_the_point_once_more() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            key(&mut ed, Action::Rotate);
+            assert_eq!(ed.tool_label(plot), Some("ROTATE"));
+            assert_eq!(
+                ed.curve_status(plot).unwrap(),
+                "point 2 of 3  x 0.500 y 0.800  [out 0.000] [in 0.000]",
+                "a joined point turns both"
+            );
+            key(&mut ed, Action::Move(Motion::Right));
+            assert_eq!(
+                text(&ed),
+                CPP.replace(
+                    "{0.5f, 0.8f, 0.0f, 0.0f, true}",
+                    "{0.5f, 0.8f, -0.087f, -0.087f, true}"
+                ),
+                "five degrees clockwise, both tokens, and x untouched"
+            );
+            ed.apply(Command { count: 2, action: Action::Move(Motion::Left) });
+            assert_eq!(
+                text(&ed),
+                CPP.replace("{0.5f, 0.8f, 0.0f, 0.0f, true}", "{0.5f, 0.8f, 0.088f, 0.088f, true}"),
+                "ten back from the three decimals the text keeps"
+            );
+            key(&mut ed, Action::Undo);
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), CPP, "one undo step per turn");
+            key(&mut ed, Action::EnterNormal);
+            assert_eq!(ed.focus(), plot, "Esc leaves the rotation, not the plot");
+            assert_eq!(ed.tool_label(plot), Some("CURVE"));
+            key(&mut ed, Action::Rotate);
+            key(&mut ed, Action::Rotate);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("{0.6f, 0.8f, 0.0f, 0.0f, true}"), "x moves again");
+        }
+
+        #[test]
+        fn s_splits_the_tangents_and_joins_them_again() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            key(&mut ed, Action::Split);
+            assert_eq!(ed.session.status, "tangents split");
+            assert!(text(&ed).contains("{0.5f, 0.8f, 0.0f, 0.0f, false}"), "{}", text(&ed));
+            assert!(ed.curve_status(plot).unwrap().ends_with("out 0.000 in 0.000 split"));
+            key(&mut ed, Action::Rotate);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("{0.5f, 0.8f, -0.087f, 0.0f, false}"), "{}", text(&ed));
+            key(&mut ed, Action::NextPoint { back: false });
+            assert!(ed.curve_status(plot).unwrap().ends_with("out -0.087 [in 0.000] split"));
+            ed.apply(Command { count: 2, action: Action::Move(Motion::Right) });
+            assert!(text(&ed).contains("{0.5f, 0.8f, -0.087f, -0.176f, false}"), "{}", text(&ed));
+            key(&mut ed, Action::Split);
+            assert_eq!(ed.session.status, "tangents joined");
+            assert!(
+                text(&ed).contains("{0.5f, 0.8f, -0.087f, -0.087f, true}"),
+                "the out slope wins: {}",
+                text(&ed)
+            );
+            key(&mut ed, Action::Undo);
+            assert!(text(&ed).contains("{0.5f, 0.8f, -0.087f, -0.176f, false}"), "one step");
+            ed.run_ex("tool curve layout x,y");
+            key(&mut ed, Action::Split);
+            assert_eq!(ed.session.status, "the layout has no locked");
+        }
+
+        #[test]
+        fn tool_curve_sets_the_tangents_the_lock_and_the_angle_step() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            ed.run_ex("tool curve out 2");
+            assert!(text(&ed).contains("{0.5f, 0.8f, 2.0f, 0.0f, true}"), "{}", text(&ed));
+            ed.run_ex("tool curve in -1.5");
+            assert!(text(&ed).contains("{0.5f, 0.8f, 2.0f, -1.5f, true}"), "{}", text(&ed));
+            ed.run_ex("tool curve locked off");
+            assert!(text(&ed).contains("{0.5f, 0.8f, 2.0f, -1.5f, false}"), "{}", text(&ed));
+            ed.run_ex("tool curve locked on");
+            assert!(text(&ed).contains("{0.5f, 0.8f, 2.0f, 2.0f, true}"), "{}", text(&ed));
+            ed.run_ex("tool curve locked maybe");
+            assert_eq!(ed.session.status, "locked wants on or off");
+            ed.run_ex("tool curve astep 10");
+            ed.run_ex("tool curve astep");
+            assert_eq!(ed.session.status, "curve astep=10.0");
+            ed.run_ex("tool curve out 0");
+            key(&mut ed, Action::Rotate);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("{0.5f, 0.8f, -0.176f, -0.176f, true}"), "{}", text(&ed));
+            assert_eq!(ed.tool_label(plot), Some("ROTATE"));
         }
 
         #[test]
@@ -33540,13 +33826,13 @@ int main(void) {
             }
             key(&mut ed, Action::Undo);
             assert_eq!(text(&ed), CPP.replace("0.8f", "1.0f"), "one key, one step");
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 1.000");
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 3  x 0.500 y 1.000"));
             key(&mut ed, Action::Undo);
             key(&mut ed, Action::Undo);
             assert_eq!(text(&ed), CPP);
             key(&mut ed, Action::Redo);
             assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.500 y 0.900");
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 3  x 0.500 y 0.900"));
         }
 
         #[test]
@@ -33577,7 +33863,10 @@ int main(void) {
             ed.run_ex("tool curve y wide");
             assert!(ed.session.status.starts_with("y wants a number"), "{}", ed.session.status);
             ed.run_ex("tool curve");
-            assert_eq!(ed.session.status, "curve what? (point, x, y, xstep, ystep, layout)");
+            assert_eq!(
+                ed.session.status,
+                "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, layout)"
+            );
             ed.run_ex("tool curve ystep 0.01");
             ed.run_ex("tool curve ystep");
             assert_eq!(ed.session.status, "curve ystep=0.010");
@@ -33597,7 +33886,7 @@ int main(void) {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
             ed.run_ex("tool curve layout y,x");
-            assert_eq!(ed.curve_status(plot).unwrap(), "point 2 of 3  x 0.800 y 0.500");
+            assert!(ed.curve_status(plot).unwrap().starts_with("point 2 of 3  x 0.800 y 0.500"));
             ed.run_ex("tool curve layout");
             assert_eq!(ed.session.status, "curve layout=y,x");
             ed.run_ex("tool curve layout x,z");
@@ -34844,7 +35133,10 @@ int main(void) {
                 "tileset what? (size, kind, select, image resize, image grow)"
             );
             ed.run_ex("tool");
-            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap, curve, color, gradient)");
+            assert_eq!(
+                ed.session.status,
+                "tool what? (tileset, image, normalmap, curve, color, gradient)"
+            );
             ed.run_ex("tool lathe");
             assert_eq!(
                 ed.session.status,

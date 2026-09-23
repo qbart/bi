@@ -215,6 +215,10 @@ pub enum ContentKind {
     Tree,
     Results,
     Image,
+    /// A curve's plot: a picture whose `r` and `s` are the curve's. Never
+    /// what a `Content` says of itself — the editor knows which pictures
+    /// are plots and answers it from `content_kind`. See `docs/specs/curve.md`.
+    Plot,
     Form,
     Props,
     DapStack,
