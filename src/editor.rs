@@ -838,6 +838,9 @@ pub struct Session {
     /// in the session. Separate from the text ring: text and pixels do not
     /// paste into each other. See `docs/specs/tileset.md`.
     pub tile: Option<crate::tileset::Tile>,
+    /// What `y` in a property view took — a value with its type — for
+    /// `p` on a row of that type, in any data file. See `docs/specs/props.md`.
+    pub prop: Option<crate::props::Clip>,
     /// A capture waiting on its register name — the text `"n{operator}` took,
     /// held while the `:yname ` prompt is up. Never survives leaving the
     /// prompt: `:yname` consumes it, anything else sends it to the ring.
@@ -3100,6 +3103,10 @@ pub enum PropsCmd {
     NextSection {
         back: bool,
     },
+    /// `y` — the row's value, typed, into the session.
+    Yank,
+    /// `p` — that value onto this row, when the types agree.
+    Paste,
     Undo,
     Redo,
 }
@@ -3517,10 +3524,30 @@ impl Editor {
     fn run_props_cmd(&mut self, cmd: PropsCmd) {
         let window = self.focus;
         let height = self.window().height;
+        // `y` reads the view and writes the session: done before the
+        // view is borrowed for the rest.
+        if cmd == PropsCmd::Yank {
+            let Some(props) = self.window().props() else { return };
+            let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+            match props.yank(&key) {
+                Ok((clip, text)) => {
+                    self.session.prop = Some(clip);
+                    self.session.registers.push(Entry { text: text.clone(), kind: Shape::Chars });
+                    self.session.status = format!("yanked {text}");
+                }
+                Err(e) => self.session.status = e,
+            }
+            return;
+        }
+        let clip = self.session.prop.clone();
         let Some(props) = self.window_mut().props_mut() else { return };
-        let (key, turnable) =
-            props.selected_row().map(|r| (r.key.clone(), r.turnable)).unwrap_or_default();
-        if cmd == PropsCmd::Enter {
+        let (key, turnable, check) = props
+            .selected_row()
+            .map(|r| {
+                (r.key.clone(), r.turnable, matches!(r.widget, crate::props::RowWidget::Check(_)))
+            })
+            .unwrap_or_default();
+        if cmd == PropsCmd::Enter && !check {
             match props.tool_target(&key) {
                 Ok(Some((kind, path, edit))) => {
                     return self.open_tool_from_props(window, kind, path, edit);
@@ -3575,12 +3602,19 @@ impl Editor {
                 props.next_section(back);
                 Ok(None)
             }
+            // A bool flips on Enter, as a form's check does.
+            PropsCmd::Enter if check => props.turn(&key, 1, true).map(Some),
             PropsCmd::Enter => match props.edit_line(&key) {
                 Some(line) => Ok(Some(crate::props::Edit::Prompt(line))),
                 None => {
                     props.toggle_expand();
                     Ok(None)
                 }
+            },
+            PropsCmd::Yank => unreachable!("handled above"),
+            PropsCmd::Paste => match clip.as_ref() {
+                Some(clip) => props.paste(&key, clip).map(Some),
+                None => Err("nothing yanked in a property view yet".into()),
             },
             PropsCmd::Toggle => props.turn(&key, 1, true).map(Some),
             PropsCmd::Nudge(steps) => props.turn(&key, steps, false).map(Some),
@@ -33080,6 +33114,54 @@ int main(void) {
         }
 
         const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+
+        /// `Enter` flips a bool; `y` and `p` carry a typed value between
+        /// rows. See `docs/specs/props.md`.
+        #[test]
+        fn enter_flips_a_bool_and_y_p_carry_a_value_between_rows_of_one_type() {
+            const SCHEMA: &str = r##"{"$dialect":"bi/1","types":{"Fx":{"kind":"struct","fields":[
+                {"name":"on","type":"bool"},
+                {"name":"hp","type":"i32","default":10},
+                {"name":"name","type":"string"}]}}}"##;
+            const DATA: &str = "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"fx.bischema\",\n  \"instances\": [\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"fire\",\n      \"hp\": 40\n    },\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"ice\"\n    }\n  ]\n}\n";
+            let d = ScratchDir::new("propsyank")
+                .written("fx.bischema", SCHEMA)
+                .written("fx.bidata", DATA);
+            let mut ed = Editor::open(format!("{}/fx.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            go(&mut ed, &[DOWN]);
+            assert_eq!(key(&ed), "inst:0/on");
+            go(&mut ed, &[PropsCmd::Enter]);
+            assert!(text(&ed).contains("\"on\": true"), "Enter flips: {}", text(&ed));
+            assert_eq!(ed.session.mode, Mode::Normal, "no ex line");
+            go(&mut ed, &[PropsCmd::Enter]);
+            assert!(!text(&ed).contains("\"on\": true"), "and back: {}", text(&ed));
+            go(&mut ed, &[DOWN]);
+            assert_eq!(key(&ed), "inst:0/hp");
+            go(&mut ed, &[PropsCmd::Yank]);
+            assert_eq!(ed.session.status, "yanked 40");
+            assert_eq!(ed.session.registers.front().unwrap().text, "40");
+            go(&mut ed, &[DOWN]);
+            assert_eq!(key(&ed), "inst:0/name");
+            go(&mut ed, &[PropsCmd::Paste]);
+            assert_eq!(ed.session.status, "yanked i32, this is string");
+            go(&mut ed, &[DOWN, PropsCmd::Expand, DOWN, DOWN]);
+            assert_eq!(key(&ed), "inst:1/hp");
+            go(&mut ed, &[PropsCmd::Paste]);
+            assert_eq!(text(&ed).matches("\"hp\": 40").count(), 2, "{}", text(&ed));
+            go(&mut ed, &[PropsCmd::Undo]);
+            assert_eq!(text(&ed).matches("\"hp\": 40").count(), 1, "one edit");
+            // A whole instance from its header, onto another of its type.
+            go(&mut ed, &[PropsCmd::First, PropsCmd::Yank]);
+            assert_eq!(ed.session.status, "yanked Fx fire");
+            go(&mut ed, &[PropsCmd::Last, PropsCmd::Parent]);
+            assert_eq!(key(&ed), "inst:1");
+            go(&mut ed, &[PropsCmd::Paste]);
+            assert!(text(&ed).contains("\"$id\": \"ice\",\n      \"hp\": 40"), "{}", text(&ed));
+            ed.session.prop = None;
+            go(&mut ed, &[PropsCmd::Paste]);
+            assert_eq!(ed.session.status, "nothing yanked in a property view yet");
+        }
 
         /// A file opened from the tree lands in the view you came from,
         /// not in the tree. See `docs/specs/tree.md` §Opening a file.

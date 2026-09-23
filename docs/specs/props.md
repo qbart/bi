@@ -118,9 +118,12 @@ l  →         on a value: turn it up — a number by its step, an enum or a ref
 h  ←         on a value: turn it down; otherwise close it, or go to the parent
 H  L         ten steps
 Backspace    the parent row
-Enter  i     on a value: edit it on the ex line — `:bi set goblin.hp 40`
+Enter  i     on a bool: flip it — a form's Enter on a check
+             on any other value: edit it on the ex line — `:bi set goblin.hp 40`
              on a colour, a curve, a gradient: its editor over it — see below
              otherwise open or close the row
+y            yank the value, with its type; a whole instance from its header
+p            put it on this row — one of the same type, in this file or another
 Space        flip a bool, cycle an enum or a ref, an optional between — and
              the inner value's default; a number one step up
 Ctrl-A  Ctrl-X   the same as l and h on a value, for the vim hand
@@ -138,6 +141,18 @@ gd           on a ref: jump to its target, in this file or another
 u  Ctrl-R    undo, redo — the buffer's; the view follows
 :            the ex line
 ```
+
+**`y` and `p` carry a typed value**, not text. `y` on a row keeps the
+value and its type in the session — `40` as an `i32`, a struct as itself,
+a whole instance's fields from its header row — and puts the value's
+spelling on the register ring too, so `p` in a text window pastes what
+`Enter` would have shown. `p` on a row of the same type writes the value
+there, in this file or another data file of the schema, as one edit; an
+optional of the type takes it as well. Any other row says `yanked i32,
+this is string` and writes nothing, and a read-only row refuses as `Space`
+would. `p` on an instance header of the yanked instance's type replaces
+its fields, keeping its id. `y` on a schema row, a group or an error row
+has nothing typed to take and says so.
 
 Every key that changes something is one edit of the buffer and one undo
 step of it; the view re-reads the buffer after, so there is one direction

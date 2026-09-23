@@ -173,6 +173,14 @@ pub enum Seg {
     Index(usize),
 }
 
+/// What `y` took from a row: a value and the type it has, for `p` to
+/// check against the row it lands on. See `docs/specs/props.md`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clip {
+    pub ty: TypeExpr,
+    pub value: Value,
+}
+
 /// A field or a group inside a struct's layout.
 enum Item {
     Field(usize),
@@ -1249,6 +1257,87 @@ impl Props {
         map.insert(first.clone(), new);
         *item = normalise_one(item, &self.schema);
         Ok(())
+    }
+
+    /// `y` on a row: the value there, typed, and its spelling for the
+    /// register ring. An instance header takes the whole instance.
+    pub fn yank(&self, key: &str) -> Result<(Clip, String), String> {
+        if self.kind != Kind::Data {
+            return Err("nothing typed to yank here".into());
+        }
+        if key.contains("/@") {
+            return Err("a group: yank its fields one by one".into());
+        }
+        let (index, segs) = parse_data_key(key)?;
+        let inst = self
+            .data
+            .as_ref()
+            .ok_or("not a data file")?
+            .instances
+            .get(index)
+            .ok_or("no instance")?;
+        if segs.is_empty() {
+            let clip = Clip {
+                ty: TypeExpr::Named(inst.ty.clone()),
+                value: Value::Object(inst.values.clone()),
+            };
+            return Ok((clip, format!("{} {}", inst.ty, inst.id)));
+        }
+        let (ty, ..) = self.walk(&inst.ty, &segs)?;
+        let (value, _) = self.resolved_at(index, &segs)?;
+        let text = self.edit_text(&ty, &value);
+        Ok((Clip { ty, value }, text))
+    }
+
+    /// `p` on a row: `clip` written there when the types agree — the
+    /// row's, or an optional of it — as one edit.
+    pub fn paste(&self, key: &str, clip: &Clip) -> Result<Edit, String> {
+        if self.kind != Kind::Data {
+            return Err("nothing to paste onto here".into());
+        }
+        if key.contains("/@") {
+            return Err("a group: paste onto its fields".into());
+        }
+        let (index, segs) = parse_data_key(key)?;
+        let inst = self
+            .data
+            .as_ref()
+            .ok_or("not a data file")?
+            .instances
+            .get(index)
+            .ok_or("no instance")?;
+        let mut raw = self.raw.clone();
+        if segs.is_empty() {
+            let (TypeExpr::Named(ty), Value::Object(values)) = (&clip.ty, &clip.value) else {
+                return Err(format!("yanked {}, this is an instance", clip.ty.text()));
+            };
+            if *ty != inst.ty {
+                return Err(format!("yanked a {ty}, this is a {}", inst.ty));
+            }
+            let item = raw["instances"]
+                .get_mut(index)
+                .and_then(Value::as_object_mut)
+                .ok_or("no instance")?;
+            item.retain(|k, _| k.starts_with('$'));
+            for (k, v) in values {
+                if !k.starts_with('$') {
+                    item.insert(k.clone(), v.clone());
+                }
+            }
+            let item = &mut raw["instances"][index];
+            *item = normalise_one(item, &self.schema);
+            return Ok(Edit::Text(write_kind(self.kind, &raw)));
+        }
+        let (ty, _, readonly) = self.walk(&inst.ty, &segs)?;
+        if readonly {
+            return Err("read-only".into());
+        }
+        let fits = ty == clip.ty || matches!(&ty, TypeExpr::Optional(inner) if **inner == clip.ty);
+        if !fits {
+            return Err(format!("yanked {}, this is {}", clip.ty.text(), ty.text()));
+        }
+        self.assign_at(&mut raw, index, &segs, clip.value.clone())?;
+        Ok(Edit::Text(write_kind(self.kind, &raw)))
     }
 
     /// `dd` on a row: what it removes, or the prompt it needs.

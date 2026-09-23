@@ -1048,6 +1048,8 @@ impl Input {
             KeyCode::Enter | KeyCode::Char('i') => PropsCmd::Enter,
             KeyCode::Char(' ') => PropsCmd::Toggle,
             KeyCode::Char('a') => PropsCmd::Add,
+            KeyCode::Char('y') => PropsCmd::Yank,
+            KeyCode::Char('p') => PropsCmd::Paste,
             KeyCode::Char('u') => PropsCmd::Undo,
             // The ex line, as from every pane: `:bi …` and `:w` live there.
             KeyCode::Char(':') => return self.plain(Action::EnterCommandMode),
