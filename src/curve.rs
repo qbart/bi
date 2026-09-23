@@ -628,10 +628,12 @@ impl Tangent {
 
 /// How the selected point is drawn: whether the plot is a dial right
 /// now, and which tangent it turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Mark {
     pub rotate: bool,
     pub tangent: Tangent,
+    /// The playhead's x, when it is drawn.
+    pub play: Option<f32>,
 }
 
 // ---- the picture ----------------------------------------------------------
@@ -646,6 +648,9 @@ const HANDLE_COLOR: [u8; 4] = [255, 210, 130, 255];
 /// A split point's handles: they no longer make one line, and the
 /// colour says so.
 const SPLIT_COLOR: [u8; 4] = [190, 140, 255, 255];
+/// The playhead: the line at its x, and the disc riding the curve.
+const PLAY_LINE: [u8; 4] = [235, 70, 70, 255];
+const PLAY_DOT: [u8; 4] = [120, 240, 170, 255];
 
 /// One grid line's drawing: the canvas, the value, its colour, whether
 /// it gets a label.
@@ -665,6 +670,8 @@ const HANDLE: f32 = 0.12;
 const HANDLE_TURNING: f32 = 0.2;
 /// The ring around the anchor while rotating, in pixels.
 const RING: i64 = 9;
+/// The playhead's disc, in pixels.
+const PLAY_RADIUS: i64 = 6;
 
 /// The plot: the unit square at `UNIT` pixels a side, stretched to take in
 /// any point outside it; a grid every tenth, labels every fifth, the
@@ -771,6 +778,13 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
             cv.ring(cx, cy, RING, PICK);
         }
         cv.disc(cx, cy, 5, PICK);
+    }
+    // The playhead: a line at its x and a disc on the curve there.
+    if let Some(x) = mark.play.filter(|x| x.is_finite()) {
+        let col = sx(x).round() as i64;
+        cv.line(col, inner_t, col, inner_b, PLAY_LINE);
+        let row = sy(eval(curve, x)).round() as i64;
+        cv.disc(col, row, PLAY_RADIUS, PLAY_DOT);
     }
     (w as u32, h as u32, cv.into_pixels())
 }
@@ -990,12 +1004,19 @@ mod tests {
         curve.points[1].locked = true;
         let (_, _, joined) = render(&curve, 1, plain);
         assert_ne!(split, joined, "a joined point draws one stroke, a split one two");
-        let (_, _, turning) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out });
+        let (_, _, turning) =
+            render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out, play: None });
         assert_ne!(joined, turning, "the ring and the longer handle show");
         curve.points[1].locked = false;
-        let (_, _, out) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out });
-        let (_, _, in_) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::In });
+        let (_, _, out) =
+            render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out, play: None });
+        let (_, _, in_) =
+            render(&curve, 1, Mark { rotate: true, tangent: Tangent::In, play: None });
         assert_ne!(out, in_, "the turning tangent is the bright one");
+        let (_, _, played) = render(&curve, 1, Mark { play: Some(0.3), ..plain });
+        assert_ne!(split, played, "the playhead shows");
+        let (_, _, later) = render(&curve, 1, Mark { play: Some(0.6), ..plain });
+        assert_ne!(played, later, "and moves");
     }
 
     #[test]

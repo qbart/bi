@@ -396,6 +396,8 @@ pub enum Action {
     Rotate,
     /// `s` on a curve's plot: the tangents split, and joined again.
     Split,
+    /// `Space` on a curve's plot: the playhead paused, and running again.
+    Play,
     /// A key in a form window. See `docs/specs/form.md`.
     Form(FormCmd),
     /// A key in a property view. See `docs/specs/props.md`.
@@ -2894,6 +2896,11 @@ struct NormalMapTool {
     seen_source: (u64, u64, u32, u32),
 }
 
+/// One pass of the curve's playhead across the plot.
+const CURVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+/// A frame of it.
+const CURVE_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// One `:set editor curve`: the three windows, the buffer the curve lives
 /// in and where, and what the plot was last drawn from. The text is the
 /// truth: every key edits the buffer and the plot is rebuilt from it. See
@@ -2920,6 +2927,10 @@ struct CurveTool {
     rotate: bool,
     /// Which tangent, on a split point.
     tangent: crate::curve::Tangent,
+    /// When the playhead's pass began, while it runs.
+    play: Option<std::time::Instant>,
+    /// Where the playhead stands, `0..1`, while paused.
+    phase: f32,
     /// What the buffer last said, and where.
     curve: crate::curve::Curve,
     literal: Option<crate::curve::Literal>,
@@ -5259,6 +5270,7 @@ impl Editor {
         // The checktime poll shares the clock: whichever of the two is due
         // sooner is how long the frontend may block.
         let poll = self.poll_disk();
+        let play = self.tick_curves();
         let flash = match self.session.flash.as_ref() {
             None => None,
             Some(flash) => {
@@ -5271,7 +5283,7 @@ impl Editor {
                 }
             }
         };
-        [poll, flash].into_iter().flatten().min()
+        [poll, play, flash].into_iter().flatten().min()
     }
 
     /// The buffer a given window shows, if it shows one.
@@ -7508,6 +7520,7 @@ impl Editor {
             | Action::NextPoint { .. }
             | Action::Rotate
             | Action::Split
+            | Action::Play
             | Action::YankColor(_)
             | Action::ToggleMode
             | Action::PickColor => {}
@@ -9459,6 +9472,8 @@ impl Editor {
             astep: 5.0,
             rotate: false,
             tangent: crate::curve::Tangent::Out,
+            play: Some(std::time::Instant::now()),
+            phase: 0.0,
             curve,
             literal: Some(lit),
             lost: false,
@@ -9561,7 +9576,7 @@ impl Editor {
         match what {
             "" => {
                 self.session.status =
-                    "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, layout)"
+                    "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, play, layout)"
                         .into();
             }
             "layout" if value.is_empty() => {
@@ -9580,6 +9595,16 @@ impl Editor {
             },
             // The point's fields are read-only in the form; the ex forms
             // move the point by the curve's own rules instead.
+            "play" => {
+                self.session.status = match value {
+                    "" => format!("curve play={}", if tool.play.is_some() { "on" } else { "off" }),
+                    "on" | "off" => {
+                        self.curve_set_play(index, value == "on");
+                        String::new()
+                    }
+                    _ => "play wants on or off".into(),
+                };
+            }
             "point" | "x" | "y" | "out" | "in" | "locked" if !value.is_empty() => {
                 let n = tool.curve.points.len();
                 self.session.status = match what {
@@ -9624,7 +9649,7 @@ impl Editor {
             }
             other => {
                 self.session.status = format!(
-                    "not a curve setting: {other} (want point, x, y, out, in, locked, xstep, ystep, astep, layout)"
+                    "not a curve setting: {other} (want point, x, y, out, in, locked, xstep, ystep, astep, play, layout)"
                 );
             }
         }
@@ -9663,15 +9688,12 @@ impl Editor {
         if lost && !tool.lost {
             self.session.status = "curve lost".into();
         }
-        let mark = crate::curve::Mark { rotate: tool.rotate, tangent: tool.tangent };
-        let (w, h, pixels) = crate::curve::render(&curve, selected, mark);
-        if let Some(img) = self.window_mut_of(tool.plot).and_then(Window::img_mut) {
-            img.rgba = pixels;
-            img.width = w;
-            img.height = h;
-            img.generation += 1;
-            img.dirty = false;
+        if let Some(t) = self.curve_mut(index) {
+            t.curve = curve.clone();
+            t.selected = selected;
+            t.lost = lost;
         }
+        self.curve_draw(index);
         let fields = if lost {
             Vec::new()
         } else {
@@ -9687,6 +9709,83 @@ impl Editor {
             t.selected = selected;
             t.lost = lost;
         }
+    }
+
+    /// The playhead's x now: along the plot's x range, a pass every
+    /// `CURVE_PERIOD`, from where it stood when paused.
+    fn curve_playhead(tool: &CurveTool) -> f32 {
+        let phase = match tool.play {
+            Some(since) => (since.elapsed().as_secs_f32() / CURVE_PERIOD.as_secs_f32()).fract(),
+            None => tool.phase,
+        };
+        let ((x0, x1), _) = crate::curve::plot_range(&tool.curve);
+        x0 + phase * (x1 - x0)
+    }
+
+    /// The plot painted from the curve the tool last read: the selection,
+    /// the tangents, the playhead. No re-parse.
+    fn curve_draw(&mut self, index: usize) {
+        let Some(tool) = self.curve(index) else { return };
+        let mark = crate::curve::Mark {
+            rotate: tool.rotate,
+            tangent: tool.tangent,
+            play: (!tool.lost).then(|| Self::curve_playhead(&tool)),
+        };
+        let (w, h, pixels) = crate::curve::render(&tool.curve, tool.selected, mark);
+        if let Some(img) = self.window_mut_of(tool.plot).and_then(Window::img_mut) {
+            img.rgba = pixels;
+            img.width = w;
+            img.height = h;
+            img.generation += 1;
+            img.dirty = false;
+        }
+    }
+
+    /// The playhead's clock: every running plot redrawn, and how long
+    /// until the next frame — nothing when none runs, so a still editor
+    /// blocks on the keyboard as before. See `docs/specs/curve.md`.
+    fn tick_curves(&mut self) -> Option<std::time::Duration> {
+        let running: Vec<usize> = self
+            .tools
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| match t {
+                Tool::Curve(c) if c.play.is_some() && !c.lost => Some(i),
+                _ => None,
+            })
+            .collect();
+        if running.is_empty() {
+            return None;
+        }
+        for index in running {
+            self.curve_draw(index);
+        }
+        Some(CURVE_FRAME)
+    }
+
+    /// `Space`: the playhead paused where it stands, or running again
+    /// from there.
+    fn curve_set_play(&mut self, index: usize, on: bool) {
+        let Some(tool) = self.curve(index) else { return };
+        if on == tool.play.is_some() {
+            return;
+        }
+        let phase = Self::curve_playhead(&tool);
+        let ((x0, x1), _) = crate::curve::plot_range(&tool.curve);
+        let phase = if x1 > x0 { (phase - x0) / (x1 - x0) } else { 0.0 };
+        if let Some(t) = self.curve_mut(index) {
+            if on {
+                t.play = Some(
+                    std::time::Instant::now()
+                        .checked_sub(CURVE_PERIOD.mul_f32(phase.clamp(0.0, 1.0)))
+                        .unwrap_or_else(std::time::Instant::now),
+                );
+            } else {
+                t.play = None;
+                t.phase = phase;
+            }
+        }
+        self.curve_draw(index);
     }
 
     /// Whether `id` is a curve tool's plot.
@@ -10852,6 +10951,7 @@ impl Editor {
             _ if tool.lost => self.session.status = "curve lost".into(),
             Action::Rotate => self.curve_set_rotate(index, !tool.rotate),
             Action::Split => self.curve_split(index),
+            Action::Play => self.curve_set_play(index, tool.play.is_none()),
             // The dial: on a split point `Tab` picks the tangent, and the
             // moves turn it. See `docs/specs/curve.md` §Tangents.
             Action::NextPoint { .. } if tool.rotate && !p.locked => {
@@ -15930,6 +16030,7 @@ impl View<'_> {
             | Action::NextPoint { .. }
             | Action::Rotate
             | Action::Split
+            | Action::Play
             | Action::YankColor(_)
             | Action::ToggleMode
             | Action::PickColor => {}
@@ -33683,6 +33784,33 @@ int main(void) {
         }
 
         #[test]
+        fn the_playhead_runs_on_the_editors_clock_and_space_pauses_it() {
+            let (mut ed, source) = open();
+            let plot = plot_of(&ed, source);
+            let generation = |ed: &Editor| ed.window_of(plot).unwrap().img().unwrap().generation;
+            let wait = ed.redraw_in().expect("a frame is owed while the playhead runs");
+            assert!(wait <= CURVE_FRAME, "{wait:?}");
+            let before = generation(&ed);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            ed.redraw_in();
+            assert!(generation(&ed) > before, "each frame redraws the plot");
+            key(&mut ed, Action::Play);
+            assert_eq!(ed.tick_curves(), None, "paused: no frame owed");
+            let still = generation(&ed);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            ed.redraw_in();
+            assert_eq!(generation(&ed), still);
+            ed.run_ex("tool curve play");
+            assert_eq!(ed.session.status, "curve play=off");
+            key(&mut ed, Action::Play);
+            assert_eq!(ed.tick_curves(), Some(CURVE_FRAME), "running again");
+            ed.run_ex("tool curve play off");
+            assert_eq!(ed.tick_curves(), None);
+            ed.run_ex("tool curve play maybe");
+            assert_eq!(ed.session.status, "play wants on or off");
+        }
+
+        #[test]
         fn r_turns_the_tangents_and_r_again_moves_the_point_once_more() {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
@@ -33865,7 +33993,7 @@ int main(void) {
             ed.run_ex("tool curve");
             assert_eq!(
                 ed.session.status,
-                "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, layout)"
+                "curve what? (point, x, y, out, in, locked, xstep, ystep, astep, play, layout)"
             );
             ed.run_ex("tool curve ystep 0.01");
             ed.run_ex("tool curve ystep");

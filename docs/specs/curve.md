@@ -79,6 +79,7 @@ a                add a point halfway to the next one, on the curve, and select i
 x                delete the point; the first and last stay, and a curve keeps two
 r                rotation mode on, and off again — see below
 s                split the point's tangents, and join them again
+Space            pause the playhead, and let it run again — see below
 u  Ctrl-R        undo, redo — the source buffer's
 Enter            the point on the ex line: `:tool curve y 0.8`
 Esc              back to the source, the plot stays; in rotation mode, out of it
@@ -88,6 +89,23 @@ Esc              back to the source, the plot stays; in rotation mode, out of it
 The plot is `ContentKind::Plot` to the keymap — the picture's grammar,
 except that `r` and `s` are the curve's rather than the tileset's turn
 and the find. Any other picture stays `ContentKind::Image`.
+
+### The playhead
+
+A curve is a motion, and the plot plays it: a filled disc runs along the
+curve from the left edge of the plot to the right, two seconds a pass,
+around again without end, its height the curve's real `eval` at the
+moment's x — so an overshoot bounces and a flat lands the way the engine
+will land it. A thin red line stands at the current x, top to bottom of
+the square, the disc on it. `Space` pauses it where it is and lets it run
+again from there; `:tool curve play off` and `on` are the same switch.
+Opening the tool starts it.
+
+The clock is the editor's: `redraw_in`, which already wakes the frontend
+for a yank's flash, asks for a frame every fiftieth of a second while any
+plot plays, and each frame redraws the plot from the curve it last read
+— no re-parse, the picture only. A paused plot asks for nothing, so a
+still editor still blocks on the keyboard.
 
 ### Tangents
 
@@ -249,7 +267,7 @@ pub fn slope(curve: &Curve, x: f32) -> f32;
 pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String;
 pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32));   // the unit square, stretched to the points
 pub enum Tangent { Out, In }
-pub struct Mark { pub rotate: bool, pub tangent: Tangent }      // how the selected point is drawn
+pub struct Mark { pub rotate: bool, pub tangent: Tangent, pub play: Option<f32> }   // how the selected point is drawn; the playhead's x
 pub fn rotated(slope: f32, degrees: f32) -> f32;                // the slope turned, clamped to ±89°
 pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>);
 ```
@@ -287,6 +305,8 @@ struct CurveTool {
     astep: f32,                // degrees per rotation press, five by default
     rotate: bool,              // `r`: the keys turn the tangent
     tangent: Tangent,          // which one, on a split point
+    play: Option<Instant>,     // when the pass began, while it runs
+    phase: f32,                // where it stands, 0..1, while paused
     seen: (u64, u64),          // buffer edits, form generation, the plot reflects
 }
 ```
@@ -389,6 +409,11 @@ point.
   rotating and not.
 - `:tool curve out 2` rewrites the out token; `:tool curve locked off`
   splits; `:tool curve astep 10` sets the angle step.
+- Opening the tool starts the playhead: `redraw_in` answers a frame's
+  wait, the plot's generation moves between two frames, and `render`
+  with a playhead differs from without; `Space` pauses it and `redraw_in`
+  goes back to `None`; `Space` again resumes; `:tool curve play off`
+  pauses.
 - Deleting the list by hand says `curve lost`.
 - The plot's pixels change and its generation moves after any edit; the
   status row says `point 2 of 3  x 0.500 y 0.800  out 0.000 in 0.000`

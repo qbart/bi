@@ -1122,6 +1122,7 @@ impl Input {
             match key.code {
                 KeyCode::Char('r') => return self.plain(Action::Rotate),
                 KeyCode::Char('s') => return self.plain(Action::Split),
+                KeyCode::Char(' ') => return self.plain(Action::Play),
                 _ => {}
             }
         }
@@ -3998,6 +3999,8 @@ leader = \" \"
             assert_eq!(cmd.action, Action::Rotate);
             let cmd = feed(&mut input, "s", ContentKind::Plot).unwrap();
             assert_eq!(cmd.action, Action::Split);
+            let cmd = feed(&mut input, " ", ContentKind::Plot).unwrap();
+            assert_eq!(cmd.action, Action::Play);
             let cmd = feed(&mut input, "3l", ContentKind::Plot).unwrap();
             assert_eq!((cmd.count, cmd.action), (3, Action::Move(Motion::Right)));
             let cmd = feed(&mut input, "rl", ContentKind::Image).unwrap();
