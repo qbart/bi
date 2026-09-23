@@ -604,7 +604,7 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:bi add <Name> struct [f:t …]` | a struct with its fields — `:bi add Color struct r:u8 g:u8 b:u8`; `:bi add <Name> enum [v …]` an enum with its values |
 | `:bi add <Type> <f>:<t> …` | fields on a struct (`:bi add Weapon speed f32` for one); `:bi add <Enum> <v> …` values on an enum |
 | `:bi rename <Type>.<old> <new>` | a field or enum value in a schema, an id in a data file — every data file of the schema rewritten; `:bi rename <Type> <New>` a type |
-| `:bi init` `:bi schema [path]` | the skeleton written over the buffer; a data file's `$schema` set or reported — both work on a broken file |
+| `:bi init` `:bi sample` `:bi schema [path]` | the skeleton or the sample written over the buffer; a data file's `$schema` set or reported — all work on a broken file |
 | `:bi remap <Type>.<old> <new>` | an unknown key renamed across the data files, after a rename made by hand |
 | `:bi prune` `:bi migrate` | every unknown key of this file removed; an older `$dialect` brought up to `bi/1` |
 | `:sp [path]` `:vs [path]` | split below / right; bare, the new window duplicates this one |

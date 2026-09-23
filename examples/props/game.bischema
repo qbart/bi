@@ -1,0 +1,62 @@
+{
+  "$dialect": "bi/1",
+  "types": {
+    "Rarity": {
+      "kind": "enum",
+      "values": ["common", "rare", "epic", "legendary"],
+      "doc": "Drop tier, drives colour and loot tables"
+    },
+    "Element": {
+      "kind": "enum",
+      "values": ["none", "fire", "ice", "lightning"]
+    },
+    "Vec2": {
+      "kind": "struct",
+      "fields": [
+        { "name": "x", "type": "f32", "default": 0 },
+        { "name": "y", "type": "f32", "default": 0 }
+      ]
+    },
+    "Stats": {
+      "kind": "struct",
+      "doc": "The numbers every living thing has",
+      "fields": [
+        { "name": "hp", "type": "i32", "default": 100, "min": 1, "max": 9999 },
+        { "name": "armor", "type": "u8", "default": 0, "min": 0, "max": 100 },
+        { "name": "speed", "type": "f32", "default": 1.0, "min": 0, "max": 10, "step": 0.1 }
+      ]
+    },
+    "Weapon": {
+      "kind": "struct",
+      "doc": "A thing to hit with",
+      "groups": { "Advanced": { "collapsed": true, "doc": "Rarely tuned by hand" } },
+      "fields": [
+        { "name": "name", "type": "string", "doc": "Shown in the inventory" },
+        { "name": "damage", "type": "i32", "default": 10, "min": 0, "max": 999, "group": "Combat" },
+        { "name": "element", "type": "Element", "default": "none", "group": "Combat", "widget": "toggle" },
+        { "name": "crit_chance", "type": "f32", "default": 0.05, "min": 0, "max": 1, "step": 0.01, "group": "Combat", "label": "Crit chance" },
+        { "name": "crit_multiplier", "type": "f32", "default": 2, "min": 1, "max": 5, "step": 0.1, "group": "Combat", "label": "Crit multiplier", "show_if": "crit_chance > 0" },
+        { "name": "rarity", "type": "Rarity", "default": "common" },
+        { "name": "two_handed", "type": "bool", "default": false },
+        { "name": "tags", "type": "list<string>" },
+        { "name": "offset", "type": "Vec2", "default": { "x": 0.5 }, "group": "Advanced", "widget": "inline" },
+        { "name": "id_hash", "type": "u32", "group": "Advanced", "readonly": true, "doc": "Assigned by the build" },
+        { "name": "notes", "type": "optional<string>", "group": "Advanced" }
+      ]
+    },
+    "Enemy": {
+      "kind": "struct",
+      "fields": [
+        { "name": "name", "type": "string", "order": -1 },
+        { "name": "stats", "type": "Stats", "widget": "inline" },
+        { "name": "weapon", "type": "ref<Weapon>" },
+        { "name": "drops", "type": "list<ref<Weapon>>" },
+        { "name": "spawn", "type": "Vec2" },
+        { "name": "leader", "type": "optional<ref<Enemy>>" },
+        { "name": "boss", "type": "bool", "default": false, "group": "Boss" },
+        { "name": "boss_phases", "type": "u8", "default": 1, "min": 1, "max": 3, "group": "Boss", "show_if": "boss" },
+        { "name": "boss_music", "type": "optional<string>", "group": "Boss", "hide_if": "!boss" }
+      ]
+    }
+  }
+}

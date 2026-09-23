@@ -58,6 +58,24 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Invocation::GenSample(kind) => {
+            let dir = std::env::current_dir().context("no working directory to write into")?;
+            for outcome in gen_sample(&dir, kind)? {
+                match outcome {
+                    Generated::Wrote(path) => println!("wrote {}", path.display()),
+                    // As `debug init`: the text still reaches stdout, the
+                    // warning stderr, so a redirect stays clean.
+                    Generated::Existed(path, text) => {
+                        print!("{text}");
+                        eprintln!(
+                            "{} already exists — printed the sample instead of creating it",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
         Invocation::Open(path) => path,
     };
 
@@ -131,6 +149,9 @@ enum Invocation {
     ConfigEdit,
     /// `bi debug init` — a project's `.bi.toml` seeded with launch configs.
     DebugInit,
+    /// `bi gen sample [schema|data]` — the sample `.bischema` and
+    /// `.bidata` written beside you. See `docs/specs/props.md`.
+    GenSample(Option<bi::props::Kind>),
 }
 
 /// `config` and `debug` are subcommands only in the two-word form, so a file
@@ -148,7 +169,19 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
             "init" => Ok(Invocation::DebugInit),
             other => bail!("no such command: bi debug {other} — try `init`"),
         },
-        _ => bail!("usage: bi [path] | bi config init | bi config edit | bi debug init"),
+        [first, sub, rest @ ..] if first == "gen" => match (sub.as_str(), rest) {
+            ("sample", []) => Ok(Invocation::GenSample(None)),
+            ("sample", [kind]) => match kind.as_str() {
+                "schema" | "bischema" => Ok(Invocation::GenSample(Some(bi::props::Kind::Schema))),
+                "data" | "bidata" => Ok(Invocation::GenSample(Some(bi::props::Kind::Data))),
+                other => bail!("no such sample: {other} — try `schema` or `data`"),
+            },
+            ("sample", _) => bail!("usage: bi gen sample [schema|data]"),
+            (other, _) => bail!("no such command: bi gen {other} — try `sample`"),
+        },
+        _ => bail!(
+            "usage: bi [path] | bi config init | bi config edit | bi debug init | bi gen sample [schema|data]"
+        ),
     }
 }
 
@@ -287,6 +320,39 @@ enum DebugInit {
 
 /// Writes `.bi.toml` in `dir` if it is absent. Never overwrites: a project's
 /// config is the project's, and this seeds one only where there is none.
+/// One file `bi gen sample` handled.
+enum Generated {
+    Wrote(PathBuf),
+    Existed(PathBuf, &'static str),
+}
+
+/// `bi gen sample [schema|data]`: `game.bischema` and `level1.bidata`
+/// written into `dir` — both when no kind is named — each left alone when
+/// it already exists. The data file points at the schema by name, so the
+/// pair opens straight into the property view.
+fn gen_sample(dir: &Path, kind: Option<bi::props::Kind>) -> Result<Vec<Generated>> {
+    use bi::props::{Kind, sample};
+    let wanted: Vec<Kind> = match kind {
+        Some(kind) => vec![kind],
+        None => vec![Kind::Schema, Kind::Data],
+    };
+    let mut out = Vec::new();
+    for kind in wanted {
+        let (name, text) = match kind {
+            Kind::Schema => (sample::SCHEMA_NAME, sample::SCHEMA),
+            Kind::Data => (sample::DATA_NAME, sample::DATA),
+        };
+        let path = dir.join(name);
+        if path.exists() {
+            out.push(Generated::Existed(path, text));
+            continue;
+        }
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        out.push(Generated::Wrote(path));
+    }
+    Ok(out)
+}
+
 fn debug_init(dir: &Path) -> Result<DebugInit> {
     let path = dir.join(".bi.toml");
     if path.exists() {
@@ -630,7 +696,48 @@ mod tests {
         assert!(parse_args(&args(&["config", "nope"])).is_err());
         assert!(matches!(parse_args(&args(&["debug", "init"])).unwrap(), Invocation::DebugInit));
         assert!(parse_args(&args(&["debug", "nope"])).is_err());
+        assert!(matches!(
+            parse_args(&args(&["gen", "sample"])).unwrap(),
+            Invocation::GenSample(None)
+        ));
+        assert!(matches!(
+            parse_args(&args(&["gen", "sample", "schema"])).unwrap(),
+            Invocation::GenSample(Some(bi::props::Kind::Schema))
+        ));
+        assert!(matches!(
+            parse_args(&args(&["gen", "sample", "data"])).unwrap(),
+            Invocation::GenSample(Some(bi::props::Kind::Data))
+        ));
+        assert!(parse_args(&args(&["gen", "sample", "nope"])).is_err());
+        assert!(parse_args(&args(&["gen", "nope"])).is_err());
         assert!(parse_args(&args(&["a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn gen_sample_writes_the_pair_once_then_prints() {
+        let dir = std::env::temp_dir().join(format!("bi-gen-sample-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = gen_sample(&dir, None).unwrap();
+        assert!(matches!(first.as_slice(), [Generated::Wrote(_), Generated::Wrote(_)]));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("game.bischema")).unwrap(),
+            bi::props::sample::SCHEMA
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("level1.bidata")).unwrap(),
+            bi::props::sample::DATA
+        );
+        let again = gen_sample(&dir, Some(bi::props::Kind::Schema)).unwrap();
+        assert!(
+            matches!(again.as_slice(), [Generated::Existed(_, text)] if *text == bi::props::sample::SCHEMA)
+        );
+        // The pair opens straight into the view, refs resolving.
+        let ed = Editor::open(dir.join("level1.bidata")).unwrap();
+        let props = ed.window().props().expect("the property view");
+        assert_eq!(props.error, None);
+        assert_eq!(props.warnings(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

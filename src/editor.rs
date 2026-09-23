@@ -3560,14 +3560,14 @@ impl Editor {
     fn bi_command(&mut self, arg: &str) {
         use crate::props::{Edit, Kind, Props, Refactor};
         const WHAT: &str =
-            "bi what? (set, new, delete, add, rename, remap, prune, init, schema, migrate)";
+            "bi what? (set, new, delete, add, rename, remap, prune, init, sample, schema, migrate)";
         let (what, rest) = match arg.trim().split_once(char::is_whitespace) {
             Some((what, rest)) => (what, rest.trim()),
             None => (arg.trim(), ""),
         };
         let window = self.focus;
         // The commands that mend a file work without a readable view.
-        if matches!(what, "migrate" | "init" | "schema") {
+        if matches!(what, "migrate" | "init" | "sample" | "schema") {
             let Some(buffer) = self.window().buffer() else {
                 self.session.status = "no buffer in this window".into();
                 return;
@@ -3588,6 +3588,16 @@ impl Editor {
                     let schema = self.guess_schema(buffer);
                     Ok((Props::skeleton(kind, schema.as_deref()), String::new()))
                 }
+                // The sample pair, as `bi gen sample` writes it; a data
+                // buffer's `$schema` follows the schema beside it.
+                "sample" => match kind {
+                    Kind::Schema => Ok((crate::props::sample::SCHEMA.to_string(), String::new())),
+                    Kind::Data => match self.guess_schema(buffer) {
+                        Some(rel) => Props::with_schema_ref(crate::props::sample::DATA, &rel)
+                            .map(|t| (t, String::new())),
+                        None => Ok((crate::props::sample::DATA.to_string(), String::new())),
+                    },
+                },
                 _ if kind != Kind::Data => Err("a schema names no schema".into()),
                 _ if rest.is_empty() => {
                     let current = crate::props::data::schema_of(&text).unwrap_or_default();
@@ -3677,7 +3687,7 @@ impl Editor {
                 edit
             }),
             other => Err(format!(
-                "not a bi command: {other} (want set, new, delete, add, rename, remap, prune, init, schema, migrate)"
+                "not a bi command: {other} (want set, new, delete, add, rename, remap, prune, init, sample, schema, migrate)"
             )),
         };
         match result {
@@ -31532,7 +31542,7 @@ int main(void) {
             ed.run_ex("bi");
             assert_eq!(
                 ed.session.status,
-                "bi what? (set, new, delete, add, rename, remap, prune, init, schema, migrate)"
+                "bi what? (set, new, delete, add, rename, remap, prune, init, sample, schema, migrate)"
             );
             ed.run_ex("bi new Enemy orc");
             assert!(text(&ed).contains("\"$id\": \"orc\""));
@@ -31720,6 +31730,31 @@ int main(void) {
             go(&mut ed, &[PropsCmd::Enter]);
             assert!(
                 matches!(&ed.session.mode, Mode::Command(line) if line.to_string() == "bi set Enemy.hp.default 101")
+            );
+        }
+
+        #[test]
+        fn bi_sample_fills_a_fresh_pair() {
+            let d =
+                ScratchDir::new("sample").written("rules.bischema", "").written("world.bidata", "");
+            let mut ed = Editor::open(format!("{}/rules.bischema", d.path())).unwrap();
+            sized(&mut ed);
+            ed.run_ex("bi sample");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            assert_eq!(text(&ed), crate::props::sample::SCHEMA);
+            assert_eq!(props(&ed).rows.len(), 6);
+            ed.run_ex("w");
+            ed.run_ex(&format!("e {}/world.bidata", d.path()));
+            ed.run_ex("bi sample");
+            assert_eq!(props(&ed).error, None, "{:?}", props(&ed).error);
+            assert!(
+                text(&ed).contains("\"$schema\": \"rules.bischema\""),
+                "points at the schema beside it"
+            );
+            assert_eq!(props(&ed).warnings(), 0);
+            assert!(
+                props(&ed).rows.iter().any(|r| r.key == "inst:0/@Combat"),
+                "the sample lays out groups"
             );
         }
 

@@ -5,6 +5,7 @@
 //! format and `docs/specs/props.md` for the view.
 
 pub mod data;
+pub mod sample;
 pub mod schema;
 pub mod view;
 

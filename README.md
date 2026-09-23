@@ -41,6 +41,7 @@ Then set up your config:
 ```sh
 bi config init   # writes ~/.config/bi/config.toml, defaults commented out
 bi config edit   # opens the config directory in bi
+bi gen sample    # writes game.bischema and level1.bidata here — the property view's sample
 ```
 
 `:reload` inside bi re-reads the config without restarting.

@@ -210,6 +210,7 @@ const LIB_MODULES: &[&str] = &[
     "picker.rs",
     "props/data.rs",
     "props/mod.rs",
+    "props/sample.rs",
     "props/schema.rs",
     "props/view.rs",
     "range.rs",

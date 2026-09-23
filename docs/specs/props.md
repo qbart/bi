@@ -223,14 +223,24 @@ struct with `x` still at the field's default.
 :bi remap <Type>.<old> <new>     an unknown key renamed across the data files — a rename made by hand
 :bi prune                        every unknown key of this file removed
 :bi init                         the skeleton written over the buffer, $schema guessed
+:bi sample                       the sample schema or data written over the buffer — see below
 :bi schema [path]                a data file's $schema set, or reported
 :bi migrate                      an older `$dialect` brought up to bi/1
 ```
 
 Each refuses with a message when the path does not exist or the name is
 taken; a thing just added is opened and selected. `:bi` alone lists them.
-`init`, `schema` and `migrate` work on a broken file, since they are how
-it gets mended; the rest want a file that reads.
+`init`, `sample`, `schema` and `migrate` work on a broken file, since they
+are how it gets mended; the rest want a file that reads.
+
+**The sample.** `examples/props/game.bischema` and `level1.bidata` are a
+pair that uses every type expression, every layout attribute, sparse
+storage, refs and an optional — the thing to open first. `bi gen sample`
+on the command line writes both into the working directory (`bi gen
+sample schema` or `data` for one), leaving a file that already exists
+alone and printing the text instead; `:bi sample` writes the one of the
+buffer's kind into the buffer, the data's `$schema` pointed at whatever
+`.bischema` sits beside it.
 
 **The project's data files** are every `.bidata` under the project root
 (the tree's root, else the schema's directory) whose `$schema` resolves to

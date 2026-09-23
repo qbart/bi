@@ -1,0 +1,60 @@
+{
+  "$dialect": "bi/1",
+  "$schema": "game.bischema",
+  "instances": [
+    {
+      "$type": "Weapon",
+      "$id": "rusty_sword",
+      "name": "Rusty Sword",
+      "damage": 12,
+      "tags": ["melee", "starter"],
+      "id_hash": 3141
+    },
+    {
+      "$type": "Weapon",
+      "$id": "dagger",
+      "name": "Dagger",
+      "damage": 7,
+      "crit_chance": 0.25,
+      "crit_multiplier": 3,
+      "rarity": "rare",
+      "tags": ["melee", "fast"],
+      "offset": { "x": 0.25, "y": -0.1 },
+      "id_hash": 2718
+    },
+    {
+      "$type": "Weapon",
+      "$id": "frost_hammer",
+      "name": "Frost Hammer",
+      "damage": 40,
+      "element": "ice",
+      "crit_chance": 0,
+      "rarity": "epic",
+      "two_handed": true,
+      "id_hash": 1618,
+      "notes": "Slows on hit; see the status effects table"
+    },
+    {
+      "$type": "Enemy",
+      "$id": "goblin",
+      "name": "Goblin",
+      "stats": { "hp": 40, "speed": 1.4 },
+      "weapon": "rusty_sword",
+      "drops": ["rusty_sword", "dagger"],
+      "spawn": { "x": 12, "y": 3 },
+      "leader": "goblin_chief"
+    },
+    {
+      "$type": "Enemy",
+      "$id": "goblin_chief",
+      "name": "Goblin Chief",
+      "stats": { "hp": 120, "armor": 10 },
+      "weapon": "frost_hammer",
+      "drops": ["frost_hammer"],
+      "spawn": { "x": 20, "y": 3 },
+      "boss": true,
+      "boss_phases": 2,
+      "boss_music": "chief_theme.ogg"
+    }
+  ]
+}
