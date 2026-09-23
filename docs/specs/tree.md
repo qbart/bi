@@ -416,6 +416,14 @@ Enter on a file opens it in the **last-focused window that is not this one**, an
 the tree stays where it is. With no other window it opens in place, and the tree
 goes to `alt`.
 
+"Window" means one that shows a document — text, a picture, a property
+view — since that is what a file replaces. A property view or a picture
+you came from takes the file the way a text window would, and `Ctrl-^`
+brings it back, because `alt` carries whole contents. A tool's picture
+or form, a results list, a debug pane and another tree are not places a
+file goes: the hand-off skips them, and only when nothing else is open
+does the file land in the tree itself.
+
 **That is the rule for every way of opening a file from a tree**, not only for
 Enter: `Ctrl-P` and `:e <file>` land in the same window and leave the sidebar
 alone. One question — "which window does a file go in" — answered in one place

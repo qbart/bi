@@ -6596,8 +6596,18 @@ impl Editor {
     /// that this one, which is the single-window case and means the tree is
     /// displaced. See `docs/specs/tree.md`.
     fn handoff_window(&self) -> WindowId {
+        // A window that shows a document — text, a picture, a property
+        // view — and is not a tool's half: that is what a file replaces.
+        // See `docs/specs/tree.md` §Opening a file.
         let usable = |id: &WindowId| {
-            *id != self.focus && self.window_of(*id).is_some_and(|w| w.text().is_some())
+            *id != self.focus
+                && self.window_of(*id).is_some_and(|w| {
+                    matches!(
+                        w.content.kind(),
+                        ContentKind::Text | ContentKind::Props | ContentKind::Image
+                    )
+                })
+                && !self.tools.iter().any(|t| t.result() == *id || t.form() == *id)
         };
         self.previous
             .filter(usable)
@@ -33043,6 +33053,25 @@ int main(void) {
         }
 
         const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+
+        /// A file opened from the tree lands in the view you came from,
+        /// not in the tree. See `docs/specs/tree.md` §Opening a file.
+        #[test]
+        fn the_tree_hands_a_file_to_the_property_view_it_grew_from() {
+            let d = project("handoff").written("a.rs", "fn a() {}\n");
+            let mut ed = open(&d);
+            let view = ed.focus();
+            ed.apply(cmd(Action::Window(WindowCmd::Tree)));
+            let tree = ed.focus();
+            assert_ne!(tree, view);
+            ed.apply(cmd(Action::Tree(TreeCmd::First)));
+            ed.apply(cmd(Action::Tree(TreeCmd::Select { down: true, count: 1 })));
+            ed.apply(cmd(Action::Tree(TreeCmd::Enter)));
+            assert!(ed.window_of(tree).unwrap().tree().is_some(), "the tree stayed");
+            assert_eq!(ed.focus(), view, "the file landed where you came from");
+            assert_eq!(ed.content_kind_of(view), Some(ContentKind::Text));
+            assert!(ed.name_of(ed.window().buffer().unwrap()).ends_with("a.rs"));
+        }
 
         #[test]
         fn a_bidata_opens_in_the_view_and_a_broken_one_as_text() {
