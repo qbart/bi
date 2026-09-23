@@ -66,6 +66,8 @@ pub enum RowWidget {
     Color([u8; 4]),
     /// A curve: sixteen samples across `0..1`, each `0..=7` of the way up.
     Curve([u8; 16]),
+    /// A gradient: sixteen colours sampled across `0..1`.
+    Gradient([[u8; 4]; 16]),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +143,25 @@ impl Refactor {
                 data::rename_enum_value(doc, schema, en, old, new)
             }
             Refactor::RenameType { old, new } => data::rename_type(doc, old, new),
+        }
+    }
+}
+
+/// Which editor `Enter` opens over a row's value. See
+/// `docs/specs/props.md` §Colours, curves and gradients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Color,
+    Curve,
+    Gradient,
+}
+
+impl ToolKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            ToolKind::Color => "colour",
+            ToolKind::Curve => "curve",
+            ToolKind::Gradient => "gradient",
         }
     }
 }
@@ -637,6 +658,16 @@ impl Props {
                 Ok(curve) => RowWidget::Curve(sparkline(&curve)),
                 Err(_) => RowWidget::Plain,
             },
+            TypeExpr::Gradient => match super::schema::gradient_of(value) {
+                Ok(g) => {
+                    let mut cells = [[0u8; 4]; 16];
+                    for (i, cell) in cells.iter_mut().enumerate() {
+                        *cell = crate::gradient::eval(&g, (i as f32 + 0.5) / 16.0);
+                    }
+                    RowWidget::Gradient(cells)
+                }
+                Err(_) => RowWidget::Plain,
+            },
             TypeExpr::Named(n) if self.schema.enum_values(n).is_some() => {
                 if field.is_some_and(|f| f.widget == Some(Widget::Toggle)) {
                     RowWidget::Toggle
@@ -770,6 +801,10 @@ impl Props {
             (TypeExpr::Curve, Value::Array(items)) => match items.len() {
                 1 => "1 point".into(),
                 n => format!("{n} points"),
+            },
+            (TypeExpr::Gradient, Value::Array(items)) => match items.len() {
+                1 => "1 stop".into(),
+                n => format!("{n} stops"),
             },
             (TypeExpr::Named(_), Value::String(s)) => s.clone(),
             (TypeExpr::List(inner), Value::Array(items)) => {
@@ -1394,14 +1429,19 @@ impl Props {
             TypeExpr::Str => Err("a string: Enter edits it".into()),
             TypeExpr::Rgb | TypeExpr::Rgba => Err("a colour: Enter edits it".into()),
             TypeExpr::Curve => Err("a curve: Enter opens it".into()),
+            TypeExpr::Gradient => Err("a gradient: Enter opens it".into()),
             TypeExpr::List(_) => Err("a list: open it, or `a` adds an item".into()),
         }
     }
 
-    /// `Enter` on a curve row: the row's path, and the edit that writes
-    /// an inherited curve into the instance first so there is a literal
-    /// to edit. `None` on any other row; a read-only curve refuses.
-    pub fn curve_target(&self, key: &str) -> Result<Option<(String, Option<Edit>)>, String> {
+    /// `Enter` on a colour, curve or gradient row: which editor, the
+    /// row's path, and the edit that writes an inherited value into the
+    /// instance first so there is a literal to edit. `None` on any other
+    /// row; a read-only value refuses.
+    pub fn tool_target(
+        &self,
+        key: &str,
+    ) -> Result<Option<(ToolKind, String, Option<Edit>)>, String> {
         if self.kind != Kind::Data {
             return Ok(None);
         }
@@ -1417,9 +1457,12 @@ impl Props {
             TypeExpr::Optional(inner) => (*inner, true),
             other => (other, false),
         };
-        if ty != TypeExpr::Curve {
-            return Ok(None);
-        }
+        let kind = match ty {
+            TypeExpr::Curve => ToolKind::Curve,
+            TypeExpr::Gradient => ToolKind::Gradient,
+            TypeExpr::Rgb | TypeExpr::Rgba => ToolKind::Color,
+            _ => return Ok(None),
+        };
         if readonly {
             return Err("read-only".into());
         }
@@ -1429,15 +1472,23 @@ impl Props {
             // Absent: `Space` turns it on; Enter edits the ex line as ever.
             return Ok(None);
         }
-        let edit = if stored && resolved.as_array().is_some_and(|a| !a.is_empty()) {
+        let too_few = match kind {
+            ToolKind::Curve => resolved.as_array().is_none_or(Vec::is_empty),
+            ToolKind::Gradient => resolved.as_array().is_none_or(|a| a.len() < 2),
+            ToolKind::Color => false,
+        };
+        let edit = if stored && !too_few {
             None
         } else {
-            // Inherited, absent or empty: the resolved curve — the linear
-            // preset for an empty one — written whole, as one undo step.
-            let value = if resolved.as_array().is_none_or(Vec::is_empty) {
-                super::schema::curve_value(&crate::curve::linear())
-            } else {
-                resolved
+            // Inherited, absent or too short: the resolved value — the
+            // linear preset for an empty curve, black to white for a
+            // gradient — written whole, as one undo step.
+            let value = match (kind, too_few) {
+                (ToolKind::Curve, true) => super::schema::curve_value(&crate::curve::linear()),
+                (ToolKind::Gradient, true) => {
+                    super::schema::gradient_value(&crate::gradient::linear())
+                }
+                _ => resolved,
             };
             let mut raw = self.raw.clone();
             self.assign_at(&mut raw, index, &segs, value.clone())?;
@@ -1473,7 +1524,7 @@ impl Props {
             }
             Some(Edit::Text(write_kind(self.kind, &raw)))
         };
-        Ok(Some((path, edit)))
+        Ok(Some((kind, path, edit)))
     }
 
     /// The byte span of the value at `path` in `text`, the buffer's text
@@ -2673,11 +2724,13 @@ mod tests {
             {"name":"glow","type":"rgba"},
             {"name":"falloff","type":"curve"},
             {"name":"fixed","type":"curve","readonly":true},
-            {"name":"maybe","type":"optional<curve>"}]}}}"##;
+            {"name":"maybe","type":"optional<curve>"},
+            {"name":"ramp","type":"gradient"}]}}}"##;
     const PAINT_DATA: &str = r##"{"$dialect":"bi/1","$schema":"paint.bischema","instances":[
         {"$type":"Fx","$id":"fire","glow":"#ff880080",
          "falloff":[[0, 0], [0.5, 1, 0, 0, true], [1, 0]]},
-        {"$type":"Fx","$id":"plain","tint":"#FFFFFF","falloff":[]}]}"##;
+        {"$type":"Fx","$id":"plain","tint":"#FFFFFF","falloff":[],
+         "ramp":[[0, "#ff0000"], [1, "#0000ff80"]]}]}"##;
 
     fn paint_view() -> Props {
         let mut p = Props::new(Kind::Data, BufferId(1), Some(PathBuf::from("/p/fx.bidata")));
@@ -2707,6 +2760,26 @@ mod tests {
         assert_eq!(linear.value, "2 points");
         assert!(linear.readonly && linear.inherited);
         assert_eq!(row(&p, "inst:0/maybe").widget, RowWidget::Choice, "an absent optional");
+        let ramp = row(&p, "inst:0/ramp");
+        assert_eq!(ramp.value, "2 stops");
+        let RowWidget::Gradient(cells) = ramp.widget else { panic!("{:?}", ramp.widget) };
+        assert_eq!(cells[0], [8, 8, 8, 255], "black to white, sampled mid-cell");
+        assert_eq!(cells[15], [247, 247, 247, 255]);
+        assert!(ramp.inherited && !ramp.turnable);
+        open(&mut p, "inst:1");
+        let RowWidget::Gradient(cells) = row(&p, "inst:1/ramp").widget else {
+            panic!("a gradient")
+        };
+        assert_eq!(cells[0], [247, 0, 8, 251], "red to translucent blue");
+        assert_eq!(p.turn("inst:0/ramp", 1, false), Err("a gradient: Enter opens it".into()));
+        assert_eq!(
+            p.tool_target("inst:1/ramp"),
+            Ok(Some((ToolKind::Gradient, "plain.ramp".into(), None)))
+        );
+        let (kind, _, edit) = p.tool_target("inst:0/ramp").unwrap().unwrap();
+        assert_eq!(kind, ToolKind::Gradient);
+        let Some(Edit::Text(text)) = edit else { panic!("inherited: written first") };
+        assert!(text.contains("\"ramp\": [[0, \"#000000ff\"], [1, \"#ffffffff\"]]"), "{text}");
 
         assert_eq!(p.turn("inst:0/tint", 1, false), Err("a colour: Enter edits it".into()));
         assert_eq!(p.turn("inst:0/falloff", 1, false), Err("a curve: Enter opens it".into()));
@@ -2729,12 +2802,25 @@ mod tests {
         let mut p = paint_view();
         open(&mut p, "inst:0");
         open(&mut p, "inst:1");
-        assert_eq!(p.curve_target("inst:0/tint"), Ok(None), "a colour is not a curve");
-        assert_eq!(p.curve_target("inst:0"), Ok(None));
-        assert_eq!(p.curve_target("inst:0/falloff"), Ok(Some(("fire.falloff".into(), None))));
-        assert_eq!(p.curve_target("inst:0/fixed"), Err("read-only".into()));
-        assert_eq!(p.curve_target("inst:0/maybe"), Ok(None), "absent: nothing to open");
-        let (path, edit) = p.curve_target("inst:1/falloff").unwrap().unwrap();
+        let (kind, path, edit) = p.tool_target("inst:0/tint").unwrap().unwrap();
+        assert_eq!((kind, path.as_str()), (ToolKind::Color, "fire.tint"));
+        let Some(Edit::Text(text)) = edit else {
+            panic!("an inherited colour is written: {edit:?}")
+        };
+        assert!(text.contains("\"tint\": \"#c83c1e\""), "{text}");
+        assert_eq!(
+            p.tool_target("inst:0/glow"),
+            Ok(Some((ToolKind::Color, "fire.glow".into(), None))),
+            "stored: nothing to write"
+        );
+        assert_eq!(p.tool_target("inst:0"), Ok(None));
+        assert_eq!(
+            p.tool_target("inst:0/falloff"),
+            Ok(Some((ToolKind::Curve, "fire.falloff".into(), None)))
+        );
+        assert_eq!(p.tool_target("inst:0/fixed"), Err("read-only".into()));
+        assert_eq!(p.tool_target("inst:0/maybe"), Ok(None), "absent: nothing to open");
+        let (_, path, edit) = p.tool_target("inst:1/falloff").unwrap().unwrap();
         assert_eq!(path, "plain.falloff");
         let Some(Edit::Text(text)) = edit else { panic!("an empty curve is seeded: {edit:?}") };
         assert!(
@@ -2743,8 +2829,8 @@ mod tests {
         );
         p.load(&text, Some(Ok(PAINT.into())), Index::default()).unwrap();
         assert_eq!(
-            p.curve_target("inst:1/falloff"),
-            Ok(Some(("plain.falloff".into(), None))),
+            p.tool_target("inst:1/falloff"),
+            Ok(Some((ToolKind::Curve, "plain.falloff".into(), None))),
             "stored now"
         );
         let (s, e) = p.locate(&text, "plain.falloff").expect("located");
@@ -3339,7 +3425,7 @@ mod tests {
             text.contains("{ \"name\": \"name\", \"type\": \"rgb\" }"),
             "string → the next primitive: {text}"
         );
-        let text = text_of(p.turn("type:Weapon/field:name/type", 4, false));
+        let text = text_of(p.turn("type:Weapon/field:name/type", 5, false));
         assert!(
             text.contains("{ \"name\": \"name\", \"type\": \"Rarity\" }"),
             "past the primitives, the first type: {text}"

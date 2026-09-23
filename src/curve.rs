@@ -3,6 +3,7 @@
 //! as a hermite curve and drawn into RGBA. No editor in here. See
 //! `docs/specs/curve.md`.
 
+use crate::canvas::{Canvas, text_width};
 /// What one number of a point means. `Skip` is the `_` of a layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -168,7 +169,7 @@ fn is_ident(b: u8) -> bool {
 /// The number, if one starts at `at`: an optional sign, digits with an
 /// optional fraction and exponent, and a glued suffix of letters and
 /// underscores.
-fn number_at(bytes: &[u8], at: usize) -> Option<usize> {
+pub(crate) fn number_at(bytes: &[u8], at: usize) -> Option<usize> {
     let mut i = at;
     if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
         i += 1;
@@ -259,9 +260,7 @@ fn parse_groups(text: &str) -> Group {
                 i += 1;
                 prev_ident = false;
             }
-            _ if b.is_ascii_digit()
-                || ((b == b'-' || b == b'+' || b == b'.') && !prev_ident) =>
-            {
+            _ if b.is_ascii_digit() || ((b == b'-' || b == b'+' || b == b'.') && !prev_ident) => {
                 match number_at(bytes, i) {
                     Some(end) => {
                         stack.last_mut().unwrap().tokens.push(Token { start: i, end });
@@ -393,7 +392,7 @@ pub fn initial_text(text: &str, open: usize, close: usize, layout: &Layout) -> S
 
 /// Where a point's text starts: at its bracket, or at the name glued to
 /// the bracket — `Point { … }`, `Vec2(…)` — so a copy of it keeps the name.
-fn span_start(text: &str, open: usize) -> usize {
+pub(crate) fn span_start(text: &str, open: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = open;
     while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
@@ -453,7 +452,6 @@ pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve {
     Curve { points }
 }
 
-
 // ---- writing back ---------------------------------------------------------
 
 /// How many decimals a step needs: `0.01` two, `0.25` two, `1` none.
@@ -487,7 +485,8 @@ pub fn rewrite(token: &str, value: f32, step: f32) -> String {
             text.pop();
         }
     }
-    if text == "-0" || text.starts_with("-0.") && text[1..].bytes().all(|b| b == b'0' || b == b'.') {
+    if text == "-0" || text.starts_with("-0.") && text[1..].bytes().all(|b| b == b'0' || b == b'.')
+    {
         text.remove(0);
     }
     text.push_str(suffix);
@@ -592,7 +591,6 @@ pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32)) {
 
 // ---- the picture ----------------------------------------------------------
 
-const BG: [u8; 4] = [24, 24, 28, 255];
 const GRID: [u8; 4] = [44, 44, 52, 255];
 const AXIS: [u8; 4] = [96, 96, 108, 255];
 const LABEL: [u8; 4] = [150, 150, 160, 255];
@@ -600,102 +598,6 @@ const LINE: [u8; 4] = [110, 190, 255, 255];
 const DOT: [u8; 4] = [235, 235, 240, 255];
 const PICK: [u8; 4] = [255, 180, 60, 255];
 const HANDLE_COLOR: [u8; 4] = [255, 210, 130, 255];
-
-/// Three-by-five glyphs for the tick labels: digits, minus, point.
-fn glyph(c: char) -> [u8; 5] {
-    match c {
-        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
-        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
-        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
-        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
-        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
-        '7' => [0b111, 0b001, 0b001, 0b001, 0b001],
-        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
-        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
-        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
-        '.' => [0b000, 0b000, 0b000, 0b000, 0b010],
-        _ => [0; 5],
-    }
-}
-
-struct Canvas {
-    w: u32,
-    h: u32,
-    px: Vec<u8>,
-}
-
-impl Canvas {
-    fn new(w: u32, h: u32) -> Self {
-        let mut px = Vec::with_capacity((w * h * 4) as usize);
-        for _ in 0..w * h {
-            px.extend_from_slice(&BG);
-        }
-        Self { w, h, px }
-    }
-
-    fn put(&mut self, x: i64, y: i64, c: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 {
-            return;
-        }
-        let at = ((y as u32 * self.w + x as u32) * 4) as usize;
-        self.px[at..at + 4].copy_from_slice(&c);
-    }
-
-    fn line(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
-        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
-        let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
-        let (mut x, mut y, mut err) = (x0, y0, dx + dy);
-        loop {
-            self.put(x, y, c);
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
-        }
-    }
-
-    fn disc(&mut self, cx: i64, cy: i64, r: i64, c: [u8; 4]) {
-        for y in -r..=r {
-            for x in -r..=r {
-                if x * x + y * y <= r * r {
-                    self.put(cx + x, cy + y, c);
-                }
-            }
-        }
-    }
-
-    /// `text` in the tiny font with its top-left at `x, y`; four pixels
-    /// per glyph. Returns the width drawn.
-    fn text(&mut self, x: i64, y: i64, text: &str, c: [u8; 4]) -> i64 {
-        let mut at = x;
-        for ch in text.chars() {
-            let rows = glyph(ch);
-            for (r, bits) in rows.iter().enumerate() {
-                for col in 0..3 {
-                    if bits & (0b100 >> col) != 0 {
-                        self.put(at + col, y + r as i64, c);
-                    }
-                }
-            }
-            at += 4;
-        }
-        at - x
-    }
-}
-
-const fn text_width(s: &str) -> i64 {
-    s.len() as i64 * 4
-}
 
 /// One grid line's drawing: the canvas, the value, its colour, whether
 /// it gets a label.
@@ -801,7 +703,7 @@ pub fn render(curve: &Curve, selected: usize) -> (u32, u32, Vec<u8>) {
         }
         cv.disc(cx, cy, 5, PICK);
     }
-    (w as u32, h as u32, cv.px)
+    (w as u32, h as u32, cv.into_pixels())
 }
 
 #[cfg(test)]
@@ -1030,8 +932,14 @@ mod tests {
             "\n        {0.0, 0.0, 1.0, 0.0, true},\n        {1.0, 1.0, 1.0, 1.0, true},\n    "
         );
         let py = "pts = []";
-        assert_eq!(initial_text(py, 6, 7, &Layout::parse("x,y").unwrap()), "(0.0, 0.0), (1.0, 1.0)");
-        let seeded = format!("std::vector<Point> pts = {{{}}};", initial_text(text, at - 1, at, &Layout::default()));
+        assert_eq!(
+            initial_text(py, 6, 7, &Layout::parse("x,y").unwrap()),
+            "(0.0, 0.0), (1.0, 1.0)"
+        );
+        let seeded = format!(
+            "std::vector<Point> pts = {{{}}};",
+            initial_text(text, at - 1, at, &Layout::default())
+        );
         let lit = find(&seeded, 30).unwrap();
         assert_eq!(read(&seeded, &lit, &Layout::default()), linear());
     }

@@ -7,9 +7,9 @@ use serde_json::{Map, Number, Value};
 
 use super::{Diagnostic, check_dialect, is_identifier, json_eq};
 
-pub const PRIMITIVES: [&str; 15] = [
+pub const PRIMITIVES: [&str; 16] = [
     "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "string", "rgb",
-    "rgba", "curve",
+    "rgba", "curve", "gradient",
 ];
 pub const GENERICS: [&str; 3] = ["list", "optional", "ref"];
 
@@ -85,6 +85,8 @@ pub enum TypeExpr {
     Rgba,
     /// The curve editor's list of points, in JSON.
     Curve,
+    /// The gradient editor's list of stops, in JSON.
+    Gradient,
     /// A key of `types`: a struct or an enum.
     Named(String),
     List(Box<TypeExpr>),
@@ -131,6 +133,7 @@ impl TypeExpr {
             "rgb" => TypeExpr::Rgb,
             "rgba" => TypeExpr::Rgba,
             "curve" => TypeExpr::Curve,
+            "gradient" => TypeExpr::Gradient,
             name if is_identifier(name) => TypeExpr::Named(name.into()),
             _ => return Err(format!("type {text:?} does not parse")),
         })
@@ -147,6 +150,7 @@ impl TypeExpr {
             TypeExpr::Rgb => "rgb".into(),
             TypeExpr::Rgba => "rgba".into(),
             TypeExpr::Curve => "curve".into(),
+            TypeExpr::Gradient => "gradient".into(),
             TypeExpr::Named(n) => n.clone(),
             TypeExpr::List(t) => format!("list<{}>", t.text()),
             TypeExpr::Optional(t) => format!("optional<{}>", t.text()),
@@ -609,6 +613,7 @@ impl Schema {
             TypeExpr::Rgb => Value::String("#000000".into()),
             TypeExpr::Rgba => Value::String("#000000ff".into()),
             TypeExpr::Curve => curve_value(&crate::curve::linear()),
+            TypeExpr::Gradient => gradient_value(&crate::gradient::linear()),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => {
                     Value::String(values.first().cloned().unwrap_or_default())
@@ -760,6 +765,11 @@ impl Schema {
                     out.push(Diagnostic::error(Some(at), e));
                 }
             }
+            TypeExpr::Gradient => {
+                if let Err(e) = gradient_of(value) {
+                    out.push(Diagnostic::error(Some(at), e));
+                }
+            }
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => match value.as_str() {
                     Some(v) if values.iter().any(|x| x == v) => {}
@@ -854,6 +864,7 @@ impl Schema {
             TypeExpr::Rgb => "a colour as #rrggbb".into(),
             TypeExpr::Rgba => "a colour as #rrggbbaa".into(),
             TypeExpr::Curve => "a curve as JSON: [[x, y, out, in, locked], …]".into(),
+            TypeExpr::Gradient => "a gradient as JSON: [[t, \"#rrggbbaa\"], …]".into(),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => format!("one of {}", values.join(", ")),
                 _ => format!("a {name} as JSON"),
@@ -893,7 +904,7 @@ impl Schema {
                     None => return refuse(),
                 }
             }
-            TypeExpr::Curve => match serde_json::from_str::<Value>(text) {
+            TypeExpr::Curve | TypeExpr::Gradient => match serde_json::from_str::<Value>(text) {
                 Ok(v) if v.is_array() => v,
                 _ => return refuse(),
             },
@@ -973,6 +984,56 @@ pub fn curve_of(value: &Value) -> Result<crate::curve::Curve, String> {
         points.push(p);
     }
     Ok(crate::curve::Curve { points })
+}
+
+/// A `gradient` value as the gradient module holds it: every stop an
+/// array of `t` and a colour, sorted by `t` inside `0..1`, two at least.
+pub fn gradient_of(value: &Value) -> Result<crate::gradient::Gradient, String> {
+    let Some(items) = value.as_array() else {
+        return Err("a gradient is an array of stops".into());
+    };
+    if items.len() < 2 {
+        return Err("a gradient wants two stops at least".into());
+    }
+    let mut stops = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Some(parts) = item.as_array() else {
+            return Err(format!("stop [{i}] is not an array"));
+        };
+        if parts.len() != 2 {
+            return Err(format!("stop [{i}] wants [t, \"#rrggbbaa\"]"));
+        }
+        let t = parts[0].as_f64().ok_or_else(|| format!("stop [{i}] t is not a number"))? as f32;
+        let color = parts[1]
+            .as_str()
+            .and_then(|s| super::color::parse(s, true))
+            .ok_or_else(|| format!("stop [{i}] colour is not #rrggbb or #rrggbbaa"))?;
+        if !(0.0..=1.0).contains(&t) {
+            return Err(format!("stop [{i}] t {t} is outside 0..1"));
+        }
+        if let Some(prev) = stops.last().map(|s: &crate::gradient::Stop| s.t)
+            && t < prev
+        {
+            return Err(format!("stop [{i}] t {t} is before the stop ahead of it"));
+        }
+        stops.push(crate::gradient::Stop { t, color });
+    }
+    Ok(crate::gradient::Gradient { stops })
+}
+
+/// The gradient as the format writes it.
+pub fn gradient_value(g: &crate::gradient::Gradient) -> Value {
+    Value::Array(
+        g.stops
+            .iter()
+            .map(|s| {
+                Value::Array(vec![
+                    number(s.t as f64),
+                    Value::String(super::color::text(s.color, true)),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// The curve as the format writes it.
@@ -1540,6 +1601,37 @@ mod tests {
         );
         assert_eq!(curve("[0, 1]"), Err("point [0] is not an array".into()));
         assert_eq!(curve("{}"), Err("a curve is an array of points".into()));
+        assert_eq!(TypeExpr::parse("gradient"), Ok(TypeExpr::Gradient));
+        assert_eq!(
+            s.default_of(&TypeExpr::Gradient),
+            serde_json::json!([[0, "#000000ff"], [1, "#ffffffff"]])
+        );
+        let grad = |t: &str| s.check(&TypeExpr::Gradient, &serde_json::from_str(t).unwrap());
+        assert_eq!(grad(r##"[[0, "#000000"], [0.5, "#ff880080"], [1, "#FFFFFF"]]"##), Ok(()));
+        assert_eq!(
+            grad(r##"[[0, "#000000"]]"##),
+            Err("a gradient wants two stops at least".into())
+        );
+        assert_eq!(
+            grad(r##"[[0, "#000000"], [2, "#ffffff"]]"##),
+            Err("stop [1] t 2 is outside 0..1".into())
+        );
+        assert_eq!(
+            grad(r##"[[1, "#000000"], [0, "#ffffff"]]"##),
+            Err("stop [1] t 0 is before the stop ahead of it".into())
+        );
+        assert_eq!(
+            grad(r##"[[0, "red"], [1, "#ffffff"]]"##),
+            Err("stop [0] colour is not #rrggbb or #rrggbbaa".into())
+        );
+        assert_eq!(
+            grad(r##"[[0, "#000000", 1], [1, "#ffffff"]]"##),
+            Err("stop [0] wants [t, \"#rrggbbaa\"]".into())
+        );
+        assert_eq!(
+            s.parse_value(&TypeExpr::Gradient, "[[1, \"#000000\"]]"),
+            Err("wants a gradient as JSON: [[t, \"#rrggbbaa\"], …]".into())
+        );
         let read = curve_of(&serde_json::json!([[0, 0], [1, 1, 2, 3, true]])).unwrap();
         assert_eq!(
             read.points[0],

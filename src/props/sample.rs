@@ -50,6 +50,7 @@ pub const SCHEMA: &str = r##"{
         { "name": "tint", "type": "rgb", "default": "#c8c8c8", "doc": "The sprite's colour" },
         { "name": "glow", "type": "rgba", "group": "Advanced" },
         { "name": "falloff", "type": "curve", "group": "Combat", "doc": "Damage over the swing, 0..1" },
+        { "name": "trail", "type": "gradient", "group": "Advanced", "doc": "The swing's trail, start to end" },
         { "name": "offset", "type": "Vec2", "default": { "x": 0.5 }, "group": "Advanced", "widget": "inline" },
         { "name": "id_hash", "type": "u32", "group": "Advanced", "readonly": true, "doc": "Assigned by the build" },
         { "name": "notes", "type": "optional<string>", "group": "Advanced" }
@@ -109,6 +110,7 @@ pub const DATA: &str = r##"{
       "tint": "#7fd4ff",
       "glow": "#7fd4ff80",
       "falloff": [[0, 0.2, 0, 0, false], [0.6, 1, 0, 0, true], [1, 0.4, -1.5, -1.5, true]],
+      "trail": [[0, "#7fd4ffff"], [0.7, "#7fd4ff80"], [1, "#7fd4ff00"]],
       "id_hash": 1618,
       "notes": "Slows on hit; see the status effects table"
     },

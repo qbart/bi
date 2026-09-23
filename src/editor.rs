@@ -379,6 +379,14 @@ pub enum Action {
     /// `Enter` in a curve's plot: the selected point's value on the ex
     /// line. See `docs/specs/curve.md`.
     EditValue,
+    /// `yh`, `yf`, `yr` on a tool's picture: the colour into the
+    /// register ring, spelled as hex, floats or bytes. See
+    /// `docs/specs/color-picker.md`.
+    YankColor(crate::color_picker::Format),
+    /// `m` on the colour picker: the square's axis, value or lightness.
+    ToggleMode,
+    /// `c` on the gradient's bar: the picker over the selected stop.
+    PickColor,
     /// `Tab` and `Shift-Tab` in a curve's plot: the next or previous
     /// point, wrapping. See `docs/specs/curve.md`.
     NextPoint {
@@ -737,6 +745,48 @@ fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f
     form.push(Field::bool("locked", "Locked", p.locked).readonly());
     form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, xstep));
     form.push(Field::float("ystep", "Y step", 0.001, 1.0, 0.001, ystep));
+    form
+}
+
+/// The picker's form: the bytes, the hue and its two companions, the
+/// mode and the step — every one turns. See `docs/specs/color-picker.md`.
+fn color_form(state: &crate::color_picker::State, alpha: bool, step: f32) -> Form {
+    use crate::color_picker::Mode;
+    use crate::form::Field;
+    let mut form = Form::new("color", "Colour");
+    let c = state.color();
+    form.push(Field::int("r", "R", 0, 255, 1, c[0] as i64));
+    form.push(Field::int("g", "G", 0, 255, 1, c[1] as i64));
+    form.push(Field::int("b", "B", 0, 255, 1, c[2] as i64));
+    if alpha {
+        form.push(Field::int("a", "A", 0, 255, 1, c[3] as i64));
+    }
+    form.push(Field::float("h", "H", 0.0, 360.0, 1.0, state.hue.round()));
+    form.push(Field::float("s", "S", 0.0, 100.0, 1.0, (state.sat * 100.0).round()));
+    let (axis, label) = match state.mode {
+        Mode::Hsv => ("v", "V"),
+        Mode::Hsl => ("l", "L"),
+    };
+    form.push(Field::float(axis, label, 0.0, 100.0, 1.0, (state.val * 100.0).round()));
+    let mode = match state.mode {
+        Mode::Hsv => 0,
+        Mode::Hsl => 1,
+    };
+    form.push(Field::choice("mode", "Mode", &["hsv", "hsl"], mode));
+    form.push(Field::float("step", "Step", 0.001, 0.5, 0.001, step));
+    form
+}
+
+/// The bar's form: a readout of the selected stop, and the step. See
+/// `docs/specs/gradient.md`.
+fn gradient_form(g: &crate::gradient::Gradient, selected: usize, step: f32) -> Form {
+    use crate::form::Field;
+    let mut form = Form::new("gradient", "Gradient");
+    let n = g.stops.len();
+    let t = g.stops.get(selected).map_or(0.0, |s| s.t);
+    form.push(Field::int("stop", "Stop", 1, n.max(1) as i64, 1, selected as i64 + 1).readonly());
+    form.push(Field::float("t", "T", 0.0, 1.0, step, t).readonly());
+    form.push(Field::float("step", "Step", 0.001, 0.5, 0.001, step));
     form
 }
 
@@ -2868,12 +2918,64 @@ struct CurveTool {
     seen: Option<(u64, u64)>,
 }
 
-/// A tool on a source window: the normal map's or the curve's three
-/// windows. One list, so closing and syncing are one path each.
+/// One `:set editor color`: the picker over a hex literal. The text is
+/// the truth, as for the curve: every key rewrites the digits and the
+/// picture is rebuilt from them. See `docs/specs/color-picker.md`.
+#[derive(Debug, Clone)]
+struct ColorTool {
+    source: WindowId,
+    picture: WindowId,
+    form: WindowId,
+    buffer: BufferId,
+    /// Byte offset of the `#`.
+    anchor: usize,
+    /// Opened from the property view: the value's path there.
+    path: Option<String>,
+    /// Where `Esc` and `:q` put the focus when it is not the source —
+    /// the gradient's bar that opened the picker.
+    back: Option<WindowId>,
+    state: crate::color_picker::State,
+    focus: crate::color_picker::Component,
+    /// A fiftieth of each range, by default.
+    step: f32,
+    /// The colour the picker opened on: the swatch's left half.
+    before: crate::color_picker::Rgba,
+    literal: Option<crate::color_picker::Literal>,
+    lost: bool,
+    seen: Option<(u64, u64)>,
+    /// Mid-sync: the edit a form change makes re-enters the sync, and
+    /// that pass must wait for this one to finish reading the form.
+    busy: bool,
+}
+
+/// One `:set editor gradient`: the bar over a list of stops. The text
+/// is the truth, as for the curve. See `docs/specs/gradient.md`.
+#[derive(Debug, Clone)]
+struct GradientTool {
+    source: WindowId,
+    bar: WindowId,
+    form: WindowId,
+    buffer: BufferId,
+    /// Byte offset of the list's opening bracket.
+    anchor: usize,
+    path: Option<String>,
+    selected: usize,
+    step: f32,
+    gradient: crate::gradient::Gradient,
+    literal: Option<crate::gradient::Literal>,
+    lost: bool,
+    seen: Option<(u64, u64)>,
+}
+
+/// A tool on a source window: the normal map's, the curve's, the colour
+/// picker's, the gradient's three windows. One list, so closing and
+/// syncing are one path each.
 #[derive(Debug, Clone)]
 enum Tool {
     NormalMap(NormalMapTool),
     Curve(CurveTool),
+    Color(ColorTool),
+    Gradient(GradientTool),
 }
 
 impl Tool {
@@ -2881,14 +2983,18 @@ impl Tool {
         match self {
             Tool::NormalMap(t) => t.source,
             Tool::Curve(t) => t.source,
+            Tool::Color(t) => t.source,
+            Tool::Gradient(t) => t.source,
         }
     }
 
-    /// The derived picture: the map, or the plot.
+    /// The derived picture: the map, the plot, the picker, the bar.
     fn result(&self) -> WindowId {
         match self {
             Tool::NormalMap(t) => t.result,
             Tool::Curve(t) => t.plot,
+            Tool::Color(t) => t.picture,
+            Tool::Gradient(t) => t.bar,
         }
     }
 
@@ -2896,6 +3002,8 @@ impl Tool {
         match self {
             Tool::NormalMap(t) => t.form,
             Tool::Curve(t) => t.form,
+            Tool::Color(t) => t.form,
+            Tool::Gradient(t) => t.form,
         }
     }
 
@@ -2907,6 +3015,25 @@ impl Tool {
         match self {
             Tool::NormalMap(_) => "normalmap",
             Tool::Curve(_) => "curve",
+            Tool::Color(_) => "color",
+            Tool::Gradient(_) => "gradient",
+        }
+    }
+
+    /// A view of a text buffer — the curve, the picker — whose `:w`,
+    /// `:q` and undo are the buffer's. The normal map's source is a
+    /// picture, and its result a picture of its own.
+    fn over_text(&self) -> bool {
+        !matches!(self, Tool::NormalMap(_))
+    }
+
+    /// The status row's label on the picture.
+    fn label(&self) -> &'static str {
+        match self {
+            Tool::NormalMap(_) => "NORMALMAP",
+            Tool::Curve(_) => "CURVE",
+            Tool::Color(_) => "COLOR",
+            Tool::Gradient(_) => "GRADIENT",
         }
     }
 }
@@ -3370,8 +3497,10 @@ impl Editor {
         let (key, turnable) =
             props.selected_row().map(|r| (r.key.clone(), r.turnable)).unwrap_or_default();
         if cmd == PropsCmd::Enter {
-            match props.curve_target(&key) {
-                Ok(Some((path, edit))) => return self.open_curve_from_props(window, path, edit),
+            match props.tool_target(&key) {
+                Ok(Some((kind, path, edit))) => {
+                    return self.open_tool_from_props(window, kind, path, edit);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     self.session.status = e;
@@ -7323,6 +7452,16 @@ impl Editor {
         {
             return self.run_curve_action(index, cmd);
         }
+        if let Some(index) =
+            self.color_at(self.focus).filter(|&i| self.tools[i].result() == self.focus)
+        {
+            return self.run_color_action(index, cmd);
+        }
+        if let Some(index) =
+            self.gradient_at(self.focus).filter(|&i| self.tools[i].result() == self.focus)
+        {
+            return self.run_gradient_action(index, cmd);
+        }
         let Some(img) = self.window_mut().img_mut() else { return false };
         if img.tileset().is_some() {
             return self.run_tileset_action(cmd);
@@ -7348,7 +7487,12 @@ impl Editor {
             // A turn with no grid to turn on, a slide with no curve.
             // Swallowed rather than passed to a view this window does not
             // have.
-            Action::Turn(_) | Action::EditValue | Action::NextPoint { .. } => {}
+            Action::Turn(_)
+            | Action::EditValue
+            | Action::NextPoint { .. }
+            | Action::YankColor(_)
+            | Action::ToggleMode
+            | Action::PickColor => {}
             // The history is the image's, grid or no grid: `u` after a
             // `:tool image grayscale` brings the colours back either way.
             Action::Undo => {
@@ -8416,9 +8560,9 @@ impl Editor {
                 let Some(path) = self.expand_path(&path) else { return };
                 self.edit_path_how(&path, enc, ff, force)
             }
-            ExLine::Quit { force } => match self.curve_at(self.focus) {
-                // `:q` on the plot or in the form closes the tool and puts
-                // the cursor back in the code. See `docs/specs/curve.md`.
+            ExLine::Quit { force } => match self.tool_at(self.focus) {
+                // `:q` on the picture or in the form closes the tool and
+                // puts the cursor back. See `docs/specs/curve.md`.
                 Some(index) if self.tools[index].source() != self.focus => self.close_tool(index),
                 _ => self.quit(force),
             },
@@ -8524,7 +8668,7 @@ impl Editor {
                     // The view normalises and writes its buffer. See
                     // `docs/specs/props.md`.
                     self.write_props(&path, force);
-                } else if let Some(source) = self.curve_source_of(self.focus) {
+                } else if let Some(source) = self.tool_source_of(self.focus) {
                     // The plot and the form are views of the code: `:w`
                     // there writes the code. See `docs/specs/curve.md`.
                     let back = self.focus;
@@ -8936,6 +9080,12 @@ impl Editor {
         if value == "curve" {
             return self.open_curve();
         }
+        if value == "color" || value == "colour" {
+            return self.open_color();
+        }
+        if value == "gradient" {
+            return self.open_gradient();
+        }
         if let Some(kind) = crate::props::Kind::parse(value) {
             return self.set_editor_props(kind);
         }
@@ -8962,7 +9112,7 @@ impl Editor {
                 String::new()
             }
             other => format!(
-                "not an editor: {other} (want tileset, normalmap, curve, bischema, bidata or image)"
+                "not an editor: {other} (want tileset, normalmap, curve, color, gradient, bischema, bidata or image)"
             ),
         };
     }
@@ -9037,7 +9187,15 @@ impl Editor {
                 self.close_window(id);
             }
         }
-        if self.window_of(tool.source()).is_some() {
+        // A picker the gradient opened goes back to the bar; anything
+        // else to its source.
+        let back = match &tool {
+            Tool::Color(c) => c.back.filter(|&b| self.window_of(b).is_some()),
+            _ => None,
+        };
+        if let Some(back) = back {
+            self.set_focus(back);
+        } else if self.window_of(tool.source()).is_some() {
             self.set_focus(tool.source());
         }
     }
@@ -9054,9 +9212,20 @@ impl Editor {
         self.sync_props();
         let mut index = 0;
         while index < self.tools.len() {
+            // A picture without its form, or a form without its picture,
+            // is half a tool: the other half goes with it and the cursor
+            // returns to the source. See `docs/specs/curve.md`.
+            let alive = |ed: &Self, id: WindowId| ed.window_of(id).is_some();
+            let tool = &self.tools[index];
+            if !alive(self, tool.form()) || !alive(self, tool.result()) {
+                self.close_tool(index);
+                continue;
+            }
             let keep = match &self.tools[index] {
                 Tool::NormalMap(_) => self.sync_normalmap(index),
                 Tool::Curve(_) => self.sync_curve(index),
+                Tool::Color(_) => self.sync_color(index),
+                Tool::Gradient(_) => self.sync_gradient(index),
             };
             if keep {
                 index += 1;
@@ -9124,15 +9293,8 @@ impl Editor {
             self.set_focus(plot);
             return;
         }
-        if let Some(props) = self.window().props() {
-            // The view: the selected row's curve, as `Enter` opens it.
-            let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
-            match props.curve_target(&key) {
-                Ok(Some((path, edit))) => self.open_curve_from_props(self.focus, path, edit),
-                Ok(None) => self.session.status = "no curve on this row".into(),
-                Err(e) => self.session.status = e,
-            }
-            return;
+        if self.window().props().is_some() {
+            return self.open_tool_on_props_row(crate::props::ToolKind::Curve);
         }
         let Some((buffer, cursor)) =
             self.window().text().map(|t| (t.buffer, t.selections.primary().head.at))
@@ -9147,20 +9309,43 @@ impl Editor {
         self.open_curve_at(buffer, at, self.focus, None);
     }
 
-    /// `Enter` on a curve row of the property view: the curve written
-    /// into the instance first when it was inherited, then the tool over
-    /// its literal, the view as the source. A tool already on this row
-    /// is focused; one on another row of the view is replaced.
-    fn open_curve_from_props(
+    /// `:set editor curve|color` on the property view: the selected
+    /// row's value, when it is one the editor named.
+    fn open_tool_on_props_row(&mut self, want: crate::props::ToolKind) {
+        let Some(props) = self.window().props() else { return };
+        let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+        match props.tool_target(&key) {
+            Ok(Some((kind, path, edit))) if kind == want => {
+                self.open_tool_from_props(self.focus, kind, path, edit)
+            }
+            Ok(_) => self.session.status = format!("no {} on this row", want.name()),
+            Err(e) => self.session.status = e,
+        }
+    }
+
+    /// `Enter` on a colour, curve or gradient row of the property view:
+    /// the value written into the instance first when it was inherited,
+    /// then the tool over its literal, the view as the source. A tool
+    /// already on this row is focused; one on another row of the view is
+    /// replaced. See `docs/specs/props.md`.
+    fn open_tool_from_props(
         &mut self,
         window: WindowId,
+        kind: crate::props::ToolKind,
         path: String,
         edit: Option<crate::props::Edit>,
     ) {
-        if let Some(index) = self.curve_at(window) {
-            if self.curve(index).and_then(|t| t.path) == Some(path.clone()) {
-                let plot = self.tools[index].result();
-                self.set_focus(plot);
+        use crate::props::ToolKind;
+        if let Some(index) = self.tool_at(window).filter(|&i| self.tools[i].source() == window) {
+            let same = match &self.tools[index] {
+                Tool::Curve(t) => t.path.as_deref() == Some(path.as_str()),
+                Tool::Color(t) => t.path.as_deref() == Some(path.as_str()),
+                Tool::Gradient(t) => t.path.as_deref() == Some(path.as_str()),
+                Tool::NormalMap(_) => false,
+            };
+            if same {
+                let picture = self.tools[index].result();
+                self.set_focus(picture);
                 return;
             }
             self.close_tool(index);
@@ -9173,11 +9358,16 @@ impl Editor {
         let buffer = props.buffer;
         let text = self.entry(buffer).buffer.rope().to_string();
         let Some((open, _)) = props.locate(&text, &path) else {
-            self.session.status = format!("no curve at {path}");
+            self.session.status = format!("no {} at {path}", kind.name());
             return;
         };
         self.set_focus(window);
-        self.open_curve_at(buffer, open + 1, window, Some(path));
+        match kind {
+            ToolKind::Curve => self.open_curve_at(buffer, open + 1, window, Some(path)),
+            ToolKind::Gradient => self.open_gradient_at(buffer, open + 1, window, Some(path)),
+            // The value is `"#…"`: the `#` sits after the quote.
+            ToolKind::Color => self.open_color_at(buffer, open + 1, window, Some(path), None),
+        }
     }
 
     /// The tool over the list around byte `at` of `buffer`, `source` the
@@ -9293,12 +9483,13 @@ impl Editor {
         self.buffers.iter().find(|b| b.id == id).map(|b| b.buffer.edits())
     }
 
-    /// The source of the curve tool whose plot or form is `window`.
-    fn curve_source_of(&self, window: WindowId) -> Option<WindowId> {
-        self.tools.iter().find_map(|t| match t {
-            Tool::Curve(c) if c.plot == window || c.form == window => Some(c.source),
-            _ => None,
-        })
+    /// The source of the text tool — curve, picker — whose picture or
+    /// form is `window`.
+    fn tool_source_of(&self, window: WindowId) -> Option<WindowId> {
+        self.tools
+            .iter()
+            .find(|t| t.over_text() && (t.result() == window || t.form() == window))
+            .map(Tool::source)
     }
 
     /// The form's mirror fields moved: whichever differs from the curve is
@@ -9465,6 +9656,1121 @@ impl Editor {
         self.tools.iter().any(|t| matches!(t, Tool::Curve(c) if c.plot == id))
     }
 
+    /// The status row's label when `id` is a tool's picture: `CURVE`,
+    /// `COLOR`.
+    pub fn tool_label(&self, id: WindowId) -> Option<&'static str> {
+        self.tools.iter().find(|t| t.over_text() && t.result() == id).map(Tool::label)
+    }
+
+    /// The picture's status text, for whichever tool draws it.
+    pub fn tool_status(&self, id: WindowId) -> Option<String> {
+        self.curve_status(id).or_else(|| self.color_status(id)).or_else(|| self.gradient_status(id))
+    }
+
+    // ---- the colour picker: see `docs/specs/color-picker.md` ----
+
+    fn color_at(&self, window: WindowId) -> Option<usize> {
+        self.tools.iter().position(|t| matches!(t, Tool::Color(_)) && t.windows().contains(&window))
+    }
+
+    fn color(&self, index: usize) -> Option<ColorTool> {
+        match self.tools.get(index) {
+            Some(Tool::Color(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    fn color_mut(&mut self, index: usize) -> Option<&mut ColorTool> {
+        match self.tools.get_mut(index) {
+            Some(Tool::Color(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `:set editor color`: the hex literal under the cursor drawn as a
+    /// picker split to the right, a form down the edge, focus on the
+    /// picker. On a window that already has the tool, just the focus.
+    fn open_color(&mut self) {
+        if let Some(index) = self.color_at(self.focus) {
+            let picture = self.tools[index].result();
+            self.set_focus(picture);
+            return;
+        }
+        if self.window().props().is_some() {
+            return self.open_tool_on_props_row(crate::props::ToolKind::Color);
+        }
+        let Some((buffer, cursor)) =
+            self.window().text().map(|t| (t.buffer, t.selections.primary().head.at))
+        else {
+            self.session.status = "no colour under the cursor".into();
+            return;
+        };
+        let (text, at) = {
+            let rope = self.entry(buffer).buffer.rope();
+            (rope.to_string(), rope.char_to_byte(cursor.min(rope.len_chars())))
+        };
+        let Some(lit) = crate::color_picker::find(&text, at) else {
+            self.session.status = "no colour under the cursor".into();
+            return;
+        };
+        self.open_color_at(buffer, lit.start, self.focus, None, None);
+    }
+
+    /// The picker over the literal whose `#` is at byte `anchor` of
+    /// `buffer`; `source` the window it was asked from, `back` where to
+    /// return instead when a gradient asked.
+    fn open_color_at(
+        &mut self,
+        buffer: BufferId,
+        anchor: usize,
+        source: WindowId,
+        path: Option<String>,
+        back: Option<WindowId>,
+    ) {
+        use crate::color_picker::{Component, Mode, State, at_hash, parse_hex};
+        let text = self.entry(buffer).buffer.rope().to_string();
+        let Some(lit) = at_hash(&text, anchor) else {
+            self.session.status = "no colour under the cursor".into();
+            return;
+        };
+        let Some(color) = parse_hex(&text[lit.start..lit.end], lit.alpha) else { return };
+        let state = State::of(color, Mode::Hsv);
+        let step = 0.02;
+        let name = self.name_of(buffer);
+        self.set_focus(source);
+        let Some(picture) = self.split_focus(Dir::Vertical) else { return };
+        let img = Img::from_pixels(
+            PathBuf::from(format!("{name}.color")),
+            1,
+            1,
+            vec![0; 4],
+            self.next_image,
+        );
+        self.next_image += 1;
+        if let Some(window) = self.window_mut_of(picture) {
+            window.content = Content::Image(img);
+            window.alt = None;
+        }
+        let form = color_form(&state, lit.alpha, step);
+        let Some(form) = self.open_form_sidebar(form) else {
+            self.close_window(picture);
+            self.set_focus(source);
+            return;
+        };
+        self.tools.push(Tool::Color(ColorTool {
+            source,
+            picture,
+            form,
+            buffer,
+            anchor: lit.start,
+            path,
+            back,
+            state,
+            focus: Component::Square,
+            step,
+            before: color,
+            literal: Some(lit),
+            lost: false,
+            seen: None,
+            busy: false,
+        }));
+        self.sync_tools();
+        self.set_focus(picture);
+    }
+
+    /// One picker's sync, the curve's shape: false when the buffer is
+    /// gone.
+    fn sync_color(&mut self, index: usize) -> bool {
+        let Some(tool) = self.color(index) else { return true };
+        let Some(edits) = self.buffer_edits(tool.buffer) else { return false };
+        let Some(form_generation) =
+            self.window_of(tool.form).and_then(Window::form).map(Form::generation)
+        else {
+            return false;
+        };
+        if tool.seen == Some((edits, form_generation)) || tool.busy {
+            return true;
+        }
+        if let Some(t) = self.color_mut(index) {
+            t.busy = true;
+        }
+        if tool.seen.is_some_and(|seen| seen.1 != form_generation) {
+            self.color_form_changed(index);
+        }
+        self.color_reread(index);
+        let edits = self.buffer_edits(tool.buffer).unwrap_or(edits);
+        let form_generation = self
+            .window_of(tool.form)
+            .and_then(Window::form)
+            .map_or(form_generation, Form::generation);
+        if let Some(tool) = self.color_mut(index) {
+            tool.seen = Some((edits, form_generation));
+            tool.busy = false;
+        }
+        true
+    }
+
+    /// The literal re-found — by path from the view, by the anchor, by
+    /// the source's cursor — read, and the picture and form redrawn.
+    fn color_reread(&mut self, index: usize) {
+        use crate::color_picker::{State, at_hash, find, parse_hex};
+        let Some(tool) = self.color(index) else { return };
+        let Some(entry) = self.buffers.iter().find(|b| b.id == tool.buffer) else { return };
+        let rope = entry.buffer.rope();
+        let text = rope.to_string();
+        let by_path = tool.path.as_deref().and_then(|path| {
+            let props = self.window_of(tool.source).and_then(Window::props)?;
+            let (start, _) = props.locate(&text, path)?;
+            at_hash(&text, start + 1)
+        });
+        let mut lit = by_path.or_else(|| at_hash(&text, tool.anchor));
+        if lit.is_none()
+            && let Some(cursor) = self.window_of(tool.source).and_then(Window::text)
+        {
+            let at = rope.char_to_byte(cursor.selections.primary().head.at.min(rope.len_chars()));
+            lit = find(&text, at);
+        }
+        let color = lit.as_ref().and_then(|l| parse_hex(&text[l.start..l.end], l.alpha));
+        let lost = color.is_none();
+        if lost && !tool.lost {
+            self.session.status = "colour lost".into();
+        }
+        let mut state = tool.state;
+        if let Some(c) = color
+            && !state.keeps(c)
+        {
+            // Another hand changed the digits: the state follows them.
+            state = State::of(c, state.mode);
+        }
+        let alpha = lit.as_ref().is_some_and(|l| l.alpha);
+        let (w, h, pixels) = if lost {
+            (1, 1, vec![0; 4])
+        } else {
+            crate::color_picker::render(&state, tool.focus, tool.before, alpha)
+        };
+        if let Some(img) = self.window_mut_of(tool.picture).and_then(Window::img_mut) {
+            img.rgba = pixels;
+            img.width = w;
+            img.height = h;
+            img.generation += 1;
+            img.dirty = false;
+        }
+        let fields =
+            if lost { Vec::new() } else { color_form(&state, alpha, tool.step).fields().to_vec() };
+        if let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) {
+            form.replace_fields(fields);
+        }
+        if let Some(t) = self.color_mut(index) {
+            t.anchor = lit.as_ref().map_or(t.anchor, |l| l.start);
+            t.literal = lit;
+            t.state = state;
+            t.lost = lost;
+        }
+    }
+
+    /// The form moved: bytes set the colour, hue/saturation/value set
+    /// the state, mode and step are kept.
+    fn color_form_changed(&mut self, index: usize) {
+        use crate::color_picker::{Mode, State};
+        let Some(tool) = self.color(index) else { return };
+        let Some(form) = self.window_of(tool.form).and_then(Window::form) else { return };
+        let alpha = tool.literal.as_ref().is_some_and(|l| l.alpha);
+        let mut state = tool.state;
+        // Read whole before anything is touched: the form is borrowed
+        // from the window the tool is about to change.
+        let step = form.get_f32("step");
+        let mode = Mode::parse(form.get_choice("mode"));
+        let bytes = [form.get_i64("r"), form.get_i64("g"), form.get_i64("b")]
+            .map(|n| n.clamp(0, 255) as u8);
+        let a_field = form.get_i64("a").clamp(0, 255) as u8;
+        let axis = state.mode.axis();
+        let (h, sat, val) =
+            (form.get_f32("h"), form.get_f32("s") / 100.0, form.get_f32(axis) / 100.0);
+        if step > 0.0
+            && let Some(t) = self.color_mut(index)
+        {
+            t.step = step;
+        }
+        if let Some(mode) = mode
+            && mode != state.mode
+        {
+            state = state.in_mode(mode);
+            if let Some(t) = self.color_mut(index) {
+                t.state = state;
+            }
+            return;
+        }
+        let was = state.color();
+        let a = if alpha { a_field } else { was[3] };
+        if [bytes[0], bytes[1], bytes[2], a] != was {
+            let mut next = State::of([bytes[0], bytes[1], bytes[2], a], state.mode);
+            if next.sat <= 0.0 || next.val <= 0.0 {
+                next.hue = state.hue;
+            }
+            return self.color_set_state(index, next);
+        }
+        // The form was built from rounded values: a field that still
+        // shows its rounding was not touched, and the exact value stays.
+        let differs = |shown: f32, exact: f32, scale: f32| {
+            (shown * scale - (exact * scale).round()).abs() > 1e-3
+        };
+        let mut moved = false;
+        if differs(h, state.hue, 1.0) {
+            state.hue = h;
+            moved = true;
+        }
+        if differs(sat, state.sat, 100.0) {
+            state.sat = sat;
+            moved = true;
+        }
+        if differs(val, state.val, 100.0) {
+            state.val = val;
+            moved = true;
+        }
+        if moved {
+            self.color_set_state(index, state);
+        }
+    }
+
+    /// The state made the colour, and the colour made the digits: one
+    /// edit of the buffer when they differ.
+    fn color_set_state(&mut self, index: usize, mut state: crate::color_picker::State) {
+        state.clamp();
+        let Some(tool) = self.color(index) else { return };
+        let Some(lit) = tool.literal.clone() else { return };
+        if let Some(t) = self.color_mut(index) {
+            t.state = state;
+        }
+        let new = crate::color_picker::write(&lit, state.color());
+        let Some(old) = self.buffer_bytes(tool.buffer, lit.start, lit.end) else { return };
+        if new == old {
+            // A grey moved along its hue: the digits stand, the picture
+            // still follows the state.
+            self.color_reread(index);
+            return;
+        }
+        self.tool_edit(tool.source, tool.buffer, vec![(lit.start, lit.end, new)]);
+    }
+
+    /// A colour set whole — the ex line's `hex`, `rgb`, `floats` — with
+    /// the held hue kept where the new colour has none of its own.
+    fn color_adopt(&mut self, index: usize, c: crate::color_picker::Rgba) {
+        let Some(tool) = self.color(index) else { return };
+        let mut next = crate::color_picker::State::of(c, tool.state.mode);
+        if next.sat <= 0.0 || next.val <= 0.0 {
+            next.hue = tool.state.hue;
+        }
+        self.color_set_state(index, next);
+    }
+
+    /// The keys on the picker. See `docs/specs/color-picker.md`.
+    fn run_color_action(&mut self, index: usize, cmd: &Command) -> bool {
+        use crate::color_picker::Component;
+        let count = cmd.count.max(1) as f32;
+        let Some(tool) = self.color(index) else { return false };
+        let alpha = tool.literal.as_ref().is_some_and(|l| l.alpha);
+        let mut state = tool.state;
+        let step = tool.step;
+        let alpha_step = (step * 255.0).round().max(1.0);
+        let back = tool.back.filter(|&b| self.window_of(b).is_some()).unwrap_or(tool.source);
+        match &cmd.action {
+            Action::Undo => self.tool_undo(tool.source, tool.buffer, false),
+            Action::Redo => self.tool_undo(tool.source, tool.buffer, true),
+            Action::EnterNormal => self.set_focus(back),
+            _ if tool.lost => self.session.status = "colour lost".into(),
+            Action::NextPoint { back } => {
+                let next = tool.focus.next(*back, alpha);
+                if let Some(t) = self.color_mut(index) {
+                    t.focus = next;
+                }
+                self.color_reread(index);
+            }
+            Action::Move(Motion::Left | Motion::Right | Motion::Up | Motion::Down) => {
+                let (right, up) = match &cmd.action {
+                    Action::Move(Motion::Right) => (1.0, 0.0),
+                    Action::Move(Motion::Left) => (-1.0, 0.0),
+                    Action::Move(Motion::Up) => (0.0, 1.0),
+                    _ => (0.0, -1.0),
+                };
+                let along = if right != 0.0 { right } else { up };
+                match tool.focus {
+                    Component::Square => {
+                        state.sat += right * step * count;
+                        state.val += up * step * count;
+                    }
+                    Component::Hue => state.hue += along * step * 360.0 * count,
+                    Component::Alpha => {
+                        let a = state.alpha as f32 + along * alpha_step * count;
+                        state.alpha = a.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+                self.color_set_state(index, state);
+            }
+            Action::Move(Motion::LineStart | Motion::FirstNonBlank) => {
+                match tool.focus {
+                    Component::Square => state.sat = 0.0,
+                    Component::Hue => state.hue = 0.0,
+                    Component::Alpha => state.alpha = 0,
+                }
+                self.color_set_state(index, state);
+            }
+            Action::Move(Motion::LineEnd | Motion::LastNonBlank) => {
+                match tool.focus {
+                    Component::Square => state.sat = 1.0,
+                    Component::Hue => state.hue = 0.0,
+                    Component::Alpha => state.alpha = 255,
+                }
+                self.color_set_state(index, state);
+            }
+            Action::Move(Motion::FirstLine) => {
+                state.val = 1.0;
+                self.color_set_state(index, state);
+            }
+            Action::Move(Motion::LastLine | Motion::Line(_)) => {
+                state.val = 0.0;
+                self.color_set_state(index, state);
+            }
+            Action::ToggleMode => {
+                let mode = match state.mode {
+                    crate::color_picker::Mode::Hsv => crate::color_picker::Mode::Hsl,
+                    crate::color_picker::Mode::Hsl => crate::color_picker::Mode::Hsv,
+                };
+                if let Some(t) = self.color_mut(index) {
+                    t.state = state.in_mode(mode);
+                }
+                self.color_reread(index);
+            }
+            Action::YankColor(format) => self.color_yank(index, *format),
+            Action::EditValue => {
+                let line =
+                    format!("tool color hex {}", crate::color_picker::hex(state.color(), alpha));
+                self.session.status.clear();
+                self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
+            }
+            // Swallowed: each would move the session into a mode that reads
+            // a buffer this window does not have, or is nothing to a picker.
+            Action::EnterFind
+            | Action::EnterSearch { .. }
+            | Action::SearchWord { .. }
+            | Action::ShowScopes
+            | Action::EnterVisual(_)
+            | Action::Turn(_)
+            | Action::ScrollHalfPage { .. }
+            | Action::ScrollLine { .. }
+            | Action::Operate { .. }
+            | Action::EnterInsert
+            | Action::EnterInsertAfter
+            | Action::EnterInsertLineStart
+            | Action::EnterInsertLineEnd
+            | Action::PickColor
+            | Action::Move(_) => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// `yh`, `yf`, `yr`: the colour into the register ring.
+    fn color_yank(&mut self, index: usize, format: crate::color_picker::Format) {
+        let Some(tool) = self.color(index) else { return };
+        let alpha = tool.literal.as_ref().is_some_and(|l| l.alpha);
+        let text = format.spell(tool.state.color(), alpha);
+        self.session.registers.push(Entry { text: text.clone(), kind: Shape::Chars });
+        self.session.status = format!("yanked {text}");
+    }
+
+    /// `:tool color …`: the ex forms of the picker's moves.
+    fn color_tool(&mut self, arg: &str) {
+        use crate::color_picker::{Component, Format, Mode, State, parse_hex};
+        let Some(index) = self.color_at(self.focus) else {
+            self.session.status = "no colour picker here (:set editor color)".into();
+            return;
+        };
+        let (what, value) = match arg.split_once(char::is_whitespace) {
+            Some((what, value)) => (what, value.trim()),
+            None => (arg, ""),
+        };
+        let Some(tool) = self.color(index) else { return };
+        let alpha = tool.literal.as_ref().is_some_and(|l| l.alpha);
+        let state = tool.state;
+        let c = state.color();
+        let numbers = |value: &str| -> Vec<f32> {
+            value
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| p.parse::<f32>().ok())
+                .collect()
+        };
+        let report = |text: String| text;
+        self.session.status = match what {
+            "" => report(
+                "color what? (hex, rgb, floats, hsv, hsl, alpha, step, mode, focus, yank, r, g, b, a, h, s, v, l)"
+                    .into(),
+            ),
+            "hex" if value.is_empty() => format!("color hex={}", crate::color_picker::hex(c, alpha)),
+            "hex" => match parse_hex(value, alpha) {
+                Some(next) => {
+                    self.color_adopt(index, next);
+                    String::new()
+                }
+                None => format!("hex wants #rrggbb{}", if alpha { " or #rrggbbaa" } else { "" }),
+            },
+            "rgb" if value.is_empty() => format!("color rgb={}", crate::color_picker::bytes(c, alpha)),
+            "floats" if value.is_empty() => {
+                format!("color floats={}", crate::color_picker::floats(c, alpha))
+            }
+            "rgb" | "floats" => {
+                let parts = numbers(value);
+                let scale = if what == "rgb" { 1.0 } else { 255.0 };
+                let ok = (parts.len() == 3 || (parts.len() == 4 && alpha))
+                    && parts.iter().all(|&n| n >= 0.0 && n * scale <= 255.0);
+                if ok {
+                    let b = |i: usize| (parts[i] * scale).round() as u8;
+                    let a = if parts.len() == 4 { b(3) } else { c[3] };
+                    self.color_adopt(index, [b(0), b(1), b(2), a]);
+                    String::new()
+                } else if what == "rgb" {
+                    format!("rgb wants three bytes{}", if alpha { ", an alpha fourth" } else { "" })
+                } else {
+                    format!("floats wants three numbers 0..1{}", if alpha { ", an alpha fourth" } else { "" })
+                }
+            }
+            "hsv" | "hsl" if value.is_empty() => {
+                let mode = Mode::parse(what).unwrap_or_default();
+                let in_mode = state.in_mode(mode);
+                format!(
+                    "color {what}={} {} {}",
+                    in_mode.hue.round(),
+                    (in_mode.sat * 100.0).round(),
+                    (in_mode.val * 100.0).round()
+                )
+            }
+            "hsv" | "hsl" => {
+                let parts = numbers(value);
+                let mode = Mode::parse(what).unwrap_or_default();
+                if parts.len() == 3 && parts[1] >= 0.0 && parts[1] <= 100.0 && parts[2] >= 0.0 && parts[2] <= 100.0 {
+                    let next = State {
+                        mode,
+                        hue: parts[0],
+                        sat: parts[1] / 100.0,
+                        val: parts[2] / 100.0,
+                        alpha: c[3],
+                    };
+                    self.color_set_state(index, next.in_mode(state.mode));
+                    String::new()
+                } else {
+                    format!("{what} wants degrees, a percent and a percent")
+                }
+            }
+            "alpha" if !alpha => "this literal has no alpha (six digits)".into(),
+            "alpha" if value.is_empty() => format!("color alpha={}", c[3]),
+            "alpha" => match value.parse::<u8>() {
+                Ok(a) => {
+                    let mut next = state;
+                    next.alpha = a;
+                    self.color_set_state(index, next);
+                    String::new()
+                }
+                Err(_) => "alpha wants a byte 0..255".into(),
+            },
+            "mode" if value.is_empty() => format!("color mode={}", state.mode.name()),
+            "mode" => match Mode::parse(value) {
+                Some(mode) => {
+                    if let Some(t) = self.color_mut(index) {
+                        t.state = state.in_mode(mode);
+                    }
+                    self.color_reread(index);
+                    String::new()
+                }
+                None => "mode wants hsv or hsl".into(),
+            },
+            "focus" if value.is_empty() => format!("color focus={}", tool.focus.name()),
+            "focus" => match Component::parse(value) {
+                Some(Component::Alpha) if !alpha => "this literal has no alpha (six digits)".into(),
+                Some(part) => {
+                    if let Some(t) = self.color_mut(index) {
+                        t.focus = part;
+                    }
+                    self.color_reread(index);
+                    String::new()
+                }
+                None => "focus wants square, hue or alpha".into(),
+            },
+            "yank" => match Format::parse(value) {
+                Some(format) => {
+                    self.color_yank(index, format);
+                    return;
+                }
+                None => "yank wants hex, floats or rgb".into(),
+            },
+            "step" | "r" | "g" | "b" | "a" | "h" | "s" | "v" | "l" => {
+                let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else {
+                    return;
+                };
+                if value.is_empty() {
+                    match form.value_text(what) {
+                        Some(text) => format!("color {what}={text}"),
+                        None => format!("no {what} here"),
+                    }
+                } else {
+                    form.set(what, value).err().unwrap_or_default()
+                }
+            }
+            other => format!("color {other}: not a thing to set (:tool color)"),
+        };
+        self.sync_tools();
+    }
+
+    // ---- the gradient editor: see `docs/specs/gradient.md` ----
+
+    fn gradient_at(&self, window: WindowId) -> Option<usize> {
+        self.tools
+            .iter()
+            .position(|t| matches!(t, Tool::Gradient(_)) && t.windows().contains(&window))
+    }
+
+    fn gradient(&self, index: usize) -> Option<GradientTool> {
+        match self.tools.get(index) {
+            Some(Tool::Gradient(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    fn gradient_mut(&mut self, index: usize) -> Option<&mut GradientTool> {
+        match self.tools.get_mut(index) {
+            Some(Tool::Gradient(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `:set editor gradient`: the list of stops under the cursor drawn
+    /// as a bar split to the right, a form down the edge, focus on the
+    /// bar. On a window that already has the tool, just the focus.
+    fn open_gradient(&mut self) {
+        if let Some(index) = self.gradient_at(self.focus) {
+            let bar = self.tools[index].result();
+            self.set_focus(bar);
+            return;
+        }
+        if self.window().props().is_some() {
+            return self.open_tool_on_props_row(crate::props::ToolKind::Gradient);
+        }
+        let Some((buffer, cursor)) =
+            self.window().text().map(|t| (t.buffer, t.selections.primary().head.at))
+        else {
+            self.session.status = "no gradient under the cursor".into();
+            return;
+        };
+        let at = {
+            let rope = self.entry(buffer).buffer.rope();
+            rope.char_to_byte(cursor.min(rope.len_chars()))
+        };
+        self.open_gradient_at(buffer, at, self.focus, None);
+    }
+
+    /// The tool over the list around byte `at` of `buffer`.
+    fn open_gradient_at(
+        &mut self,
+        buffer: BufferId,
+        at: usize,
+        source: WindowId,
+        path: Option<String>,
+    ) {
+        let text = self.entry(buffer).buffer.rope().to_string();
+        let Some(lit) = crate::gradient::find(&text, at) else {
+            self.session.status = "no gradient under the cursor".into();
+            return;
+        };
+        let selected = lit.stops.iter().position(|s| s.start <= at && at < s.end).unwrap_or(0);
+        let gradient = crate::gradient::read(&text, &lit);
+        let step = 0.05;
+        let name = self.name_of(buffer);
+        self.set_focus(source);
+        let Some(bar) = self.split_focus(Dir::Vertical) else { return };
+        let img = Img::from_pixels(
+            PathBuf::from(format!("{name}.gradient")),
+            1,
+            1,
+            vec![0; 4],
+            self.next_image,
+        );
+        self.next_image += 1;
+        if let Some(window) = self.window_mut_of(bar) {
+            window.content = Content::Image(img);
+            window.alt = None;
+        }
+        let form = gradient_form(&gradient, selected, step);
+        let Some(form) = self.open_form_sidebar(form) else {
+            self.close_window(bar);
+            self.set_focus(source);
+            return;
+        };
+        self.tools.push(Tool::Gradient(GradientTool {
+            source,
+            bar,
+            form,
+            buffer,
+            anchor: lit.open,
+            path,
+            selected,
+            step,
+            gradient,
+            literal: Some(lit),
+            lost: false,
+            seen: None,
+        }));
+        self.sync_tools();
+        self.set_focus(bar);
+    }
+
+    /// One bar's sync, the curve's shape.
+    fn sync_gradient(&mut self, index: usize) -> bool {
+        let Some(tool) = self.gradient(index) else { return true };
+        let Some(edits) = self.buffer_edits(tool.buffer) else { return false };
+        let Some(form_generation) =
+            self.window_of(tool.form).and_then(Window::form).map(Form::generation)
+        else {
+            return false;
+        };
+        if tool.seen == Some((edits, form_generation)) {
+            return true;
+        }
+        if tool.seen.is_some_and(|seen| seen.1 != form_generation)
+            && let Some(form) = self.window_of(tool.form).and_then(Window::form)
+        {
+            let step = form.get_f32("step");
+            if step > 0.0
+                && let Some(t) = self.gradient_mut(index)
+            {
+                t.step = step;
+            }
+        }
+        self.gradient_reread(index);
+        let edits = self.buffer_edits(tool.buffer).unwrap_or(edits);
+        let form_generation = self
+            .window_of(tool.form)
+            .and_then(Window::form)
+            .map_or(form_generation, Form::generation);
+        if let Some(tool) = self.gradient_mut(index) {
+            tool.seen = Some((edits, form_generation));
+        }
+        true
+    }
+
+    fn gradient_reread(&mut self, index: usize) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(entry) = self.buffers.iter().find(|b| b.id == tool.buffer) else { return };
+        let rope = entry.buffer.rope();
+        let text = rope.to_string();
+        let by_path = tool.path.as_deref().and_then(|path| {
+            let props = self.window_of(tool.source).and_then(Window::props)?;
+            let (open, _) = props.locate(&text, path)?;
+            crate::gradient::find(&text, open + 1).filter(|l| l.open == open)
+        });
+        let mut lit = by_path.or_else(|| {
+            crate::gradient::find(&text, tool.anchor + 1).filter(|l| l.open == tool.anchor)
+        });
+        if lit.is_none()
+            && let Some(cursor) = self.window_of(tool.source).and_then(Window::text)
+        {
+            let at = rope.char_to_byte(cursor.selections.primary().head.at.min(rope.len_chars()));
+            lit = crate::gradient::find(&text, at);
+        }
+        let (gradient, selected, lost) = match &lit {
+            Some(lit) => {
+                let g = crate::gradient::read(&text, lit);
+                let selected = tool.selected.min(g.stops.len().saturating_sub(1));
+                (g, selected, false)
+            }
+            None => (crate::gradient::Gradient::default(), 0, true),
+        };
+        if lost && !tool.lost {
+            self.session.status = "gradient lost".into();
+        }
+        let (w, h, pixels) =
+            if lost { (1, 1, vec![0; 4]) } else { crate::gradient::render(&gradient, selected) };
+        if let Some(img) = self.window_mut_of(tool.bar).and_then(Window::img_mut) {
+            img.rgba = pixels;
+            img.width = w;
+            img.height = h;
+            img.generation += 1;
+            img.dirty = false;
+        }
+        let fields = if lost {
+            Vec::new()
+        } else {
+            gradient_form(&gradient, selected, tool.step).fields().to_vec()
+        };
+        if let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) {
+            form.replace_fields(fields);
+        }
+        if let Some(t) = self.gradient_mut(index) {
+            t.anchor = lit.as_ref().map_or(t.anchor, |l| l.open);
+            t.literal = lit;
+            t.gradient = gradient;
+            t.selected = selected;
+            t.lost = lost;
+        }
+    }
+
+    /// The keys on the bar. See `docs/specs/gradient.md`.
+    fn run_gradient_action(&mut self, index: usize, cmd: &Command) -> bool {
+        let count = cmd.count.max(1);
+        let Some(tool) = self.gradient(index) else { return false };
+        let n = tool.gradient.stops.len();
+        let last = n.saturating_sub(1);
+        let t = tool.gradient.stops.get(tool.selected).map_or(0.0, |s| s.t);
+        match &cmd.action {
+            Action::Undo => self.tool_undo(tool.source, tool.buffer, false),
+            Action::Redo => self.tool_undo(tool.source, tool.buffer, true),
+            Action::EnterNormal => self.set_focus(tool.source),
+            _ if tool.lost => self.session.status = "gradient lost".into(),
+            Action::NextPoint { back } if n > 0 => {
+                let step = count % n;
+                let next =
+                    if *back { (tool.selected + n - step) % n } else { (tool.selected + step) % n };
+                self.gradient_select(index, next);
+            }
+            Action::Move(Motion::FirstLine) => self.gradient_select(index, 0),
+            Action::Move(Motion::LastLine | Motion::Line(_)) => self.gradient_select(index, last),
+            Action::Move(Motion::Left) => {
+                self.gradient_set_t(index, t - count as f32 * tool.step);
+            }
+            Action::Move(Motion::Right) => {
+                self.gradient_set_t(index, t + count as f32 * tool.step);
+            }
+            Action::Move(Motion::LineStart | Motion::FirstNonBlank) => {
+                self.gradient_set_t(index, 0.0);
+            }
+            Action::Move(Motion::LineEnd | Motion::LastNonBlank) => self.gradient_set_t(index, 1.0),
+            Action::EnterInsertAfter => self.gradient_add(index, None),
+            Action::Operate { op: Operator::Delete, .. } => self.gradient_delete(index),
+            Action::PickColor => self.gradient_pick(index),
+            Action::YankColor(format) => self.gradient_yank(index, *format),
+            Action::EditValue => {
+                let line = format!("tool gradient t {}", crate::form::compact(t));
+                self.session.status.clear();
+                self.session.mode = Mode::Command(CmdLine::from(line.as_str()));
+            }
+            Action::EnterFind
+            | Action::EnterSearch { .. }
+            | Action::SearchWord { .. }
+            | Action::ShowScopes
+            | Action::EnterVisual(_)
+            | Action::Turn(_)
+            | Action::ScrollHalfPage { .. }
+            | Action::ScrollLine { .. }
+            | Action::Operate { .. }
+            | Action::EnterInsert
+            | Action::EnterInsertLineStart
+            | Action::EnterInsertLineEnd
+            | Action::NextPoint { .. }
+            | Action::ToggleMode
+            | Action::Move(_) => {}
+            _ => return false,
+        }
+        true
+    }
+
+    fn gradient_select(&mut self, index: usize, selected: usize) {
+        if let Some(tool) = self.gradient_mut(index) {
+            tool.selected = selected;
+        }
+        self.gradient_reread(index);
+    }
+
+    /// The selected stop moved to `t`, clamped to `0..1`; when that
+    /// changes its rank the stops' texts are written into the slots
+    /// their ranks now have, and the moved one stays selected.
+    fn gradient_set_t(&mut self, index: usize, t: f32) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let sel = tool.selected;
+        if sel >= lit.stops.len() || lit.stops.len() != tool.gradient.stops.len() {
+            return;
+        }
+        let t = t.clamp(0.0, 1.0);
+        let Some(text) = self.buffer_bytes(tool.buffer, 0, usize::MAX) else { return };
+        let was = tool.gradient.stops[sel].t;
+        let mut moved = tool.gradient.clone();
+        moved.stops[sel].t = t;
+        // Sorted by t; a stop slid onto a neighbour's t passes it in the
+        // direction it was going, so `l` at the clamp still changes places.
+        let dir = (t - was).signum();
+        let mut order: Vec<usize> = (0..moved.stops.len()).collect();
+        order.sort_by(|&a, &b| {
+            let key = |i: usize| (moved.stops[i].t, if i == sel { dir } else { 0.0 });
+            key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let texts: Vec<String> = (0..lit.stops.len())
+            .map(|i| {
+                let span = &lit.stops[i];
+                if i == sel {
+                    let number = &text[span.number.start..span.number.end];
+                    let new = crate::curve::rewrite(number, t, tool.step);
+                    let mut out = text[span.start..span.end].to_string();
+                    out.replace_range(
+                        span.number.start - span.start..span.number.end - span.start,
+                        &new,
+                    );
+                    out
+                } else {
+                    text[span.start..span.end].to_string()
+                }
+            })
+            .collect();
+        let mut edits = Vec::new();
+        for (slot, &stop) in order.iter().enumerate() {
+            let span = &lit.stops[slot];
+            let new = &texts[stop];
+            if &text[span.start..span.end] != new {
+                edits.push((span.start, span.end, new.clone()));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let rank = order.iter().position(|&i| i == sel).unwrap_or(sel);
+        if let Some(tool) = self.gradient_mut(index) {
+            tool.selected = rank;
+        }
+        self.tool_edit(tool.source, tool.buffer, edits);
+    }
+
+    /// `a`: a stop halfway to the next one — from the last, halfway back
+    /// — in the ramp's colour there, shaped like the selected stop's
+    /// text, and selected. `at` places it instead.
+    fn gradient_add(&mut self, index: usize, at: Option<f32>) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let (stops, n) = (&tool.gradient.stops, tool.gradient.stops.len());
+        if n < 1 || lit.stops.len() != n {
+            return;
+        }
+        // The stop the new one goes after: from the last, the one before.
+        let sel = if tool.selected + 1 < n || n == 1 { tool.selected.min(n - 1) } else { n - 2 };
+        let t = match at {
+            Some(t) => t.clamp(0.0, 1.0),
+            None if n == 1 => (stops[0].t + 1.0) / 2.0,
+            None => (stops[sel].t + stops[sel + 1].t) / 2.0,
+        };
+        let color = crate::gradient::eval(&tool.gradient, t);
+        let Some(text) = self.buffer_bytes(tool.buffer, 0, usize::MAX) else { return };
+        let sep = if n >= 2 {
+            text[lit.stops[sel].end..lit.stops[sel + 1].start].to_string()
+        } else {
+            ", ".to_string()
+        };
+        // Written with the decimals it needs and no more: a midpoint of
+        // 0.75 is `0.75f`, not `0.750f`.
+        let decimals = (1..=4).find(|&k| (t * 10f32.powi(k)).fract().abs() < 1e-4).unwrap_or(4);
+        let new =
+            crate::gradient::stop_text(&text, &lit.stops[sel], t, color, 10f32.powi(-decimals));
+        let after = lit.stops[sel].end;
+        if let Some(tool) = self.gradient_mut(index) {
+            tool.selected = sel + 1;
+        }
+        self.tool_edit(tool.source, tool.buffer, vec![(after, after, format!("{sep}{new}"))]);
+        // Placed by hand, it may belong elsewhere in the order.
+        if at.is_some() {
+            self.gradient_set_t(index, t);
+        }
+    }
+
+    /// `x`: the selected stop and the separator after it gone; a
+    /// gradient keeps two.
+    fn gradient_delete(&mut self, index: usize) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let (sel, n) = (tool.selected, lit.stops.len());
+        if n <= 2 {
+            self.session.status = "a gradient keeps two stops".into();
+            return;
+        }
+        let (start, end) = if sel + 1 < n {
+            (lit.stops[sel].start, lit.stops[sel + 1].start)
+        } else {
+            (lit.stops[sel - 1].end, lit.stops[sel].end)
+        };
+        if let Some(tool) = self.gradient_mut(index) {
+            tool.selected = sel.min(n - 2);
+        }
+        self.tool_edit(tool.source, tool.buffer, vec![(start, end, String::new())]);
+    }
+
+    /// `c`: the picker over the selected stop's colour, the bar to come
+    /// back to.
+    fn gradient_pick(&mut self, index: usize) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(lit) = tool.literal.as_ref() else { return };
+        let Some(span) = lit.stops.get(tool.selected) else { return };
+        if let Some(existing) = self
+            .color_at(tool.source)
+            .filter(|&i| matches!(&self.tools[i], Tool::Color(c) if c.source == tool.source))
+        {
+            self.close_tool(existing);
+        }
+        let anchor = span.color.start;
+        self.open_color_at(tool.buffer, anchor, tool.source, None, Some(tool.bar));
+    }
+
+    fn gradient_yank(&mut self, index: usize, format: crate::color_picker::Format) {
+        let Some(tool) = self.gradient(index) else { return };
+        let Some(stop) = tool.gradient.stops.get(tool.selected) else { return };
+        let alpha = tool
+            .literal
+            .as_ref()
+            .and_then(|l| l.stops.get(tool.selected))
+            .is_some_and(|s| s.color.alpha);
+        let text = format.spell(stop.color, alpha);
+        self.session.registers.push(Entry { text: text.clone(), kind: Shape::Chars });
+        self.session.status = format!("yanked {text}");
+    }
+
+    /// `:tool gradient …`: the ex forms of the bar's moves.
+    fn gradient_tool(&mut self, arg: &str) {
+        use crate::color_picker::Format;
+        let Some(index) = self.gradient_at(self.focus) else {
+            self.session.status = "no gradient here (:set editor gradient)".into();
+            return;
+        };
+        let (what, value) = match arg.split_once(char::is_whitespace) {
+            Some((what, value)) => (what, value.trim()),
+            None => (arg, ""),
+        };
+        let Some(tool) = self.gradient(index) else { return };
+        let n = tool.gradient.stops.len();
+        let stop = tool.gradient.stops.get(tool.selected).copied();
+        self.session.status = match what {
+            "" => "gradient what? (stop, t, color, step, add, delete, pick, yank)".into(),
+            "stop" if value.is_empty() => format!("gradient stop={}", tool.selected + 1),
+            "stop" => match value.parse::<usize>() {
+                Ok(p) if p >= 1 && p <= n => {
+                    self.gradient_select(index, p - 1);
+                    String::new()
+                }
+                _ => format!("stop wants a whole number 1..{n}"),
+            },
+            "t" if value.is_empty() => {
+                format!("gradient t={}", crate::form::compact(stop.map_or(0.0, |s| s.t)))
+            }
+            "t" => match value.parse::<f32>() {
+                Ok(t) if t.is_finite() => {
+                    self.gradient_set_t(index, t);
+                    String::new()
+                }
+                _ => "t wants a number 0..1".into(),
+            },
+            "color" | "colour" if value.is_empty() => match (stop, tool.literal.as_ref()) {
+                (Some(s), Some(lit)) => {
+                    let alpha = lit.stops.get(tool.selected).is_some_and(|x| x.color.alpha);
+                    format!("gradient color={}", crate::color_picker::hex(s.color, alpha))
+                }
+                _ => "no stop".into(),
+            },
+            "color" | "colour" => {
+                let Some(lit) = tool.literal.as_ref() else { return };
+                let Some(span) = lit.stops.get(tool.selected) else { return };
+                match crate::color_picker::parse_hex(value, span.color.alpha) {
+                    Some(c) => {
+                        let new = crate::color_picker::write(&span.color, c);
+                        let (start, end) = (span.color.start, span.color.end);
+                        self.tool_edit(tool.source, tool.buffer, vec![(start, end, new)]);
+                        String::new()
+                    }
+                    None => format!(
+                        "color wants #rrggbb{}",
+                        if span.color.alpha { " or #rrggbbaa" } else { "" }
+                    ),
+                }
+            }
+            "add" if value.is_empty() => {
+                self.gradient_add(index, None);
+                String::new()
+            }
+            "add" => match value.parse::<f32>() {
+                Ok(t) if t.is_finite() => {
+                    self.gradient_add(index, Some(t));
+                    String::new()
+                }
+                _ => "add wants a number 0..1, or nothing".into(),
+            },
+            "delete" => {
+                self.gradient_delete(index);
+                return;
+            }
+            "pick" => {
+                self.gradient_pick(index);
+                return;
+            }
+            "yank" => match Format::parse(value) {
+                Some(format) => {
+                    self.gradient_yank(index, format);
+                    return;
+                }
+                None => "yank wants hex, floats or rgb".into(),
+            },
+            "step" => {
+                let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else {
+                    return;
+                };
+                if value.is_empty() {
+                    format!("gradient step={}", form.value_text("step").unwrap_or_default())
+                } else {
+                    form.set("step", value).err().unwrap_or_default()
+                }
+            }
+            other => format!("gradient {other}: not a thing to set (:tool gradient)"),
+        };
+        self.sync_tools();
+    }
+
+    pub fn is_gradient_bar(&self, id: WindowId) -> bool {
+        self.tools.iter().any(|t| matches!(t, Tool::Gradient(g) if g.bar == id))
+    }
+
+    /// The bar's status row: the selected stop, its position and colour.
+    pub fn gradient_status(&self, id: WindowId) -> Option<String> {
+        let tool = self.tools.iter().find_map(|t| match t {
+            Tool::Gradient(g) if g.bar == id && !g.lost => Some(g),
+            _ => None,
+        })?;
+        let stop = tool.gradient.stops.get(tool.selected)?;
+        let alpha = tool
+            .literal
+            .as_ref()
+            .and_then(|l| l.stops.get(tool.selected))
+            .is_some_and(|s| s.color.alpha);
+        Some(format!(
+            "stop {} of {}  t {:.3}  {}",
+            tool.selected + 1,
+            tool.gradient.stops.len(),
+            stop.t,
+            crate::color_picker::hex(stop.color, alpha)
+        ))
+    }
+
+    pub fn is_color_picture(&self, id: WindowId) -> bool {
+        self.tools.iter().any(|t| matches!(t, Tool::Color(c) if c.picture == id))
+    }
+
+    /// The picker's status row: the hex and the state.
+    pub fn color_status(&self, id: WindowId) -> Option<String> {
+        let tool = self.tools.iter().find_map(|t| match t {
+            Tool::Color(c) if c.picture == id && !c.lost => Some(c),
+            _ => None,
+        })?;
+        let alpha = tool.literal.as_ref().is_some_and(|l| l.alpha);
+        let s = tool.state;
+        Some(format!(
+            "{}  h {} s {} {} {}",
+            crate::color_picker::hex(s.color(), alpha),
+            s.hue.round(),
+            (s.sat * 100.0).round(),
+            s.mode.axis(),
+            (s.val * 100.0).round()
+        ))
+    }
+
     /// The plot's status row: the selected point, when the plot has one.
     pub fn curve_status(&self, id: WindowId) -> Option<String> {
         let tool = self.tools.iter().find_map(|t| match t {
@@ -9541,6 +10847,9 @@ impl Editor {
             | Action::EnterInsertLineStart
             | Action::EnterInsertLineEnd
             | Action::NextPoint { .. }
+            | Action::YankColor(_)
+            | Action::ToggleMode
+            | Action::PickColor
             | Action::Move(_) => {}
             _ => return false,
         }
@@ -9657,11 +10966,17 @@ impl Editor {
     /// history, through the source window's view so the cursor follows.
     fn curve_undo(&mut self, index: usize, redo: bool) {
         let Some(tool) = self.curve(index) else { return };
+        self.tool_undo(tool.source, tool.buffer, redo);
+    }
+
+    /// `u` and `Ctrl-R` on a text tool's picture: the source buffer's
+    /// history, through its view when the source shows one.
+    fn tool_undo(&mut self, source: WindowId, buffer: BufferId, redo: bool) {
         let action = if redo { Action::Redo } else { Action::Undo };
-        match self.view(tool.source) {
+        match self.view(source) {
             Some(mut view) => view.apply(Command { count: 1, action }),
             None => {
-                let Some(entry) = self.buffers.iter_mut().find(|b| b.id == tool.buffer) else {
+                let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else {
                     return;
                 };
                 let done = if redo {
@@ -9692,14 +11007,26 @@ impl Editor {
     /// The one place the tool writes the buffer: byte-ranged replacements,
     /// applied last to first, one undo revision with the source window's
     /// cursors on both sides. The sync after re-reads everything.
-    fn curve_edit(&mut self, index: usize, mut edits: Vec<(usize, usize, String)>) {
+    fn curve_edit(&mut self, index: usize, edits: Vec<(usize, usize, String)>) {
         let Some(tool) = self.curve(index) else { return };
+        self.tool_edit(tool.source, tool.buffer, edits);
+    }
+
+    /// `edits` — byte spans and their replacements — applied to `buffer`
+    /// as one undo step, then every tool re-synced. What every key of a
+    /// text tool ends in.
+    fn tool_edit(
+        &mut self,
+        source: WindowId,
+        buffer: BufferId,
+        mut edits: Vec<(usize, usize, String)>,
+    ) {
         let before = self
-            .window_of(tool.source)
+            .window_of(source)
             .and_then(Window::text)
             .map(|t| t.selections.as_pairs())
             .unwrap_or_default();
-        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == tool.buffer) else { return };
+        let Some(entry) = self.buffers.iter_mut().find(|b| b.id == buffer) else { return };
         edits.sort_by_key(|e| std::cmp::Reverse(e.0));
         for (start, end, text) in edits {
             let rope = entry.buffer.rope();
@@ -9818,11 +11145,16 @@ impl Editor {
             None => (arg.trim(), ""),
         };
         match tool {
-            "" => self.session.status = "tool what? (tileset, image, normalmap, curve)".into(),
+            "" => {
+                self.session.status =
+                    "tool what? (tileset, image, normalmap, curve, color, gradient)".into()
+            }
             "tileset" => self.tileset_tool(rest),
             "image" => self.image_tool(rest),
             "normalmap" => self.normalmap_tool(rest),
             "curve" => self.curve_tool(rest),
+            "color" | "colour" => self.color_tool(rest),
+            "gradient" => self.gradient_tool(rest),
             other => {
                 self.session.status =
                     format!("not a tool: {other} (want tileset, image, normalmap or curve)")
@@ -14412,7 +15744,12 @@ impl View<'_> {
             Action::JumpBack { .. } | Action::JumpForward { .. } | Action::JumpLast => {}
             // Only ever produced in an image window, which `run_image_action`
             // answers before a view is looked for.
-            Action::Turn(_) | Action::EditValue | Action::NextPoint { .. } => {}
+            Action::Turn(_)
+            | Action::EditValue
+            | Action::NextPoint { .. }
+            | Action::YankColor(_)
+            | Action::ToggleMode
+            | Action::PickColor => {}
             // Only ever produced in a form or property window; answered in
             // `Editor::apply`.
             Action::Form(_) | Action::Props(_) => {}
@@ -32092,16 +33429,15 @@ int main(void) {
             key(&mut ed, Action::Undo);
             assert!(!text(&ed).contains("\"$id\": \"ice\",\n      \"falloff\""), "two steps back");
 
-            // A colour row is not a curve: Enter prefills the hex.
+            // A colour row is not a curve: Enter opens the picker instead,
+            // over the default written into the instance.
             ed.run_ex("q");
             go(&mut ed, PropsCmd::Select { down: false, count: 1 });
             assert_eq!(row(&ed).key, "inst:1/tint");
             go(&mut ed, PropsCmd::Enter);
-            assert!(
-                matches!(&ed.session.mode, Mode::Command(c) if c == "bi set ice.tint #000000"),
-                "{:?}",
-                ed.session.mode
-            );
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            assert!(text(&ed).contains("\"tint\": \"#000000\""), "{}", text(&ed));
+            assert!(ed.is_color_picture(ed.focus()));
         }
 
         #[test]
@@ -32324,12 +33660,721 @@ int main(void) {
         }
 
         #[test]
-        fn closing_the_plot_by_hand_forgets_the_tool() {
+        fn closing_the_plot_or_the_form_by_hand_closes_the_other_too() {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
-            ed.close_window(plot);
-            ed.apply(cmd(Action::Move(Motion::Left)));
+            ed.set_focus(plot);
+            ed.apply(cmd(Action::Window(WindowCmd::Close)));
             assert!(ed.tools.is_empty());
+            assert_eq!(ed.window_ids(), vec![source], "the form went with the plot");
+            assert_eq!(ed.focus(), source);
+
+            let (mut ed, source) = open();
+            let form = form_of(&ed);
+            ed.set_focus(form);
+            ed.run_ex("close");
+            assert!(ed.tools.is_empty());
+            assert_eq!(ed.window_ids(), vec![source], "the plot went with the form");
+            assert_eq!(ed.focus(), source);
+        }
+    }
+
+    /// `:set editor color`: the picker over a hex literal. See
+    /// `docs/specs/color-picker.md`.
+    mod color_picker_tool {
+        use super::curve_tool::{form_of, plot_of, text};
+        use super::*;
+        use crate::color_picker::Format;
+
+        pub const CSS: &str =
+            "a { color: #fb4934; }\nb { color: \"#00FF00\"; }\nc { color: #12345680; }\n";
+
+        fn open_on(needle: &str) -> (Editor, WindowId) {
+            let mut ed = editor(CSS);
+            sized(&mut ed);
+            let at = CSS.find(needle).unwrap() + 2;
+            ed.set_cursor(Cursor::at(CSS[..at].chars().count()));
+            let source = ed.focus();
+            ed.run_ex("set editor color");
+            (ed, source)
+        }
+
+        fn key(ed: &mut Editor, action: Action) {
+            ed.apply(cmd(action));
+        }
+
+        fn keys(ed: &mut Editor, count: usize, action: Action) {
+            ed.apply(Command { count, action });
+        }
+
+        fn form_names(ed: &Editor) -> Vec<String> {
+            let form = ed.window_of(form_of(ed)).unwrap().form().unwrap();
+            form.fields().iter().map(|f| f.name().to_string()).collect()
+        }
+
+        #[test]
+        fn needs_a_colour_under_the_cursor() {
+            let mut ed = editor("int x = 1;");
+            ed.run_ex("set editor color");
+            assert_eq!(ed.session.status, "no colour under the cursor");
+            assert_eq!(ed.window_ids().len(), 1);
+        }
+
+        #[test]
+        fn opens_beside_the_source_and_the_keys_rewrite_the_digits() {
+            let (mut ed, source) = open_on("#fb4934");
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            let picture = plot_of(&ed, source);
+            assert_eq!(ed.focus(), picture);
+            assert!(ed.is_color_picture(picture));
+            assert_eq!(ed.tool_label(picture), Some("COLOR"));
+            assert_eq!(ed.color_status(picture).unwrap(), "#fb4934  h 6 s 79 v 98");
+            assert_eq!(form_names(&ed), ["r", "g", "b", "h", "s", "v", "mode", "step"], "no alpha");
+            let img = ed.window_of(picture).unwrap().img().unwrap();
+            assert_eq!(img.width, 528);
+
+            // The square: `h` washes out, `j` darkens; nothing else changes.
+            key(&mut ed, Action::Move(Motion::Left));
+            let after = text(&ed);
+            assert_ne!(after, CSS);
+            assert_eq!(after.len(), CSS.len());
+            assert_eq!(&after[..11], &CSS[..11]);
+            assert_eq!(&after[18..], &CSS[18..], "only the digits moved");
+            let status = ed.color_status(picture).unwrap();
+            assert!(status.contains("s 77"), "{status}");
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), CSS, "one undo step");
+            keys(&mut ed, 5, Action::Move(Motion::Down));
+            assert!(
+                ed.color_status(picture).unwrap().contains("v 88"),
+                "{}",
+                ed.color_status(picture).unwrap()
+            );
+            key(&mut ed, Action::Move(Motion::LastLine));
+            assert!(text(&ed).contains("color: #000000;"), "{}", text(&ed));
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            assert!(
+                ed.color_status(picture).unwrap().starts_with("#ff"),
+                "the hue survived black: {}",
+                ed.color_status(picture).unwrap()
+            );
+
+            // Tab to the hue strip; `l` turns the hue.
+            key(&mut ed, Action::NextPoint { back: false });
+            keys(&mut ed, 10, Action::Move(Motion::Right));
+            let status = ed.color_status(picture).unwrap();
+            assert!(status.contains("h 78"), "{status}");
+            key(&mut ed, Action::NextPoint { back: false });
+            key(&mut ed, Action::Move(Motion::Right));
+            let status = ed.color_status(picture).unwrap();
+            assert!(
+                status.contains("h 78") && status.contains("s 81"),
+                "two parts wrap to the square: {status}"
+            );
+        }
+
+        #[test]
+        fn tab_wraps_over_two_parts_without_alpha_and_three_with() {
+            let (mut ed, source) = open_on("#fb4934");
+            let picture = plot_of(&ed, source);
+            key(&mut ed, Action::NextPoint { back: false });
+            key(&mut ed, Action::NextPoint { back: false });
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(ed.color_status(picture).unwrap().contains("s 77"), "back on the square");
+
+            let (mut ed, source) = open_on("#12345680");
+            let picture = plot_of(&ed, source);
+            assert_eq!(form_names(&ed), ["r", "g", "b", "a", "h", "s", "v", "mode", "step"]);
+            key(&mut ed, Action::NextPoint { back: true });
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("#12345685"), "alpha up by five: {}", text(&ed));
+            key(&mut ed, Action::Move(Motion::LineEnd));
+            assert!(text(&ed).contains("#123456ff"), "{}", text(&ed));
+            assert!(ed.color_status(picture).unwrap().starts_with("#123456ff"));
+        }
+
+        #[test]
+        fn m_switches_the_square_to_lightness_and_the_form_follows() {
+            let (mut ed, source) = open_on("#fb4934");
+            let picture = plot_of(&ed, source);
+            key(&mut ed, Action::ToggleMode);
+            assert_eq!(form_names(&ed), ["r", "g", "b", "h", "s", "l", "mode", "step"]);
+            assert_eq!(text(&ed), CSS, "a mode change writes nothing");
+            assert_eq!(ed.color_status(picture).unwrap(), "#fb4934  h 6 s 96 l 59");
+            ed.run_ex("tool color mode hsv");
+            assert_eq!(form_names(&ed)[5], "v");
+        }
+
+        #[test]
+        fn yanks_land_in_the_register_ring_in_three_spellings() {
+            let (mut ed, _s) = open_on("#12345680");
+            key(&mut ed, Action::YankColor(Format::Hex));
+            assert_eq!(ed.session.registers.front().unwrap().text, "#12345680");
+            assert_eq!(ed.session.status, "yanked #12345680");
+            key(&mut ed, Action::YankColor(Format::Floats));
+            assert_eq!(ed.session.registers.front().unwrap().text, "0.071, 0.204, 0.337, 0.502");
+            key(&mut ed, Action::YankColor(Format::Bytes));
+            assert_eq!(ed.session.registers.front().unwrap().text, "18, 52, 86, 128");
+            ed.run_ex("tool color yank hex");
+            assert_eq!(ed.session.registers.front().unwrap().text, "#12345680");
+            let (mut ed, _s) = open_on("#fb4934");
+            key(&mut ed, Action::YankColor(Format::Bytes));
+            assert_eq!(ed.session.registers.front().unwrap().text, "251, 73, 52", "no alpha");
+        }
+
+        #[test]
+        fn enter_prefills_the_hex_and_the_case_is_kept() {
+            let (mut ed, source) = open_on("#00FF00");
+            let picture = plot_of(&ed, source);
+            key(&mut ed, Action::EditValue);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(c) if c == "tool color hex #00ff00"),
+                "{:?}",
+                ed.session.mode
+            );
+            ed.session.mode = Mode::Normal;
+            ed.set_focus(picture);
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(
+                text(&ed).contains("\"#05FF05\""),
+                "upper stays upper, quotes stay: {}",
+                text(&ed)
+            );
+        }
+
+        #[test]
+        fn q_closes_three_windows_and_a_hand_close_takes_the_rest() {
+            let (mut ed, source) = open_on("#fb4934");
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids(), vec![source]);
+            assert_eq!(ed.focus(), source);
+            assert!(ed.tools.is_empty());
+
+            let (mut ed, source) = open_on("#fb4934");
+            let form = form_of(&ed);
+            ed.set_focus(form);
+            ed.run_ex("close");
+            assert_eq!(ed.window_ids(), vec![source], "the picker went with the form");
+
+            let (mut ed, source) = open_on("#fb4934");
+            key(&mut ed, Action::EnterNormal);
+            assert_eq!(ed.focus(), source, "Esc goes back; the tool stays");
+            assert_eq!(ed.window_ids().len(), 3);
+            ed.run_ex("set editor color");
+            assert_eq!(ed.focus(), plot_of(&ed, source), "reopening focuses the picker");
+            ed.run_ex("set editor");
+            assert_eq!(ed.session.status, "editor=color");
+        }
+
+        #[test]
+        fn a_hand_edit_of_the_digits_redraws_and_losing_them_says_so() {
+            let (mut ed, source) = open_on("#fb4934");
+            let picture = plot_of(&ed, source);
+            let before = ed.window_of(picture).unwrap().img().unwrap().generation;
+            ed.set_focus(source);
+            let at = CSS.find("fb4934").unwrap();
+            ed.set_cursor(Cursor::at(at));
+            ed.apply(Command {
+                count: 6,
+                action: Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Right),
+                    count: 6,
+                    sink: Sink::Ring,
+                },
+            });
+            ed.apply(cmd(Action::EnterInsert));
+            for c in "0000ff".chars() {
+                ed.apply(cmd(Action::InsertChar(c)));
+            }
+            ed.apply(cmd(Action::EnterNormal));
+            assert!(text(&ed).contains("#0000ff"), "{}", text(&ed));
+            assert_eq!(ed.color_status(picture).unwrap(), "#0000ff  h 240 s 100 v 100");
+            assert!(ed.window_of(picture).unwrap().img().unwrap().generation > before);
+
+            ed.set_focus(source);
+            ed.set_cursor(Cursor::at(0));
+            ed.apply(cmd(Action::Operate {
+                op: Operator::Delete,
+                target: Target::Motion(Motion::CurrentLine),
+                count: 1,
+                sink: Sink::Ring,
+            }));
+            ed.set_focus(picture);
+            ed.apply(cmd(Action::Move(Motion::Left)));
+            assert_eq!(ed.session.status, "colour lost");
+            assert!(ed.color_status(picture).is_none());
+        }
+
+        #[test]
+        fn tool_color_sets_reports_and_refuses() {
+            let (mut ed, source) = open_on("#fb4934");
+            let picture = plot_of(&ed, source);
+            ed.run_ex("tool color rgb 0 0 255");
+            assert!(text(&ed).contains("color: #0000ff;"), "{}", text(&ed));
+            ed.run_ex("tool color hsv 120 100 100");
+            assert!(text(&ed).contains("color: #00ff00;"), "{}", text(&ed));
+            ed.run_ex("tool color hsl 0 100 50");
+            assert!(text(&ed).contains("color: #ff0000;"), "{}", text(&ed));
+            ed.run_ex("tool color floats 1 1 1");
+            assert!(text(&ed).contains("color: #ffffff;"), "{}", text(&ed));
+            ed.run_ex("tool color hex 123456");
+            assert!(text(&ed).contains("color: #123456;"), "{}", text(&ed));
+            ed.run_ex("tool color hex");
+            assert_eq!(ed.session.status, "color hex=#123456");
+            ed.run_ex("tool color rgb");
+            assert_eq!(ed.session.status, "color rgb=18, 52, 86");
+            ed.run_ex("tool color hsv");
+            assert_eq!(ed.session.status, "color hsv=210 79 34");
+            ed.run_ex("tool color alpha 128");
+            assert_eq!(ed.session.status, "this literal has no alpha (six digits)");
+            ed.run_ex("tool color hex red");
+            assert_eq!(ed.session.status, "hex wants #rrggbb");
+            ed.run_ex("tool color rgb 1 2");
+            assert_eq!(ed.session.status, "rgb wants three bytes");
+            ed.run_ex("tool color focus alpha");
+            assert_eq!(ed.session.status, "this literal has no alpha (six digits)");
+            ed.run_ex("tool color focus hue");
+            assert_eq!(ed.session.status, "");
+            ed.run_ex("tool color focus");
+            assert_eq!(ed.session.status, "color focus=hue");
+            ed.run_ex("tool color step 0.5");
+            ed.run_ex("tool color step");
+            assert_eq!(ed.session.status, "color step=0.500");
+            ed.set_focus(picture);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(
+                ed.color_status(picture).unwrap().contains("h 30"),
+                "half a turn: {}",
+                ed.color_status(picture).unwrap()
+            );
+            ed.run_ex("tool color v 50");
+            assert!(text(&ed).contains("color: #"), "{}", text(&ed));
+            assert!(
+                ed.color_status(picture).unwrap().contains("v 50"),
+                "{}",
+                ed.color_status(picture).unwrap()
+            );
+            ed.run_ex("tool color nope");
+            assert_eq!(ed.session.status, "color nope: not a thing to set (:tool color)");
+            ed.run_ex("tool color");
+            assert!(ed.session.status.starts_with("color what?"));
+            ed.set_focus(source);
+            ed.run_ex("tool color hex #000000");
+            assert_eq!(ed.session.status, "");
+            let (mut ed, _s) = open_on("#12345680");
+            ed.run_ex("tool color alpha 0");
+            assert!(text(&ed).contains("#12345600"), "{}", text(&ed));
+            ed.run_ex("tool color rgb 1 2 3 4");
+            assert!(text(&ed).contains("#01020304"), "{}", text(&ed));
+        }
+
+        #[test]
+        fn the_form_turns_the_colour_both_ways() {
+            let (mut ed, source) = open_on("#fb4934");
+            let picture = plot_of(&ed, source);
+            let form = form_of(&ed);
+            ed.set_focus(form);
+            ed.run_ex("tool color r 0");
+            assert!(text(&ed).contains("color: #004934;"), "{}", text(&ed));
+            ed.run_ex("tool color h 120");
+            let status = ed.color_status(picture).unwrap();
+            assert!(status.contains("h 120"), "{status}");
+            assert!(text(&ed).contains("color: #004900;"), "{}", text(&ed));
+            ed.run_ex("tool color s 0");
+            assert!(text(&ed).contains("color: #494949;"), "grey: {}", text(&ed));
+            ed.run_ex("tool color s 100");
+            assert!(
+                text(&ed).contains("color: #004900;"),
+                "the hue was kept through grey: {}",
+                text(&ed)
+            );
+        }
+
+        #[test]
+        fn enter_on_a_props_colour_row_opens_the_picker_over_the_json() {
+            const SCHEMA: &str = r##"{"$dialect":"bi/1","types":{"Fx":{"kind":"struct","fields":[
+                {"name":"tint","type":"rgb","default":"#c83c1e"},
+                {"name":"glow","type":"rgba"}]}}}"##;
+            const DATA: &str = "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"fx.bischema\",\n  \"instances\": [\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"fire\",\n      \"glow\": \"#ff880080\"\n    }\n  ]\n}\n";
+            let d = ScratchDir::new("propscolor")
+                .written("fx.bischema", SCHEMA)
+                .written("fx.bidata", DATA);
+            let mut ed = Editor::open(format!("{}/fx.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            let view = ed.focus();
+            let go = |ed: &mut Editor, c: PropsCmd| ed.apply(cmd(Action::Props(c)));
+            let row = |ed: &Editor| {
+                ed.window_of(view).unwrap().props().unwrap().selected_row().unwrap().clone()
+            };
+            const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            assert_eq!(row(&ed).key, "inst:0/glow");
+            go(&mut ed, PropsCmd::Enter);
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            let picture = plot_of(&ed, view);
+            assert_eq!(ed.focus(), picture);
+            assert_eq!(ed.color_status(picture).unwrap(), "#ff880080  h 32 s 100 v 100");
+            key(&mut ed, Action::NextPoint { back: true });
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("\"glow\": \"#ff880085\""), "{}", text(&ed));
+            assert_eq!(
+                row(&ed).widget,
+                crate::props::RowWidget::Color([0xff, 0x88, 0, 0x85]),
+                "the brick follows"
+            );
+            ed.run_ex("q");
+            assert_eq!(ed.focus(), view);
+
+            // An inherited colour is written first.
+            go(&mut ed, PropsCmd::Select { down: false, count: 1 });
+            assert_eq!(row(&ed).key, "inst:0/tint");
+            assert!(row(&ed).inherited);
+            ed.run_ex("set editor color");
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            assert!(text(&ed).contains("\"tint\": \"#c83c1e\""), "{}", text(&ed));
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(!text(&ed).contains("\"tint\": \"#c83c1e\""), "{}", text(&ed));
+            key(&mut ed, Action::Undo);
+            key(&mut ed, Action::Undo);
+            assert!(!text(&ed).contains("tint"), "two steps back: {}", text(&ed));
+        }
+    }
+
+    /// `:set editor gradient`: the bar over a list of stops. See
+    /// `docs/specs/gradient.md`.
+    mod gradient_tool {
+        use super::curve_tool::{form_of, plot_of, text};
+        use super::*;
+        use crate::color_picker::Format;
+
+        pub const SRC: &str = "Stop ramp[] = {\n    {0.0f, \"#000000\"},\n    {0.5f, \"#ff8800\"},\n    {1.0f, \"#ffffff\"},\n};\n";
+
+        fn open() -> (Editor, WindowId) {
+            let mut ed = editor(SRC);
+            sized(&mut ed);
+            let at = SRC.find("0.5f").unwrap();
+            ed.set_cursor(Cursor::at(SRC[..at].chars().count()));
+            let source = ed.focus();
+            ed.run_ex("set editor gradient");
+            (ed, source)
+        }
+
+        fn key(ed: &mut Editor, action: Action) {
+            ed.apply(cmd(action));
+        }
+
+        fn keys(ed: &mut Editor, count: usize, action: Action) {
+            ed.apply(Command { count, action });
+        }
+
+        /// The bar: the tool's picture, not the picker's.
+        fn bar_of(ed: &Editor) -> WindowId {
+            ed.window_ids().into_iter().find(|&w| ed.is_gradient_bar(w)).expect("a bar")
+        }
+
+        #[test]
+        fn needs_a_list_of_stops_under_the_cursor() {
+            let mut ed = editor("int x = 1;");
+            ed.run_ex("set editor gradient");
+            assert_eq!(ed.session.status, "no gradient under the cursor");
+            assert_eq!(ed.window_ids().len(), 1);
+        }
+
+        #[test]
+        fn opens_beside_the_source_and_the_keys_slide_the_stops() {
+            let (mut ed, source) = open();
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            let bar = plot_of(&ed, source);
+            assert_eq!(ed.focus(), bar);
+            assert!(ed.is_gradient_bar(bar));
+            assert_eq!(ed.tool_label(bar), Some("GRADIENT"));
+            assert_eq!(ed.gradient_status(bar).unwrap(), "stop 2 of 3  t 0.500  #ff8800");
+            let img = ed.window_of(bar).unwrap().img().unwrap();
+            assert_eq!(img.width, 528);
+
+            key(&mut ed, Action::Move(Motion::Right));
+            assert_eq!(text(&ed), SRC.replace("0.5f", "0.55f"));
+            keys(&mut ed, 2, Action::Move(Motion::Left));
+            assert_eq!(text(&ed), SRC.replace("0.5f", "0.45f"));
+            key(&mut ed, Action::Undo);
+            key(&mut ed, Action::Undo);
+            assert_eq!(text(&ed), SRC);
+            key(&mut ed, Action::NextPoint { back: false });
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 3 of 3"));
+            key(&mut ed, Action::NextPoint { back: false });
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 1 of 3"), "wraps");
+            key(&mut ed, Action::Move(Motion::LastLine));
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 3"));
+            key(&mut ed, Action::Move(Motion::FirstLine));
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 1"));
+            key(&mut ed, Action::Move(Motion::Left));
+            assert_eq!(text(&ed), SRC, "clamped at 0: nothing written");
+            let form = ed.window_of(form_of(&ed)).unwrap().form().unwrap();
+            assert_eq!(form.get_i64("stop"), 1);
+        }
+
+        #[test]
+        fn sliding_past_a_neighbour_swaps_the_stops_and_follows_the_moved_one() {
+            let (mut ed, source) = open();
+            let bar = plot_of(&ed, source);
+            ed.run_ex("tool gradient step 0.3");
+            ed.set_focus(bar);
+            keys(&mut ed, 2, Action::Move(Motion::Right));
+            assert_eq!(
+                text(&ed),
+                "Stop ramp[] = {\n    {0.0f, \"#000000\"},\n    {1.0f, \"#ffffff\"},\n    {1.0f, \"#ff8800\"},\n};\n",
+                "past the last: the texts change places, the lines stay"
+            );
+            assert_eq!(ed.gradient_status(bar).unwrap(), "stop 3 of 3  t 1.000  #ff8800");
+            keys(&mut ed, 2, Action::Move(Motion::Left));
+            assert_eq!(text(&ed), SRC.replace("0.5f", "0.4f"), "and back: {}", text(&ed));
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 2 of 3  t 0.400"));
+            key(&mut ed, Action::Move(Motion::LineStart));
+            assert!(
+                text(&ed).starts_with(
+                    "Stop ramp[] = {\n    {0.0f, \"#ff8800\"},\n    {0.0f, \"#000000\"},"
+                ),
+                "{}",
+                text(&ed)
+            );
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 1 of 3  t 0.000"));
+        }
+
+        #[test]
+        fn a_adds_halfway_in_the_ramps_colour_and_x_deletes() {
+            let (mut ed, source) = open();
+            let bar = plot_of(&ed, source);
+            key(&mut ed, Action::EnterInsertAfter);
+            assert_eq!(
+                text(&ed),
+                "Stop ramp[] = {\n    {0.0f, \"#000000\"},\n    {0.5f, \"#ff8800\"},\n    {0.75f, \"#ffc480\"},\n    {1.0f, \"#ffffff\"},\n};\n"
+            );
+            assert_eq!(ed.gradient_status(bar).unwrap(), "stop 3 of 4  t 0.750  #ffc480");
+            key(
+                &mut ed,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Right),
+                    count: 1,
+                    sink: Sink::Ring,
+                },
+            );
+            assert_eq!(text(&ed), SRC);
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 3 of 3"));
+            key(&mut ed, Action::Move(Motion::LastLine));
+            key(&mut ed, Action::EnterInsertAfter);
+            assert!(
+                text(&ed).contains("{0.75f, \"#ffc480\"},\n    {1.0f"),
+                "from the last, halfway back: {}",
+                text(&ed)
+            );
+            key(
+                &mut ed,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Right),
+                    count: 1,
+                    sink: Sink::Ring,
+                },
+            );
+            key(&mut ed, Action::Move(Motion::LastLine));
+            key(
+                &mut ed,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Right),
+                    count: 1,
+                    sink: Sink::Ring,
+                },
+            );
+            assert_eq!(
+                text(&ed),
+                "Stop ramp[] = {\n    {0.0f, \"#000000\"},\n    {0.5f, \"#ff8800\"},\n};\n",
+                "the last goes with the separator before it"
+            );
+            key(
+                &mut ed,
+                Action::Operate {
+                    op: Operator::Delete,
+                    target: Target::Motion(Motion::Right),
+                    count: 1,
+                    sink: Sink::Ring,
+                },
+            );
+            assert_eq!(ed.session.status, "a gradient keeps two stops");
+        }
+
+        #[test]
+        fn c_opens_the_picker_over_the_stop_and_comes_back_to_the_bar() {
+            let (mut ed, source) = open();
+            let bar = plot_of(&ed, source);
+            key(&mut ed, Action::PickColor);
+            assert_eq!(ed.window_ids().len(), 5, "{:?}", ed.window_ids());
+            let picker = ed.focus();
+            assert!(ed.is_color_picture(picker));
+            assert_eq!(ed.color_status(picker).unwrap(), "#ff8800  h 32 s 100 v 100");
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(text(&ed).contains("{0.5f, \"#ff8a05\"}"), "{}", text(&ed));
+            assert!(
+                ed.gradient_status(bar).unwrap().ends_with("#ff8a05"),
+                "the bar follows the picker"
+            );
+            key(&mut ed, Action::EnterNormal);
+            assert_eq!(ed.focus(), bar, "Esc comes back to the bar");
+            ed.set_focus(picker);
+            ed.run_ex("q");
+            assert_eq!(ed.focus(), bar, "and so does :q");
+            assert_eq!(ed.window_ids().len(), 3);
+            key(&mut ed, Action::YankColor(Format::Hex));
+            assert_eq!(ed.session.registers.front().unwrap().text, "#ff8a05");
+            key(&mut ed, Action::YankColor(Format::Bytes));
+            assert_eq!(ed.session.registers.front().unwrap().text, "255, 138, 5");
+            key(&mut ed, Action::EditValue);
+            assert!(
+                matches!(&ed.session.mode, Mode::Command(c) if c == "tool gradient t 0.5"),
+                "{:?}",
+                ed.session.mode
+            );
+        }
+
+        #[test]
+        fn tool_gradient_sets_reports_and_refuses() {
+            let (mut ed, source) = open();
+            let bar = plot_of(&ed, source);
+            ed.run_ex("tool gradient stop 3");
+            assert!(ed.gradient_status(bar).unwrap().starts_with("stop 3 of 3"));
+            ed.run_ex("tool gradient stop");
+            assert_eq!(ed.session.status, "gradient stop=3");
+            ed.run_ex("tool gradient stop 9");
+            assert_eq!(ed.session.status, "stop wants a whole number 1..3");
+            ed.run_ex("tool gradient stop 2");
+            ed.run_ex("tool gradient t 0.25");
+            assert_eq!(text(&ed), SRC.replace("0.5f", "0.25f"));
+            ed.run_ex("tool gradient t");
+            assert_eq!(ed.session.status, "gradient t=0.25");
+            ed.run_ex("tool gradient color #00ff00");
+            assert!(text(&ed).contains("{0.25f, \"#00ff00\"}"), "{}", text(&ed));
+            ed.run_ex("tool gradient color");
+            assert_eq!(ed.session.status, "gradient color=#00ff00");
+            ed.run_ex("tool gradient color #00ff0080");
+            assert_eq!(ed.session.status, "color wants #rrggbb");
+            ed.run_ex("tool gradient add 0.9");
+            assert!(
+                text(&ed).contains("{0.90f, \"#ddffdd\"}"),
+                "the copied stop keeps its decimals: {}",
+                text(&ed)
+            );
+            assert!(
+                ed.gradient_status(bar).unwrap().starts_with("stop 3 of 4  t 0.900"),
+                "{}",
+                ed.gradient_status(bar).unwrap()
+            );
+            ed.run_ex("tool gradient delete");
+            assert_eq!(text(&ed), SRC.replace("0.5f", "0.25f").replace("#ff8800", "#00ff00"));
+            ed.run_ex("tool gradient yank floats");
+            assert_eq!(ed.session.registers.front().unwrap().text, "1.000, 1.000, 1.000");
+            ed.run_ex("tool gradient step");
+            assert_eq!(ed.session.status, "gradient step=0.050");
+            ed.run_ex("tool gradient nope");
+            assert_eq!(ed.session.status, "gradient nope: not a thing to set (:tool gradient)");
+            ed.run_ex("tool gradient pick");
+            assert!(ed.is_color_picture(ed.focus()));
+            ed.run_ex("q");
+            assert_eq!(ed.focus(), bar);
+            ed.run_ex("q");
+            assert_eq!(ed.window_ids(), vec![source]);
+            ed.run_ex("tool gradient t 0.5");
+            assert_eq!(ed.session.status, "no gradient here (:set editor gradient)");
+        }
+
+        #[test]
+        fn a_hand_edit_redraws_and_losing_the_list_says_so() {
+            let (mut ed, source) = open();
+            let bar = plot_of(&ed, source);
+            ed.set_focus(source);
+            ed.set_cursor(Cursor::at(0));
+            ed.apply(cmd(Action::Operate {
+                op: Operator::Delete,
+                target: Target::Motion(Motion::CurrentLine),
+                count: 5,
+                sink: Sink::Ring,
+            }));
+            ed.set_focus(bar);
+            ed.apply(cmd(Action::Move(Motion::Left)));
+            assert_eq!(ed.session.status, "gradient lost");
+            assert!(ed.gradient_status(bar).is_none());
+        }
+
+        #[test]
+        fn enter_on_a_props_gradient_row_opens_the_bar_over_the_json() {
+            const SCHEMA: &str = r##"{"$dialect":"bi/1","types":{"Fx":{"kind":"struct","fields":[
+                {"name":"hp","type":"i32","default":10},
+                {"name":"ramp","type":"gradient"}]}}}"##;
+            const DATA: &str = "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"fx.bischema\",\n  \"instances\": [\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"fire\",\n      \"ramp\": [[0, \"#ff0000ff\"], [0.5, \"#ffff00ff\"], [1, \"#00000000\"]]\n    },\n    {\n      \"$type\": \"Fx\",\n      \"$id\": \"ice\"\n    }\n  ]\n}\n";
+            let d = ScratchDir::new("propsgradient")
+                .written("fx.bischema", SCHEMA)
+                .written("fx.bidata", DATA);
+            let mut ed = Editor::open(format!("{}/fx.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            let view = ed.focus();
+            let go = |ed: &mut Editor, c: PropsCmd| ed.apply(cmd(Action::Props(c)));
+            let row = |ed: &Editor| {
+                ed.window_of(view).unwrap().props().unwrap().selected_row().unwrap().clone()
+            };
+            const DOWN: PropsCmd = PropsCmd::Select { down: true, count: 1 };
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            assert_eq!(row(&ed).key, "inst:0/ramp");
+            assert_eq!(row(&ed).value, "3 stops");
+            go(&mut ed, PropsCmd::Enter);
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            let bar = bar_of(&ed);
+            assert_eq!(ed.focus(), bar);
+            assert_eq!(ed.gradient_status(bar).unwrap(), "stop 1 of 3  t 0.000  #ff0000ff");
+            key(&mut ed, Action::NextPoint { back: false });
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(text(&ed).contains("[0.55, \"#ffff00ff\"]"), "{}", text(&ed));
+            let crate::props::RowWidget::Gradient(cells) = row(&ed).widget else {
+                panic!("a gradient row")
+            };
+            assert_eq!(cells[0][0], 255, "the bricks follow");
+            key(&mut ed, Action::PickColor);
+            assert!(ed.is_color_picture(ed.focus()));
+            key(&mut ed, Action::NextPoint { back: true });
+            key(&mut ed, Action::Move(Motion::Left));
+            assert!(
+                text(&ed).contains("[0.55, \"#ffff00fa\"]"),
+                "the picker edits the JSON: {}",
+                text(&ed)
+            );
+            ed.run_ex("q");
+            assert_eq!(ed.focus(), bar);
+            ed.set_focus(view);
+            ed.run_ex("bi set fire.hp 12345");
+            ed.set_focus(bar);
+            key(&mut ed, Action::Move(Motion::Right));
+            assert!(
+                text(&ed).contains("[0.60, \"#ffff00fa\"]"),
+                "found again by path: {}",
+                text(&ed)
+            );
+            ed.run_ex("q");
+
+            go(&mut ed, PropsCmd::NextSection { back: false });
+            go(&mut ed, PropsCmd::Expand);
+            go(&mut ed, DOWN);
+            go(&mut ed, DOWN);
+            assert_eq!(row(&ed).key, "inst:1/ramp");
+            assert!(row(&ed).inherited);
+            ed.run_ex("set editor gradient");
+            assert_eq!(ed.window_ids().len(), 3, "{}", ed.session.status);
+            assert!(
+                text(&ed).contains("\"ramp\": [[0, \"#000000ff\"], [1, \"#ffffffff\"]]"),
+                "{}",
+                text(&ed)
+            );
         }
     }
 
@@ -32491,11 +34536,11 @@ int main(void) {
         }
 
         #[test]
-        fn closing_the_form_by_hand_drops_the_tool() {
+        fn closing_the_form_by_hand_drops_the_tool_and_its_result() {
             let (_d, mut ed, source) = open("close");
             ed.run_ex("q");
-            assert_eq!(ed.window_ids().len(), 2);
-            ed.set_focus(source);
+            assert_eq!(ed.window_ids(), vec![source], "the result went with the form");
+            assert_eq!(ed.focus(), source);
             ed.run_ex("tool normalmap strength 3");
             assert_eq!(ed.session.status, "no normal map here (:set editor normalmap)");
         }
@@ -32799,7 +34844,7 @@ int main(void) {
                 "tileset what? (size, kind, select, image resize, image grow)"
             );
             ed.run_ex("tool");
-            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap, curve)");
+            assert_eq!(ed.session.status, "tool what? (tileset, image, normalmap, curve, color, gradient)");
             ed.run_ex("tool lathe");
             assert_eq!(
                 ed.session.status,

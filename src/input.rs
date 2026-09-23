@@ -105,6 +105,10 @@ pub struct Input {
     /// keymap lookup, the way an operator's motion is, so a rebound `j`
     /// turns the way it moves. See `docs/specs/tileset.md`.
     turn_pending: bool,
+    /// `y` in an image window: the next key picks how a colour is
+    /// spelled — `h`, `f`, `r` — or is a second `y` for the tileset's
+    /// yank. See `docs/specs/color-picker.md`.
+    yank_pending: bool,
 }
 
 /// The keys that name a motion on their own. `G` is missing because what it
@@ -1135,6 +1139,41 @@ impl Input {
         if key.code == KeyCode::Char('r') && !ctrl && !self.window_pending && !self.g_pending {
             self.turn_pending = true;
             return None;
+        }
+        // A tool's picture: `yh`, `yf`, `yr` yank its colour; `yy` is
+        // still the tileset's yank, fed through the normal grammar as
+        // two keys. See `docs/specs/color-picker.md`.
+        if self.yank_pending {
+            self.yank_pending = false;
+            let format = match key.code {
+                KeyCode::Char('h') if !ctrl => Some(crate::color_picker::Format::Hex),
+                KeyCode::Char('f') if !ctrl => Some(crate::color_picker::Format::Floats),
+                KeyCode::Char('r') if !ctrl => Some(crate::color_picker::Format::Bytes),
+                _ => None,
+            };
+            return match format {
+                Some(format) => self.plain(Action::YankColor(format)),
+                None if key.code == KeyCode::Char('y') && !ctrl => {
+                    let y = Key { code: KeyCode::Char('y'), mods: key.mods };
+                    self.normal(y);
+                    self.normal(y)
+                }
+                None => {
+                    self.reset();
+                    None
+                }
+            };
+        }
+        if !ctrl && !self.window_pending && !self.g_pending && !self.mid_command() {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.yank_pending = true;
+                    return None;
+                }
+                KeyCode::Char('m') => return self.plain(Action::ToggleMode),
+                KeyCode::Char('c') => return self.plain(Action::PickColor),
+                _ => {}
+            }
         }
         // The curve's plot: `Enter` edits, `Tab` and `Shift-Tab` pick the
         // next and previous point. Nothing in the normal keymap claims

@@ -114,7 +114,10 @@ picture of its own: `:w` from the plot or the form writes the source
 buffer, and `:q` from either closes the plot and the form and puts the
 cursor back in the code. `Esc` is the softer way out — focus to the
 source, the tool still open, `Ctrl-W` back into it. `:set editor curve`
-on a source that already has the tool focuses its plot.
+on a source that already has the tool focuses its plot. Closing the plot
+or the form by any other way — `Ctrl-W q`, `:close` — closes the other
+one too and puts the cursor back in the code: a form with no plot, or a
+plot with no form, is half a tool, and the tool is gone either way.
 
 ## From the property view
 

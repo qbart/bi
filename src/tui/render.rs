@@ -1150,6 +1150,26 @@ fn render_props(
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(cells_at(&row.value, 8), value_style));
                     }
+                    RowWidget::Gradient(cells) => {
+                        // Sixteen bricks, each painted its sample, alphas
+                        // blended over the pane's ground.
+                        let ground = match ui.background {
+                            Some(ThemeColor::Rgb(r, g, b)) => [r, g, b],
+                            _ => [0, 0, 0],
+                        };
+                        for c in cells {
+                            let a = c[3] as f32 / 255.0;
+                            let mix = |i: usize| {
+                                (c[i] as f32 * a + ground[i] as f32 * (1.0 - a)).round() as u8
+                            };
+                            spans.push(Span::styled(
+                                "█",
+                                Style::default().fg(Color::Rgb(mix(0), mix(1), mix(2))),
+                            ));
+                        }
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(cells_at(&row.value, 8), value_style));
+                    }
                     RowWidget::Curve(samples) => {
                         const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
                         let bar: String =
@@ -1970,7 +1990,9 @@ fn window_status(ed: &Editor, id: WindowId, focused: bool, width: u16) -> Vec<Sp
     };
     let right = match (focused, image, tileset) {
         (true, true, _) if props.is_some() => format!(" {} ", props.clone().unwrap_or_default()),
-        (true, true, _) if ed.is_curve_plot(id) => " CURVE ".to_string(),
+        (true, true, _) if ed.tool_label(id).is_some() => {
+            format!(" {} ", ed.tool_label(id).unwrap_or_default())
+        }
         (true, true, true) => " TILESET ".to_string(),
         (true, false, _) => format!(" {} ", ed.session.mode.label()),
         _ => String::new(),
@@ -2037,9 +2059,10 @@ fn window_status_text(ed: &Editor, id: WindowId, focused: bool) -> String {
             if img.zoom() != 1.0 {
                 at.push_str(&format!(" {}x", img.zoom()));
             }
-            // A curve's plot says which point is picked, not how many
-            // pixels it was drawn at. See docs/specs/curve.md.
-            if let Some(point) = ed.curve_status(id) {
+            // A curve's plot says which point is picked, a picker which
+            // colour — not how many pixels it was drawn at. See
+            // docs/specs/curve.md and color-picker.md.
+            if let Some(point) = ed.tool_status(id) {
                 at = point;
             }
             if let Some(map) = img.tileset() {

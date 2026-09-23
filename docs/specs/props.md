@@ -43,6 +43,7 @@ row. The data view:
     leader      ‹ goblin_chief → Enemy ›  ⚠ no Enemy goblin_chief
     tint        ██ #c83c1e
     falloff     ▁▂▃▅▆▇██▇▆▅▃▂▁▁▁  5 points
+    ramp        ████████████████  3 stops
     damage      99                        ⚠ unknown key
 ```
 
@@ -50,6 +51,7 @@ A number with both `min` and `max` is a slider; a bool a checkbox; an
 enum, a ref or an optional a choice turned with `h` and `l`; a string its
 text; a struct or a list a fold; an `rgb` or `rgba` a brick painted its
 colour beside the hex; a `curve` a sparkline of its shape beside its point
+count; a `gradient` sixteen bricks sampled across it beside its stop
 count. A set value is drawn plainly, an inherited
 one dim, a read-only one muted; a warning rides on its row after `⚠`. A
 row's `doc` — the schema's — shows in the status row while it is selected.
@@ -117,7 +119,7 @@ h  ←         on a value: turn it down; otherwise close it, or go to the parent
 H  L         ten steps
 Backspace    the parent row
 Enter  i     on a value: edit it on the ex line — `:bi set goblin.hp 40`
-             on a curve: the curve editor over it — see below
+             on a colour, a curve, a gradient: its editor over it — see below
              otherwise open or close the row
 Space        flip a bool, cycle an enum or a ref, an optional between — and
              the inner value's default; a number one step up
@@ -142,26 +144,29 @@ step of it; the view re-reads the buffer after, so there is one direction
 of data flow and no second history. A read-only field (the schema's
 `readonly`) answers every one of these with `read-only`.
 
-## Colours and curves
+## Colours, curves and gradients
 
 An `rgb` or `rgba` row draws a brick — two cells painted the colour, an
 `rgba` blended over the pane's background by its alpha — and the hex after
-it. Nothing turns it: `Enter` puts the hex on the ex line, `dd` puts the
-default back.
+it. A `curve` row draws a sparkline, the curve sampled across sixteen
+cells with `y` clamped to `0..1`, and says how many points it has. A
+`gradient` row draws sixteen bricks sampled across the ramp and says how
+many stops. None of the three turns: `dd` puts the default back, and
+`Enter` opens the value's editor.
 
-A `curve` row draws a sparkline, the curve sampled across sixteen cells
-with `y` clamped to `0..1`, and says how many points it has. `Enter` on it
-opens the curve editor (`curve.md`) on that value: the plot splits to the
-right of the view, the form down the edge, focus on the plot, and the keys
-there move the points by rewriting the numbers in this buffer. The view
-re-reads after every one, so the sparkline follows the plot. An inherited
-curve is written into the instance first, as its own undo step, so there
-is a literal to edit; a read-only one refuses with `read-only`. `:set
-editor curve` on the view does the same as `Enter`. `Esc` on the plot
-comes back to the view with the tool open, `:q` closes it. When an edit
-made in the view moves the literal, the tool finds it again by its path
-rather than by its bytes, so editing `goblin.hp` above the curve does not
-lose the plot.
+`Enter` on a colour opens the colour picker (`color-picker.md`), on a
+curve the curve editor (`curve.md`), on a gradient the gradient editor
+(`gradient.md`), each over that value: the picture splits to the right
+of the view, the form down the edge, focus on the picture, and the keys
+there change the value by rewriting the JSON in this buffer. The view
+re-reads after every one, so the brick, the sparkline or the bricks
+follow. An inherited value is written into the instance first, as its own
+undo step, so there is a literal to edit; a read-only one refuses with
+`read-only`. `:set editor color`, `curve` and `gradient` on the view do
+the same as `Enter`. `Esc` on the picture comes back to the view with the
+tool open, `:q` closes it. When an edit made in the view moves the
+literal, the tool finds it again by its path rather than by its bytes, so
+editing `goblin.hp` above the curve does not lose the plot.
 
 ## Layout
 
@@ -222,7 +227,7 @@ type cannot carry, rather than refusing.
 string as typed, quotes optional and JSON escapes honoured inside them; an
 enum by name; a ref by id; `null`, `none` or `-` for an absent optional;
 a colour as hex with or without the `#`, six digits or eight; a list, a
-struct or a curve as JSON. A value that does not parse is refused naming
+struct, a curve or a gradient as JSON. A value that does not parse is refused naming
 what the field takes; a number outside `min..max` is written and warned
 about, as the format says. `:bi set <path>` with no value reports it, and
 `Enter` on an unset attribute or an absent optional prefills nothing, so
@@ -334,14 +339,16 @@ pub fn project_files(root: &Path, schema: &Path) -> Vec<PathBuf>;
 pub struct Props { kind, buffer, path, schema_path, raw: Value, schema, data,
                    diagnostics, index, rows: Vec<Row>, selected, expanded, collapsed, error, seen }
 pub enum RowWidget { Plain, Header, Group, Fold, Slider(f32), Check(bool), Choice, Toggle, Text,
-                     Color([u8; 4]), Curve([u8; 16]) }   // the brick's rgba; sixteen samples, 0..=7
+                     Color([u8; 4]), Curve([u8; 16]), Gradient([[u8; 4]; 16]) }
+                     // the brick's rgba; sixteen samples, 0..=7; sixteen sampled colours
 pub struct Row { pub key, pub depth, pub label, pub value, pub kind: RowKind, pub widget,
                  pub inherited, pub readonly, pub turnable, pub warning, pub doc,
                  pub expandable, pub expanded }
 pub enum Edit { Text(String), Prompt(String), Refactor { text, refactor } }
+pub enum ToolKind { Color, Curve, Gradient }
 impl Props {
-    pub fn curve_target(&self, key: &str) -> Result<Option<(String, Option<Edit>)>, String>;
-                                                       // a curve row: its path, and the edit that materialises it
+    pub fn tool_target(&self, key: &str) -> Result<Option<(ToolKind, String, Option<Edit>)>, String>;
+                                    // a colour, curve or gradient row: its path, and the edit that materialises it
     pub fn locate(&self, text: &str, path: &str) -> Option<(usize, usize)>;   // the value's bytes in the text
 }
 
