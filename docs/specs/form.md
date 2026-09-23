@@ -70,7 +70,8 @@ Space               toggle a bool, cycle a choice
 Enter  i            edit the value on the ex line: `:tool <owner> <field> <value>`
 u  Ctrl-R           undo, redo a change
 Tab                 cycle the form's cycle field, when it names one — see below
-Esc                 back to the picture the form belongs to
+Esc                 back to the picture the form belongs to; in a text tool's form
+                    — the curve's, the picker's, the gradient's — close the tool
 q                   close the form — and the tool that owns it, result and all
 :                   the ex line, so `:q` and `:tool …` are typeable here
 ```

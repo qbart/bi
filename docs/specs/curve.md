@@ -82,7 +82,7 @@ s                split the point's tangents, and join them again
 Space            pause the playhead, and let it run again — see below
 u  Ctrl-R        undo, redo — the source buffer's
 Enter            the point on the ex line: `:tool curve y 0.8`
-Esc              back to the source, the plot stays; in rotation mode, out of it
+Esc              close the tool, back where you came from; in rotation mode, out of it
 :                the ex line
 ```
 
@@ -181,9 +181,10 @@ naming what the field takes.
 **`:w` and `:q` are the code's.** The plot is a view of the source, not a
 picture of its own: `:w` from the plot or the form writes the source
 buffer, and `:q` from either closes the plot and the form and puts the
-cursor back in the code. `Esc` is the softer way out — focus to the
-source, the tool still open, `Ctrl-W` back into it. `:set editor curve`
-on a source that already has the tool focuses its plot. Closing the plot
+cursor back in the code. `Esc` on the plot or in the form is `:q` for
+the hand that is already on the keyboard: the tool closes and the focus
+goes back to the window you came from. `:set editor curve` on a source
+that already has the tool focuses its plot. Closing the plot
 or the form by any other way — `Ctrl-W q`, `:close` — closes the other
 one too and puts the cursor back in the code: a form with no plot, or a
 plot with no form, is half a tool, and the tool is gone either way.
@@ -388,8 +389,8 @@ point.
 - `u` on the plot restores the buffer's text and the plot redraws from it;
   editing a number by hand in the source redraws too.
 - `:w` on the plot writes the source's file; `:q` on the plot closes plot
-  and form and focuses the source; `Esc` focuses the source and leaves
-  the tool open.
+  and form and focuses the source; `Esc` on the plot or in the form does
+  the same.
 - `:tool curve x 0.5` moves the selected point and clamps to its
   neighbours; `:tool curve layout x,y` re-reads; `:tool curve point`
   reports `curve point=2`.

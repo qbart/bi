@@ -7226,6 +7226,13 @@ impl Editor {
             return;
         }
         if cmd == FormCmd::Leave {
+            // A text tool's form — the curve's, the picker's, the
+            // gradient's — closes with `Esc` as its picture does.
+            if let Some(index) =
+                self.tools.iter().position(|t| t.over_text() && t.form() == self.focus)
+            {
+                return self.close_tool(index);
+            }
             let home = self.form_home(self.focus).or(self.previous);
             if let Some(home) = home.filter(|&w| w != self.focus && self.window_of(w).is_some()) {
                 self.set_focus(home);
@@ -10180,11 +10187,12 @@ impl Editor {
         let mut state = tool.state;
         let step = tool.step;
         let alpha_step = (step * 255.0).round().max(1.0);
-        let back = tool.back.filter(|&b| self.window_of(b).is_some()).unwrap_or(tool.source);
         match &cmd.action {
             Action::Undo => self.tool_undo(tool.source, tool.buffer, false),
             Action::Redo => self.tool_undo(tool.source, tool.buffer, true),
-            Action::EnterNormal => self.set_focus(back),
+            // `Esc` is `:q` for the hand on the keyboard: the tool closes
+            // and the focus goes back where it came from.
+            Action::EnterNormal => self.close_tool(index),
             _ if tool.lost => self.session.status = "colour lost".into(),
             Action::NextPoint { back } => {
                 let next = tool.focus.next(*back, alpha);
@@ -10630,7 +10638,7 @@ impl Editor {
         match &cmd.action {
             Action::Undo => self.tool_undo(tool.source, tool.buffer, false),
             Action::Redo => self.tool_undo(tool.source, tool.buffer, true),
-            Action::EnterNormal => self.set_focus(tool.source),
+            Action::EnterNormal => self.close_tool(index),
             _ if tool.lost => self.session.status = "gradient lost".into(),
             Action::NextPoint { back } if n > 0 => {
                 let step = count % n;
@@ -11018,7 +11026,7 @@ impl Editor {
             Action::Redo => self.curve_undo(index, true),
             // `Esc` while rotating leaves the rotation, not the plot.
             Action::EnterNormal if tool.rotate => self.curve_set_rotate(index, false),
-            Action::EnterNormal => self.set_focus(tool.source),
+            Action::EnterNormal => self.close_tool(index),
             _ if tool.lost => self.session.status = "curve lost".into(),
             Action::Rotate => self.curve_set_rotate(index, !tool.rotate),
             Action::Split => self.curve_split(index),
@@ -34113,7 +34121,13 @@ int main(void) {
             ed.session.mode = Mode::Normal;
             key(&mut ed, Action::EnterNormal);
             assert_eq!(ed.focus(), source);
-            assert_eq!(ed.window_ids().len(), 3, "the tool stays open");
+            assert_eq!(ed.window_ids(), vec![source], "Esc closes the tool");
+            assert!(ed.tools.is_empty());
+            let (mut ed, source) = open();
+            ed.set_focus(form_of(&ed));
+            ed.apply(cmd(Action::Form(FormCmd::Leave)));
+            assert_eq!(ed.window_ids(), vec![source], "and so does Esc in the form");
+            assert_eq!(ed.focus(), source);
         }
 
         #[test]
@@ -34413,8 +34427,11 @@ int main(void) {
 
             let (mut ed, source) = open_on("#fb4934");
             key(&mut ed, Action::EnterNormal);
-            assert_eq!(ed.focus(), source, "Esc goes back; the tool stays");
+            assert_eq!(ed.focus(), source, "Esc goes back");
+            assert_eq!(ed.window_ids(), vec![source], "and closes the picker");
+            ed.run_ex("set editor color");
             assert_eq!(ed.window_ids().len(), 3);
+            ed.set_focus(source);
             ed.run_ex("set editor color");
             assert_eq!(ed.focus(), plot_of(&ed, source), "reopening focuses the picker");
             ed.run_ex("set editor");
@@ -34794,7 +34811,9 @@ int main(void) {
             );
             key(&mut ed, Action::EnterNormal);
             assert_eq!(ed.focus(), bar, "Esc comes back to the bar");
-            ed.set_focus(picker);
+            assert_eq!(ed.window_ids().len(), 3, "and closes the picker");
+            key(&mut ed, Action::PickColor);
+            assert_eq!(ed.window_ids().len(), 5);
             ed.run_ex("q");
             assert_eq!(ed.focus(), bar, "and so does :q");
             assert_eq!(ed.window_ids().len(), 3);

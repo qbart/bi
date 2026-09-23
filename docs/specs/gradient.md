@@ -38,7 +38,7 @@ c                the colour picker over this stop's colour
 yh  yf  yr       yank this stop's colour as hex, floats, bytes
 Enter            the stop on the ex line: `:tool gradient t 0.5`
 u  Ctrl-R        undo, redo — the source buffer's
-Esc              back to the source, the bar stays
+Esc              close the tool, back to the source
 :                the ex line
 ```
 
@@ -54,7 +54,7 @@ one.
 `c` opens the picker with the bar as the window to come back to — its
 picture split to the right of the bar, its form under the gradient's
 form, so the two pictures sit side by side and the two forms stack at
-the edge: `Esc` or `:q` in the picker lands on the bar, and while the picker is open
+the edge: `Esc` or `:q` in the picker closes it and lands on the bar, and while the picker is open
 every step it takes redraws the ramp, since both are views of one buffer.
 Every key that changes something is one edit of the source buffer and one
 undo step of it.

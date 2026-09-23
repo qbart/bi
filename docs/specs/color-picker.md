@@ -73,7 +73,7 @@ yf               as floats: `0.984, 0.286, 0.204`, and the alpha when the litera
 yr               as bytes: `251, 73, 52`, likewise
 Enter            the colour on the ex line: `:tool color hex #fb4934`
 u  Ctrl-R        undo, redo — the source buffer's
-Esc              back to where you came from, the picker stays
+Esc              close the picker, back to where you came from
 :                the ex line
 ```
 
