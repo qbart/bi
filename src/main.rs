@@ -33,6 +33,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let path = match parse_args(&args)? {
+        Invocation::Help(text) => {
+            print!("{text}");
+            return Ok(());
+        }
+        Invocation::Version => {
+            println!("bi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Invocation::ConfigInit => {
             let dir = config_dir().context("no HOME and no XDG_CONFIG_HOME — nowhere to write")?;
             return config_init(&dir);
@@ -142,9 +150,13 @@ fn main() -> Result<()> {
     result
 }
 
-/// What the command line asked for.
+/// What the command line asked for. See `docs/specs/cli.md`.
+#[derive(Debug)]
 enum Invocation {
     Open(Option<String>),
+    /// `--help`, or a command word alone: the list to print.
+    Help(&'static str),
+    Version,
     ConfigInit,
     ConfigEdit,
     /// `bi debug init` — a project's `.bi.toml` seeded with launch configs.
@@ -154,24 +166,81 @@ enum Invocation {
     GenSample(Option<bi::props::Kind>),
 }
 
-/// `config` and `debug` are subcommands only in the two-word form, so a file
-/// actually named `config` still opens.
+const USAGE: &str = "\
+bi — a text editor
+
+usage:
+  bi                             start empty
+  bi <path>                      open the file
+  bi -- <path>                   open the file, whatever it is called
+  bi config init                 the user config written, every default commented out
+  bi config edit                 the user config opened, written first when it is not there
+  bi debug init                  a project's .bi.toml seeded with launch configs
+  bi gen sample [schema|data]    the sample .bischema and .bidata written beside you
+  bi help <command>              one command's list
+  bi --help, -h                  this list
+  bi --version, -V               the version
+
+A command word wins over a file of the same name: `bi ./gen` or `bi -- gen`
+opens the file.
+";
+
+const CONFIG_USAGE: &str = "\
+usage: bi config <command>
+
+  init    the user config written, every default commented out
+  edit    the user config opened, written first when it is not there
+";
+
+const DEBUG_USAGE: &str = "\
+usage: bi debug <command>
+
+  init    a project's .bi.toml seeded with launch configs
+";
+
+const GEN_USAGE: &str = "\
+usage: bi gen <command>
+
+  sample [schema|data]    the sample .bischema and .bidata written beside you;
+                          `schema` or `data` for one of them
+";
+
+/// The list a command word prints on its own, or under `help`.
+fn usage_of(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "config" => CONFIG_USAGE,
+        "debug" => DEBUG_USAGE,
+        "gen" => GEN_USAGE,
+        _ => return None,
+    })
+}
+
+/// A command word wins over a file of the same name; `--` or a `./` puts
+/// the file back. See `docs/specs/cli.md`.
 fn parse_args(args: &[String]) -> Result<Invocation> {
-    match args {
-        [] => Ok(Invocation::Open(None)),
-        [one] => Ok(Invocation::Open(Some(one.clone()))),
-        [first, sub] if first == "config" => match sub.as_str() {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        [] | ["--"] => Ok(Invocation::Open(None)),
+        ["--", path] => Ok(Invocation::Open(Some((*path).to_string()))),
+        ["--help" | "-h" | "help"] => Ok(Invocation::Help(USAGE)),
+        ["help", word] => match usage_of(word) {
+            Some(text) => Ok(Invocation::Help(text)),
+            None => bail!("no such command: bi {word} — `bi --help` lists them"),
+        },
+        ["--version" | "-V"] => Ok(Invocation::Version),
+        [word] if usage_of(word).is_some() => Ok(Invocation::Help(usage_of(word).unwrap())),
+        ["config", sub] => match *sub {
             "init" => Ok(Invocation::ConfigInit),
             "edit" => Ok(Invocation::ConfigEdit),
             other => bail!("no such command: bi config {other} — try `init` or `edit`"),
         },
-        [first, sub] if first == "debug" => match sub.as_str() {
+        ["debug", sub] => match *sub {
             "init" => Ok(Invocation::DebugInit),
             other => bail!("no such command: bi debug {other} — try `init`"),
         },
-        [first, sub, rest @ ..] if first == "gen" => match (sub.as_str(), rest) {
+        ["gen", sub, rest @ ..] => match (*sub, rest) {
             ("sample", []) => Ok(Invocation::GenSample(None)),
-            ("sample", [kind]) => match kind.as_str() {
+            ("sample", [kind]) => match *kind {
                 "schema" | "bischema" => Ok(Invocation::GenSample(Some(bi::props::Kind::Schema))),
                 "data" | "bidata" => Ok(Invocation::GenSample(Some(bi::props::Kind::Data))),
                 other => bail!("no such sample: {other} — try `schema` or `data`"),
@@ -179,9 +248,11 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
             ("sample", _) => bail!("usage: bi gen sample [schema|data]"),
             (other, _) => bail!("no such command: bi gen {other} — try `sample`"),
         },
-        _ => bail!(
-            "usage: bi [path] | bi config init | bi config edit | bi debug init | bi gen sample [schema|data]"
-        ),
+        [flag] if flag.starts_with('-') => {
+            bail!("no such flag: {flag} — `bi --help` lists them, `bi -- {flag}` opens the file")
+        }
+        [one] => Ok(Invocation::Open(Some((*one).to_string()))),
+        _ => bail!("usage: bi [path] — `bi --help` lists the commands"),
     }
 }
 
@@ -681,16 +752,41 @@ mod tests {
         );
     }
 
+    /// See `docs/specs/cli.md`.
     #[test]
-    fn args_route_the_two_subcommands_and_nothing_else() {
+    fn args_route_the_commands_and_a_command_word_wins_over_a_file() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         assert!(matches!(parse_args(&args(&[])).unwrap(), Invocation::Open(None)));
         assert!(matches!(parse_args(&args(&["a.rs"])).unwrap(), Invocation::Open(Some(_))));
+        for flag in ["--help", "-h", "help"] {
+            assert!(
+                matches!(parse_args(&args(&[flag])).unwrap(), Invocation::Help(USAGE)),
+                "{flag}"
+            );
+        }
+        assert!(matches!(parse_args(&args(&["--version"])).unwrap(), Invocation::Version));
+        assert!(matches!(parse_args(&args(&["-V"])).unwrap(), Invocation::Version));
+        for word in ["config", "debug", "gen"] {
+            let alone = parse_args(&args(&[word])).unwrap();
+            let Invocation::Help(text) = alone else { panic!("bi {word} lists its commands") };
+            assert!(text.starts_with(&format!("usage: bi {word} <command>")), "{text}");
+            let helped = parse_args(&args(&["help", word])).unwrap();
+            assert!(matches!(helped, Invocation::Help(t) if t == text), "bi help {word}");
+        }
+        assert!(parse_args(&args(&["help", "nope"])).is_err());
         assert!(
-            matches!(parse_args(&args(&["config"])).unwrap(), Invocation::Open(Some(_))),
-            "a file named `config` still opens; the subcommand form takes two words"
+            matches!(parse_args(&args(&["--", "gen"])).unwrap(), Invocation::Open(Some(p)) if p == "gen"),
+            "`--` puts the file back"
         );
+        assert!(
+            matches!(parse_args(&args(&["./gen"])).unwrap(), Invocation::Open(Some(p)) if p == "./gen")
+        );
+        assert!(matches!(parse_args(&args(&["--"])).unwrap(), Invocation::Open(None)));
+        let err = parse_args(&args(&["--nope"])).unwrap_err().to_string();
+        assert!(err.contains("bi --help") && err.contains("bi -- --nope"), "{err}");
+        assert!(USAGE.contains("bi gen sample [schema|data]"));
+        assert!(GEN_USAGE.contains("sample [schema|data]"));
         assert!(matches!(parse_args(&args(&["config", "init"])).unwrap(), Invocation::ConfigInit));
         assert!(matches!(parse_args(&args(&["config", "edit"])).unwrap(), Invocation::ConfigEdit));
         assert!(parse_args(&args(&["config", "nope"])).is_err());
