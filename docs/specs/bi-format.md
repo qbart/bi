@@ -59,8 +59,8 @@ a type name; each value is a type definition with a `kind`.
 | `types`       | yes      | Object: type name → type definition  |
 
 Type names are identifiers (`[A-Za-z_][A-Za-z0-9_]*`), unique within the
-file, and may not shadow a primitive (`bool`, `i32`, …) or a built-in
-generic (`list`, `optional`, `ref`). PascalCase is the convention. Type
+file, and may not shadow a primitive (`bool`, `i32`, `u8`, …) or a
+built-in generic (`list`, `optional`, `ref`). PascalCase is the convention. Type
 definitions may reference each other in any order; recursion through
 `ref<T>` or `list<T>` is allowed, direct recursion by embedding (a struct
 containing itself as a plain field) is an error.
@@ -81,8 +81,14 @@ field object:
 | `name`              | yes      | Identifier, unique within the struct; the key used in data files |
 | `type`              | yes      | Type expression (next section)                          |
 | `default`           | no       | Value in that type's data encoding; replaces the implicit default |
-| `min`, `max`, `step`| no       | Numbers; only on numeric fields (`i32`, `i64`, `f32`, `f64`) |
+| `min`, `max`, `step`| no       | Numbers; only on numeric fields (the integer and float types) |
 | `doc`               | no       | One-line description                                    |
+| `group`, `order`, `label`, `readonly`, `show_if`, `hide_if`, `widget` | no | Layout for the property view — see `props.md` §Layout |
+
+A struct may also carry `groups`, an object of options per group name:
+`{ "Stats": { "collapsed": true, "doc": "…" } }`. Layout keys change how
+the editor draws the field and never what the data means; a reader that
+does not know them ignores them.
 
 The name is the field's identity: data files store values by name, and
 nothing else refers to a field. Renaming is therefore an editor action
@@ -135,7 +141,8 @@ allowed inside it:
 type      := primitive | name | generic
 generic   := ( "list" | "optional" | "ref" ) "<" type ">"
 name      := identifier             (a key of `types`)
-primitive := "bool" | "i32" | "i64" | "f32" | "f64" | "string"
+primitive := "bool" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+           | "f32" | "f64" | "string"
 ```
 
 Parse every type string once at schema load into a tree and validate each
@@ -145,7 +152,8 @@ is a schema error.
 | Expression       | Meaning                              | Data encoding                    | Implicit default |
 |------------------|--------------------------------------|----------------------------------|------------------|
 | `bool`           | boolean                              | `true` / `false`                 | `false`          |
-| `i32`, `i64`     | signed integer                       | JSON number without fraction     | `0`              |
+| `i8`, `i16`, `i32`, `i64` | signed integer              | JSON number without fraction, within the width | `0`   |
+| `u8`, `u16`, `u32`, `u64` | unsigned integer            | JSON number without fraction, within the width | `0`   |
 | `f32`, `f64`     | float                                | JSON number                      | `0`              |
 | `string`         | UTF-8 text                           | JSON string                      | `""`             |
 | `E` (enum name)  | one of `E.values`                    | JSON string equal to a value     | first value      |
@@ -255,7 +263,8 @@ or saving.
 | `default` not encodable as the field's type; `min`/`max`/`step` on a non-numeric field | schema | error |
 | `$type` not a struct in the schema; `$id` missing or not an identifier  | data   | error   |
 | Duplicate `($type, $id)` across the project                             | data   | error   |
-| Value not encodable as the field's type (string in an `i32`, unknown enum value) | data | error |
+| Value not encodable as the field's type (string in an `i32`, `300` in a `u8`, unknown enum value) | data | error |
+| `show_if`/`hide_if` naming no sibling; `widget` on a type it does not fit | schema | error |
 | Number outside `min`/`max`                                              | data   | warning |
 | ref to an id that does not exist for that type                          | data   | warning (dangling ref) |
 | Required ref field absent                                               | data   | warning |

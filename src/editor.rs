@@ -712,10 +712,13 @@ fn split_flags(arg: &str) -> std::result::Result<(Vec<String>, Vec<(String, Stri
 /// See `docs/specs/curve.md` §The form.
 fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f32) -> Form {
     use crate::form::Field;
-    let mut form = Form::with_cycle("curve", "Curve", "point");
+    // The point's fields are a readout: the plot's keys move a point by
+    // the curve's rules (sorted x, clamped to the neighbours), and a form
+    // that turned them freely could break those. Only the steps turn.
+    let mut form = Form::new("curve", "Curve");
     let n = curve.points.len();
     let p = curve.points.get(selected).copied().unwrap_or_default();
-    form.push(Field::int("point", "Point", 1, n.max(1) as i64, 1, selected as i64 + 1));
+    form.push(Field::int("point", "Point", 1, n.max(1) as i64, 1, selected as i64 + 1).readonly());
     let (x_min, x_max) = curve_x_bounds(curve, selected);
     let (_, (y0, y1)) = crate::curve::plot_range(curve);
     // A list read through the wrong layout can put the bounds in any
@@ -727,11 +730,11 @@ fn curve_form(curve: &crate::curve::Curve, selected: usize, xstep: f32, ystep: f
     let (x_min, x_max) = sorted(x_min, x_max);
     let (y0, y1) = sorted(y0, y1);
     let (out, in_) = (sorted(p.out, p.out).0, sorted(p.in_, p.in_).0);
-    form.push(Field::float("x", "X", x_min, x_max, xstep, p.x));
-    form.push(Field::float("y", "Y", y0, y1, ystep, p.y));
-    form.push(Field::float("out", "Out", out, out, 0.1, out));
-    form.push(Field::float("in", "In", in_, in_, 0.1, in_));
-    form.push(Field::bool("locked", "Locked", p.locked));
+    form.push(Field::float("x", "X", x_min, x_max, xstep, p.x).readonly());
+    form.push(Field::float("y", "Y", y0, y1, ystep, p.y).readonly());
+    form.push(Field::float("out", "Out", out, out, 0.1, out).readonly());
+    form.push(Field::float("in", "In", in_, in_, 0.1, in_).readonly());
+    form.push(Field::bool("locked", "Locked", p.locked).readonly());
     form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, xstep));
     form.push(Field::float("ystep", "Y step", 0.001, 1.0, 0.001, ystep));
     form
@@ -2933,6 +2936,16 @@ pub enum PropsCmd {
     Delete,
     /// `gd` — a ref's target.
     Goto,
+    /// `Backspace` — the parent row.
+    Parent,
+    /// `J` / `K` — the row moved among its siblings.
+    Move {
+        down: bool,
+    },
+    /// `Tab` / `Shift-Tab` — the next or previous instance or type.
+    NextSection {
+        back: bool,
+    },
     Undo,
     Redo,
 }
@@ -3031,12 +3044,15 @@ impl Editor {
         else {
             return;
         };
-        if let Err(e) = self.open_props(window, kind) {
+        if let Err(e) = self.open_props(window, kind, false) {
             self.session.status = e;
         }
     }
 
     /// `:set editor bischema|bidata`: the focused text window as the view.
+    /// An empty buffer gets the skeleton first; a broken one keeps the view
+    /// up with the error, so `:bi init`, `:bi schema` and `:bi migrate`
+    /// can mend it.
     fn set_editor_props(&mut self, kind: crate::props::Kind) {
         if let Some(props) = self.window().props() {
             if props.kind == kind {
@@ -3044,21 +3060,58 @@ impl Editor {
             }
             self.props_to_text(self.focus);
         }
-        if self.window().text().is_none() {
+        let Some(buffer) = self.window().text().map(|t| t.buffer) else {
             self.session.status = "no text here".into();
             return;
+        };
+        self.props_text.retain(|&b| b != buffer);
+        if self.entry(buffer).buffer.rope().to_string().trim().is_empty() {
+            let schema = self.guess_schema(buffer);
+            let text = crate::props::Props::skeleton(kind, schema.as_deref());
+            self.splice_buffer(buffer, &text);
         }
-        if let Some(buffer) = self.window().buffer() {
-            self.props_text.retain(|&b| b != buffer);
-        }
-        if let Err(e) = self.open_props(self.focus, kind) {
+        if let Err(e) = self.open_props(self.focus, kind, true) {
             self.session.status = e;
+        }
+        if kind == crate::props::Kind::Data
+            && self.window().props().is_some_and(|p| p.error.as_deref() == Some("no $schema"))
+        {
+            self.session.status = "no $schema — `:bi schema <path>` names the schema file".into();
         }
     }
 
-    /// The window's text replaced by the view over the same buffer, or
-    /// left as it was with the reason.
-    fn open_props(&mut self, window: WindowId, kind: crate::props::Kind) -> Result<(), String> {
+    /// The one `.bischema` beside the buffer's file, for a fresh data file
+    /// to point at.
+    fn guess_schema(&self, buffer: BufferId) -> Option<String> {
+        let path = self.entry(buffer).buffer.path.clone()?;
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|e| crate::props::kind_of(&e.path()) == Some(crate::props::Kind::Schema))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        match found.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
+    /// The window's text replaced by the view over the same buffer. A file
+    /// that does not read stays text when the extension asked for the view
+    /// and keeps the view, showing the error, when the user asked for it
+    /// by `:set editor`.
+    fn open_props(
+        &mut self,
+        window: WindowId,
+        kind: crate::props::Kind,
+        explicit: bool,
+    ) -> Result<(), String> {
         let Some(text) = self.window_of(window).and_then(Window::text) else {
             return Err("no text here".into());
         };
@@ -3070,7 +3123,13 @@ impl Editor {
             w.content = Content::Props(Box::new(props));
         }
         match self.load_props(window, true) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(props) = self.window_mut_of(window).and_then(Window::props_mut) {
+                    props.expand_first();
+                }
+                Ok(())
+            }
+            Err(e) if explicit => Err(e),
             Err(e) => {
                 let mut text = Text::new(buffer);
                 text.selections = Selections::from_pairs(pairs);
@@ -3299,12 +3358,15 @@ impl Editor {
         }
     }
 
-    /// A key in the focused property view. See `docs/specs/props.md`.
+    /// A key in the focused property view. `h` and `l` turn a value row
+    /// and open or close anything else. See `docs/specs/props.md`.
     fn run_props_cmd(&mut self, cmd: PropsCmd) {
         let window = self.focus;
         let height = self.window().height;
         let Some(props) = self.window_mut().props_mut() else { return };
-        let key = props.selected_row().map(|r| r.key.clone()).unwrap_or_default();
+        let (key, turnable) =
+            props.selected_row().map(|r| (r.key.clone(), r.turnable)).unwrap_or_default();
+        let mut select_after = None;
         let result: Result<Option<crate::props::Edit>, String> = match cmd {
             PropsCmd::Select { down, count } => {
                 props.select_by(if down { count as isize } else { -(count as isize) });
@@ -3324,11 +3386,27 @@ impl Editor {
                 Ok(None)
             }
             PropsCmd::Expand => {
-                props.expand();
-                Ok(None)
+                if turnable {
+                    props.turn(&key, 1, false).map(Some)
+                } else {
+                    props.expand();
+                    Ok(None)
+                }
             }
             PropsCmd::Collapse => {
-                props.collapse();
+                if turnable {
+                    props.turn(&key, -1, false).map(Some)
+                } else {
+                    props.collapse();
+                    Ok(None)
+                }
+            }
+            PropsCmd::Parent => {
+                props.parent();
+                Ok(None)
+            }
+            PropsCmd::NextSection { back } => {
+                props.next_section(back);
                 Ok(None)
             }
             PropsCmd::Enter => match props.edit_line(&key) {
@@ -3340,6 +3418,10 @@ impl Editor {
             },
             PropsCmd::Toggle => props.turn(&key, 1, true).map(Some),
             PropsCmd::Nudge(steps) => props.turn(&key, steps, false).map(Some),
+            PropsCmd::Move { down } => props.shift(&key, down).map(|(edit, key)| {
+                select_after = Some(key);
+                Some(edit)
+            }),
             PropsCmd::Add => props.add(&key).map(Some),
             PropsCmd::Delete => props.delete(&key).map(Some),
             PropsCmd::Goto => {
@@ -3355,6 +3437,11 @@ impl Editor {
             Err(e) => self.session.status = e,
         }
         self.sync_tools();
+        if let Some(key) = select_after
+            && let Some(props) = self.window_mut_of(window).and_then(Window::props_mut)
+        {
+            props.select_key(&key);
+        }
     }
 
     /// `gd` on a ref: the target's row here, or its file opened on it.
@@ -3472,13 +3559,15 @@ impl Editor {
     /// `:bi …` — the property view's ex surface. See `docs/specs/props.md`.
     fn bi_command(&mut self, arg: &str) {
         use crate::props::{Edit, Kind, Props, Refactor};
-        const WHAT: &str = "bi what? (set, new, delete, add, rename, remap, prune, migrate)";
+        const WHAT: &str =
+            "bi what? (set, new, delete, add, rename, remap, prune, init, schema, migrate)";
         let (what, rest) = match arg.trim().split_once(char::is_whitespace) {
             Some((what, rest)) => (what, rest.trim()),
             None => (arg.trim(), ""),
         };
         let window = self.focus;
-        if what == "migrate" {
+        // The commands that mend a file work without a readable view.
+        if matches!(what, "migrate" | "init" | "schema") {
             let Some(buffer) = self.window().buffer() else {
                 self.session.status = "no buffer in this window".into();
                 return;
@@ -3487,17 +3576,34 @@ impl Editor {
                 self.entry(buffer).buffer.path.as_deref().and_then(crate::props::kind_of)
             });
             let Some(kind) = kind else {
-                self.session.status = "not a .bidata or .bischema".into();
+                self.session.status =
+                    "not a .bidata or .bischema (:set editor bidata first)".into();
                 return;
             };
             let text = self.entry(buffer).buffer.rope().to_string();
-            match Props::migrate(&text, kind) {
-                Ok(new) => {
+            let result = match what {
+                "migrate" => Props::migrate(&text, kind)
+                    .map(|t| (t, format!("migrated to {}", crate::props::DIALECT))),
+                "init" => {
+                    let schema = self.guess_schema(buffer);
+                    Ok((Props::skeleton(kind, schema.as_deref()), String::new()))
+                }
+                _ if kind != Kind::Data => Err("a schema names no schema".into()),
+                _ if rest.is_empty() => {
+                    let current = crate::props::data::schema_of(&text).unwrap_or_default();
+                    Err(format!("$schema = {current}"))
+                }
+                _ => Props::with_schema_ref(&text, rest).map(|t| (t, String::new())),
+            };
+            match result {
+                Ok((new, status)) => {
                     self.splice_buffer(buffer, &new);
-                    self.session.status = format!("migrated to {}", crate::props::DIALECT);
+                    self.session.status = status;
                     if self.window().props().is_none() {
                         self.props_text.retain(|&b| b != buffer);
-                        self.auto_props(window);
+                        if let Err(e) = self.open_props(window, kind, true) {
+                            self.session.status = e;
+                        }
                     }
                 }
                 Err(e) => self.session.status = e,
@@ -3513,8 +3619,16 @@ impl Editor {
             };
             return;
         };
+        if props.error.is_some() && !what.is_empty() {
+            self.session.status = format!(
+                "{} — fix the file first (:set editor text)",
+                props.error.clone().unwrap_or_default()
+            );
+            return;
+        }
         let args: Vec<&str> = rest.split('#').next().unwrap_or("").split_whitespace().collect();
         let mut pruned = None;
+        let mut select_after: Option<String> = None;
         let result: Result<Edit, String> = match what {
             "" => Err(WHAT.into()),
             "set" => match rest.split_once(char::is_whitespace) {
@@ -3530,10 +3644,16 @@ impl Editor {
                 [ty, id] => props.delete_instance(ty, id),
                 _ => Err("delete what? (`:bi delete <Type> <id>`)".into()),
             },
-            "add" => props.add_to_schema(&args),
+            "add" => props.add_to_schema(&args).map(|(edit, key)| {
+                select_after = key;
+                edit
+            }),
             "rename" => match args.as_slice() {
                 [spec, new] => props.rename(spec, new),
-                _ => Err("rename what? (`:bi rename <Type>.<old> <new>`)".into()),
+                _ => {
+                    Err("rename what? (`:bi rename <Type>.<old> <new>`, `:bi rename <Type> <New>`)"
+                        .into())
+                }
             },
             "remap" => match args.as_slice() {
                 [spec, new] if props.kind == Kind::Data => match spec.split_once('.') {
@@ -3557,7 +3677,7 @@ impl Editor {
                 edit
             }),
             other => Err(format!(
-                "not a bi command: {other} (want set, new, delete, add, rename, remap, prune, migrate)"
+                "not a bi command: {other} (want set, new, delete, add, rename, remap, prune, init, schema, migrate)"
             )),
         };
         match result {
@@ -3570,11 +3690,15 @@ impl Editor {
                 };
                 self.apply_props_edit(window, edit);
                 self.sync_tools();
-                if what == "new"
-                    && let [ty, id] = args.as_slice()
-                    && let Some(props) = self.window_mut_of(window).and_then(Window::props_mut)
-                {
-                    props.select_instance(ty, id);
+                if let Some(props) = self.window_mut_of(window).and_then(Window::props_mut) {
+                    if what == "new"
+                        && let [ty, id] = args.as_slice()
+                    {
+                        props.select_instance(ty, id);
+                    }
+                    if let Some(key) = select_after {
+                        props.reveal(&key);
+                    }
                 }
             }
             Err(e) => self.session.status = e,
@@ -9129,6 +9253,7 @@ impl Editor {
     /// `:tool curve <field> [value]` and `:tool curve layout <fields>`,
     /// from any of the tool's three windows. See `docs/specs/curve.md`.
     fn curve_tool(&mut self, arg: &str) {
+        use crate::curve::Field;
         let Some(index) = self.curve_at(self.focus) else {
             self.session.status = "no curve here (:set editor curve)".into();
             return;
@@ -9156,6 +9281,29 @@ impl Editor {
                 }
                 Err(e) => self.session.status = e,
             },
+            // The point's fields are read-only in the form; the ex forms
+            // move the point by the curve's own rules instead.
+            "point" | "x" | "y" if !value.is_empty() => {
+                let n = tool.curve.points.len();
+                self.session.status = match what {
+                    "point" => match value.parse::<usize>() {
+                        Ok(p) if p >= 1 && p <= n => {
+                            self.curve_select(index, p - 1);
+                            String::new()
+                        }
+                        _ => format!("point wants a whole number 1..{n}"),
+                    },
+                    field => match value.parse::<f32>() {
+                        Ok(v) if v.is_finite() => {
+                            let field = if field == "x" { Field::X } else { Field::Y };
+                            self.curve_set(index, field, v);
+                            String::new()
+                        }
+                        _ => format!("{field} wants a number"),
+                    },
+                };
+                self.sync_tools();
+            }
             "point" | "x" | "y" | "xstep" | "ystep" => {
                 let Some(form) = self.window_mut_of(tool.form).and_then(Window::form_mut) else {
                     return;
@@ -31194,8 +31342,9 @@ int main(void) {
             let ed = open(&d);
             assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
             assert_eq!(props(&ed).kind, Kind::Data);
-            assert_eq!(props(&ed).rows.len(), 5);
-            assert_eq!(ed.props_status(ed.focus()), Some(("level1.bidata".into(), "1/5".into())));
+            assert_eq!(props(&ed).rows.len(), 11, "the first instance is open");
+            assert!(props(&ed).rows[0].expanded);
+            assert_eq!(ed.props_status(ed.focus()), Some(("level1.bidata".into(), "1/11".into())));
             assert!(ed.buffer().is_some(), "the buffer is the file's");
 
             let d = ScratchDir::new("nodialect")
@@ -31242,18 +31391,86 @@ int main(void) {
             ed.run_ex("set editor bischema");
             assert_eq!(
                 ed.content_kind_of(ed.focus()),
-                Some(ContentKind::Text),
-                "not a schema: refused back to text"
+                Some(ContentKind::Props),
+                "asked for by hand: the view stays, with the error"
             );
-            assert!(ed.session.status.contains("no types object"), "{}", ed.session.status);
+            assert_eq!(props(&ed).error.as_deref(), Some("no types object"));
+            assert_eq!(ed.session.status, "no types object");
+            ed.run_ex("bi set x y");
+            assert_eq!(
+                ed.session.status,
+                "no types object — fix the file first (:set editor text)"
+            );
+            ed.run_ex("set editor bidata");
+            assert_eq!(props(&ed).error, None);
+        }
+
+        #[test]
+        fn an_empty_buffer_gets_the_skeleton_and_a_broken_one_is_mended() {
+            let d = ScratchDir::new("skeleton")
+                .written("game.bischema", SCHEMA)
+                .written("new.bidata", "");
+            let mut ed = Editor::open(format!("{}/new.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            assert_eq!(
+                ed.content_kind_of(ed.focus()),
+                Some(ContentKind::Text),
+                "empty: not read by the extension"
+            );
+            ed.run_ex("set editor bidata");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            assert_eq!(
+                text(&ed),
+                "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"game.bischema\",\n  \"instances\": []\n}\n",
+                "the one schema beside it is guessed"
+            );
+            assert_eq!(props(&ed).error, None);
+            ed.run_ex("bi new Weapon sword");
+            assert!(text(&ed).contains("\"$id\": \"sword\""));
+            // A broken file: the view stays up, and `:bi init` mends it.
+            let d = ScratchDir::new("broken")
+                .written("a.bischema", SCHEMA)
+                .written("b.bischema", SCHEMA)
+                .written("bad.bidata", "{ not json");
+            let mut ed = Editor::open(format!("{}/bad.bidata", d.path())).unwrap();
+            sized(&mut ed);
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Text));
+            ed.run_ex("set editor bidata");
+            assert_eq!(ed.content_kind_of(ed.focus()), Some(ContentKind::Props));
+            assert!(props(&ed).error.as_deref().unwrap().starts_with("invalid JSON"));
+            assert_eq!(props(&ed).rows[0].kind, RowKind::Error);
+            ed.run_ex("bi init");
+            assert_eq!(
+                props(&ed).error.as_deref(),
+                Some("no $schema"),
+                "two schemas beside it: none guessed"
+            );
+            assert_eq!(
+                text(&ed),
+                "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"\",\n  \"instances\": []\n}\n"
+            );
+            ed.run_ex("bi schema");
+            assert_eq!(ed.session.status, "$schema = ");
+            ed.run_ex("bi schema a.bischema");
+            assert_eq!(props(&ed).error, None);
+            assert!(text(&ed).contains("\"$schema\": \"a.bischema\""));
+            ed.run_ex("bi schema");
+            assert_eq!(ed.session.status, "$schema = a.bischema");
+            go(&mut ed, &[PropsCmd::Undo]);
+            assert!(props(&ed).error.is_some(), "one undo step back to no $schema");
         }
 
         #[test]
         fn the_keys_edit_the_buffer_as_one_undo_step_and_the_view_follows() {
             let d = project("keys");
             let mut ed = open(&d);
-            go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN]);
+            const NEXT: PropsCmd = PropsCmd::NextSection { back: false };
+            go(&mut ed, &[NEXT, NEXT, NEXT, PropsCmd::Expand, DOWN, DOWN]);
             assert_eq!(key(&ed), "inst:3/hp");
+            go(&mut ed, &[PropsCmd::Expand]);
+            assert!(text(&ed).contains("\"hp\": 41"), "l on a value turns it: {}", text(&ed));
+            go(&mut ed, &[PropsCmd::Collapse]);
+            assert!(text(&ed).contains("\"hp\": 40"), "h turns it back");
             go(&mut ed, &[PropsCmd::Nudge(5)]);
             assert!(text(&ed).contains("\"hp\": 45"));
             assert_eq!(props(&ed).selected_row().unwrap().value, "45");
@@ -31279,10 +31496,16 @@ int main(void) {
                 text(&ed)
             );
             assert_eq!(key(&ed), "inst:3/spawn", "the row that took the deleted one's place");
+            go(&mut ed, &[PropsCmd::Parent]);
+            assert_eq!(key(&ed), "inst:3", "Backspace: to the parent");
             go(&mut ed, &[PropsCmd::Collapse]);
-            assert_eq!(key(&ed), "inst:3", "to the parent");
-            go(&mut ed, &[PropsCmd::Collapse]);
-            assert!(!props(&ed).selected_row().unwrap().expanded);
+            assert!(!props(&ed).selected_row().unwrap().expanded, "h on a fold closes it");
+            go(&mut ed, &[PropsCmd::Move { down: true }]);
+            assert_eq!(key(&ed), "inst:4", "J moved the instance and followed it");
+            assert_eq!(props(&ed).selected_row().unwrap().label, "Enemy goblin");
+            go(&mut ed, &[PropsCmd::NextSection { back: true }]);
+            assert_eq!(key(&ed), "inst:3");
+            assert_eq!(props(&ed).selected_row().unwrap().label, "Enemy goblin_chief");
             assert_eq!(ed.props_status(ed.focus()).unwrap().0, "level1.bidata +");
         }
 
@@ -31290,7 +31513,8 @@ int main(void) {
         fn enter_prefills_the_ex_line_and_bi_set_writes() {
             let d = project("enter");
             let mut ed = open(&d);
-            go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Enter]);
+            const NEXT: PropsCmd = PropsCmd::NextSection { back: false };
+            go(&mut ed, &[NEXT, NEXT, NEXT, PropsCmd::Enter]);
             assert!(props(&ed).selected_row().unwrap().expanded, "Enter opens an instance");
             go(&mut ed, &[DOWN, DOWN, PropsCmd::Enter]);
             assert!(
@@ -31302,13 +31526,13 @@ int main(void) {
             ed.run_ex("bi set goblin.hp");
             assert_eq!(ed.session.status, "goblin.hp = 41");
             ed.run_ex("bi set goblin.hp lots");
-            assert_eq!(ed.session.status, "goblin.hp wants a whole number");
+            assert_eq!(ed.session.status, "goblin.hp wants a whole number -2147483648..2147483647");
             ed.run_ex("bi set rusty_sword.name Iron Sword of Doom");
             assert!(text(&ed).contains("\"name\": \"Iron Sword of Doom\""));
             ed.run_ex("bi");
             assert_eq!(
                 ed.session.status,
-                "bi what? (set, new, delete, add, rename, remap, prune, migrate)"
+                "bi what? (set, new, delete, add, rename, remap, prune, init, schema, migrate)"
             );
             ed.run_ex("bi new Enemy orc");
             assert!(text(&ed).contains("\"$id\": \"orc\""));
@@ -31340,9 +31564,10 @@ int main(void) {
                 r#"{"$dialect":"bi/1","$schema":"game.bischema","instances":[{"$type":"Weapon","$id":"axe","name":"Axe"}]}"#,
             );
             let mut ed = open(&d);
+            const NEXT: PropsCmd = PropsCmd::NextSection { back: false };
             go(
                 &mut ed,
-                &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN, DOWN, DOWN, PropsCmd::Goto],
+                &[NEXT, NEXT, NEXT, PropsCmd::Expand, DOWN, DOWN, DOWN, DOWN, PropsCmd::Goto],
             );
             assert_eq!(key(&ed), "inst:0");
             assert!(props(&ed).selected_row().unwrap().expanded);
@@ -31474,9 +31699,19 @@ int main(void) {
             let view = ed.window_of(data).unwrap().props().unwrap();
             let rarity = view.rows.iter().find(|r| r.key == "inst:0/rarity").unwrap();
             assert_eq!((rarity.value.as_str(), rarity.inherited), ("epic", true));
-            ed.run_ex("bi add Weapon speed f32");
+            ed.run_ex("bi add Weapon speed:f32 weight:u8");
             let view = ed.window_of(data).unwrap().props().unwrap();
             assert!(view.rows.iter().any(|r| r.key == "inst:0/speed"));
+            assert!(view.rows.iter().any(|r| r.key == "inst:0/weight"));
+            assert_eq!(key(&ed), "type:Weapon/field:weight", "the last thing added is selected");
+            ed.run_ex("bi add Rarity mythic legendary");
+            assert_eq!(key(&ed), "type:Rarity/value:4");
+            ed.run_ex("bi rename Weapon Arm");
+            assert_eq!(ed.session.status, "renamed in 1 other file");
+            let view = ed.window_of(data).unwrap().props().unwrap();
+            assert_eq!(view.error, None);
+            assert_eq!(view.rows[0].label, "Arm rusty_sword");
+            ed.run_ex("bi rename Arm Weapon");
             go(&mut ed, &[PropsCmd::Last, PropsCmd::Expand]);
             assert_eq!(key(&ed), "type:Enemy");
             go(&mut ed, &[DOWN, DOWN, DOWN, PropsCmd::Expand, DOWN, DOWN, PropsCmd::Nudge(1)]);
@@ -31820,19 +32055,32 @@ int main(void) {
         }
 
         #[test]
-        fn turning_y_in_the_form_edits_the_code_and_tab_cycles_the_point() {
+        fn the_form_shows_the_point_read_only_and_turns_only_the_steps() {
             let (mut ed, source) = open();
             let plot = plot_of(&ed, source);
             ed.set_focus(form_of(&ed));
             ed.run_form_cmd(FormCmd::Select { down: true, count: 2 }); // point → x → y
             ed.run_form_cmd(FormCmd::Nudge(1));
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
+            assert_eq!(text(&ed), CPP, "y is a readout");
             ed.run_form_cmd(FormCmd::CycleMap);
-            assert!(ed.curve_status(plot).unwrap().starts_with("point 3 of 3"));
+            assert!(
+                ed.curve_status(plot).unwrap().starts_with("point 2 of 3"),
+                "Tab cycles nothing here"
+            );
+            assert_eq!(ed.session.status, "nothing to cycle");
+            ed.run_form_cmd(FormCmd::Select { down: true, count: 4 }); // → xstep
+            ed.run_form_cmd(FormCmd::Nudge(1));
+            ed.run_ex("tool curve xstep");
+            assert_eq!(ed.session.status, "curve xstep=0.101");
+            assert_eq!(text(&ed), CPP, "a step is the tool's, not the code's");
+            ed.set_focus(plot);
+            key(&mut ed, Action::Move(Motion::Up));
+            assert!(text(&ed).contains("0.9f"), "{}", text(&ed));
+            ed.set_focus(form_of(&ed));
             ed.run_form_cmd(FormCmd::Undo);
             assert_eq!(text(&ed), CPP, "the form's u is the buffer's");
             ed.run_form_cmd(FormCmd::Redo);
-            assert_eq!(text(&ed), CPP.replace("0.8f", "0.9f"));
+            assert!(text(&ed).contains("0.9f"));
         }
 
         #[test]

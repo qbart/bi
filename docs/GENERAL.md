@@ -601,8 +601,10 @@ keybinding ran. See [docs/specs/cmdline-history.md](specs/cmdline-history.md).
 | `:set editor bidata\|bischema\|text` | the property view over this buffer, or the text back; bare, reports which is up |
 | `:bi set <path> [value]` | a value by path — `goblin.hp 40`, `dagger.offset.x 0.25`, `goblin.drops[1] axe`, `Weapon.damage.default 10` in a schema; bare, reports it |
 | `:bi new <Type> <id>` `:bi delete <Type> <id>` | an instance added at the end, or removed |
-| `:bi add <Type> <field> <type>` | a field on a struct; `:bi add <Enum> <value>` a value; `:bi add <Name> struct\|enum` a type |
-| `:bi rename <Type>.<old> <new>` | a field or enum value in a schema, an id in a data file — every data file of the schema rewritten |
+| `:bi add <Name> struct [f:t …]` | a struct with its fields — `:bi add Color struct r:u8 g:u8 b:u8`; `:bi add <Name> enum [v …]` an enum with its values |
+| `:bi add <Type> <f>:<t> …` | fields on a struct (`:bi add Weapon speed f32` for one); `:bi add <Enum> <v> …` values on an enum |
+| `:bi rename <Type>.<old> <new>` | a field or enum value in a schema, an id in a data file — every data file of the schema rewritten; `:bi rename <Type> <New>` a type |
+| `:bi init` `:bi schema [path]` | the skeleton written over the buffer; a data file's `$schema` set or reported — both work on a broken file |
 | `:bi remap <Type>.<old> <new>` | an unknown key renamed across the data files, after a rename made by hand |
 | `:bi prune` `:bi migrate` | every unknown key of this file removed; an older `$dialect` brought up to `bi/1` |
 | `:sp [path]` `:vs [path]` | split below / right; bare, the new window duplicates this one |
@@ -864,25 +866,34 @@ filesystem. Nothing in it enters insert mode, so a tree never can be.
 ### The property view
 
 A `.bischema` or `.bidata` — the bi property format, see
-[docs/specs/bi-format.md](specs/bi-format.md) — opens as a tree of rows over
-its buffer instead of as text: one row per field of every instance, a set
-value plain and an inherited one dim, a warning after `⚠` on the row it is
-about. `:set editor bidata` or `:set editor bischema` does the same for a
-file without the extension, and `:set editor text` puts the text back. The
-file stays the file: `:w`, `:q`, `u` and the modified marker are the
-buffer's, and every key below is one edit of it and one undo step. See
-[docs/specs/props.md](specs/props.md).
+[docs/specs/bi-format.md](specs/bi-format.md) — opens over its buffer as a
+property view instead of as text. A data file draws as a form: a section
+per instance, every field a widget — a slider for a ranged number, `[x]`
+for a bool, `‹ value ›` for an enum, a ref or an optional — grouped,
+ordered, labelled and hidden as the schema's layout attributes say, a set
+value plain and an inherited one dim, a warning after `⚠`. A schema draws
+as a tree of types, fields and attributes. `:set editor bidata` or `:set
+editor bischema` does the same for a file without the extension — an empty
+buffer gets the skeleton written first, a broken one keeps the view with
+the error so `:bi init` or `:bi schema` can mend it — and `:set editor
+text` puts the text back. The file stays the file: `:w`, `:q`, `u` and the
+modified marker are the buffer's, and every key below is one edit of it
+and one undo step. See [docs/specs/props.md](specs/props.md).
 
 | Key | Does |
 |---|---|
 | `j` `k` `gg` `G` `Ctrl-D` `Ctrl-U` | pick a row, with a count |
-| `l` / `→` | open a struct, a list, a type or a field's attributes |
-| `h` / `←` | close it, or go to the parent row |
-| `Enter` `i` | open a row with children; on a value, edit it on the ex line — `:bi set goblin.hp 40` |
-| `Space` | flip a bool; cycle an enum, a ref through the ids of its type, an optional between `—` and a value |
-| `Ctrl-A` `Ctrl-X` | a number up or down by its step, clamped to `min..max`; an enum or a ref along; counts multiply |
+| `Tab` `Shift-Tab` | the next, previous instance or type |
+| `l` / `→` | on a value, turn it up — a number by its step, an enum or a ref along, a bool on; on a fold, a group, an instance or a type, open it |
+| `h` / `←` | on a value, turn it down; otherwise close it, or go to the parent row |
+| `H` `L` | ten steps |
+| `Backspace` | the parent row |
+| `Enter` `i` | on a value, edit it on the ex line — `:bi set goblin.hp 40`; otherwise open or close the row |
+| `Space` | flip a bool; cycle an enum, a ref, an optional between `—` and a value; a number one step up |
+| `Ctrl-A` `Ctrl-X` | the same as `l` and `h` on a value |
+| `J` `K` | move the row among its siblings — an instance, a list item, a type, a field, an enum value |
 | `a` | add: an item to a list, an instance, a field, an enum value, a type — the ones that need a name prefill the ex line |
-| `dd` | remove: a set value goes back to its default, a list item, an unknown key or an instance goes; one other instances reference prefills `:bi delete` as the confirmation |
+| `dd` | remove: a set value goes back to its default, a list item, an unknown key or an instance goes; one other instances reference prefills `:bi delete` as the confirmation; a field, a value or an unused type leaves the schema; an attribute goes back to unset |
 | `gd` | on a ref, jump to its target — here, or in the data file that has it |
 | `u` `Ctrl-R` | undo, redo the buffer; the view follows |
 | `:` | the ex line |

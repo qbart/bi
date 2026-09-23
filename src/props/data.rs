@@ -473,6 +473,22 @@ fn rename_enum_in(
     }
 }
 
+/// Every instance whose `$type` is `old` retyped `new` — the data side
+/// of `:bi rename <Type> <New>`.
+pub fn rename_type(doc: &mut Value, old: &str, new: &str) -> bool {
+    let mut changed = false;
+    let Some(items) = doc.get_mut("instances").and_then(Value::as_array_mut) else { return false };
+    for item in items {
+        if let Some(map) = item.as_object_mut()
+            && map.get("$type").and_then(Value::as_str) == Some(old)
+        {
+            map.insert("$type".into(), Value::String(new.into()));
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Every key of every instance that its struct does not name, removed.
 pub fn prune(doc: &mut Value, schema: &Schema) -> usize {
     let mut removed = 0;
@@ -624,7 +640,11 @@ mod tests {
         );
         assert_eq!(
             messages(&file(r#"[{"$type":"Weapon","$id":"a","damage":"lots"}]"#), &none),
-            [(Level::Error, "inst:0/damage".into(), "\"lots\" is not a whole number".into())]
+            [(
+                Level::Error,
+                "inst:0/damage".into(),
+                "\"lots\" is not a whole number -2147483648..2147483647".into()
+            )]
         );
         assert_eq!(
             messages(&file(r#"[{"$type":"Weapon","$id":"a","rarity":"mythic"}]"#), &none),
@@ -731,6 +751,15 @@ mod tests {
         assert!(rename_enum_value(&mut doc, &schema, "Rarity", "rare", "uncommon"));
         assert_eq!(doc["instances"][1]["rarity"], serde_json::json!("uncommon"));
         assert!(!rename_enum_value(&mut doc, &schema, "Rarity", "rare", "uncommon"));
+    }
+
+    #[test]
+    fn renaming_a_type_retypes_its_instances() {
+        let (mut doc, _, _) = both();
+        assert!(rename_type(&mut doc, "Weapon", "Arm"));
+        assert_eq!(doc["instances"][0]["$type"], serde_json::json!("Arm"));
+        assert_eq!(doc["instances"][3]["$type"], serde_json::json!("Enemy"));
+        assert!(!rename_type(&mut doc, "Weapon", "Arm"));
     }
 
     #[test]

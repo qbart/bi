@@ -46,6 +46,11 @@ while blur moves by whole pixels, and a slider can be drawn from the
 range. A value is clamped to its range whichever way it is set. A bool
 toggles; a choice cycles through its options and wraps.
 
+**A field can be a readout.** `Field::readonly()` marks one the keys and
+`:tool` never turn: it is drawn as its value alone, muted, and `nudge`,
+`toggle`, `set` and `Tab` leave it — `set` says `x is read-only`. The
+curve's point fields are readouts; its steps are not. See `curve.md`.
+
 **The owner reads, the form does not call back.** Every change bumps
 `generation`; after each key the editor asks every tool whether its form
 moved and recomputes what depends on it. No closures in the form, which

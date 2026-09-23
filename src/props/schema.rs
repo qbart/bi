@@ -1,19 +1,80 @@
 //! A `.bischema`: types, their fields, and what every type expression
 //! means — its default, whether a value encodes it, how the ex line
-//! spells one. See `docs/specs/bi-format.md`.
+//! spells one — plus the layout a field asks for in the data view. See
+//! `docs/specs/bi-format.md`.
 
 use serde_json::{Map, Number, Value};
 
 use super::{Diagnostic, check_dialect, is_identifier, json_eq};
 
-pub const PRIMITIVES: [&str; 6] = ["bool", "i32", "i64", "f32", "f64", "string"];
+pub const PRIMITIVES: [&str; 12] =
+    ["bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "string"];
 pub const GENERICS: [&str; 3] = ["list", "optional", "ref"];
+
+/// The integer widths, signed and unsigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntKind {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl IntKind {
+    pub fn text(self) -> &'static str {
+        match self {
+            IntKind::I8 => "i8",
+            IntKind::I16 => "i16",
+            IntKind::I32 => "i32",
+            IntKind::I64 => "i64",
+            IntKind::U8 => "u8",
+            IntKind::U16 => "u16",
+            IntKind::U32 => "u32",
+            IntKind::U64 => "u64",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<IntKind> {
+        Some(match text {
+            "i8" => IntKind::I8,
+            "i16" => IntKind::I16,
+            "i32" => IntKind::I32,
+            "i64" => IntKind::I64,
+            "u8" => IntKind::U8,
+            "u16" => IntKind::U16,
+            "u32" => IntKind::U32,
+            "u64" => IntKind::U64,
+            _ => return None,
+        })
+    }
+
+    pub fn range(self) -> (i128, i128) {
+        match self {
+            IntKind::I8 => (i8::MIN as i128, i8::MAX as i128),
+            IntKind::I16 => (i16::MIN as i128, i16::MAX as i128),
+            IntKind::I32 => (i32::MIN as i128, i32::MAX as i128),
+            IntKind::I64 => (i64::MIN as i128, i64::MAX as i128),
+            IntKind::U8 => (0, u8::MAX as i128),
+            IntKind::U16 => (0, u16::MAX as i128),
+            IntKind::U32 => (0, u32::MAX as i128),
+            IntKind::U64 => (0, u64::MAX as i128),
+        }
+    }
+
+    pub fn fits(self, n: i128) -> bool {
+        let (lo, hi) = self.range();
+        (lo..=hi).contains(&n)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeExpr {
     Bool,
-    I32,
-    I64,
+    Int(IntKind),
     F32,
     F64,
     Str,
@@ -52,10 +113,11 @@ impl TypeExpr {
                 other => Err(format!("type {text:?}: not a generic: {other}")),
             };
         }
+        if let Some(kind) = IntKind::parse(text) {
+            return Ok(TypeExpr::Int(kind));
+        }
         Ok(match text {
             "bool" => TypeExpr::Bool,
-            "i32" => TypeExpr::I32,
-            "i64" => TypeExpr::I64,
             "f32" => TypeExpr::F32,
             "f64" => TypeExpr::F64,
             "string" => TypeExpr::Str,
@@ -68,8 +130,7 @@ impl TypeExpr {
     pub fn text(&self) -> String {
         match self {
             TypeExpr::Bool => "bool".into(),
-            TypeExpr::I32 => "i32".into(),
-            TypeExpr::I64 => "i64".into(),
+            TypeExpr::Int(kind) => kind.text().into(),
             TypeExpr::F32 => "f32".into(),
             TypeExpr::F64 => "f64".into(),
             TypeExpr::Str => "string".into(),
@@ -81,7 +142,7 @@ impl TypeExpr {
     }
 
     pub fn is_integer(&self) -> bool {
-        matches!(self, TypeExpr::I32 | TypeExpr::I64)
+        matches!(self, TypeExpr::Int(_))
     }
 
     pub fn is_float(&self) -> bool {
@@ -93,12 +154,161 @@ impl TypeExpr {
     }
 
     /// Every named type this expression mentions.
-    fn names(&self, out: &mut Vec<String>) {
+    pub fn names(&self, out: &mut Vec<String>) {
         match self {
             TypeExpr::Named(n) | TypeExpr::Ref(n) => out.push(n.clone()),
             TypeExpr::List(t) | TypeExpr::Optional(t) => t.names(out),
             _ => {}
         }
+    }
+
+    /// The same expression with type `old` called `new`.
+    pub fn renamed(&self, old: &str, new: &str) -> TypeExpr {
+        match self {
+            TypeExpr::Named(n) if n == old => TypeExpr::Named(new.into()),
+            TypeExpr::Ref(n) if n == old => TypeExpr::Ref(new.into()),
+            TypeExpr::List(t) => TypeExpr::List(Box::new(t.renamed(old, new))),
+            TypeExpr::Optional(t) => TypeExpr::Optional(Box::new(t.renamed(old, new))),
+            other => other.clone(),
+        }
+    }
+}
+
+/// How a field asks to be drawn, beyond what its type implies. See
+/// `docs/specs/props.md` §Layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Widget {
+    /// An enum as every value in a row, the current one marked.
+    Toggle,
+    /// A struct always open, with no fold of its own.
+    Inline,
+}
+
+impl Widget {
+    pub const NAMES: [&str; 2] = ["toggle", "inline"];
+
+    pub fn parse(text: &str) -> Option<Widget> {
+        match text {
+            "toggle" => Some(Widget::Toggle),
+            "inline" => Some(Widget::Inline),
+            _ => None,
+        }
+    }
+
+    pub fn text(self) -> &'static str {
+        match self {
+            Widget::Toggle => "toggle",
+            Widget::Inline => "inline",
+        }
+    }
+}
+
+/// `show_if` / `hide_if`: a test on a sibling field's value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cond {
+    pub field: String,
+    pub op: CondOp,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cond {
+    /// `field`, `!field`, `field == value`, `field != value`, `field < n`,
+    /// `field <= n`, `field > n`, `field >= n`. A value is `true`, `false`,
+    /// a number, or a string with or without quotes.
+    pub fn parse(text: &str) -> Result<Cond, String> {
+        let text = text.trim();
+        if let Some(field) = text.strip_prefix('!') {
+            let field = field.trim();
+            if !is_identifier(field) {
+                return Err(format!("{text:?}: not a field name"));
+            }
+            return Ok(Cond { field: field.into(), op: CondOp::Eq, value: Value::Bool(false) });
+        }
+        for (spelling, op) in [
+            ("==", CondOp::Eq),
+            ("!=", CondOp::Ne),
+            ("<=", CondOp::Le),
+            (">=", CondOp::Ge),
+            ("<", CondOp::Lt),
+            (">", CondOp::Gt),
+        ] {
+            if let Some((field, value)) = text.split_once(spelling) {
+                let field = field.trim();
+                if !is_identifier(field) {
+                    return Err(format!("{text:?}: not a field name before {spelling}"));
+                }
+                let value = value.trim();
+                let value = match value {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    v => match v.parse::<f64>() {
+                        Ok(n) if n.is_finite() => number(n),
+                        _ => Value::String(unquote(v)),
+                    },
+                };
+                if matches!(op, CondOp::Lt | CondOp::Le | CondOp::Gt | CondOp::Ge)
+                    && !value.is_number()
+                {
+                    return Err(format!("{text:?}: {spelling} wants a number"));
+                }
+                return Ok(Cond { field: field.into(), op, value });
+            }
+        }
+        if !is_identifier(text) {
+            return Err(format!("{text:?}: not a condition"));
+        }
+        Ok(Cond { field: text.into(), op: CondOp::Eq, value: Value::Bool(true) })
+    }
+
+    pub fn text(&self) -> String {
+        let value = match &self.value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        match (self.op, &self.value) {
+            (CondOp::Eq, Value::Bool(true)) => self.field.clone(),
+            (CondOp::Eq, Value::Bool(false)) => format!("!{}", self.field),
+            (op, _) => format!("{} {} {value}", self.field, op_text(op)),
+        }
+    }
+
+    /// The test against the sibling values, `siblings` resolved.
+    pub fn holds(&self, siblings: &Map<String, Value>) -> bool {
+        let Some(actual) = siblings.get(&self.field) else { return false };
+        match self.op {
+            CondOp::Eq => json_eq(actual, &self.value),
+            CondOp::Ne => !json_eq(actual, &self.value),
+            op => match (actual.as_f64(), self.value.as_f64()) {
+                (Some(a), Some(b)) => match op {
+                    CondOp::Lt => a < b,
+                    CondOp::Le => a <= b,
+                    CondOp::Gt => a > b,
+                    _ => a >= b,
+                },
+                _ => false,
+            },
+        }
+    }
+}
+
+fn op_text(op: CondOp) -> &'static str {
+    match op {
+        CondOp::Eq => "==",
+        CondOp::Ne => "!=",
+        CondOp::Lt => "<",
+        CondOp::Le => "<=",
+        CondOp::Gt => ">",
+        CondOp::Ge => ">=",
     }
 }
 
@@ -111,11 +321,59 @@ pub struct FieldDef {
     pub max: Option<f64>,
     pub step: Option<f64>,
     pub doc: Option<String>,
+    // ---- layout ----
+    /// `Stats`, or nested `Stats/Combat`: the section the field sits in.
+    pub group: Option<String>,
+    /// Display order among siblings; the array order breaks ties.
+    pub order: Option<f64>,
+    /// What the row says instead of the name.
+    pub label: Option<String>,
+    pub readonly: bool,
+    pub show_if: Option<Cond>,
+    pub hide_if: Option<Cond>,
+    pub widget: Option<Widget>,
+}
+
+impl FieldDef {
+    /// The row's label: `label`, else the name.
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether the field shows beside `siblings`, resolved.
+    pub fn shown(&self, siblings: &Map<String, Value>) -> bool {
+        if let Some(cond) = &self.show_if
+            && !cond.holds(siblings)
+        {
+            return false;
+        }
+        if let Some(cond) = &self.hide_if
+            && cond.holds(siblings)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// The attributes a field may carry, in the order the schema view lists
+/// them; `name` last, since it is the field's identity rather than a
+/// setting.
+pub const FIELD_ATTRS: [&str; 14] = [
+    "type", "default", "min", "max", "step", "doc", "group", "order", "label", "readonly",
+    "show_if", "hide_if", "widget", "name",
+];
+
+/// A group's options, from the struct's `groups` map.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupDef {
+    pub collapsed: bool,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDef {
-    Struct { fields: Vec<FieldDef>, doc: Option<String> },
+    Struct { fields: Vec<FieldDef>, doc: Option<String>, groups: Vec<(String, GroupDef)> },
     Enum { values: Vec<String>, doc: Option<String> },
 }
 
@@ -137,6 +395,15 @@ impl TypeDef {
         match self {
             TypeDef::Struct { fields, .. } => fields,
             TypeDef::Enum { .. } => &[],
+        }
+    }
+
+    pub fn group(&self, name: &str) -> Option<&GroupDef> {
+        match self {
+            TypeDef::Struct { groups, .. } => {
+                groups.iter().find(|(n, _)| n == name).map(|(_, g)| g)
+            }
+            TypeDef::Enum { .. } => None,
         }
     }
 }
@@ -192,21 +459,25 @@ impl Schema {
     }
 
     /// The second pass: every name known, refs to structs, no embedding
-    /// cycles, every default encodable, min/max/step where numbers are.
+    /// cycles, every default encodable, min/max/step where numbers are,
+    /// conditions naming siblings, widgets on the types they fit.
     fn check_types(&self, errors: &mut Vec<Diagnostic>) {
         for (name, def) in &self.types {
             let TypeDef::Struct { fields, .. } = def else { continue };
             for field in fields {
                 let at = format!("type:{name}/field:{}", field.name);
+                let refuse = |errors: &mut Vec<Diagnostic>, what: String| {
+                    errors.push(Diagnostic::error(
+                        Some(&at),
+                        format!("{name}.{}: {what}", field.name),
+                    ));
+                };
                 let mut names = Vec::new();
                 field.ty.names(&mut names);
                 let mut known = true;
                 for n in names {
                     if self.get(&n).is_none() {
-                        errors.push(Diagnostic::error(
-                            Some(&at),
-                            format!("{name}.{}: unknown type {n}", field.name),
-                        ));
+                        refuse(errors, format!("unknown type {n}"));
                         known = false;
                     }
                 }
@@ -216,37 +487,41 @@ impl Schema {
                 if let Some(target) = ref_target(&field.ty)
                     && !matches!(self.get(target), Some(TypeDef::Struct { .. }))
                 {
-                    errors.push(Diagnostic::error(
-                        Some(&at),
-                        format!("{name}.{}: ref<{target}> wants a struct", field.name),
-                    ));
+                    refuse(errors, format!("ref<{target}> wants a struct"));
                 }
                 if let TypeExpr::Named(embedded) = &field.ty
                     && self.embeds(embedded, name, &mut Vec::new())
                 {
-                    errors.push(Diagnostic::error(
-                        Some(&at),
-                        format!("{name}.{}: {embedded} embeds {name} back", field.name),
-                    ));
+                    refuse(errors, format!("{embedded} embeds {name} back"));
                     continue;
                 }
                 if (field.min.is_some() || field.max.is_some() || field.step.is_some())
                     && !field.ty.is_numeric()
                 {
-                    errors.push(Diagnostic::error(
-                        Some(&at),
-                        format!("{name}.{}: min/max/step on a {}", field.name, field.ty.text()),
-                    ));
+                    refuse(errors, format!("min/max/step on a {}", field.ty.text()));
                 }
                 if let Some(default) = &field.default {
                     let mut out = Vec::new();
                     self.check_value(&field.ty, default, &at, &mut out, None);
                     if let Some(first) = out.into_iter().find(|d| d.level == super::Level::Error) {
-                        errors.push(Diagnostic::error(
-                            Some(&at),
-                            format!("{name}.{}: default {}", field.name, first.message),
-                        ));
+                        refuse(errors, format!("default {}", first.message));
                     }
+                }
+                for (what, cond) in [("show_if", &field.show_if), ("hide_if", &field.hide_if)] {
+                    if let Some(cond) = cond
+                        && !fields.iter().any(|f| f.name == cond.field)
+                    {
+                        refuse(errors, format!("{what} names no field {}", cond.field));
+                    }
+                }
+                match field.widget {
+                    Some(Widget::Toggle) if self.enum_values(&field.ty.text()).is_none() => {
+                        refuse(errors, "widget toggle wants an enum".into());
+                    }
+                    Some(Widget::Inline) if !self.is_struct(&field.ty.text()) => {
+                        refuse(errors, "widget inline wants a struct".into());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -303,11 +578,20 @@ impl Schema {
             .map(|(n, _)| n.as_str())
     }
 
+    /// Every type expression a field could be given, for cycling: the
+    /// primitives, every type, and a ref to every struct.
+    pub fn type_choices(&self) -> Vec<String> {
+        let mut out: Vec<String> = PRIMITIVES.iter().map(|p| p.to_string()).collect();
+        out.extend(self.types.iter().map(|(n, _)| n.clone()));
+        out.extend(self.structs().map(|s| format!("ref<{s}>")));
+        out
+    }
+
     /// The implicit default of a type expression — the format's table.
     pub fn default_of(&self, ty: &TypeExpr) -> Value {
         match ty {
             TypeExpr::Bool => Value::Bool(false),
-            TypeExpr::I32 | TypeExpr::I64 | TypeExpr::F32 | TypeExpr::F64 => Value::from(0),
+            TypeExpr::Int(_) | TypeExpr::F32 | TypeExpr::F64 => Value::from(0),
             TypeExpr::Str => Value::String(String::new()),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => {
@@ -369,9 +653,8 @@ impl Schema {
         }
     }
 
-    /// A resolved value with every struct key equal to its default taken
-    /// out again — sparse storage. An object that empties goes with it.
-    /// Lists are kept whole.
+    /// A resolved value with every struct key equal to the struct's own
+    /// default taken out again — sparse storage. Lists are kept whole.
     pub fn sparse(&self, ty: &TypeExpr, value: &Value) -> Value {
         match (ty, value) {
             (TypeExpr::Named(name), Value::Object(map)) => match self.get(name) {
@@ -422,13 +705,18 @@ impl Schema {
                     wrong(out);
                 }
             }
-            TypeExpr::I32 | TypeExpr::I64 => match value.as_i64() {
-                Some(n) if *ty == TypeExpr::I32 && i32::try_from(n).is_err() => {
-                    out.push(Diagnostic::error(Some(at), format!("{n} does not fit an i32")));
+            TypeExpr::Int(kind) => {
+                let whole =
+                    value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from));
+                match whole {
+                    Some(n) if !kind.fits(n) => out.push(Diagnostic::error(
+                        Some(at),
+                        format!("{n} does not fit {}", kind.text()),
+                    )),
+                    Some(_) => {}
+                    None => wrong(out),
                 }
-                Some(_) => {}
-                None => wrong(out),
-            },
+            }
             TypeExpr::F32 | TypeExpr::F64 => {
                 if !value.is_number() {
                     wrong(out);
@@ -524,7 +812,10 @@ impl Schema {
     pub fn wants(&self, ty: &TypeExpr) -> String {
         match ty {
             TypeExpr::Bool => "true or false".into(),
-            TypeExpr::I32 | TypeExpr::I64 => "a whole number".into(),
+            TypeExpr::Int(kind) => {
+                let (lo, hi) = kind.range();
+                format!("a whole number {lo}..{hi}")
+            }
             TypeExpr::F32 | TypeExpr::F64 => "a number".into(),
             TypeExpr::Str => "a string".into(),
             TypeExpr::Named(name) => match self.get(name) {
@@ -550,9 +841,9 @@ impl Schema {
                 "false" => Value::Bool(false),
                 _ => return refuse(),
             },
-            TypeExpr::I32 | TypeExpr::I64 => match text.parse::<i64>() {
-                Ok(n) => Value::from(n),
-                Err(_) => return refuse(),
+            TypeExpr::Int(kind) => match text.parse::<i128>() {
+                Ok(n) if kind.fits(n) => int_value(n),
+                _ => return refuse(),
             },
             TypeExpr::F32 | TypeExpr::F64 => match text.parse::<f64>() {
                 Ok(n) if n.is_finite() => number(n),
@@ -633,39 +924,27 @@ fn parse_typedef(
                     continue;
                 };
                 let fat = format!("{at}/field:{fname}");
+                let mut refuse = |what: String| {
+                    errors.push(Diagnostic::error(Some(&fat), format!("{name}.{fname}: {what}")));
+                };
                 if fname.starts_with('$') {
-                    errors.push(Diagnostic::error(
-                        Some(&fat),
-                        format!("{name}.{fname}: $ names are reserved"),
-                    ));
+                    refuse("$ names are reserved".into());
                 } else if !is_identifier(fname) {
-                    errors.push(Diagnostic::error(
-                        Some(&fat),
-                        format!("{name}.{fname:?} is not an identifier"),
-                    ));
+                    refuse("not an identifier".into());
                 }
                 if fields.iter().any(|x| x.name == fname) {
-                    errors.push(Diagnostic::error(
-                        Some(&fat),
-                        format!("{name}.{fname} is defined twice"),
-                    ));
+                    refuse("defined twice".into());
                 }
                 let ty = match f.get("type").and_then(Value::as_str) {
                     Some(t) => match TypeExpr::parse(t) {
                         Ok(ty) => ty,
                         Err(e) => {
-                            errors.push(Diagnostic::error(
-                                Some(&fat),
-                                format!("{name}.{fname}: {e}"),
-                            ));
+                            refuse(e);
                             continue;
                         }
                     },
                     None => {
-                        errors.push(Diagnostic::error(
-                            Some(&fat),
-                            format!("{name}.{fname} has no type"),
-                        ));
+                        refuse("no type".into());
                         continue;
                     }
                 };
@@ -674,17 +953,70 @@ fn parse_typedef(
                         Some(v) => match v.as_f64() {
                             Some(n) => Some(n),
                             None => {
-                                errors.push(Diagnostic::error(
-                                    Some(&fat),
-                                    format!("{name}.{fname}: {key} is not a number"),
-                                ));
+                                refuse(format!("{key} is not a number"));
                                 None
                             }
                         },
                         None => None,
                     }
                 };
-                let (min, max, step) = (num("min"), num("max"), num("step"));
+                let (min, max, step, order) = (num("min"), num("max"), num("step"), num("order"));
+                let mut text = |key: &str| -> Option<String> {
+                    match f.get(key) {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(_) => {
+                            refuse(format!("{key} is not a string"));
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                let (doc, group, label) = (text("doc"), text("group"), text("label"));
+                if group
+                    .as_deref()
+                    .is_some_and(|g| g.is_empty() || g.split('/').any(|p| p.trim().is_empty()))
+                {
+                    refuse("group is empty".into());
+                }
+                let mut cond = |key: &str| -> Option<Cond> {
+                    match f.get(key) {
+                        Some(Value::String(s)) => match Cond::parse(s) {
+                            Ok(c) => Some(c),
+                            Err(e) => {
+                                refuse(format!("{key} {e}"));
+                                None
+                            }
+                        },
+                        Some(_) => {
+                            refuse(format!("{key} is not a string"));
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                let (show_if, hide_if) = (cond("show_if"), cond("hide_if"));
+                let readonly = match f.get("readonly") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => {
+                        refuse("readonly is not true or false".into());
+                        false
+                    }
+                    None => false,
+                };
+                let widget = match f.get("widget") {
+                    Some(Value::String(s)) => match Widget::parse(s) {
+                        Some(w) => Some(w),
+                        None => {
+                            refuse(format!("widget {s:?} (want {})", Widget::NAMES.join(", ")));
+                            None
+                        }
+                    },
+                    Some(_) => {
+                        refuse("widget is not a string".into());
+                        None
+                    }
+                    None => None,
+                };
                 fields.push(FieldDef {
                     name: fname.into(),
                     ty,
@@ -692,10 +1024,44 @@ fn parse_typedef(
                     min,
                     max,
                     step,
-                    doc: f.get("doc").and_then(Value::as_str).map(str::to_string),
+                    doc,
+                    group,
+                    order,
+                    label,
+                    readonly,
+                    show_if,
+                    hide_if,
+                    widget,
                 });
             }
-            Some(TypeDef::Struct { fields, doc })
+            let mut groups = Vec::new();
+            match map.get("groups") {
+                None => {}
+                Some(Value::Object(defs)) => {
+                    for (gname, gdef) in defs {
+                        let Some(g) = gdef.as_object() else {
+                            errors.push(Diagnostic::error(
+                                Some(at),
+                                format!("{name}: group {gname} is not an object"),
+                            ));
+                            continue;
+                        };
+                        groups.push((
+                            gname.clone(),
+                            GroupDef {
+                                collapsed: g
+                                    .get("collapsed")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                                doc: g.get("doc").and_then(Value::as_str).map(str::to_string),
+                            },
+                        ));
+                    }
+                }
+                Some(_) => errors
+                    .push(Diagnostic::error(Some(at), format!("{name}: groups is not an object"))),
+            }
+            Some(TypeDef::Struct { fields, doc, groups })
         }
         Some("enum") => {
             let Some(items) = map.get("values").and_then(Value::as_array) else {
@@ -760,6 +1126,17 @@ pub fn number(n: f64) -> Value {
     }
 }
 
+/// A JSON number from an integer of any width the format has.
+pub fn int_value(n: i128) -> Value {
+    if let Ok(n) = i64::try_from(n) {
+        Value::from(n)
+    } else if let Ok(n) = u64::try_from(n) {
+        Value::from(n)
+    } else {
+        Value::Null
+    }
+}
+
 /// A quoted JSON string unescaped, or the text as typed.
 pub fn unquote(text: &str) -> String {
     if text.len() >= 2
@@ -794,7 +1171,9 @@ mod tests {
 
     #[test]
     fn type_expressions_parse_and_refuse() {
-        assert_eq!(TypeExpr::parse("i32"), Ok(TypeExpr::I32));
+        assert_eq!(TypeExpr::parse("i32"), Ok(TypeExpr::Int(IntKind::I32)));
+        assert_eq!(TypeExpr::parse("u8"), Ok(TypeExpr::Int(IntKind::U8)));
+        assert_eq!(TypeExpr::parse("u64"), Ok(TypeExpr::Int(IntKind::U64)));
         assert_eq!(TypeExpr::parse("string"), Ok(TypeExpr::Str));
         assert_eq!(TypeExpr::parse("Weapon"), Ok(TypeExpr::Named("Weapon".into())));
         assert_eq!(
@@ -802,8 +1181,8 @@ mod tests {
             Ok(TypeExpr::List(Box::new(TypeExpr::Ref("Weapon".into()))))
         );
         assert_eq!(
-            TypeExpr::parse("optional<list<i32>>"),
-            Ok(TypeExpr::Optional(Box::new(TypeExpr::List(Box::new(TypeExpr::I32)))))
+            TypeExpr::parse("optional<list<i16>>"),
+            Ok(TypeExpr::Optional(Box::new(TypeExpr::List(Box::new(TypeExpr::Int(IntKind::I16))))))
         );
         assert!(TypeExpr::parse("list< i32 >").is_err());
         assert!(TypeExpr::parse("set<i32>").is_err());
@@ -812,6 +1191,10 @@ mod tests {
         assert!(TypeExpr::parse("").is_err());
         assert!(TypeExpr::parse("list<").is_err());
         assert_eq!(TypeExpr::parse("list<list<f32>>").unwrap().text(), "list<list<f32>>");
+        assert_eq!(
+            TypeExpr::parse("list<ref<Weapon>>").unwrap().renamed("Weapon", "Arm").text(),
+            "list<ref<Arm>>"
+        );
     }
 
     #[test]
@@ -821,17 +1204,23 @@ mod tests {
         assert_eq!(names, ["Rarity", "Vec2", "Weapon", "Enemy"]);
         assert_eq!(s.enum_values("Rarity").unwrap(), ["common", "rare", "epic"]);
         let damage = s.field("Weapon", "damage").unwrap();
-        assert_eq!(damage.ty, TypeExpr::I32);
+        assert_eq!(damage.ty, TypeExpr::Int(IntKind::I32));
         assert_eq!(damage.default, Some(serde_json::json!(10)));
         assert_eq!((damage.min, damage.max), (Some(0.0), Some(999.0)));
         assert_eq!(
             s.get("Rarity").unwrap().doc(),
             Some("Drop tier, drives colour and loot tables")
         );
+        assert!(s.type_choices().contains(&"ref<Weapon>".to_string()));
+        assert!(s.type_choices().contains(&"u16".to_string()));
     }
 
     fn errors_of(text: &str) -> Vec<String> {
         Schema::parse(text).unwrap_err().into_iter().map(|d| d.message).collect()
+    }
+
+    fn one(types: &str) -> Vec<String> {
+        errors_of(&format!(r#"{{"$dialect":"bi/1","types":{types}}}"#))
     }
 
     #[test]
@@ -842,7 +1231,6 @@ mod tests {
         );
         assert_eq!(errors_of(r#"{"types":{}}"#), ["no $dialect (want \"bi/1\")"]);
         assert_eq!(errors_of(r#"{"$dialect":"bi/1"}"#), ["no types object"]);
-        let one = |types: &str| errors_of(&format!(r#"{{"$dialect":"bi/1","types":{types}}}"#));
         assert_eq!(
             one(r#"{"1a":{"kind":"enum","values":["x"]}}"#),
             ["type name \"1a\" is not an identifier"]
@@ -851,6 +1239,7 @@ mod tests {
             one(r#"{"list":{"kind":"enum","values":["x"]}}"#),
             ["type list shadows a built-in"]
         );
+        assert_eq!(one(r#"{"u8":{"kind":"enum","values":["x"]}}"#), ["type u8 shadows a built-in"]);
         assert_eq!(one(r#"{"A":{"kind":"union"}}"#), ["type A: unknown kind \"union\""]);
         assert_eq!(one(r#"{"A":{"kind":"struct"}}"#), ["struct A has no fields array"]);
         assert_eq!(one(r#"{"A":{"kind":"enum","values":[]}}"#), ["enum A has no values"]);
@@ -863,7 +1252,7 @@ mod tests {
             one(
                 r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32"},{"name":"x","type":"i32"}]}}"#
             ),
-            ["A.x is defined twice"]
+            ["A.x: defined twice"]
         );
         assert_eq!(
             one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32 "}]}}"#),
@@ -891,16 +1280,105 @@ mod tests {
         );
         assert_eq!(
             one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","default":"ten"}]}}"#),
-            ["A.x: default \"ten\" is not a whole number"]
+            ["A.x: default \"ten\" is not a whole number -2147483648..2147483647"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"u8","default":300}]}}"#),
+            ["A.x: default 300 does not fit u8"]
         );
         assert_eq!(
             one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"string","min":0}]}}"#),
             ["A.x: min/max/step on a string"]
         );
         assert!(
-            Schema::parse(r#"{"$dialect":"bi/1","types":{"A":{"kind":"struct","fields":[{"name":"s","type":"optional<A>"},{"name":"l","type":"list<A>"}]}}}"#).is_ok(),
+            Schema::parse(
+                r#"{"$dialect":"bi/1","types":{"A":{"kind":"struct","fields":[{"name":"s","type":"optional<A>"},{"name":"l","type":"list<A>"}]}}}"#
+            )
+            .is_ok(),
             "recursion through optional and list is fine"
         );
+    }
+
+    #[test]
+    fn layout_attributes_parse_and_are_checked() {
+        let text = r#"{"$dialect":"bi/1","types":{
+            "Rarity":{"kind":"enum","values":["common","rare"]},
+            "Vec2":{"kind":"struct","fields":[{"name":"x","type":"f32"},{"name":"y","type":"f32"}]},
+            "W":{"kind":"struct","groups":{"Stats":{"collapsed":true,"doc":"numbers"}},"fields":[
+                {"name":"two_handed","type":"bool","group":"Stats","order":2,"label":"Two-handed","readonly":true},
+                {"name":"hp","type":"i32","group":"Stats/Combat","order":1,"show_if":"two_handed"},
+                {"name":"rarity","type":"Rarity","widget":"toggle","hide_if":"hp > 10"},
+                {"name":"off","type":"Vec2","widget":"inline"}
+            ]}}}"#;
+        let (_, s) = Schema::parse(text).unwrap();
+        let w = s.get("W").unwrap();
+        assert_eq!(
+            w.group("Stats"),
+            Some(&GroupDef { collapsed: true, doc: Some("numbers".into()) })
+        );
+        let two = s.field("W", "two_handed").unwrap();
+        assert_eq!(
+            (two.group.as_deref(), two.order, two.label(), two.readonly),
+            (Some("Stats"), Some(2.0), "Two-handed", true)
+        );
+        let hp = s.field("W", "hp").unwrap();
+        assert_eq!(hp.show_if.as_ref().unwrap().text(), "two_handed");
+        assert_eq!(s.field("W", "rarity").unwrap().hide_if.as_ref().unwrap().text(), "hp > 10");
+        assert_eq!(s.field("W", "rarity").unwrap().widget, Some(Widget::Toggle));
+        assert_eq!(s.field("W", "off").unwrap().widget, Some(Widget::Inline));
+        let mut siblings = Map::new();
+        siblings.insert("two_handed".into(), Value::Bool(false));
+        siblings.insert("hp".into(), serde_json::json!(20));
+        assert!(!hp.shown(&siblings));
+        assert!(!s.field("W", "rarity").unwrap().shown(&siblings));
+        siblings.insert("two_handed".into(), Value::Bool(true));
+        siblings.insert("hp".into(), serde_json::json!(5));
+        assert!(hp.shown(&siblings));
+        assert!(s.field("W", "rarity").unwrap().shown(&siblings));
+
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","show_if":"y"}]}}"#),
+            ["A.x: show_if names no field y"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","hide_if":"x <"}]}}"#),
+            ["A.x: hide_if \"x <\": < wants a number"]
+        );
+        assert_eq!(
+            one(
+                r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","widget":"toggle"}]}}"#
+            ),
+            ["A.x: widget toggle wants an enum"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","widget":"knob"}]}}"#),
+            ["A.x: widget \"knob\" (want toggle, inline)"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","group":""}]}}"#),
+            ["A.x: group is empty"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","fields":[{"name":"x","type":"i32","readonly":1}]}}"#),
+            ["A.x: readonly is not true or false"]
+        );
+        assert_eq!(
+            one(r#"{"A":{"kind":"struct","groups":[],"fields":[{"name":"x","type":"i32"}]}}"#),
+            ["A: groups is not an object"]
+        );
+    }
+
+    #[test]
+    fn conditions_parse_every_form() {
+        assert_eq!(Cond::parse("flag").unwrap().text(), "flag");
+        assert_eq!(Cond::parse("!flag").unwrap().text(), "!flag");
+        assert_eq!(Cond::parse("rarity == epic").unwrap().text(), "rarity == epic");
+        assert_eq!(Cond::parse("rarity != \"epic\"").unwrap().value, serde_json::json!("epic"));
+        assert_eq!(Cond::parse("hp >= 10").unwrap().text(), "hp >= 10");
+        assert_eq!(Cond::parse("hp<=2.5").unwrap().text(), "hp <= 2.5");
+        assert!(Cond::parse("1x").is_err());
+        assert!(Cond::parse("hp > big").is_err());
+        assert!(Cond::parse("").is_err());
     }
 
     #[test]
@@ -908,6 +1386,7 @@ mod tests {
         let s = schema();
         assert_eq!(s.default_of(&TypeExpr::Bool), serde_json::json!(false));
         assert_eq!(s.default_of(&TypeExpr::F32), serde_json::json!(0));
+        assert_eq!(s.default_of(&TypeExpr::Int(IntKind::U64)), serde_json::json!(0));
         assert_eq!(s.default_of(&TypeExpr::Str), serde_json::json!(""));
         assert_eq!(s.default_of(&TypeExpr::Named("Rarity".into())), serde_json::json!("common"));
         assert_eq!(
@@ -941,6 +1420,12 @@ mod tests {
         assert!(!ok("i32", serde_json::json!("3")));
         assert!(!ok("i32", serde_json::json!(5_000_000_000i64)));
         assert!(ok("i64", serde_json::json!(5_000_000_000i64)));
+        assert!(ok("u8", serde_json::json!(255)));
+        assert!(!ok("u8", serde_json::json!(256)));
+        assert!(!ok("u8", serde_json::json!(-1)));
+        assert!(!ok("i8", serde_json::json!(128)));
+        assert!(ok("u64", serde_json::json!(u64::MAX)));
+        assert!(!ok("i64", serde_json::json!(u64::MAX)));
         assert!(ok("f32", serde_json::json!(3)));
         assert!(ok("Rarity", serde_json::json!("epic")));
         assert!(!ok("Rarity", serde_json::json!("mythic")));
@@ -951,8 +1436,8 @@ mod tests {
         assert!(ok("optional<i32>", Value::Null));
         assert!(!ok("optional<i32>", serde_json::json!(true)));
         assert_eq!(
-            s.check(&TypeExpr::I32, &serde_json::json!("x")),
-            Err("\"x\" is not a whole number".into())
+            s.check(&TypeExpr::Int(IntKind::I32), &serde_json::json!("x")),
+            Err("\"x\" is not a whole number -2147483648..2147483647".into())
         );
         let mut out = Vec::new();
         let damage = s.field("Weapon", "damage").unwrap();
@@ -968,7 +1453,9 @@ mod tests {
         assert_eq!(p("bool", "true"), Ok(serde_json::json!(true)));
         assert_eq!(p("bool", "yes"), Err("wants true or false".into()));
         assert_eq!(p("i32", "42"), Ok(serde_json::json!(42)));
-        assert_eq!(p("i32", "4.2"), Err("wants a whole number".into()));
+        assert_eq!(p("i32", "4.2"), Err("wants a whole number -2147483648..2147483647".into()));
+        assert_eq!(p("u8", "300"), Err("wants a whole number 0..255".into()));
+        assert_eq!(p("u64", "18446744073709551615"), Ok(serde_json::json!(u64::MAX)));
         assert_eq!(p("f32", "4.2"), Ok(serde_json::json!(4.2)));
         assert_eq!(p("f32", "4"), Ok(serde_json::json!(4)));
         assert_eq!(p("string", "Rusty Sword"), Ok(serde_json::json!("Rusty Sword")));

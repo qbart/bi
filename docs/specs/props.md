@@ -2,45 +2,56 @@
 
 Data-driven properties: a `.bischema` defines struct-like types, a
 `.bidata` holds typed instances of them, and both are JSON. A text editor
-shows the JSON; what a designer wants is Unity's inspector — every field of
-an instance on its own row, defaults dimmed, enums cycled, refs resolved,
-and a number turned without retyping the line around it. `:set editor
-bidata` (or the extension) draws that view of the file. The file stays the
-file; the view is a view of it. The format itself is
-`docs/specs/bi-format.md`.
+shows the JSON; what a designer wants is Unity's inspector with Odin on
+it — every field of an instance as a widget, sliders and checkboxes and
+choices, grouped and ordered and hidden as the type says, defaults dimmed,
+refs resolved. `:set editor bidata` (or the extension) draws that view of
+the file. The file stays the file; the view is a view of it. The format
+itself is `docs/specs/bi-format.md`.
 
 ## Status
 
-**Built.** Both modes, editing, validation, refs across the project, and
-the `:bi` refactorings — `new`, `delete`, `add`, `rename`, `remap`,
-`prune`, `migrate`.
+**Built.** Both modes, the form-style data view with the schema's layout,
+validation, refs across the project, and the `:bi` commands — `set`,
+`new`, `delete`, `add`, `rename`, `remap`, `prune`, `init`, `schema`,
+`migrate`.
 
 ## What it looks like
 
-A `.bidata` opens as a tree of instances; a `.bischema` as a tree of types.
-One pane, in the window the file opened in, with the file's status row:
+A `.bidata` opens as a form per instance; a `.bischema` as a tree of
+types. One pane, in the window the file opened in, with the file's status
+row. The data view:
 
 ```
-▾ Weapon rusty_sword
+▾ Weapon rusty_sword ────────────────────────────────
     name        "Rusty Sword"
-    damage      12
-    rarity      common                    ← dimmed: the default
-  ▸ offset      { x 0.5, y 0 }            ← dimmed, a struct
-    tags        [melee, starter]
-    two_handed  false
-▸ Weapon dagger
-▾ Enemy goblin
+    damage      ━●━━━━━━━━━━━━━━  12
+    rarity      ‹ common ›                 ← dimmed: the default
+  ▸ offset      { x 0.5, y 0 }
+  ▸ tags        [melee, starter]
+      [ ] two_handed
+▸ Weapon dagger ─────────────────────────────────────
+▾ Enemy goblin ──────────────────────────────────────
     name        "Goblin"
-    hp          40
-    speed       1.4
-    weapon      rusty_sword  → Weapon
-  ▾ drops       2 × ref<Weapon>
-      [0]       rusty_sword
-      [1]       dagger
-  ▸ spawn       { x 12, y 3 }
-    leader      goblin_chief  ⚠ no Enemy goblin_chief
-    damage      99            ⚠ unknown key
+  ▾ Stats                                  ← a group the schema declared
+      hp        40
+      speed     ━━●━━━━━━━━━━━━━  1.4
+    weapon      ‹ rusty_sword → Weapon ›
+  ▾ drops       [rusty_sword, dagger]
+      [0]       ‹ rusty_sword → Weapon ›
+      [1]       ‹ dagger → Weapon ›
+    leader      ‹ goblin_chief → Enemy ›  ⚠ no Enemy goblin_chief
+    damage      99                        ⚠ unknown key
 ```
+
+A number with both `min` and `max` is a slider; a bool a checkbox; an
+enum, a ref or an optional a choice turned with `h` and `l`; a string its
+text; a struct or a list a fold. A set value is drawn plainly, an inherited
+one dim, a read-only one muted; a warning rides on its row after `⚠`. A
+row's `doc` — the schema's — shows in the status row while it is selected.
+
+The schema view is a tree, one row per type, its fields under it, each
+field's attributes under that:
 
 ```
 ▾ Rarity  enum        Drop tier, drives colour and loot tables
@@ -49,23 +60,21 @@ One pane, in the window the file opened in, with the file's status row:
     epic
 ▾ Weapon  struct
   ▸ name        string
-  ▾ damage      i32 = 10  0..999
+  ▾ damage      i32 = 10  0..999  @Stats
       type      i32
       default   10
       min       0
       max       999
       step      —
       doc       —
+      group     Stats
+      order     —
+      label     —
+      readonly  —
+      show_if   —
+      hide_if   —
+      widget    —
 ```
-
-A set value is drawn plainly, an inherited one in the dim colour; a
-warning rides on its row after `⚠`. A row's `doc` is the status message
-while it is selected.
-
-**Errors block the view**, as the format says: a file that fails to parse
-or validate opens in text view with the error in the status. A view
-already open whose text is broken by hand — in a text split beside it —
-goes blank with the error as its one row until the text is fixed.
 
 ## Opening
 
@@ -73,10 +82,17 @@ The extension is the trigger and `$dialect` the confirmation:
 
 - `bi level1.bidata`, `:e level1.bidata`, `Enter` on it in the tree, the
   file picker — every path a file opens by — reads the extension, opens
-  the text buffer as ever, and puts the property view over it.
-- `:set editor bischema` and `:set editor bidata` on a text window do the
-  same for a file without the extension; `:set editor text` on the view
-  puts the text back. `:set editor` alone says which is up.
+  the text buffer as ever, and puts the property view over it, the first
+  instance open. A file that does not read opens as text with the error
+  in the status, as the format says.
+- `:set editor bischema` and `:set editor bidata` on a text window ask
+  for the view by hand. An **empty buffer** gets the skeleton written into
+  it first — `$dialect`, `types: {}` or `$schema` and `instances: []` —
+  with `$schema` filled in when exactly one `.bischema` sits beside the
+  file. A **broken buffer** keeps the view up with the error as its one
+  row, so that `:bi init`, `:bi schema <path>` and `:bi migrate` can mend
+  it; `:set editor text` puts the text back. `:set editor` alone says
+  which is up.
 - A `.bidata` names its schema by `$schema`, relative to itself; a schema
   that is open in a buffer is read from the buffer, not the disk, so an
   unsaved change to a field's default already shows in the data.
@@ -84,24 +100,33 @@ The extension is the trigger and `$dialect` the confirmation:
 ## The keys
 
 The pane borrows the tree's keymap for what it does not claim, so `Ctrl-W`
-and the leader still work, and reads its own vocabulary on top:
+and the leader still work, and reads its own vocabulary on top. `h` and
+`l` are the form's keys on a value and the tree's keys on anything else:
 
 ```
 j  k  ↓ ↑   Ctrl-D  Ctrl-U   pick a row; counts multiply      gg  G   first, last
-l  →  Enter  open a struct, a list, a type or a field's attributes
-h  ←         close it, or go to the parent row
+Tab  Shift-Tab               the next, previous instance or type
+l  →         on a value: turn it up — a number by its step, an enum or a ref
+             to the next, a bool flipped, an optional on; counts multiply
+             on a fold, a group, an instance, a type: open it
+h  ←         on a value: turn it down; otherwise close it, or go to the parent
+H  L         ten steps
+Backspace    the parent row
 Enter  i     on a value: edit it on the ex line — `:bi set goblin.hp 40`
-Space        flip a bool, cycle an enum, a ref through the ids of its type,
-             an optional between — and the inner value's default
-Ctrl-A  Ctrl-X   a number up, down by its step, clamped to min..max;
-             an enum or a ref to the next, previous; counts multiply
+             otherwise open or close the row
+Space        flip a bool, cycle an enum or a ref, an optional between — and
+             the inner value's default; a number one step up
+Ctrl-A  Ctrl-X   the same as l and h on a value, for the vim hand
+J  K         move the row among its siblings: an instance, a list item, a
+             type, a field, an enum value — display order is the file's order
 a            add: an item to a list, an instance to a data file, a field to a
              struct, a value to an enum, a type to a schema — the ones that
              need a name prefill the ex line
 dd           remove: a set value goes back to its default, a list item goes,
              an unknown key goes, an instance goes — one other instances
              reference prefills `:bi delete Enemy goblin` instead, and that
-             line is the confirmation — a field or value leaves the schema
+             line is the confirmation — a field, a value or an unused type
+             leaves the schema; an attribute goes back to unset
 gd           on a ref: jump to its target, in this file or another
 u  Ctrl-R    undo, redo — the buffer's; the view follows
 :            the ex line
@@ -109,7 +134,40 @@ u  Ctrl-R    undo, redo — the buffer's; the view follows
 
 Every key that changes something is one edit of the buffer and one undo
 step of it; the view re-reads the buffer after, so there is one direction
-of data flow and no second history.
+of data flow and no second history. A read-only field (the schema's
+`readonly`) answers every one of these with `read-only`.
+
+## Layout
+
+The schema says how a struct's fields are laid out, Odin's way: as
+attributes on the field. Every one is optional and every reader that does
+not know them ignores them, which is what keeps them inside bi/1.
+
+| Attribute  | Value                    | Effect in the data view                                    |
+|------------|--------------------------|------------------------------------------------------------|
+| `group`    | `"Stats"`, `"Stats/Combat"` | The field sits under a titled, foldable section; `/` nests |
+| `order`    | number                   | Fields sort by it, lowest first; unset is 0; the array order breaks ties |
+| `label`    | string                   | The row says this instead of the field's name              |
+| `readonly` | `true`                   | Shown, never turned, set, added to or removed              |
+| `show_if`  | condition                | The row is there only while the condition holds            |
+| `hide_if`  | condition                | The row is gone while the condition holds                  |
+| `widget`   | `"toggle"`, `"inline"`   | `toggle`: an enum as every value with the current one marked; `inline`: a struct always open, with no fold |
+
+A **condition** names a sibling field: `two_handed`, `!two_handed`,
+`rarity == epic`, `rarity != epic`, `hp > 10`, `hp >= 10`, `hp < 10`,
+`hp <= 10`. The value is `true`, `false`, a number, or a string with or
+without quotes; the comparisons want a number. A condition that names no
+sibling is a schema error. Conditions read the resolved values, so a
+default counts.
+
+A struct may carry a `groups` object beside `fields` with options per
+group: `{ "Stats": { "collapsed": true, "doc": "the numbers" } }`. A
+collapsed group starts closed; `doc` is the group row's status text.
+
+A number with both `min` and `max` draws as a slider without asking. The
+attributes are rows of the schema view like any other: `Enter` edits one,
+`Space` and `l` turn `readonly`, `widget` and `type` through their
+choices, `dd` unsets one.
 
 ## Paths
 
@@ -117,31 +175,38 @@ The ex forms name a row by a path, the same string `Enter` prefills.
 
 In a data file: `<id>.<field>`, deeper with `.` for a struct's field and
 `[n]` for a list item — `goblin.hp`, `dagger.offset.x`, `goblin.drops[1]`.
-Ids are per type, so an id two types share is written `Enemy:goblin`. The
-instance's own id is `goblin.$id`; setting it rewrites every ref to it in
-every data file of the schema, which is what the format promises.
+Groups are layout, not data, and do not appear in paths. Ids are per
+type, so an id two types share is written `Enemy:goblin`. The instance's
+own id is `goblin.$id`; setting it rewrites every ref to it in every data
+file of the schema, which is what the format promises.
 
 In a schema: `<Type>.<field>.<attr>` with `type`, `default`, `min`, `max`,
-`step`, `doc` as the attributes, `<Type>.<field>.name` to rename the field,
-`<Type>.doc` for the type's own line, `<Enum>.values[n]` for a value.
-Renaming a field or an enum value through `set` is the refactoring: every
-data file of the schema is rewritten in the same step.
+`step`, `doc`, `group`, `order`, `label`, `readonly`, `show_if`, `hide_if`
+and `widget` as the attributes, `<Type>.<field>.name` to rename the
+field, `<Type>.doc` for the type's own line, `<Enum>.values[n]` for a
+value. Renaming a field or an enum value through `set` is the
+refactoring: every data file of the schema is rewritten in the same step.
+Changing a field's `type` drops a default, a range or a widget the new
+type cannot carry, rather than refusing.
 
 ## Values on the ex line
 
 `:bi set <path> <value>` parses `<value>` by the field's type: `true` and
-`false`; a number, whole for the integer types; a string as typed, quotes
-optional and JSON escapes honoured inside them; an enum by name; a ref by
-id; `null`, `none` or `-` for an absent optional; a list or a struct as
-JSON. A value that does not parse is refused naming what the field takes;
-a number outside `min..max` is written and warned about, as the format
-says. `:bi set <path>` with no value reports it.
+`false`; a number, whole and within its width for the integer types; a
+string as typed, quotes optional and JSON escapes honoured inside them; an
+enum by name; a ref by id; `null`, `none` or `-` for an absent optional;
+a list or a struct as JSON. A value that does not parse is refused naming
+what the field takes; a number outside `min..max` is written and warned
+about, as the format says. `:bi set <path>` with no value reports it, and
+`Enter` on an unset attribute or an absent optional prefills nothing, so
+what is typed is the value.
 
 Writing a value equal to the default removes the key: the row goes dim
 and the file loses a line, which is what sparse storage means. A list or
 struct value is materialised whole from the resolved value before an item
 inside it is changed, so `goblin.drops[1]` on an inherited list writes the
-list.
+list, and `rusty_sword.offset.y` on an inherited struct writes the whole
+struct with `x` still at the field's default.
 
 ## `:bi`
 
@@ -149,22 +214,28 @@ list.
 :bi set <path> [value]           the value, or a report
 :bi new <Type> <id>              a new instance at the end of a data file, required refs blank
 :bi delete <Type> <id>           an instance, however many refs it has; they dangle and warn
-:bi add <Type> <field> <type>    a field on a struct — `:bi add Weapon speed f32`
-:bi add <Enum> <value>           a value on an enum
-:bi add <Name> struct|enum       a type
+:bi add <Name> struct [f:t …]    a struct, with fields — `:bi add Color struct r:u8 g:u8 b:u8`
+:bi add <Name> enum [v …]        an enum with its values — `:bi add Rarity enum common rare epic`
+:bi add <Type> <f>:<t> …         fields on a struct; `:bi add Weapon speed f32` for one
+:bi add <Enum> <v> …             values on an enum
 :bi rename <Type>.<old> <new>    a field, an enum value (schema) or an id (data), data files rewritten
+:bi rename <Type> <New>          a type: its key, every type expression, every instance's $type
 :bi remap <Type>.<old> <new>     an unknown key renamed across the data files — a rename made by hand
 :bi prune                        every unknown key of this file removed
+:bi init                         the skeleton written over the buffer, $schema guessed
+:bi schema [path]                a data file's $schema set, or reported
 :bi migrate                      an older `$dialect` brought up to bi/1
 ```
 
 Each refuses with a message when the path does not exist or the name is
-taken. `:bi` alone lists them.
+taken; a thing just added is opened and selected. `:bi` alone lists them.
+`init`, `schema` and `migrate` work on a broken file, since they are how
+it gets mended; the rest want a file that reads.
 
 **The project's data files** are every `.bidata` under the project root
 (the tree's root, else the schema's directory) whose `$schema` resolves to
 the schema in hand, ignoring what git ignores. The index over them is
-what checks duplicate ids and dangling refs, what `Space` cycles a ref
+what checks duplicate ids and dangling refs, what `l` cycles a ref
 through, what `gd` jumps by, and what the refactorings rewrite. A file
 that is open in a buffer is read and rewritten in the buffer, as one undo
 step of that buffer; one that is not is rewritten on disk. The index of
@@ -197,9 +268,13 @@ pub fn write_schema(doc: &Value) -> String;           // the layout above
 pub fn write_data(doc: &Value) -> String;
 
 // schema.rs
-pub enum TypeExpr { Bool, I32, I64, F32, F64, Str, Named(String), List(Box<..>), Optional(Box<..>), Ref(String) }
-pub struct FieldDef { name, ty, default: Option<Value>, min, max, step, doc }
-pub enum TypeDef { Struct { fields, doc }, Enum { values, doc } }
+pub enum IntKind { I8, I16, I32, I64, U8, U16, U32, U64 }
+pub enum TypeExpr { Bool, Int(IntKind), F32, F64, Str, Named(String), List(Box<..>), Optional(Box<..>), Ref(String) }
+pub struct Cond { field, op, value }                   // show_if / hide_if
+pub enum Widget { Toggle, Inline }
+pub struct FieldDef { name, ty, default, min, max, step, doc,
+                      group, order, label, readonly, show_if, hide_if, widget }
+pub enum TypeDef { Struct { fields, doc, groups }, Enum { values, doc } }
 pub struct Schema { types: Vec<(String, TypeDef)> }
 impl Schema {
     pub fn parse(text: &str) -> Result<(Value, Schema), Vec<Diagnostic>>;
@@ -219,13 +294,13 @@ pub fn normalise(doc: &Value, schema: &Schema) -> Value;
 pub fn project_files(root: &Path, schema: &Path) -> Vec<PathBuf>;
 
 // view.rs
-pub struct Props { kind, buffer, path, schema_path, raw: Value, schema: Option<Schema>,
-                   data: Option<DataFile>, diagnostics, index, rows: Vec<Row>,
-                   selected, scroll, expanded: BTreeSet<String>, error: Option<String>,
-                   seen: Option<u64> }
-pub struct Row { pub key: String, pub depth: usize, pub label: String, pub value: String,
-                 pub kind: RowKind, pub inherited: bool, pub warning: Option<String>,
-                 pub doc: Option<String>, pub expandable: bool, pub expanded: bool }
+pub struct Props { kind, buffer, path, schema_path, raw: Value, schema, data,
+                   diagnostics, index, rows: Vec<Row>, selected, expanded, collapsed, error, seen }
+pub enum RowWidget { Plain, Header, Group, Fold, Slider(f32), Check(bool), Choice, Toggle, Text }
+pub struct Row { pub key, pub depth, pub label, pub value, pub kind: RowKind, pub widget,
+                 pub inherited, pub readonly, pub turnable, pub warning, pub doc,
+                 pub expandable, pub expanded }
+pub enum Edit { Text(String), Prompt(String), Refactor { text, refactor } }
 ```
 
 The raw `Value` — `serde_json` with `preserve_order` — is the document;
@@ -236,10 +311,12 @@ anyone listing them. An edit returns the new text; the editor puts it in
 the buffer as one undo step and the view re-reads on the next sync, the
 curve tool's arrangement.
 
-Rows are rebuilt from the document and the `expanded` set after every
-change; selection and expansion are held by row key, so an edit that
+Rows are rebuilt from the document, the layout and the expanded set after
+every change; selection and expansion are held by row key — `inst:3/hp`,
+`inst:0/@Stats`, `type:Weapon/field:damage/default` — so an edit that
 reorders nothing keeps the cursor where it was, and one that removes the
-selected row lands on the nearest.
+selected row lands on the row that took its place. A row says which
+widget it draws as; the core decides, the frontend draws.
 
 ## The view in the editor
 
@@ -252,11 +329,14 @@ props window whose buffer's edit counter moved.
 
 ## Tests
 
-- `TypeExpr::parse` reads every primitive, a name, and nested generics;
-  refuses whitespace, an unknown generic, `ref<i32>`,
-  `optional<optional<T>>`.
+- `TypeExpr::parse` reads every primitive including the eight integer
+  widths, a name, and nested generics; refuses whitespace, an unknown
+  generic, `ref<i32>`, `optional<optional<T>>`. A value outside its
+  width does not encode.
 - `Schema::parse` on the full example finds four types; every schema
-  error in the format's table is reported with its type or field named.
+  error in the format's table is reported with its type or field named;
+  every layout attribute parses and a condition naming no sibling, a
+  widget on the wrong type, an empty group are refused.
 - `default_of` gives the table's implicit defaults; a partial struct
   default fills from the struct's own; `parse_value` reads each encoding
   and refuses with what the type wants.
@@ -268,17 +348,24 @@ props window whose buffer's edit counter moved.
   orders keys, keeps unknown keys after.
 - `write_data` on the example round-trips its layout byte for byte;
   `write_schema` the same.
-- Rows: the example expands to the tree above; inherited rows are dimmed;
-  a dangling ref carries its warning; the `expanded` set survives a
-  rebuild.
+- Rows: the example expands to the tree above with the right widgets;
+  inherited rows are dimmed; a dangling ref carries its warning; the
+  `expanded` set survives a rebuild; groups nest and start collapsed when
+  told; `order` sorts; `show_if` and `hide_if` follow the values; `label`
+  and `readonly` show; `toggle` and `inline` draw as they say.
 - Edits: `set goblin.hp 41` rewrites one line; `set rusty_sword.rarity
   common` removes the key; `set goblin.drops[1] warhammer` writes the
   list; `set rusty_sword.$id iron_sword` rewrites three places; `Space`
-  on a bool, an enum, a ref, an optional; `Ctrl-A` clamps at `max`; `dd`
-  on a set value, a list item, an unknown key, an instance; `a` on a list;
-  `new`, `delete`, `add`, `rename`, `remap`, `prune` each as one undo
-  step; a bad value is refused naming the type.
-- Opening: a `.bidata` opens in the view; a missing `$dialect` opens as
-  text with the error; `:set editor text` and back; a schema edited by
-  hand in a split updates the data view; `:w` normalises and writes; `u`
-  restores the text and the view.
+  on a bool, an enum, a ref, an optional; `l` clamps at `max` and an
+  integer at its `min`; `dd` on a set value, a list item, an unknown key,
+  an instance; `a` on a list; `J`/`K` move an instance, an item, a
+  field, a value, a type; `new`, `delete`, `add` with many values and
+  fields, `rename` of a field, a value, an id and a type, `remap`,
+  `prune` each as one undo step; a read-only field refuses; a bad value
+  is refused naming the type.
+- Opening: a `.bidata` opens in the view with the first instance open; a
+  missing `$dialect` opens as text with the error; `:set editor bidata`
+  on an empty buffer writes the skeleton, on a broken one keeps the view
+  with the error and `:bi init` mends it; `:set editor text` and back; a
+  schema edited by hand in a split updates the data view; `:w` normalises
+  and writes; `u` restores the text and the view.

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-pub use view::{Edit, Props, Refactor, Row, RowKind};
+pub use view::{Edit, Props, Refactor, Row, RowKind, RowWidget};
 
 /// The format's major version, as `$dialect` spells it.
 pub const DIALECT: &str = "bi/1";

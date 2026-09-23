@@ -27,6 +27,8 @@ pub struct Field {
     label: String,
     kind: Kind,
     value: Value,
+    /// A readout: the owner rebuilds it, and no key or `:tool` sets it.
+    readonly: bool,
 }
 
 impl Field {
@@ -37,6 +39,7 @@ impl Field {
             label: label.into(),
             kind,
             value: Value::Float(value.clamp(min, max)),
+            readonly: false,
         }
     }
 
@@ -47,11 +50,18 @@ impl Field {
             label: label.into(),
             kind,
             value: Value::Int(value.clamp(min, max)),
+            readonly: false,
         }
     }
 
     pub fn bool(name: &str, label: &str, value: bool) -> Self {
-        Self { name: name.into(), label: label.into(), kind: Kind::Bool, value: Value::Bool(value) }
+        Self {
+            name: name.into(),
+            label: label.into(),
+            kind: Kind::Bool,
+            value: Value::Bool(value),
+            readonly: false,
+        }
     }
 
     pub fn choice(name: &str, label: &str, options: &[&str], index: usize) -> Self {
@@ -62,7 +72,20 @@ impl Field {
             label: label.into(),
             kind: Kind::Choice { options },
             value: Value::Choice(index),
+            readonly: false,
         }
+    }
+
+    /// The field as a readout: shown, never turned. A tool whose value
+    /// the keys must not move — a curve's point, which has rules of its
+    /// own — mirrors it this way.
+    pub fn readonly(mut self) -> Self {
+        self.readonly = true;
+        self
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
     }
 
     pub fn name(&self) -> &str {
@@ -292,9 +315,13 @@ impl Form {
         self.selected = self.fields.len().saturating_sub(1);
     }
 
-    /// `h` and `l`: the selected field `steps` of its step along.
+    /// `h` and `l`: the selected field `steps` of its step along. A
+    /// read-only field stays.
     pub fn nudge(&mut self, steps: i64) {
         let Some(field) = self.fields.get(self.selected) else { return };
+        if field.readonly {
+            return;
+        }
         let value = field.nudged(steps);
         self.change(self.selected, value);
     }
@@ -302,6 +329,9 @@ impl Form {
     /// `Space`: a bool flipped, a choice advanced.
     pub fn toggle(&mut self) {
         let Some(field) = self.fields.get(self.selected) else { return };
+        if field.readonly {
+            return;
+        }
         let value = match field.kind {
             Kind::Bool | Kind::Choice { .. } => field.nudged(1),
             _ => return,
@@ -314,6 +344,9 @@ impl Form {
     pub fn cycle_map(&mut self) -> bool {
         let Some(cycle) = self.cycle.as_deref() else { return false };
         let Some(index) = self.fields.iter().position(|f| f.name == cycle) else { return false };
+        if self.fields[index].readonly {
+            return false;
+        }
         let value = self.fields[index].nudged(1);
         self.change(index, value);
         true
@@ -325,6 +358,9 @@ impl Form {
             let names: Vec<&str> = self.fields.iter().map(|f| f.name.as_str()).collect();
             return Err(format!("no field {name} ({})", names.join(", ")));
         };
+        if self.fields[index].readonly {
+            return Err(format!("{name} is read-only"));
+        }
         let value = self.fields[index].parse(text)?;
         self.change(index, value);
         Ok(())
@@ -542,6 +578,31 @@ mod tests {
         let mut plain = Form::new("t", "T");
         plain.push(Field::int("point", "Point", 1, 3, 1, 1));
         assert!(!plain.cycle_map());
+    }
+
+    #[test]
+    fn a_readonly_field_is_shown_and_never_turned() {
+        let mut form = Form::with_cycle("t", "T", "point");
+        form.push(Field::int("point", "Point", 1, 3, 1, 2).readonly());
+        form.push(Field::float("x", "X", 0.0, 1.0, 0.1, 0.5).readonly());
+        form.push(Field::bool("locked", "Locked", true).readonly());
+        form.push(Field::float("xstep", "X step", 0.001, 1.0, 0.001, 0.1));
+        let g = form.generation();
+        form.nudge(1);
+        form.toggle();
+        assert!(!form.cycle_map());
+        assert_eq!(form.set("x", "0.9"), Err("x is read-only".into()));
+        form.select(2);
+        form.toggle();
+        assert_eq!(
+            (form.get_i64("point"), form.get_f32("x"), form.get_bool("locked")),
+            (2, 0.5, true)
+        );
+        assert_eq!(form.generation(), g, "nothing the owner needs to hear about");
+        assert!(form.fields()[0].is_readonly());
+        form.select(3);
+        form.nudge(1);
+        assert!(form.generation() > g, "the step is not read-only");
     }
 
     #[test]

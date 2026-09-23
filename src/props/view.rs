@@ -1,6 +1,7 @@
 //! The property view: rows over a schema or a data file, and every edit
-//! the keys and `:bi` make, each returning the buffer's new text. See
-//! `docs/specs/props.md`.
+//! the keys and `:bi` make, each returning the buffer's new text. A data
+//! file's rows are widgets — sliders, checks, choices — laid out as the
+//! schema asks; a schema's rows are a tree. See `docs/specs/props.md`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -8,7 +9,10 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use super::data::{self, DataFile, Index};
-use super::schema::{FieldDef, Schema, TypeDef, TypeExpr, compact, number, range_text, unquote};
+use super::schema::{
+    Cond, FIELD_ATTRS, FieldDef, Schema, TypeDef, TypeExpr, Widget, compact, number, range_text,
+    unquote,
+};
 use super::{Diagnostic, Kind, Level, check_dialect, is_identifier, summary, write_kind};
 use crate::buffer::BufferId;
 
@@ -16,6 +20,8 @@ use crate::buffer::BufferId;
 pub enum RowKind {
     /// `Weapon rusty_sword`.
     Instance,
+    /// A section of fields the schema grouped: `Stats`.
+    Group,
     /// A field of an instance, or of an embedded struct.
     Field,
     /// One item of a list.
@@ -34,20 +40,70 @@ pub enum RowKind {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How a row asks to be drawn. The value text is always there; the
+/// widget says what to draw beside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowWidget {
+    /// Label and value, as a tree row.
+    Plain,
+    /// A section title: an instance.
+    Header,
+    /// A group's title.
+    Group,
+    /// A struct or a list: opens.
+    Fold,
+    /// A number with a range: a bar this far along.
+    Slider(f32),
+    /// A bool.
+    Check(bool),
+    /// An enum, a ref, an optional: `‹ value ›`.
+    Choice,
+    /// An enum as every value, the current one marked.
+    Toggle,
+    /// A string.
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
-    /// Stable across rebuilds: `inst:3/drops/[1]`, `type:Weapon/field:damage/default`.
+    /// Stable across rebuilds: `inst:3/drops/[1]`, `inst:0/@Stats`,
+    /// `type:Weapon/field:damage/default`.
     pub key: String,
     pub depth: usize,
     pub label: String,
     pub value: String,
     pub kind: RowKind,
+    pub widget: RowWidget,
     /// The value is the default, not stored: drawn dim.
     pub inherited: bool,
+    /// The schema said so: turned and set nothing, drawn muted.
+    pub readonly: bool,
+    /// `h` and `l` turn this row's value rather than open or close it.
+    pub turnable: bool,
     pub warning: Option<String>,
     pub doc: Option<String>,
     pub expandable: bool,
     pub expanded: bool,
+}
+
+impl Row {
+    fn new(key: &str, depth: usize, label: &str, kind: RowKind) -> Row {
+        Row {
+            key: key.into(),
+            depth,
+            label: label.into(),
+            value: String::new(),
+            kind,
+            widget: RowWidget::Plain,
+            inherited: false,
+            readonly: false,
+            turnable: false,
+            warning: None,
+            doc: None,
+            expandable: false,
+            expanded: false,
+        }
+    }
 }
 
 /// What an edit asks the editor to do beyond the buffer's new text.
@@ -67,10 +123,12 @@ pub enum Refactor {
     RenameId { ty: String, old: String, new: String },
     RenameField { ty: String, old: String, new: String },
     RenameEnumValue { en: String, old: String, new: String },
+    RenameType { old: String, new: String },
 }
 
 impl Refactor {
-    /// The rewrite applied to one data document.
+    /// The rewrite applied to one data document. `schema` is the schema
+    /// as it was before the change, which is what the data still spells.
     pub fn apply(&self, doc: &mut Value, schema: &Schema) -> bool {
         match self {
             Refactor::RenameId { ty, old, new } => data::rename_id(doc, schema, ty, old, new),
@@ -78,6 +136,7 @@ impl Refactor {
             Refactor::RenameEnumValue { en, old, new } => {
                 data::rename_enum_value(doc, schema, en, old, new)
             }
+            Refactor::RenameType { old, new } => data::rename_type(doc, old, new),
         }
     }
 }
@@ -87,6 +146,18 @@ impl Refactor {
 enum Seg {
     Key(String),
     Index(usize),
+}
+
+/// A field or a group inside a struct's layout.
+enum Item {
+    Field(usize),
+    Group(GroupNode),
+}
+
+struct GroupNode {
+    name: String,
+    key: String,
+    items: Vec<Item>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +174,11 @@ pub struct Props {
     pub index: Index,
     pub rows: Vec<Row>,
     pub selected: usize,
+    /// Rows opened by hand; a group that starts collapsed is in here when
+    /// opened.
     expanded: BTreeSet<String>,
+    /// Groups closed by hand, of the ones that start open.
+    collapsed: BTreeSet<String>,
     /// The file is broken: the one row says how.
     pub error: Option<String>,
     /// The buffer's edit counter the rows reflect, and the schema
@@ -127,10 +202,46 @@ impl Props {
             rows: Vec::new(),
             selected: 0,
             expanded: BTreeSet::new(),
+            collapsed: BTreeSet::new(),
             error: None,
             seen: None,
             schema_seen: None,
         }
+    }
+
+    /// The text a fresh file of `kind` starts with: the header and the
+    /// empty container, `$schema` as given.
+    pub fn skeleton(kind: Kind, schema: Option<&str>) -> String {
+        let mut doc = Map::new();
+        doc.insert("$dialect".into(), Value::String(super::DIALECT.into()));
+        match kind {
+            Kind::Schema => {
+                doc.insert("types".into(), Value::Object(Map::new()));
+            }
+            Kind::Data => {
+                doc.insert("$schema".into(), Value::String(schema.unwrap_or("").into()));
+                doc.insert("instances".into(), Value::Array(Vec::new()));
+            }
+        }
+        write_kind(kind, &Value::Object(doc))
+    }
+
+    /// `:bi schema <path>` on any parseable data text: `$schema` set,
+    /// second key of the file.
+    pub fn with_schema_ref(text: &str, rel: &str) -> Result<String, String> {
+        let doc: Value = serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+        let Value::Object(map) = doc else { return Err("not a JSON object".into()) };
+        let mut out = Map::new();
+        if let Some(d) = map.get("$dialect") {
+            out.insert("$dialect".into(), d.clone());
+        }
+        out.insert("$schema".into(), Value::String(rel.into()));
+        for (k, v) in map {
+            if k != "$dialect" && k != "$schema" {
+                out.insert(k, v);
+            }
+        }
+        Ok(write_kind(Kind::Data, &Value::Object(out)))
     }
 
     /// The `$schema` a data text names, before the schema can be loaded;
@@ -194,18 +305,7 @@ impl Props {
             Err(errors) => {
                 let message = summary(&errors).unwrap_or_else(|| "broken".into());
                 self.error = Some(message.clone());
-                self.rows = vec![Row {
-                    key: "error".into(),
-                    depth: 0,
-                    label: message.clone(),
-                    value: String::new(),
-                    kind: RowKind::Error,
-                    inherited: false,
-                    warning: None,
-                    doc: None,
-                    expandable: false,
-                    expanded: false,
-                }];
+                self.rows = vec![Row::new("error", 0, &message, RowKind::Error)];
                 self.selected = 0;
                 Err(message)
             }
@@ -231,6 +331,15 @@ impl Props {
 
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.selected)
+    }
+
+    /// The first instance opened, for a view that just came up.
+    pub fn expand_first(&mut self) {
+        if self.kind == Kind::Data && self.rows.first().is_some_and(|r| r.kind == RowKind::Instance)
+        {
+            self.expanded.insert("inst:0".into());
+            self.rebuild();
+        }
     }
 
     // ---- rows ----
@@ -265,55 +374,147 @@ impl Props {
         for (i, inst) in data.instances.iter().enumerate() {
             let key = format!("inst:{i}");
             let expanded = self.expanded.contains(&key);
-            rows.push(Row {
-                key: key.clone(),
-                depth: 0,
-                label: format!("{} {}", inst.ty, inst.id),
-                value: String::new(),
-                kind: RowKind::Instance,
-                inherited: false,
-                warning: None,
-                doc: self.schema.get(&inst.ty).and_then(TypeDef::doc).map(str::to_string),
-                expandable: true,
-                expanded,
-            });
+            let mut row = Row::new(&key, 0, &format!("{} {}", inst.ty, inst.id), RowKind::Instance);
+            row.widget = RowWidget::Header;
+            row.doc = self.schema.get(&inst.ty).and_then(TypeDef::doc).map(str::to_string);
+            row.expandable = true;
+            row.expanded = expanded;
+            rows.push(row);
             if !expanded {
                 continue;
             }
-            let Some(fields) = self.schema.fields_of(&inst.ty) else { continue };
-            for field in fields {
-                let stored = inst.values.get(&field.name);
-                let resolved = match stored {
-                    Some(v) => self.schema.resolve(&field.ty, v),
-                    None => self.schema.field_default(field),
-                };
-                self.value_rows(
-                    rows,
-                    &format!("{key}/{}", field.name),
-                    1,
-                    &field.name,
-                    &field.ty,
-                    &resolved,
-                    stored,
-                    stored.is_none(),
-                    Some(field),
-                    RowKind::Field,
-                );
+            let Some(def) = self.schema.get(&inst.ty) else { continue };
+            let stored = Value::Object(inst.values.clone());
+            let resolved = self.schema.resolve(&TypeExpr::Named(inst.ty.clone()), &stored);
+            self.struct_rows(rows, &key, 1, def, &resolved, Some(&stored), false, false);
+        }
+    }
+
+    /// The fields of a struct value, laid out as the schema asks: sorted
+    /// by `order`, under their groups, hidden by their conditions, then
+    /// the unknown keys.
+    #[allow(clippy::too_many_arguments)]
+    fn struct_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        key: &str,
+        depth: usize,
+        def: &TypeDef,
+        resolved: &Value,
+        stored: Option<&Value>,
+        inherited: bool,
+        readonly: bool,
+    ) {
+        let fields = def.fields();
+        let Some(map) = resolved.as_object() else { return };
+        let stored_map = stored.and_then(Value::as_object);
+        let mut order: Vec<usize> = (0..fields.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (oa, ob) = (fields[a].order.unwrap_or(0.0), fields[b].order.unwrap_or(0.0));
+            oa.partial_cmp(&ob).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // The layout tree: groups in order of first appearance.
+        let mut root = GroupNode { name: String::new(), key: key.into(), items: Vec::new() };
+        for index in order {
+            let field = &fields[index];
+            let mut node = &mut root;
+            if let Some(group) = &field.group {
+                for part in group.split('/') {
+                    let gkey = format!("{}/@{part}", node.key);
+                    let at = node
+                        .items
+                        .iter()
+                        .position(|item| matches!(item, Item::Group(g) if g.name == part));
+                    let at = match at {
+                        Some(at) => at,
+                        None => {
+                            node.items.push(Item::Group(GroupNode {
+                                name: part.into(),
+                                key: gkey,
+                                items: Vec::new(),
+                            }));
+                            node.items.len() - 1
+                        }
+                    };
+                    node = match &mut node.items[at] {
+                        Item::Group(g) => g,
+                        Item::Field(_) => unreachable!("found by the group match"),
+                    };
+                }
             }
-            for (k, v) in &inst.values {
-                if !fields.iter().any(|f| &f.name == k) {
-                    rows.push(Row {
-                        key: format!("{key}/?{k}"),
-                        depth: 1,
-                        label: k.clone(),
-                        value: v.to_string(),
-                        kind: RowKind::Unknown,
-                        inherited: false,
-                        warning: None,
-                        doc: None,
-                        expandable: false,
-                        expanded: false,
-                    });
+            node.items.push(Item::Field(index));
+        }
+        self.layout_rows(rows, &root, depth, def, map, stored_map, inherited, readonly);
+        for (k, v) in map {
+            if !fields.iter().any(|f| &f.name == k) {
+                let unknown_key =
+                    if depth == 1 { format!("{key}/?{k}") } else { format!("{key}/{k}") };
+                let mut row = Row::new(&unknown_key, depth, k, RowKind::Unknown);
+                row.value = v.to_string();
+                row.inherited = inherited;
+                rows.push(row);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        node: &GroupNode,
+        depth: usize,
+        def: &TypeDef,
+        map: &Map<String, Value>,
+        stored: Option<&Map<String, Value>>,
+        inherited: bool,
+        readonly: bool,
+    ) {
+        for item in &node.items {
+            match item {
+                Item::Group(group) => {
+                    let options = def.group(&group.name).cloned().unwrap_or_default();
+                    let open = self.group_open(&group.key, options.collapsed);
+                    let mut row = Row::new(&group.key, depth, &group.name, RowKind::Group);
+                    row.widget = RowWidget::Group;
+                    row.doc = options.doc.clone();
+                    row.expandable = true;
+                    row.expanded = open;
+                    rows.push(row);
+                    if open {
+                        self.layout_rows(
+                            rows,
+                            group,
+                            depth + 1,
+                            def,
+                            map,
+                            stored,
+                            inherited,
+                            readonly,
+                        );
+                    }
+                }
+                Item::Field(index) => {
+                    let field = &def.fields()[*index];
+                    if !field.shown(map) {
+                        continue;
+                    }
+                    let Some(value) = map.get(&field.name) else { continue };
+                    let sub_stored = stored.and_then(|m| m.get(&field.name));
+                    // Groups are layout: a field's key is its data path.
+                    let base = node.key.split("/@").next().unwrap_or(&node.key);
+                    self.value_rows(
+                        rows,
+                        &format!("{base}/{}", field.name),
+                        depth,
+                        field.label(),
+                        &field.ty,
+                        value,
+                        sub_stored,
+                        inherited || sub_stored.is_none(),
+                        readonly || field.readonly,
+                        Some(field),
+                        RowKind::Field,
+                    );
                 }
             }
         }
@@ -330,6 +531,7 @@ impl Props {
         resolved: &Value,
         stored: Option<&Value>,
         inherited: bool,
+        readonly: bool,
         field: Option<&FieldDef>,
         kind: RowKind,
     ) {
@@ -337,6 +539,7 @@ impl Props {
             TypeExpr::Optional(inner) if !resolved.is_null() => inner.as_ref(),
             other => other,
         };
+        let inline = field.is_some_and(|f| f.widget == Some(Widget::Inline));
         let expandable = match (inner, resolved) {
             (TypeExpr::Named(n), Value::Object(_)) => {
                 self.schema.fields_of(n).is_some_and(|f| !f.is_empty())
@@ -344,58 +547,34 @@ impl Props {
             (TypeExpr::List(_), Value::Array(items)) => !items.is_empty(),
             _ => false,
         };
-        let expanded = expandable && self.expanded.contains(key);
-        rows.push(Row {
-            key: key.into(),
-            depth,
-            label: label.into(),
-            value: self.value_text(ty, resolved),
-            kind,
-            inherited,
-            warning: None,
-            doc: field.and_then(|f| f.doc.clone()),
-            expandable,
-            expanded,
-        });
+        let expanded = expandable && (inline || self.expanded.contains(key));
+        let mut row = Row::new(key, depth, label, kind);
+        row.value = self.value_text(ty, resolved);
+        row.widget = self.widget_of(inner, resolved, field, expandable);
+        if row.widget == RowWidget::Toggle
+            && let (TypeExpr::Named(n), Some(current)) = (inner, resolved.as_str())
+            && let Some(values) = self.schema.enum_values(n)
+        {
+            let parts: Vec<String> = values
+                .iter()
+                .map(|v| if v == current { format!("[{v}]") } else { v.clone() })
+                .collect();
+            row.value = parts.join(" ");
+        }
+        row.inherited = inherited;
+        row.readonly = readonly;
+        row.turnable = !expandable && turnable(inner, resolved);
+        row.doc = field.and_then(|f| f.doc.clone());
+        row.expandable = expandable && !inline;
+        row.expanded = expanded;
+        rows.push(row);
         if !expanded {
             return;
         }
         match (inner, resolved) {
-            (TypeExpr::Named(n), Value::Object(map)) => {
-                let Some(fields) = self.schema.fields_of(n) else { return };
-                let stored_map = stored.and_then(Value::as_object);
-                for f in fields {
-                    let sub_stored = stored_map.and_then(|m| m.get(&f.name));
-                    let Some(sub) = map.get(&f.name) else { continue };
-                    self.value_rows(
-                        rows,
-                        &format!("{key}/{}", f.name),
-                        depth + 1,
-                        &f.name,
-                        &f.ty,
-                        sub,
-                        sub_stored,
-                        inherited || sub_stored.is_none(),
-                        Some(f),
-                        RowKind::Field,
-                    );
-                }
-                for (k, v) in map {
-                    if !fields.iter().any(|f| &f.name == k) {
-                        rows.push(Row {
-                            key: format!("{key}/{k}"),
-                            depth: depth + 1,
-                            label: k.clone(),
-                            value: v.to_string(),
-                            kind: RowKind::Unknown,
-                            inherited,
-                            warning: None,
-                            doc: None,
-                            expandable: false,
-                            expanded: false,
-                        });
-                    }
-                }
+            (TypeExpr::Named(n), Value::Object(_)) => {
+                let Some(def) = self.schema.get(n) else { return };
+                self.struct_rows(rows, key, depth + 1, def, resolved, stored, inherited, readonly);
             }
             (TypeExpr::List(item_ty), Value::Array(items)) => {
                 let stored_items = stored.and_then(Value::as_array);
@@ -410,6 +589,7 @@ impl Props {
                         item,
                         sub_stored,
                         inherited,
+                        readonly,
                         None,
                         RowKind::Item,
                     );
@@ -419,22 +599,56 @@ impl Props {
         }
     }
 
+    /// The widget a value draws as.
+    fn widget_of(
+        &self,
+        ty: &TypeExpr,
+        value: &Value,
+        field: Option<&FieldDef>,
+        expandable: bool,
+    ) -> RowWidget {
+        if expandable {
+            return RowWidget::Fold;
+        }
+        match ty {
+            TypeExpr::Bool => RowWidget::Check(value.as_bool().unwrap_or(false)),
+            TypeExpr::Int(_) | TypeExpr::F32 | TypeExpr::F64 => {
+                match field.and_then(|f| f.min.zip(f.max)) {
+                    Some((min, max)) if max > min => {
+                        let n = value.as_f64().unwrap_or(min);
+                        RowWidget::Slider(((n - min) / (max - min)).clamp(0.0, 1.0) as f32)
+                    }
+                    _ => RowWidget::Plain,
+                }
+            }
+            TypeExpr::Str => RowWidget::Text,
+            TypeExpr::Named(n) if self.schema.enum_values(n).is_some() => {
+                if field.is_some_and(|f| f.widget == Some(Widget::Toggle)) {
+                    RowWidget::Toggle
+                } else {
+                    RowWidget::Choice
+                }
+            }
+            TypeExpr::Ref(_) => RowWidget::Choice,
+            TypeExpr::Optional(_) => RowWidget::Choice,
+            _ => RowWidget::Plain,
+        }
+    }
+
+    fn group_open(&self, key: &str, starts_collapsed: bool) -> bool {
+        if starts_collapsed { self.expanded.contains(key) } else { !self.collapsed.contains(key) }
+    }
+
     fn schema_rows(&self, rows: &mut Vec<Row>) {
         for (name, def) in &self.schema.types {
             let key = format!("type:{name}");
             let expanded = self.expanded.contains(&key);
-            rows.push(Row {
-                key: key.clone(),
-                depth: 0,
-                label: name.clone(),
-                value: def.kind().into(),
-                kind: RowKind::Type,
-                inherited: false,
-                warning: None,
-                doc: def.doc().map(str::to_string),
-                expandable: true,
-                expanded,
-            });
+            let mut row = Row::new(&key, 0, name, RowKind::Type);
+            row.value = def.kind().into();
+            row.doc = def.doc().map(str::to_string);
+            row.expandable = true;
+            row.expanded = expanded;
+            rows.push(row);
             if !expanded {
                 continue;
             }
@@ -449,63 +663,56 @@ impl Props {
                     for f in fields {
                         let fkey = format!("{key}/field:{}", f.name);
                         let fexpanded = self.expanded.contains(&fkey);
-                        rows.push(Row {
-                            key: fkey.clone(),
-                            depth: 1,
-                            label: f.name.clone(),
-                            value: self.field_def_text(f),
-                            kind: RowKind::FieldDef,
-                            inherited: false,
-                            warning: None,
-                            doc: f.doc.clone(),
-                            expandable: true,
-                            expanded: fexpanded,
-                        });
+                        let mut row = Row::new(&fkey, 1, &f.name, RowKind::FieldDef);
+                        row.value = self.field_def_text(f);
+                        row.doc = f.doc.clone();
+                        row.expandable = true;
+                        row.expanded = fexpanded;
+                        rows.push(row);
                         if !fexpanded {
                             continue;
                         }
-                        rows.push(attr_row(&format!("{fkey}/type"), 2, "type", Some(f.ty.text())));
-                        rows.push(attr_row(
-                            &format!("{fkey}/default"),
-                            2,
-                            "default",
-                            f.default
-                                .as_ref()
-                                .map(|d| self.value_text(&f.ty, &self.schema.resolve(&f.ty, d))),
-                        ));
-                        rows.push(attr_row(&format!("{fkey}/min"), 2, "min", f.min.map(compact)));
-                        rows.push(attr_row(&format!("{fkey}/max"), 2, "max", f.max.map(compact)));
-                        rows.push(attr_row(
-                            &format!("{fkey}/step"),
-                            2,
-                            "step",
-                            f.step.map(compact),
-                        ));
-                        rows.push(attr_row(
-                            &format!("{fkey}/doc"),
-                            2,
-                            "doc",
-                            f.doc.as_ref().map(|d| format!("{d:?}")),
-                        ));
+                        for attr in FIELD_ATTRS.iter().filter(|a| **a != "name") {
+                            let value = self.attr_value(f, attr);
+                            let mut row = attr_row(&format!("{fkey}/{attr}"), 2, attr, value);
+                            row.turnable = match *attr {
+                                "type" | "min" | "max" | "step" | "order" | "readonly"
+                                | "widget" => true,
+                                "default" => turnable(&f.ty, &self.schema.field_default(f)),
+                                _ => false,
+                            };
+                            rows.push(row);
+                        }
                     }
                 }
                 TypeDef::Enum { values, .. } => {
                     for (i, v) in values.iter().enumerate() {
-                        rows.push(Row {
-                            key: format!("{key}/value:{i}"),
-                            depth: 1,
-                            label: v.clone(),
-                            value: String::new(),
-                            kind: RowKind::EnumValue,
-                            inherited: false,
-                            warning: None,
-                            doc: None,
-                            expandable: false,
-                            expanded: false,
-                        });
+                        rows.push(Row::new(&format!("{key}/value:{i}"), 1, v, RowKind::EnumValue));
                     }
                 }
             }
+        }
+    }
+
+    /// A field attribute as its row shows it; `None` when unset.
+    fn attr_value(&self, f: &FieldDef, attr: &str) -> Option<String> {
+        match attr {
+            "type" => Some(f.ty.text()),
+            "default" => {
+                f.default.as_ref().map(|d| self.value_text(&f.ty, &self.schema.resolve(&f.ty, d)))
+            }
+            "min" => f.min.map(compact),
+            "max" => f.max.map(compact),
+            "step" => f.step.map(compact),
+            "doc" => f.doc.as_ref().map(|d| format!("{d:?}")),
+            "group" => f.group.clone(),
+            "order" => f.order.map(compact),
+            "label" => f.label.as_ref().map(|d| format!("{d:?}")),
+            "readonly" => f.readonly.then(|| "true".into()),
+            "show_if" => f.show_if.as_ref().map(Cond::text),
+            "hide_if" => f.hide_if.as_ref().map(Cond::text),
+            "widget" => f.widget.map(|w| w.text().into()),
+            _ => None,
         }
     }
 
@@ -521,6 +728,12 @@ impl Props {
         }
         if let Some(step) = f.step {
             out.push_str(&format!("  step {}", compact(step)));
+        }
+        if let Some(group) = &f.group {
+            out.push_str(&format!("  @{group}"));
+        }
+        if f.readonly {
+            out.push_str("  readonly");
         }
         out
     }
@@ -587,10 +800,11 @@ impl Props {
         }
     }
 
-    /// A value as the ex line takes it back — `Enter`'s prefill.
+    /// A value as the ex line takes it back — `Enter`'s prefill. An
+    /// absent value prefills nothing, so what is typed is the value.
     fn edit_text(&self, ty: &TypeExpr, value: &Value) -> String {
         match (ty, value) {
-            (_, Value::Null) => "none".into(),
+            (_, Value::Null) => String::new(),
             (TypeExpr::Optional(inner), v) => self.edit_text(inner, v),
             (TypeExpr::Str, Value::String(s))
             | (TypeExpr::Ref(_), Value::String(s))
@@ -616,6 +830,90 @@ impl Props {
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
     }
 
+    /// The row with `key` selected, when there is one.
+    pub fn select_key(&mut self, key: &str) -> bool {
+        match self.rows.iter().position(|r| r.key == key) {
+            Some(at) => {
+                self.selected = at;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every ancestor of `key` opened and the row selected — where a
+    /// thing just added lands.
+    pub fn reveal(&mut self, key: &str) -> bool {
+        let mut prefix = String::new();
+        for (i, part) in key.split('/').enumerate() {
+            if i > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if prefix != key {
+                self.expanded.insert(prefix.clone());
+            }
+        }
+        self.rebuild();
+        self.select_key(key)
+    }
+
+    /// `Tab` / `Shift-Tab`: the next or previous instance or type row.
+    pub fn next_section(&mut self, back: bool) {
+        let is_section = |r: &Row| matches!(r.kind, RowKind::Instance | RowKind::Type);
+        let found = if back {
+            self.rows[..self.selected].iter().rposition(is_section)
+        } else {
+            self.rows[self.selected + 1..]
+                .iter()
+                .position(is_section)
+                .map(|i| i + self.selected + 1)
+        };
+        if let Some(at) = found {
+            self.selected = at;
+        }
+    }
+
+    fn set_open(&mut self, key: &str, kind: RowKind, open: bool) {
+        if kind == RowKind::Group {
+            let starts_collapsed = self.group_starts_collapsed(key);
+            if starts_collapsed {
+                if open {
+                    self.expanded.insert(key.into())
+                } else {
+                    self.expanded.remove(key)
+                };
+            } else if open {
+                self.collapsed.remove(key);
+            } else {
+                self.collapsed.insert(key.into());
+            }
+        } else if open {
+            self.expanded.insert(key.into());
+        } else {
+            self.expanded.remove(key);
+        }
+    }
+
+    /// Whether the schema said a group row starts closed.
+    fn group_starts_collapsed(&self, key: &str) -> bool {
+        let Some(data) = &self.data else { return false };
+        let Ok((index, segs)) = parse_data_key(key.split("/@").next().unwrap_or(key)) else {
+            return false;
+        };
+        let Some(inst) = data.instances.get(index) else { return false };
+        let ty = match self.walk(&inst.ty, &segs) {
+            Ok((TypeExpr::Named(n), ..)) => n,
+            Ok((TypeExpr::Optional(inner), ..)) => match *inner {
+                TypeExpr::Named(n) => n,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let group = key.rsplit("/@").next().unwrap_or("");
+        self.schema.get(&ty).and_then(|d| d.group(group)).is_some_and(|g| g.collapsed)
+    }
+
     /// `l`: open the row. False when it has nothing to open.
     pub fn expand(&mut self) -> bool {
         let Some(row) = self.rows.get(self.selected) else { return false };
@@ -623,7 +921,8 @@ impl Props {
             return false;
         }
         if !row.expanded {
-            self.expanded.insert(row.key.clone());
+            let (key, kind) = (row.key.clone(), row.kind);
+            self.set_open(&key, kind, true);
             self.rebuild();
         }
         true
@@ -632,11 +931,18 @@ impl Props {
     /// `h`: close the row, or go to its parent.
     pub fn collapse(&mut self) {
         let Some(row) = self.rows.get(self.selected) else { return };
-        if row.expanded {
-            self.expanded.remove(&row.key);
+        if row.expanded && row.expandable {
+            let (key, kind) = (row.key.clone(), row.kind);
+            self.set_open(&key, kind, false);
             self.rebuild();
             return;
         }
+        self.parent();
+    }
+
+    /// `Backspace`: the parent row.
+    pub fn parent(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
         let depth = row.depth;
         if let Some(parent) = self.rows[..self.selected].iter().rposition(|r| r.depth < depth) {
             self.selected = parent;
@@ -649,11 +955,8 @@ impl Props {
         if !row.expandable {
             return false;
         }
-        if row.expanded {
-            self.expanded.remove(&row.key);
-        } else {
-            self.expanded.insert(row.key.clone());
-        }
+        let (key, kind, open) = (row.key.clone(), row.kind, !row.expanded);
+        self.set_open(&key, kind, open);
         self.rebuild();
         true
     }
@@ -667,10 +970,7 @@ impl Props {
         let key = format!("inst:{i}");
         self.expanded.insert(key.clone());
         self.rebuild();
-        if let Some(at) = self.rows.iter().position(|r| r.key == key) {
-            self.selected = at;
-        }
-        true
+        self.select_key(&key)
     }
 
     // ---- paths ----
@@ -686,6 +986,9 @@ impl Props {
             let inst = self.data.as_ref()?.instances.get(i)?;
             let mut out = self.instance_ref(inst.ty.as_str(), inst.id.as_str());
             for seg in rest.into_iter().flat_map(|r| r.split('/')) {
+                if seg.starts_with('@') {
+                    continue;
+                }
                 if let Some(k) = seg.strip_prefix('?') {
                     out.push_str(&format!(".{k}"));
                 } else if seg.starts_with('[') {
@@ -754,15 +1057,17 @@ impl Props {
         Ok((index, parse_segs(rest)?))
     }
 
-    /// The type at the end of a segment chain from a struct, and the
-    /// field definition it belongs to when it is a field.
+    /// The type at the end of a segment chain from a struct, the field
+    /// definition it belongs to when it is a field, and whether anything
+    /// on the way was read-only.
     fn walk<'a>(
         &'a self,
         ty: &str,
         segs: &[Seg],
-    ) -> Result<(TypeExpr, Option<&'a FieldDef>), String> {
+    ) -> Result<(TypeExpr, Option<&'a FieldDef>, bool), String> {
         let mut current = TypeExpr::Named(ty.into());
         let mut field = None;
+        let mut readonly = false;
         for seg in segs {
             let inner = match &current {
                 TypeExpr::Optional(inner) => inner.as_ref().clone(),
@@ -775,6 +1080,7 @@ impl Props {
                         .field(&name, k)
                         .ok_or_else(|| format!("no field {k} on {name}"))?;
                     current = f.ty.clone();
+                    readonly |= f.readonly;
                     field = Some(f);
                 }
                 (TypeExpr::List(item), Seg::Index(_)) => {
@@ -785,7 +1091,7 @@ impl Props {
                 (t, Seg::Index(n)) => return Err(format!("{} has no item [{n}]", t.text())),
             }
         }
-        Ok((current, field))
+        Ok((current, field, readonly))
     }
 
     // ---- data edits ----
@@ -811,10 +1117,13 @@ impl Props {
         if segs.is_empty() {
             return Err(format!("{path} is an instance; name a field"));
         }
-        let (ty, _) = self.walk(&inst.ty, &segs)?;
+        let (ty, _, readonly) = self.walk(&inst.ty, &segs)?;
         if text.is_empty() {
             let (resolved, _) = self.resolved_at(index, &segs)?;
             return Err(format!("{path} = {}", self.edit_text(&ty, &resolved)));
+        }
+        if readonly {
+            return Err(format!("{path} is read-only"));
         }
         let value = self.schema.parse_value(&ty, text).map_err(|e| format!("{path} {e}"))?;
         let mut raw = self.raw.clone();
@@ -895,6 +1204,9 @@ impl Props {
     }
 
     fn delete_data(&self, key: &str) -> Result<Edit, String> {
+        if key.contains("/@") {
+            return Err("a group: remove its fields one by one".into());
+        }
         let (index, segs) = parse_data_key(key)?;
         let data = self.data.as_ref().ok_or("not a data file")?;
         let inst = data.instances.get(index).ok_or("no instance")?;
@@ -912,6 +1224,9 @@ impl Props {
             }
             raw["instances"].as_array_mut().ok_or("no instances")?.remove(index);
             return Ok(Edit::Text(write_kind(self.kind, &raw)));
+        }
+        if let Ok((_, _, true)) = self.walk(&inst.ty, &segs) {
+            return Err("read-only".into());
         }
         let item =
             raw["instances"].get_mut(index).and_then(Value::as_object_mut).ok_or("no instance")?;
@@ -941,8 +1256,10 @@ impl Props {
         Ok(Edit::Text(write_kind(self.kind, &raw)))
     }
 
-    /// `Space` on a row: a bool flipped, an enum, a ref or an optional
-    /// turned. `steps` is the direction and count for `Ctrl-A`/`Ctrl-X`.
+    /// `Space`, `h`, `l`, `Ctrl-A`, `Ctrl-X` on a value: a bool flipped,
+    /// a number stepped, an enum, a ref or an optional turned. `steps` is
+    /// the direction and count; `space` says which key, since `Space`
+    /// turns an optional off where the steps turn its value.
     pub fn turn(&self, key: &str, steps: i64, space: bool) -> Result<Edit, String> {
         match self.kind {
             Kind::Data => self.turn_data(key, steps, space),
@@ -956,7 +1273,10 @@ impl Props {
             return Err("an instance; pick a field".into());
         }
         let inst = &self.data.as_ref().ok_or("not a data file")?.instances[index];
-        let (ty, field) = self.walk(&inst.ty, &segs)?;
+        let (ty, field, readonly) = self.walk(&inst.ty, &segs)?;
+        if readonly {
+            return Err("read-only".into());
+        }
         let (current, _) = self.resolved_at(index, &segs)?;
         let value = self.turned(&ty, field, &current, steps, space)?;
         let mut raw = self.raw.clone();
@@ -975,12 +1295,25 @@ impl Props {
     ) -> Result<Value, String> {
         match ty {
             TypeExpr::Bool => Ok(Value::Bool(!current.as_bool().unwrap_or(false))),
-            TypeExpr::I32 | TypeExpr::I64 | TypeExpr::F32 | TypeExpr::F64 => {
-                if space {
-                    return Err("a number: Ctrl-A and Ctrl-X turn it, Enter edits it".into());
+            TypeExpr::Int(kind) => {
+                let step = field.and_then(|f| f.step).unwrap_or(1.0).round().max(1.0) as i128;
+                let now = current
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| current.as_u64().map(i128::from))
+                    .unwrap_or(0);
+                let mut next = now + steps as i128 * step;
+                if let Some(min) = field.and_then(|f| f.min) {
+                    next = next.max(min.ceil() as i128);
                 }
-                let step =
-                    field.and_then(|f| f.step).unwrap_or(if ty.is_integer() { 1.0 } else { 0.1 });
+                if let Some(max) = field.and_then(|f| f.max) {
+                    next = next.min(max.floor() as i128);
+                }
+                let (lo, hi) = kind.range();
+                Ok(super::schema::int_value(next.clamp(lo, hi)))
+            }
+            TypeExpr::F32 | TypeExpr::F64 => {
+                let step = field.and_then(|f| f.step).unwrap_or(0.1);
                 let now = current.as_f64().unwrap_or(0.0);
                 let mut next = now + steps as f64 * step;
                 let scale = 10f64.powi(decimals(step) as i32);
@@ -990,9 +1323,6 @@ impl Props {
                 }
                 if let Some(max) = field.and_then(|f| f.max) {
                     next = next.min(max);
-                }
-                if ty.is_integer() {
-                    next = next.round();
                 }
                 Ok(number(next))
             }
@@ -1080,7 +1410,7 @@ impl Props {
         if matches!(segs.last(), Some(Seg::Index(_))) {
             segs.pop();
         }
-        let (ty, _) = self.walk(&inst.ty, &segs)?;
+        let (ty, _, readonly) = self.walk(&inst.ty, &segs)?;
         let item_ty = match &ty {
             TypeExpr::List(inner) => inner.as_ref().clone(),
             TypeExpr::Optional(inner) => match inner.as_ref() {
@@ -1089,6 +1419,9 @@ impl Props {
             },
             _ => return Err("not a list (`:bi new` adds an instance)".into()),
         };
+        if readonly {
+            return Err("read-only".into());
+        }
         let (current, _) = self.resolved_at(index, &segs)?;
         let mut items = current.as_array().cloned().unwrap_or_default();
         items.push(self.schema.default_of(&item_ty));
@@ -1139,13 +1472,6 @@ impl Props {
         Ok(Edit::Text(write_kind(self.kind, &raw)))
     }
 
-    /// The row `inst:i` of instance `ty` `id`, for the prompt-confirmed
-    /// delete to land the selection sensibly after.
-    pub fn instance_row(&self, ty: &str, id: &str) -> Option<usize> {
-        let i = self.data.as_ref()?.instances.iter().position(|x| x.ty == ty && x.id == id)?;
-        self.rows.iter().position(|r| r.key == format!("inst:{i}"))
-    }
-
     fn rename_id(&self, ty: &str, old: &str, new: &str) -> Result<Edit, String> {
         if !is_identifier(new) {
             return Err(format!("{new:?} is not an identifier"));
@@ -1166,12 +1492,13 @@ impl Props {
     }
 
     /// `:bi rename <Type>.<old> <new>`: an id in a data file, a field or
-    /// an enum value in a schema.
+    /// an enum value in a schema; `:bi rename <Type> <New>` a type.
     pub fn rename(&self, spec: &str, new: &str) -> Result<Edit, String> {
-        let (ty, old) = spec.split_once('.').ok_or("want <Type>.<name>")?;
-        match self.kind {
-            Kind::Data => self.rename_id(ty, old, new),
-            Kind::Schema => self.rename_in_schema(ty, old, new),
+        match (self.kind, spec.split_once('.')) {
+            (Kind::Data, Some((ty, old))) => self.rename_id(ty, old, new),
+            (Kind::Data, None) => Err("want <Type>.<id>".into()),
+            (Kind::Schema, Some((ty, old))) => self.rename_in_schema(ty, old, new),
+            (Kind::Schema, None) => self.rename_type(spec, new),
         }
     }
 
@@ -1189,7 +1516,7 @@ impl Props {
     pub fn target(&self, key: &str) -> Result<(String, String), String> {
         let (index, segs) = parse_data_key(key)?;
         let inst = &self.data.as_ref().ok_or("not a data file")?.instances[index];
-        let (ty, _) = self.walk(&inst.ty, &segs)?;
+        let (ty, ..) = self.walk(&inst.ty, &segs)?;
         let target = match &ty {
             TypeExpr::Ref(t) => t.clone(),
             TypeExpr::Optional(inner) => match inner.as_ref() {
@@ -1212,7 +1539,11 @@ impl Props {
         if row.expandable
             || matches!(
                 row.kind,
-                RowKind::Instance | RowKind::Type | RowKind::FieldDef | RowKind::Error
+                RowKind::Instance
+                    | RowKind::Group
+                    | RowKind::Type
+                    | RowKind::FieldDef
+                    | RowKind::Error
             )
         {
             return None;
@@ -1225,13 +1556,86 @@ impl Props {
                 }
                 let (index, segs) = parse_data_key(key).ok()?;
                 let inst = self.data.as_ref()?.instances.get(index)?;
-                let (ty, _) = self.walk(&inst.ty, &segs).ok()?;
+                let (ty, ..) = self.walk(&inst.ty, &segs).ok()?;
                 let (value, _) = self.resolved_at(index, &segs).ok()?;
                 self.edit_text(&ty, &value)
             }
             Kind::Schema => self.schema_edit_text(key).unwrap_or_default(),
         };
         Some(format!("bi set {path} {value}"))
+    }
+
+    /// `J` / `K`: the row moved among its siblings — an instance, a list
+    /// item, a type, a field, an enum value. The key to select after.
+    pub fn shift(&self, key: &str, down: bool) -> Result<(Edit, String), String> {
+        match self.kind {
+            Kind::Data => self.shift_data(key, down),
+            Kind::Schema => self.shift_schema(key, down),
+        }
+    }
+
+    fn shift_data(&self, key: &str, down: bool) -> Result<(Edit, String), String> {
+        let (index, segs) = parse_data_key(key)?;
+        let data = self.data.as_ref().ok_or("not a data file")?;
+        let mut raw = self.raw.clone();
+        if segs.is_empty() {
+            let items = raw["instances"].as_array_mut().ok_or("no instances")?;
+            let to = swap_target(index, items.len(), down).ok_or("nowhere to move")?;
+            items.swap(index, to);
+            return Ok((Edit::Text(write_kind(self.kind, &raw)), format!("inst:{to}")));
+        }
+        let Some(Seg::Index(n)) = segs.last().cloned() else {
+            return Err("a field keeps its place; J and K move list items and instances".into());
+        };
+        let inst = data.instances.get(index).ok_or("no instance")?;
+        let list_segs = &segs[..segs.len() - 1];
+        let (_, _, readonly) = self.walk(&inst.ty, list_segs)?;
+        if readonly {
+            return Err("read-only".into());
+        }
+        let (current, _) = self.resolved_at(index, list_segs)?;
+        let mut items = current.as_array().cloned().unwrap_or_default();
+        let to = swap_target(n, items.len(), down).ok_or("nowhere to move")?;
+        items.swap(n, to);
+        self.assign_at(&mut raw, index, list_segs, Value::Array(items))?;
+        let parent = key.rsplit_once('/').map(|(p, _)| p).unwrap_or(key);
+        Ok((Edit::Text(write_kind(self.kind, &raw)), format!("{parent}/[{to}]")))
+    }
+
+    fn shift_schema(&self, key: &str, down: bool) -> Result<(Edit, String), String> {
+        let mut parts = key.split('/');
+        let name = parts.next().and_then(|k| k.strip_prefix("type:")).ok_or("nothing to move")?;
+        let mut raw = self.raw.clone();
+        match (parts.next(), parts.next()) {
+            (None, _) => {
+                let types = raw["types"].as_object_mut().ok_or("no types")?;
+                let at = types.keys().position(|k| k == name).ok_or("no type")?;
+                let to = swap_target(at, types.len(), down).ok_or("nowhere to move")?;
+                let mut entries: Vec<(String, Value)> = std::mem::take(types).into_iter().collect();
+                entries.swap(at, to);
+                types.extend(entries);
+                Ok((Edit::Text(write_kind(self.kind, &raw)), key.into()))
+            }
+            (Some(f), None) if f.starts_with("field:") => {
+                let fname = &f["field:".len()..];
+                let fields = raw["types"][name]["fields"].as_array_mut().ok_or("no fields")?;
+                let at = fields
+                    .iter()
+                    .position(|x| x.get("name").and_then(Value::as_str) == Some(fname))
+                    .ok_or("no field")?;
+                let to = swap_target(at, fields.len(), down).ok_or("nowhere to move")?;
+                fields.swap(at, to);
+                Ok((Edit::Text(write_kind(self.kind, &raw)), key.into()))
+            }
+            (Some(v), None) if v.starts_with("value:") => {
+                let i: usize = v["value:".len()..].parse().map_err(|_| "bad row")?;
+                let values = raw["types"][name]["values"].as_array_mut().ok_or("no values")?;
+                let to = swap_target(i, values.len(), down).ok_or("nowhere to move")?;
+                values.swap(i, to);
+                Ok((Edit::Text(write_kind(self.kind, &raw)), format!("type:{name}/value:{to}")))
+            }
+            _ => Err("an attribute keeps its place".into()),
+        }
     }
 
     // ---- schema edits ----
@@ -1251,7 +1655,7 @@ impl Props {
         let def = self.schema.get(name)?;
         let second = parts.next()?;
         if second == "doc" {
-            return Some(def.doc().map(|d| format!("{d:?}")).unwrap_or_else(|| "-".into()));
+            return Some(def.doc().map(|d| format!("{d:?}")).unwrap_or_default());
         }
         if let Some(i) = second.strip_prefix("value:") {
             let i: usize = i.parse().ok()?;
@@ -1261,15 +1665,9 @@ impl Props {
         let f = self.schema.field(name, fname)?;
         let attr = parts.next()?;
         Some(match attr {
-            "type" => f.ty.text(),
-            "default" => {
-                f.default.as_ref().map(|d| self.edit_text(&f.ty, d)).unwrap_or_else(|| "-".into())
-            }
-            "min" => f.min.map(compact).unwrap_or_else(|| "-".into()),
-            "max" => f.max.map(compact).unwrap_or_else(|| "-".into()),
-            "step" => f.step.map(compact).unwrap_or_else(|| "-".into()),
-            "doc" => f.doc.as_ref().map(|d| format!("{d:?}")).unwrap_or_else(|| "-".into()),
-            _ => return None,
+            "default" => f.default.as_ref().map(|d| self.edit_text(&f.ty, d)).unwrap_or_default(),
+            "doc" | "label" => self.attr_value(f, attr).unwrap_or_default(),
+            other => self.attr_value(f, other).unwrap_or_default(),
         })
     }
 
@@ -1315,12 +1713,15 @@ impl Props {
                     }
                     return self.rename_in_schema(&name, fname, &unquote(text));
                 }
-                if text.is_empty() {
-                    let key = format!("type:{name}/field:{fname}/{attr}");
+                if !FIELD_ATTRS.contains(&attr.as_str()) {
                     return Err(format!(
-                        "{path} = {}",
-                        self.schema_edit_text(&key).unwrap_or_else(|| "-".into())
+                        "not a field attribute: {attr} (want {})",
+                        FIELD_ATTRS.join(", ")
                     ));
+                }
+                if text.is_empty() {
+                    let value = self.attr_value(f, attr).unwrap_or_else(|| "-".into());
+                    return Err(format!("{path} = {value}"));
                 }
                 let value = match attr.as_str() {
                     "type" => {
@@ -1338,7 +1739,7 @@ impl Props {
                             )
                         }
                     }
-                    "min" | "max" | "step" => {
+                    "min" | "max" | "step" | "order" => {
                         if none {
                             None
                         } else {
@@ -1347,18 +1748,38 @@ impl Props {
                             Some(number(n))
                         }
                     }
-                    "doc" => {
+                    "doc" | "label" | "group" => {
                         if none {
                             None
                         } else {
                             Some(Value::String(unquote(text)))
                         }
                     }
-                    other => {
-                        return Err(format!(
-                            "not a field attribute: {other} (want type, default, min, max, step, doc, name)"
-                        ));
+                    "readonly" => match text {
+                        "true" => Some(Value::Bool(true)),
+                        "false" => None,
+                        _ if none => None,
+                        _ => return Err(format!("{path} wants true or false")),
+                    },
+                    "show_if" | "hide_if" => {
+                        if none {
+                            None
+                        } else {
+                            Cond::parse(text).map_err(|e| format!("{path} {e}"))?;
+                            Some(Value::String(text.into()))
+                        }
                     }
+                    "widget" => {
+                        if none {
+                            None
+                        } else {
+                            Widget::parse(text).ok_or_else(|| {
+                                format!("{path} wants {} or -", Widget::NAMES.join(", "))
+                            })?;
+                            Some(Value::String(text.into()))
+                        }
+                    }
+                    _ => unreachable!("checked against FIELD_ATTRS"),
                 };
                 if attr == "type" && value.is_none() {
                     return Err("a field needs a type".into());
@@ -1373,10 +1794,43 @@ impl Props {
                         field.shift_remove(attr);
                     }
                 }
+                if attr == "type" {
+                    self.retype(&mut raw, &name, fname);
+                }
                 self.checked(raw)
             }
             [] => Err(format!("{path} is a type; name an attribute")),
             _ => Err(format!("not a schema path: {path}")),
+        }
+    }
+
+    /// After a field's type changed: a default, a range or a widget that
+    /// no longer fits it goes, rather than the change being refused.
+    fn retype(&self, raw: &mut Value, ty: &str, fname: &str) {
+        let Some(field) = field_mut(raw, ty, fname) else { return };
+        let Some(new) =
+            field.get("type").and_then(Value::as_str).and_then(|t| TypeExpr::parse(t).ok())
+        else {
+            return;
+        };
+        if let Some(default) = field.get("default")
+            && self.schema.check(&new, default).is_err()
+        {
+            field.shift_remove("default");
+        }
+        if !new.is_numeric() {
+            for key in ["min", "max", "step"] {
+                field.shift_remove(key);
+            }
+        }
+        let widget = field.get("widget").and_then(Value::as_str).and_then(Widget::parse);
+        let fits = match widget {
+            Some(Widget::Toggle) => self.schema.enum_values(&new.text()).is_some(),
+            Some(Widget::Inline) => self.schema.is_struct(&new.text()),
+            None => true,
+        };
+        if !fits {
+            field.shift_remove("widget");
         }
     }
 
@@ -1406,6 +1860,23 @@ impl Props {
                 field_mut(&mut raw, ty, old)
                     .ok_or("no field")?
                     .insert("name".into(), Value::String(new.into()));
+                // Conditions on siblings follow the name.
+                for f in fields {
+                    for key in ["show_if", "hide_if"] {
+                        let cond = match key {
+                            "show_if" => &f.show_if,
+                            _ => &f.hide_if,
+                        };
+                        if let Some(c) = cond
+                            && c.field == old
+                        {
+                            let renamed = Cond { field: new.into(), ..c.clone() };
+                            if let Some(fm) = field_mut(&mut raw, ty, &f.name) {
+                                fm.insert(key.into(), Value::String(renamed.text()));
+                            }
+                        }
+                    }
+                }
                 Refactor::RenameField { ty: ty.into(), old: old.into(), new: new.into() }
             }
             Some(TypeDef::Enum { values, .. }) => {
@@ -1428,59 +1899,152 @@ impl Props {
         Ok(Edit::Refactor { text: write_kind(self.kind, &raw), refactor })
     }
 
-    /// `:bi add <Type> <field> <type>`, `:bi add <Enum> <value>`,
-    /// `:bi add <Name> struct|enum [first value]`.
-    pub fn add_to_schema(&self, args: &[&str]) -> Result<Edit, String> {
+    /// `:bi rename Weapon Arm`: the type's key and every type expression
+    /// naming it; the data files' `$type` follow.
+    fn rename_type(&self, old: &str, new: &str) -> Result<Edit, String> {
+        if self.schema.get(old).is_none() {
+            return Err(format!("no type {old}"));
+        }
+        if new == old {
+            return Err(format!("{old} is already called that"));
+        }
+        if !is_identifier(new)
+            || super::schema::PRIMITIVES.contains(&new)
+            || super::schema::GENERICS.contains(&new)
+        {
+            return Err(format!("{new:?} is not a type name"));
+        }
+        if self.schema.get(new).is_some() {
+            return Err(format!("type {new} exists"));
+        }
+        let mut raw = self.raw.clone();
+        let types = raw["types"].as_object_mut().ok_or("no types")?;
+        let entries: Vec<(String, Value)> = std::mem::take(types)
+            .into_iter()
+            .map(|(k, v)| if k == old { (new.to_string(), v) } else { (k, v) })
+            .collect();
+        types.extend(entries);
+        for (tname, def) in &self.schema.types {
+            let tname = if tname == old { new } else { tname };
+            for f in def.fields() {
+                let renamed = f.ty.renamed(old, new);
+                if renamed != f.ty
+                    && let Some(fm) = field_mut(&mut raw, tname, &f.name)
+                {
+                    fm.insert("type".into(), Value::String(renamed.text()));
+                }
+            }
+        }
+        Schema::from_value(&raw).map_err(|e| summary(&e).unwrap_or_default())?;
+        Ok(Edit::Refactor {
+            text: write_kind(self.kind, &raw),
+            refactor: Refactor::RenameType { old: old.into(), new: new.into() },
+        })
+    }
+
+    /// `:bi add …` on a schema, and the key of the last thing added:
+    ///
+    /// ```text
+    /// :bi add Rarity enum common rare epic       a type and its values
+    /// :bi add Weapon struct name:string dmg:i32  a type and its fields
+    /// :bi add Weapon speed f32                   one field
+    /// :bi add Weapon speed:f32 weight:f32        fields
+    /// :bi add Rarity mythic legendary            values
+    /// ```
+    pub fn add_to_schema(&self, args: &[&str]) -> Result<(Edit, Option<String>), String> {
         if self.kind != Kind::Schema {
             return Err("not a schema (`:bi new` adds an instance)".into());
         }
         let mut raw = self.raw.clone();
+        let mut last = None;
         match args {
             [name, kind @ ("struct" | "enum"), rest @ ..] if self.schema.get(name).is_none() => {
-                if !is_identifier(name) {
-                    return Err(format!("{name:?} is not an identifier"));
+                if !is_identifier(name)
+                    || super::schema::PRIMITIVES.contains(name)
+                    || super::schema::GENERICS.contains(name)
+                {
+                    return Err(format!("{name:?} is not a type name"));
                 }
                 let mut def = Map::new();
                 def.insert("kind".into(), Value::String((*kind).into()));
                 if *kind == "struct" {
-                    def.insert("fields".into(), Value::Array(Vec::new()));
+                    let mut fields = Vec::new();
+                    for pair in rest {
+                        let (fname, ftype) = pair
+                            .split_once(':')
+                            .ok_or_else(|| format!("{pair}: want <field>:<type>"))?;
+                        fields.push(field_def(fname, ftype)?);
+                    }
+                    def.insert("fields".into(), Value::Array(fields));
                 } else {
-                    let first = rest.first().copied().unwrap_or("none");
-                    def.insert("values".into(), Value::Array(vec![Value::String(first.into())]));
+                    let values: Vec<&str> =
+                        if rest.is_empty() { vec!["none"] } else { rest.to_vec() };
+                    def.insert(
+                        "values".into(),
+                        Value::Array(values.iter().map(|v| Value::String((*v).into())).collect()),
+                    );
                 }
-                raw["types"].as_object_mut().ok_or("no types")?.insert((*name).into(), Value::Object(def));
+                raw["types"]
+                    .as_object_mut()
+                    .ok_or("no types")?
+                    .insert((*name).into(), Value::Object(def));
+                last = Some(format!("type:{name}"));
             }
-            [ty, field, type_text] if self.schema.is_struct(ty) => {
-                if !is_identifier(field) || field.starts_with('$') {
-                    return Err(format!("{field:?} is not an identifier"));
+            [ty, rest @ ..] if self.schema.is_struct(ty) && !rest.is_empty() => {
+                // `speed f32` or `speed:f32 weight:f32`.
+                let pairs: Vec<(String, String)> = match rest {
+                    [fname, ftype] if !fname.contains(':') => {
+                        vec![((*fname).into(), (*ftype).into())]
+                    }
+                    many => many
+                        .iter()
+                        .map(|pair| {
+                            pair.split_once(':')
+                                .map(|(a, b)| (a.to_string(), b.to_string()))
+                                .ok_or_else(|| format!("{pair}: want <field>:<type>"))
+                        })
+                        .collect::<Result<_, _>>()?,
+                };
+                for (fname, ftype) in &pairs {
+                    if self.schema.field(ty, fname).is_some() {
+                        return Err(format!("{ty}.{fname} exists"));
+                    }
+                    raw["types"][*ty]["fields"]
+                        .as_array_mut()
+                        .ok_or("no fields")?
+                        .push(field_def(fname, ftype)?);
+                    last = Some(format!("type:{ty}/field:{fname}"));
                 }
-                if self.schema.field(ty, field).is_some() {
-                    return Err(format!("{ty}.{field} exists"));
-                }
-                TypeExpr::parse(type_text)?;
-                let mut def = Map::new();
-                def.insert("name".into(), Value::String((*field).into()));
-                def.insert("type".into(), Value::String((*type_text).into()));
-                raw["types"][*ty]["fields"].as_array_mut().ok_or("no fields")?.push(Value::Object(def));
             }
-            [ty, value] if self.schema.enum_values(ty).is_some() => {
-                if self.schema.enum_values(ty).is_some_and(|v| v.iter().any(|x| x == value)) {
-                    return Err(format!("{ty}.{value} exists"));
+            [ty, values @ ..] if self.schema.enum_values(ty).is_some() && !values.is_empty() => {
+                for value in values {
+                    if self.schema.enum_values(ty).is_some_and(|v| v.iter().any(|x| x == value)) {
+                        return Err(format!("{ty}.{value} exists"));
+                    }
+                    let list = raw["types"][*ty]["values"].as_array_mut().ok_or("no values")?;
+                    list.push(Value::String((*value).into()));
+                    last = Some(format!("type:{ty}/value:{}", list.len() - 1));
                 }
-                raw["types"][*ty]["values"].as_array_mut().ok_or("no values")?.push(Value::String((*value).into()));
             }
-            [ty, ..] if self.schema.is_struct(ty) => return Err(format!("add what to {ty}? (`:bi add {ty} <field> <type>`)")),
-            [ty, ..] if self.schema.get(ty).is_some() => return Err(format!("add what to {ty}? (`:bi add {ty} <value>`)")),
-            [name, ..] if self.schema.get(name).is_none() => return Err(format!("no type {name} (`:bi add {name} struct|enum` makes one)")),
-            _ => return Err("add what? (`:bi add <Type> <field> <type>`, `:bi add <Enum> <value>`, `:bi add <Name> struct|enum`)".into()),
+            [ty] if self.schema.is_struct(ty) => {
+                return Err(format!("add what to {ty}? (`:bi add {ty} <field>:<type> …`)"));
+            }
+            [ty] if self.schema.get(ty).is_some() => {
+                return Err(format!("add what to {ty}? (`:bi add {ty} <value> …`)"));
+            }
+            [name, ..] if self.schema.get(name).is_none() => {
+                return Err(format!("no type {name} (`:bi add {name} struct|enum …` makes one)"));
+            }
+            _ => {
+                return Err("add what? (`:bi add <Type> <field>:<type> …`, `:bi add <Enum> <value> …`, `:bi add <Name> struct|enum …`)".into());
+            }
         }
-        self.checked(raw)
+        self.checked(raw).map(|edit| (edit, last))
     }
 
     fn add_schema(&self, key: &str) -> Result<Edit, String> {
         let name = key.strip_prefix("type:").and_then(|k| k.split('/').next());
         Ok(match name {
-            Some(name) if self.schema.is_struct(name) => Edit::Prompt(format!("bi add {name} ")),
             Some(name) if self.schema.get(name).is_some() => {
                 Edit::Prompt(format!("bi add {name} "))
             }
@@ -1558,23 +2122,62 @@ impl Props {
                     .unwrap_or_else(|| self.schema.default_of(&f.ty));
                 self.turned(&f.ty, Some(f), &current, steps, space)?
             }
-            "min" | "max" | "step" => {
-                if space {
-                    return Err("a number: Ctrl-A and Ctrl-X turn it, Enter edits it".into());
-                }
+            "min" | "max" | "step" | "order" => {
                 let current = match attr {
                     "min" => f.min,
                     "max" => f.max,
-                    _ => f.step,
+                    "step" => f.step,
+                    _ => f.order,
                 }
                 .unwrap_or(0.0);
-                let step = if f.ty.is_integer() { 1.0 } else { f.step.unwrap_or(0.1) };
+                let step =
+                    if f.ty.is_integer() || attr == "order" { 1.0 } else { f.step.unwrap_or(0.1) };
                 let scale = 10f64.powi(decimals(step) as i32);
                 number(((current + steps as f64 * step) * scale).round() / scale)
             }
+            "type" => {
+                let choices = self.schema.type_choices();
+                let at = choices.iter().position(|c| *c == f.ty.text());
+                let next = match at {
+                    Some(at) => (at as i64 + steps).rem_euclid(choices.len() as i64) as usize,
+                    None => 0,
+                };
+                Value::String(choices[next].clone())
+            }
+            "readonly" => Value::Bool(!f.readonly),
+            "widget" => {
+                // none → toggle → inline → none, skipping what the type refuses.
+                let mut options: Vec<Option<Widget>> = vec![None];
+                if self.schema.enum_values(&f.ty.text()).is_some() {
+                    options.push(Some(Widget::Toggle));
+                }
+                if self.schema.is_struct(&f.ty.text()) {
+                    options.push(Some(Widget::Inline));
+                }
+                if options.len() == 1 {
+                    return Err(format!("{} has no widget to pick", f.ty.text()));
+                }
+                let at = options.iter().position(|o| *o == f.widget).unwrap_or(0);
+                let next = (at as i64 + steps).rem_euclid(options.len() as i64) as usize;
+                match options[next] {
+                    Some(w) => Value::String(w.text().into()),
+                    None => Value::Null,
+                }
+            }
             _ => return Err(format!("{attr}: Enter edits it")),
         };
-        field_mut(&mut raw, name, fname).ok_or("no field")?.insert(attr.into(), value);
+        let field = field_mut(&mut raw, name, fname).ok_or("no field")?;
+        match (attr, value) {
+            ("readonly", Value::Bool(false)) | ("widget", Value::Null) => {
+                field.shift_remove(attr);
+            }
+            (_, value) => {
+                field.insert(attr.into(), value);
+            }
+        }
+        if attr == "type" {
+            self.retype(&mut raw, name, fname);
+        }
         self.checked(raw)
     }
 
@@ -1594,19 +2197,39 @@ impl Props {
     }
 }
 
-fn attr_row(key: &str, depth: usize, label: &str, value: Option<String>) -> Row {
-    Row {
-        key: key.into(),
-        depth,
-        label: label.into(),
-        value: value.clone().unwrap_or_else(|| "—".into()),
-        kind: RowKind::Attr,
-        inherited: value.is_none(),
-        warning: None,
-        doc: None,
-        expandable: false,
-        expanded: false,
+/// Whether `h` and `l` turn a value of this type.
+fn turnable(ty: &TypeExpr, value: &Value) -> bool {
+    match ty {
+        TypeExpr::Bool | TypeExpr::Int(_) | TypeExpr::F32 | TypeExpr::F64 | TypeExpr::Ref(_) => {
+            true
+        }
+        TypeExpr::Named(_) => value.is_string(),
+        TypeExpr::Optional(inner) => value.is_null() || turnable(inner, value),
+        _ => false,
     }
+}
+
+fn swap_target(at: usize, len: usize, down: bool) -> Option<usize> {
+    if down { (at + 1 < len).then_some(at + 1) } else { at.checked_sub(1) }
+}
+
+/// A field definition for `:bi add`.
+fn field_def(name: &str, ty: &str) -> Result<Value, String> {
+    if !is_identifier(name) || name.starts_with('$') {
+        return Err(format!("{name:?} is not an identifier"));
+    }
+    TypeExpr::parse(ty)?;
+    let mut def = Map::new();
+    def.insert("name".into(), Value::String(name.into()));
+    def.insert("type".into(), Value::String(ty.into()));
+    Ok(Value::Object(def))
+}
+
+fn attr_row(key: &str, depth: usize, label: &str, value: Option<String>) -> Row {
+    let mut row = Row::new(key, depth, label, RowKind::Attr);
+    row.value = value.clone().unwrap_or_else(|| "—".into());
+    row.inherited = value.is_none();
+    row
 }
 
 /// `.a.b[2].c` → segments.
@@ -1634,6 +2257,7 @@ fn parse_segs(rest: &str) -> Result<Vec<Seg>, String> {
 }
 
 /// `inst:3/drops/[1]` → (3, [drops, [1]]); `inst:0/?dmg` → (0, [dmg]).
+/// Group segments (`@Stats`) are layout, not data, and are skipped.
 fn parse_data_key(key: &str) -> Result<(usize, Vec<Seg>), String> {
     let mut parts = key.split('/');
     let index: usize = parts
@@ -1643,6 +2267,9 @@ fn parse_data_key(key: &str) -> Result<(usize, Vec<Seg>), String> {
         .ok_or("not a data row")?;
     let mut segs = Vec::new();
     for part in parts {
+        if part.starts_with('@') {
+            continue;
+        }
         if let Some(n) = part.strip_prefix('[').and_then(|p| p.strip_suffix(']')) {
             segs.push(Seg::Index(n.parse().map_err(|_| "bad row")?));
         } else {
@@ -1654,7 +2281,7 @@ fn parse_data_key(key: &str) -> Result<(usize, Vec<Seg>), String> {
 
 /// `new` written at `segs` below a value of type `ty` whose stored form
 /// is `stored` and whose meaning is `resolved`: structs on the way are
-/// created sparse, lists materialised whole.
+/// created from their meaning, lists materialised whole.
 fn assign(
     schema: &Schema,
     ty: &TypeExpr,
@@ -1714,7 +2341,7 @@ fn remove_in(
         other => other,
     };
     match (inner, segs) {
-        (TypeExpr::Named(name), [Seg::Key(k)]) => {
+        (TypeExpr::Named(_), [Seg::Key(k)]) => {
             let mut map = match stored {
                 Some(Value::Object(m)) => m.clone(),
                 _ => return Err(format!("{k} is already the default")),
@@ -1722,7 +2349,6 @@ fn remove_in(
             if map.shift_remove(k).is_none() {
                 return Err(format!("{k} is already the default"));
             }
-            let _ = name;
             Ok(Value::Object(map))
         }
         (TypeExpr::List(_), [Seg::Index(n)]) => {
@@ -1890,6 +2516,139 @@ mod tests {
     }
 
     #[test]
+    fn rows_carry_their_widgets() {
+        let mut p = data_view();
+        open(&mut p, "inst:3");
+        let widget = |p: &Props, key: &str| p.rows.iter().find(|r| r.key == key).unwrap().widget;
+        assert_eq!(widget(&p, "inst:3"), RowWidget::Header);
+        assert_eq!(widget(&p, "inst:3/name"), RowWidget::Text);
+        assert_eq!(widget(&p, "inst:3/hp"), RowWidget::Plain, "a min without a max is no slider");
+        assert_eq!(widget(&p, "inst:3/speed"), RowWidget::Slider(0.14));
+        assert_eq!(widget(&p, "inst:3/weapon"), RowWidget::Choice);
+        assert_eq!(widget(&p, "inst:3/drops"), RowWidget::Fold);
+        assert_eq!(widget(&p, "inst:3/leader"), RowWidget::Choice);
+        open(&mut p, "inst:2");
+        assert_eq!(widget(&p, "inst:2/two_handed"), RowWidget::Check(true));
+        assert_eq!(widget(&p, "inst:2/damage"), RowWidget::Slider(40.0 / 999.0));
+        assert_eq!(widget(&p, "inst:2/rarity"), RowWidget::Choice);
+        let turnable =
+            |p: &Props, key: &str| p.rows.iter().find(|r| r.key == key).unwrap().turnable;
+        assert!(turnable(&p, "inst:2/damage"));
+        assert!(turnable(&p, "inst:2/rarity"));
+        assert!(turnable(&p, "inst:3/leader"));
+        assert!(!turnable(&p, "inst:3/name"));
+        assert!(!turnable(&p, "inst:3/drops"));
+        assert!(!turnable(&p, "inst:3"));
+        p.expand_first();
+        assert!(p.rows[0].expanded);
+        p.next_section(false);
+        assert_eq!(p.selected_row().unwrap().key, "inst:1");
+        p.next_section(true);
+        assert_eq!(p.selected_row().unwrap().key, "inst:0");
+    }
+
+    const LAYOUT: &str = r#"{"$dialect":"bi/1","types":{
+        "Rarity":{"kind":"enum","values":["common","rare","epic"]},
+        "Vec2":{"kind":"struct","fields":[{"name":"x","type":"f32"},{"name":"y","type":"f32"}]},
+        "Weapon":{"kind":"struct","groups":{"Advanced":{"collapsed":true}},"fields":[
+            {"name":"name","type":"string","order":-1},
+            {"name":"damage","type":"i32","default":10,"min":0,"max":100,"group":"Stats"},
+            {"name":"crit","type":"f32","group":"Stats/Combat","show_if":"damage > 50"},
+            {"name":"rarity","type":"Rarity","widget":"toggle","label":"Tier"},
+            {"name":"offset","type":"Vec2","widget":"inline","group":"Advanced"},
+            {"name":"id_hash","type":"u32","readonly":true,"group":"Advanced"},
+            {"name":"two_handed","type":"bool","hide_if":"rarity == common"}
+        ]}}}"#;
+
+    fn layout_view(instances: &str) -> Props {
+        let mut p = Props::new(Kind::Data, BufferId(1), Some(PathBuf::from("/p/l.bidata")));
+        let text =
+            format!(r#"{{"$dialect":"bi/1","$schema":"l.bischema","instances":{instances}}}"#);
+        p.load(&text, Some(Ok(LAYOUT.into())), Index::default()).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_layout_groups_orders_hides_and_labels() {
+        let mut p = layout_view(r#"[{"$type":"Weapon","$id":"a","damage":60,"rarity":"rare"}]"#);
+        open(&mut p, "inst:0");
+        assert_eq!(
+            lines(&p),
+            [
+                "Weapon a",
+                "  ~name \"\"",
+                "  Stats",
+                "    damage 60",
+                "    Combat",
+                "      ~crit 0",
+                "  Tier common [rare] epic",
+                "  Advanced",
+                "  ~two_handed false",
+            ]
+        );
+        let keys: Vec<&str> = p.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "inst:0",
+                "inst:0/name",
+                "inst:0/@Stats",
+                "inst:0/damage",
+                "inst:0/@Stats/@Combat",
+                "inst:0/crit",
+                "inst:0/rarity",
+                "inst:0/@Advanced",
+                "inst:0/two_handed",
+            ]
+        );
+        assert_eq!(p.rows[6].widget, RowWidget::Toggle);
+        assert_eq!(p.rows[2].kind, RowKind::Group);
+        assert!(!p.rows[7].expanded, "the schema said collapsed");
+        // Open the collapsed group: the inline struct is open with no fold.
+        p.select(7);
+        assert!(p.expand());
+        assert_eq!(
+            lines(&p)[7..12],
+            [
+                "  Advanced",
+                "    ~offset { x 0, y 0 }",
+                "      ~x 0",
+                "      ~y 0",
+                "    ~id_hash 0"
+            ]
+        );
+        let offset = p.rows.iter().find(|r| r.key == "inst:0/offset").unwrap();
+        assert!(!offset.expandable && offset.expanded);
+        let hash = p.rows.iter().find(|r| r.key == "inst:0/id_hash").unwrap();
+        assert!(hash.readonly);
+        assert_eq!(p.turn("inst:0/id_hash", 1, false), Err("read-only".into()));
+        assert_eq!(p.set("a.id_hash", "3"), Err("a.id_hash is read-only".into()));
+        assert_eq!(p.delete("inst:0/id_hash"), Err("read-only".into()));
+        // Close it again, and the closed group survives a rebuild.
+        p.select(7);
+        p.collapse();
+        assert!(!p.rows[7].expanded);
+        // A group that starts open closes by hand.
+        p.select(2);
+        p.collapse();
+        assert!(!p.rows[2].expanded);
+        assert_eq!(p.rows[3].key, "inst:0/rarity");
+        p.expand();
+        assert!(p.rows[2].expanded);
+        // Conditions follow the values.
+        let text = text_of(p.set("a.damage", "20"));
+        assert!(text.contains("\"damage\": 20"));
+        p.load(&text, Some(Ok(LAYOUT.into())), Index::default()).unwrap();
+        assert!(!p.rows.iter().any(|r| r.key == "inst:0/crit"), "damage > 50 no longer holds");
+        let text = text_of(p.set("a.rarity", "common"));
+        p.load(&text, Some(Ok(LAYOUT.into())), Index::default()).unwrap();
+        assert!(!p.rows.iter().any(|r| r.key == "inst:0/two_handed"), "hidden when common");
+        assert_eq!(p.path_of("inst:0/@Stats/@Combat"), Some("a".into()));
+        assert_eq!(p.path_of("inst:0/damage"), Some("a.damage".into()));
+        assert_eq!(p.delete("inst:0/@Stats"), Err("a group: remove its fields one by one".into()));
+    }
+
+    #[test]
     fn warnings_ride_on_their_rows_and_expansion_survives_a_rebuild() {
         let mut p = data_view();
         let text = DATA
@@ -1933,6 +2692,27 @@ mod tests {
         );
         assert!(p.load(DATA, Some(Ok(SCHEMA.into())), Index::default()).is_ok());
         assert_eq!(p.error, None);
+    }
+
+    #[test]
+    fn skeletons_and_schema_refs() {
+        assert_eq!(
+            Props::skeleton(Kind::Data, Some("game.bischema")),
+            "{\n  \"$dialect\": \"bi/1\",\n  \"$schema\": \"game.bischema\",\n  \"instances\": []\n}\n"
+        );
+        assert_eq!(
+            Props::skeleton(Kind::Schema, None),
+            "{\n  \"$dialect\": \"bi/1\",\n  \"types\": {}\n}\n"
+        );
+        let fixed =
+            Props::with_schema_ref(&Props::skeleton(Kind::Data, None), "../game.bischema").unwrap();
+        assert!(fixed.contains("\"$dialect\": \"bi/1\",\n  \"$schema\": \"../game.bischema\",\n"));
+        assert!(Props::with_schema_ref("{", "x").is_err());
+        let mut p = Props::new(Kind::Data, BufferId(1), None);
+        assert_eq!(
+            p.load(&Props::skeleton(Kind::Data, None), None, Index::default()),
+            Err("no $schema".into())
+        );
     }
 
     #[test]
@@ -2014,6 +2794,7 @@ mod tests {
             refactor,
             Refactor::RenameId { ty: "Enemy".into(), old: "goblin".into(), new: "gob".into() }
         );
+        assert_eq!(p.rename("Enemy", "Foe"), Err("want <Type>.<id>".into()));
     }
 
     #[test]
@@ -2039,12 +2820,10 @@ mod tests {
         assert!(!text.contains("\"leader\""), "an optional turns off: {text}");
         let text = after(p.turn("inst:3/leader", 1, true), &mut p);
         assert!(text.contains("\"leader\": \"goblin\""), "and on, to the first id: {text}");
-        assert_eq!(
-            p.turn("inst:3/hp", 1, true),
-            Err("a number: Ctrl-A and Ctrl-X turn it, Enter edits it".into())
-        );
+        let text = after(p.turn("inst:3/hp", 1, true), &mut p);
+        assert!(text.contains("\"hp\": 41"), "Space steps a number too: {text}");
         let text = after(p.turn("inst:3/hp", 5, false), &mut p);
-        assert!(text.contains("\"hp\": 45"));
+        assert!(text.contains("\"hp\": 46"));
         let text = after(p.turn("inst:3/speed", 1, false), &mut p);
         assert!(text.contains("\"speed\": 1.5"), "by its step: {text}");
         let text = after(p.turn("inst:3/speed", 100, false), &mut p);
@@ -2056,6 +2835,10 @@ mod tests {
         let text = after(p.turn("inst:3/drops/[0]", 1, false), &mut p);
         assert!(text.contains("\"drops\": [\"warhammer\", \"dagger\"]"), "{text}");
         assert_eq!(p.turn("inst:3", 1, true), Err("an instance; pick a field".into()));
+        let mut p = layout_view(r#"[{"$type":"Weapon","$id":"a","id_hash":5}]"#);
+        let text = text_of(p.turn("inst:0/damage", -100, false));
+        assert!(text.contains("\"damage\": 0"), "an integer clamps to min: {text}");
+        p.load(&text, Some(Ok(LAYOUT.into())), Index::default()).unwrap();
     }
 
     #[test]
@@ -2099,7 +2882,10 @@ mod tests {
         assert_eq!(p.add("inst:3"), Ok(Edit::Prompt("bi new ".into())));
         assert_eq!(p.add("inst:3/hp"), Err("not a list (`:bi new` adds an instance)".into()));
         let text = after(p.new_instance("Enemy", "orc"), &mut p);
-        assert!(text.ends_with("    {\n      \"$type\": \"Enemy\",\n      \"$id\": \"orc\",\n      \"weapon\": \"\"\n    }\n  ]\n}\n"), "{text}");
+        assert!(
+            text.ends_with("    {\n      \"$type\": \"Enemy\",\n      \"$id\": \"orc\",\n      \"weapon\": \"\"\n    }\n  ]\n}\n"),
+            "{text}"
+        );
         assert_eq!(p.warnings(), 2, "the blank ref and the blank drop");
         assert_eq!(p.new_instance("Enemy", "orc"), Err("Enemy orc exists".into()));
         assert_eq!(p.new_instance("Rarity", "x"), Err("Rarity is an enum".into()));
@@ -2108,6 +2894,37 @@ mod tests {
             Err("no type Boss (want Vec2, Weapon, Enemy)".into())
         );
         assert_eq!(p.new_instance("Enemy", "1x"), Err("\"1x\" is not an identifier".into()));
+    }
+
+    #[test]
+    fn j_and_k_move_instances_items_fields_values_and_types() {
+        let mut p = data_view();
+        let (edit, key) = p.shift("inst:0", true).unwrap();
+        assert_eq!(key, "inst:1");
+        let text = after(Ok(edit), &mut p);
+        assert_eq!(p.data.as_ref().unwrap().instances[1].id, "rusty_sword");
+        assert!(text.contains("\"$id\": \"dagger\",\n      \"name\": \"Dagger\""));
+        assert_eq!(p.shift("inst:0", false).unwrap_err(), "nowhere to move");
+        let (edit, key) = p.shift("inst:3/drops/[0]", true).unwrap();
+        assert_eq!(key, "inst:3/drops/[1]");
+        let text = text_of(Ok(edit));
+        assert!(text.contains("\"drops\": [\"dagger\", \"rusty_sword\"]"));
+        assert!(p.shift("inst:3/hp", true).is_err());
+
+        let mut s = schema_view();
+        let (edit, key) = s.shift("type:Weapon/field:damage", false).unwrap();
+        assert_eq!(key, "type:Weapon/field:damage");
+        let text = text_of(Ok(edit));
+        assert!(text.contains("\"fields\": [\n        { \"name\": \"damage\""));
+        let (edit, key) = s.shift("type:Rarity/value:0", true).unwrap();
+        assert_eq!(key, "type:Rarity/value:1");
+        assert!(text_of(Ok(edit)).contains("[\"rare\", \"common\", \"epic\"]"));
+        let (edit, _) = s.shift("type:Rarity", true).unwrap();
+        let text = text_of(Ok(edit));
+        s.load(&text, None, Index::default()).unwrap();
+        let names: Vec<&str> = s.schema.types.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Vec2", "Rarity", "Weapon", "Enemy"]);
+        assert!(s.shift("type:Weapon/field:damage/min", true).is_err());
     }
 
     #[test]
@@ -2122,6 +2939,12 @@ mod tests {
         assert_eq!(p.edit_line("inst:3/drops/[1]"), Some("bi set goblin.drops[1] dagger".into()));
         assert_eq!(p.edit_line("inst:3/drops"), None, "a list opens");
         assert_eq!(p.edit_line("inst:3"), None);
+        open(&mut p, "inst:4");
+        assert_eq!(
+            p.edit_line("inst:4/leader"),
+            Some("bi set goblin_chief.leader ".into()),
+            "nothing to prefill for null"
+        );
         assert_eq!(p.target("inst:3/weapon"), Ok(("Weapon".into(), "rusty_sword".into())));
         assert_eq!(p.target("inst:3/drops/[1]"), Ok(("Weapon".into(), "dagger".into())));
         assert_eq!(p.target("inst:3/leader"), Ok(("Enemy".into(), "goblin_chief".into())));
@@ -2129,10 +2952,7 @@ mod tests {
         assert!(p.select_instance("Enemy", "goblin_chief"));
         assert_eq!(p.selected_row().unwrap().key, "inst:4");
         assert!(p.selected_row().unwrap().expanded);
-        // Two types sharing an id spell the type.
-        let shared = DATA
-            .replace("\"$id\": \"goblin\"", "\"$id\": \"dagger\"")
-            .replace("\"leader\": \"goblin_chief\"", "\"leader\": \"goblin_chief\"");
+        let shared = DATA.replace("\"$id\": \"goblin\"", "\"$id\": \"dagger\"");
         p.load(&shared, Some(Ok(SCHEMA.into())), Index::default()).unwrap();
         assert_eq!(p.path_of("inst:3/hp"), Some("Enemy:dagger.hp".into()));
         assert_eq!(
@@ -2155,7 +2975,7 @@ mod tests {
         open(&mut p, "type:Weapon/field:damage");
         let weapon = p.rows.iter().position(|r| r.key == "type:Weapon").unwrap();
         assert_eq!(
-            lines(&p)[weapon..weapon + 10],
+            lines(&p)[weapon..weapon + 17],
             [
                 "Weapon struct",
                 "  ~doc —",
@@ -2167,6 +2987,13 @@ mod tests {
                 "    max 999",
                 "    ~step —",
                 "    ~doc —",
+                "    ~group —",
+                "    ~order —",
+                "    ~label —",
+                "    ~readonly —",
+                "    ~show_if —",
+                "    ~hide_if —",
+                "    ~widget —",
             ]
         );
         let enemy = p.rows.iter().position(|r| r.key == "type:Enemy").unwrap();
@@ -2184,10 +3011,11 @@ mod tests {
         );
         assert_eq!(
             p.edit_line("type:Weapon/field:damage/step"),
-            Some("bi set Weapon.damage.step -".into())
+            Some("bi set Weapon.damage.step ".into())
         );
         assert_eq!(p.edit_line("type:Rarity/value:1"), Some("bi set Rarity.values[1] rare".into()));
         assert_eq!(p.edit_line("type:Weapon/field:damage"), None);
+        assert_eq!(p.edit_line("type:Weapon/doc"), Some("bi set Weapon.doc ".into()));
     }
 
     #[test]
@@ -2198,7 +3026,7 @@ mod tests {
         p.load(&text, None, Index::default()).unwrap();
         assert_eq!(
             p.set("Weapon.damage.default", "lots"),
-            Err("Weapon.damage.default wants a whole number".into())
+            Err("Weapon.damage.default wants a whole number -2147483648..2147483647".into())
         );
         let text = text_of(p.set("Weapon.damage.step", "5"));
         assert!(text.contains("\"max\": 999, \"step\": 5 }"));
@@ -2213,12 +3041,47 @@ mod tests {
             Err("Weapon.damage: unknown type Boss".into())
         );
         let text = text_of(p.set("Weapon.damage.type", "i64"));
-        assert!(text.contains("\"type\": \"i64\""));
+        assert!(text.contains("\"type\": \"i64\", \"default\": 20"));
+        let text = text_of(p.set("Weapon.damage.type", "string"));
+        assert!(
+            text.contains("{ \"name\": \"damage\", \"type\": \"string\" }"),
+            "the default and the range went with the type: {text}"
+        );
         let text = text_of(p.set("Weapon.doc", "A thing to hit with"));
         assert!(text.contains("\"doc\": \"A thing to hit with\"\n"));
         let text = text_of(p.set("Rarity.doc", "-"));
         assert!(!text.contains("Drop tier"));
         assert_eq!(p.set("Weapon.damage.default", ""), Err("Weapon.damage.default = 20".into()));
+        // Layout attributes.
+        let text = text_of(p.set("Weapon.damage.group", "Stats/Combat"));
+        assert!(text.contains("\"group\": \"Stats/Combat\""));
+        let text = text_of(p.set("Weapon.damage.show_if", "two_handed"));
+        assert!(text.contains("\"show_if\": \"two_handed\""));
+        assert_eq!(
+            p.set("Weapon.damage.show_if", "nothing"),
+            Err("Weapon.damage: show_if names no field nothing".into())
+        );
+        assert_eq!(
+            p.set("Weapon.damage.widget", "toggle"),
+            Err("Weapon.damage: widget toggle wants an enum".into())
+        );
+        let text = text_of(p.set("Weapon.rarity.widget", "toggle"));
+        assert!(text.contains("\"widget\": \"toggle\""));
+        assert_eq!(
+            p.set("Weapon.rarity.widget", "knob"),
+            Err("Weapon.rarity.widget wants toggle, inline or -".into())
+        );
+        let text = text_of(p.set("Weapon.damage.readonly", "true"));
+        assert!(text.contains("\"readonly\": true"));
+        let text = text_of(p.set("Weapon.damage.label", "Damage (HP)"));
+        assert!(text.contains("\"label\": \"Damage (HP)\""));
+        let text = text_of(p.set("Weapon.damage.order", "-1"));
+        assert!(text.contains("\"order\": -1"));
+        assert_eq!(
+            p.set("Weapon.damage.colour", "red"),
+            Err(format!("not a field attribute: colour (want {})", FIELD_ATTRS.join(", ")))
+        );
+        // Renames.
         let Edit::Refactor { text, refactor } = p.set("Weapon.damage.name", "dmg").unwrap() else {
             panic!()
         };
@@ -2242,17 +3105,48 @@ mod tests {
         assert_eq!(p.rename("Weapon.damage", "name"), Err("Weapon.name exists".into()));
         assert_eq!(p.rename("Weapon.nothing", "x"), Err("no field nothing on Weapon".into()));
         assert_eq!(p.rename("Boss.x", "y"), Err("no type Boss".into()));
+        let Edit::Refactor { text, refactor } = p.rename("Weapon", "Arm").unwrap() else {
+            panic!()
+        };
+        assert_eq!(refactor, Refactor::RenameType { old: "Weapon".into(), new: "Arm".into() });
+        assert!(text.contains("\"Arm\": {\n"));
+        assert!(text.contains("\"type\": \"ref<Arm>\""));
+        assert!(text.contains("\"type\": \"list<ref<Arm>>\""));
+        assert!(!text.contains("Weapon"));
+        assert_eq!(p.rename("Weapon", "Enemy"), Err("type Enemy exists".into()));
+        assert_eq!(p.rename("Weapon", "list"), Err("\"list\" is not a type name".into()));
+        // Turning attributes.
         let text = text_of(p.turn("type:Weapon/field:two_handed/default", 1, true));
         assert!(text.contains("\"default\": true"));
         let text = text_of(p.turn("type:Weapon/field:damage/max", 1, false));
         assert!(text.contains("\"max\": 1000"));
+        let text = text_of(p.turn("type:Weapon/field:damage/readonly", 1, true));
+        assert!(text.contains("\"readonly\": true"));
+        let text = text_of(p.turn("type:Weapon/field:rarity/widget", 1, true));
+        assert!(text.contains("\"widget\": \"toggle\""));
+        assert_eq!(
+            p.turn("type:Weapon/field:damage/widget", 1, true),
+            Err("i32 has no widget to pick".into())
+        );
+        let text = text_of(p.turn("type:Weapon/field:name/type", 1, false));
+        assert!(
+            text.contains("{ \"name\": \"name\", \"type\": \"Rarity\" }"),
+            "string → the first type after the primitives: {text}"
+        );
+        let text = text_of(p.turn("type:Weapon/field:name/type", -1, false));
+        assert!(text.contains("{ \"name\": \"name\", \"type\": \"f64\" }"), "{text}");
     }
 
     #[test]
     fn schema_add_and_delete() {
         let mut p = schema_view();
-        let text = text_of(p.add_to_schema(&["Weapon", "speed", "f32"]));
-        assert!(text.contains("{ \"name\": \"two_handed\", \"type\": \"bool\", \"default\": false },\n        { \"name\": \"speed\", \"type\": \"f32\" }"));
+        let (edit, key) = p.add_to_schema(&["Weapon", "speed", "f32"]).unwrap();
+        assert_eq!(key.as_deref(), Some("type:Weapon/field:speed"));
+        assert!(text_of(Ok(edit)).contains("{ \"name\": \"two_handed\", \"type\": \"bool\", \"default\": false },\n        { \"name\": \"speed\", \"type\": \"f32\" }"));
+        let (edit, key) = p.add_to_schema(&["Weapon", "speed:f32", "weight:u8"]).unwrap();
+        assert_eq!(key.as_deref(), Some("type:Weapon/field:weight"));
+        let text = text_of(Ok(edit));
+        assert!(text.contains("{ \"name\": \"speed\", \"type\": \"f32\" },\n        { \"name\": \"weight\", \"type\": \"u8\" }"));
         assert_eq!(
             p.add_to_schema(&["Weapon", "damage", "f32"]),
             Err("Weapon.damage exists".into())
@@ -2261,17 +3155,26 @@ mod tests {
             p.add_to_schema(&["Weapon", "x", "Boss"]),
             Err("Weapon.x: unknown type Boss".into())
         );
-        let text = text_of(p.add_to_schema(&["Rarity", "mythic"]));
-        assert!(text.contains("[\"common\", \"rare\", \"epic\", \"mythic\"]"));
-        let text = text_of(p.add_to_schema(&["Color", "struct"]));
+        assert_eq!(p.add_to_schema(&["Weapon", "x"]), Err("x: want <field>:<type>".into()));
+        let (edit, key) = p.add_to_schema(&["Rarity", "mythic", "legendary"]).unwrap();
+        assert_eq!(key.as_deref(), Some("type:Rarity/value:4"));
         assert!(
-            text.contains("\"Color\": {\n      \"kind\": \"struct\",\n      \"fields\": []\n    }")
+            text_of(Ok(edit))
+                .contains("[\"common\", \"rare\", \"epic\", \"mythic\", \"legendary\"]")
         );
-        let text = text_of(p.add_to_schema(&["Size", "enum", "small"]));
-        assert!(text.contains("\"values\": [\"small\"]"));
+        assert_eq!(p.add_to_schema(&["Rarity", "epic"]), Err("Rarity.epic exists".into()));
+        let (edit, key) = p.add_to_schema(&["Color", "struct", "r:u8", "g:u8", "b:u8"]).unwrap();
+        assert_eq!(key.as_deref(), Some("type:Color"));
+        let text = text_of(Ok(edit));
+        assert!(text.contains("\"Color\": {\n      \"kind\": \"struct\",\n      \"fields\": [\n        { \"name\": \"r\", \"type\": \"u8\" },\n        { \"name\": \"g\", \"type\": \"u8\" },\n        { \"name\": \"b\", \"type\": \"u8\" }\n      ]\n    }"));
+        let (edit, _) = p.add_to_schema(&["Size", "enum", "small", "large"]).unwrap();
+        assert!(text_of(Ok(edit)).contains("\"values\": [\"small\", \"large\"]"));
+        let (edit, _) = p.add_to_schema(&["Empty", "enum"]).unwrap();
+        assert!(text_of(Ok(edit)).contains("\"values\": [\"none\"]"));
+        assert_eq!(p.add_to_schema(&["u8", "struct"]), Err("\"u8\" is not a type name".into()));
         assert_eq!(
             p.add_to_schema(&["Weapon"]),
-            Err("add what to Weapon? (`:bi add Weapon <field> <type>`)".into())
+            Err("add what to Weapon? (`:bi add Weapon <field>:<type> …`)".into())
         );
         assert_eq!(p.add("type:Weapon"), Ok(Edit::Prompt("bi add Weapon ".into())));
         assert_eq!(p.add("nothing"), Ok(Edit::Prompt("bi add ".into())));
@@ -2290,8 +3193,8 @@ mod tests {
         p.load(&text.replace("[\"common\", \"rare\"]", "[\"common\"]"), None, Index::default())
             .unwrap();
         assert_eq!(p.delete("type:Rarity/value:0"), Err("an enum keeps one value".into()));
-        let text = text_of(p.add_to_schema(&["Loose", "struct"]));
-        p.load(&text, None, Index::default()).unwrap();
+        let (edit, _) = p.add_to_schema(&["Loose", "struct"]).unwrap();
+        p.load(&text_of(Ok(edit)), None, Index::default()).unwrap();
         let text = text_of(p.delete("type:Loose"));
         assert!(!text.contains("Loose"));
     }
@@ -2319,7 +3222,7 @@ mod tests {
         let mut p = data_view();
         p.select(3);
         assert!(p.expand());
-        assert_eq!(p.rows[3].expanded, true);
+        assert!(p.rows[3].expanded);
         p.select_by(2);
         assert_eq!(p.selected_row().unwrap().key, "inst:3/hp");
         p.collapse();
@@ -2332,5 +3235,9 @@ mod tests {
         assert!(p.rows[0].expanded);
         p.select_by(1);
         assert!(!p.expand(), "a string has nothing to open");
+        p.parent();
+        assert_eq!(p.selected, 0);
+        assert!(p.select_key("inst:0/damage"));
+        assert!(!p.select_key("nowhere"));
     }
 }

@@ -237,25 +237,29 @@ insert and delete-character actions normal mode already names.
 
 ## The form
 
-A readout and a place for exact values, the same `Form` every tool uses:
+A readout, and a place for the two steps, the same `Form` every tool uses:
 
 ```
-Point     ‹ 2 of 3 ›
-X         ━━━━●━━━━━   0.500        between the neighbours
-Y         ━━━━━━━●━━   0.800        over the visible range
-Out       0.000                     read-only until tangents move
+Point     2                         read-only: the plot's Tab picks
+X         0.500                     read-only: the plot's h and l move
+Y         0.800
+Out       0.000
 In        0.000
-Locked    [x]
+Locked    on
 X step    ━●━━━━━━━━   0.010
 Y step    ━●━━━━━━━━   0.010
 ```
 
-Turning `Point`, `X` or `Y` is the same edit the keys make; the form is
-rebuilt from the curve after, so its ranges follow the selection. `Tab`
-in the form cycles `Point`: the form's cycle field is a name its owner
-sets, `map` for the normal map and `point` here, a small amendment to
-`form.md`. `u` in the form undoes the source buffer, as on the plot.
-`Enter` prefills `:tool curve <field> <value>`.
+`Point`, `X`, `Y`, `Out`, `In` and `Locked` are **read-only**: they
+mirror the selected point and nothing in the form turns them. A point
+has rules — sorted `x`, clamped to its neighbours, two points at least —
+that the plot's keys keep and a freely turned slider could break, so the
+form shows and the plot moves. Only `X step` and `Y step` turn, with `h`
+and `l` or `:tool curve xstep 0.05`; `:tool curve x 0.5` is refused as
+read-only, `:tool curve x` still reports. `u` in the form undoes the
+source buffer, as on the plot. `Enter` on a step prefills `:tool curve
+xstep <value>`; `Tab` cycles nothing here — the plot's `Tab` picks the
+point.
 
 ## Tests
 

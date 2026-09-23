@@ -990,6 +990,8 @@ fn render_form(
     for (index, field) in form.fields().iter().enumerate().take(area.height as usize) {
         let label = format!("{:<label_width$}", field.label());
         let row = match field.kind() {
+            // A readout: the value alone, no slider to suggest it turns.
+            _ if field.is_readonly() => format!(" {label}  {}", field.display()),
             Kind::Bool => {
                 let mark = if field.display() == "on" { "[x]" } else { "[ ]" };
                 format!(" {mark} {}", field.label())
@@ -1020,6 +1022,7 @@ fn render_form(
         let style = match (focused, index == form.selected()) {
             (true, true) => tui(ui.selection),
             (false, true) => tui(ui.cursorline),
+            _ if field.is_readonly() => tui(ui.status_muted),
             _ => Style::default(),
         };
         let padded = format!("{row:<width$}");
@@ -1029,10 +1032,12 @@ fn render_form(
     None
 }
 
-/// A property view: one row per visible node — a marker for what opens,
-/// the label at its depth, the value in a column — an inherited value
-/// dim, a warning after `⚠`, the selected row in the selection colour.
-/// See docs/specs/props.md.
+/// A property view. A data file draws as a form: a section rule for
+/// each instance, a title for each group, and a widget per value — a
+/// slider for a ranged number, `[x]` for a bool, `‹ value ›` for a choice,
+/// the plain value otherwise — inherited values dim, read-only ones
+/// muted, a warning after `⚠`. A schema draws as a tree. See
+/// docs/specs/props.md.
 fn render_props(
     frame: &mut Frame,
     props: &bi::props::Props,
@@ -1040,8 +1045,9 @@ fn render_props(
     focused: bool,
     ui: &Ui,
 ) -> Option<(u16, u16)> {
-    use bi::props::RowKind;
+    use bi::props::{RowKind, RowWidget};
     let rows = &props.rows;
+    let width = area.width as usize;
     let height = area.height as usize;
     let first =
         if height == 0 || props.selected < height { 0 } else { props.selected + 1 - height };
@@ -1049,37 +1055,90 @@ fn render_props(
     let visible = &rows[first..last];
     // The value column: past the widest label on screen, so values line
     // up within a pane and move only when the screen's rows change.
-    let label_col =
-        visible.iter().map(|r| 2 * r.depth + 2 + r.label.chars().count()).max().unwrap_or(0) + 2;
+    let label_col = visible
+        .iter()
+        .filter(|r| !matches!(r.widget, RowWidget::Header | RowWidget::Group))
+        .map(|r| 2 * r.depth + 2 + r.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let mut cursor_at = None;
     let mut lines = Vec::with_capacity(height);
 
     for (index, row) in rows.iter().enumerate().take(last).skip(first) {
+        let indent = "  ".repeat(row.depth);
         let marker = match (row.expandable, row.expanded) {
             (true, true) => '▾',
             (true, false) => '▸',
             (false, _) => ' ',
         };
-        let head = format!("{}{marker} {}", "  ".repeat(row.depth), row.label);
-        let pad = label_col.saturating_sub(head.chars().count());
-        let head_style = match row.kind {
-            RowKind::Error => tui(ui.diag_error),
-            RowKind::Instance | RowKind::Type => {
-                tui(ThemeStyle { bold: true, ..ThemeStyle::default() })
-            }
-            RowKind::Unknown => tui(ui.diag_warning),
-            _ => Style::default(),
-        };
-        let value_style = match row.kind {
-            RowKind::Type | RowKind::FieldDef => tui(ui.status_muted),
+        let value_style = match () {
+            _ if row.kind == RowKind::Error => tui(ui.diag_error),
+            _ if row.readonly => tui(ui.status_muted),
             _ if row.inherited => tui(ui.dim),
+            _ if matches!(row.kind, RowKind::Type | RowKind::FieldDef) => tui(ui.status_muted),
             _ => Style::default(),
         };
-        let mut spans = vec![
-            Span::styled(cells_at(&head, 8), head_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(cells_at(&row.value, 8), value_style),
-        ];
+        let bold = tui(ThemeStyle { bold: true, ..ThemeStyle::default() });
+        let mut spans: Vec<Span<'static>> = match row.widget {
+            RowWidget::Header => {
+                // `▾ Weapon rusty_sword ────────` : a section rule.
+                let head = format!("{indent}{marker} {} ", row.label);
+                let used = head.chars().count();
+                let rule = "─".repeat(width.saturating_sub(used));
+                vec![Span::styled(cells_at(&head, 8), bold), Span::styled(rule, tui(ui.rule))]
+            }
+            RowWidget::Group => {
+                vec![Span::styled(cells_at(&format!("{indent}{marker} {}", row.label), 8), bold)]
+            }
+            RowWidget::Check(on) => {
+                let mark = if on { "[x]" } else { "[ ]" };
+                vec![Span::styled(
+                    cells_at(&format!("{indent}  {mark} {}", row.label), 8),
+                    value_style,
+                )]
+            }
+            _ => {
+                let head = format!("{indent}{marker} {}", row.label);
+                let pad = label_col.saturating_sub(head.chars().count());
+                let head_style = match row.kind {
+                    RowKind::Error => tui(ui.diag_error),
+                    RowKind::Type => bold,
+                    RowKind::Unknown => tui(ui.diag_warning),
+                    _ if row.readonly => tui(ui.status_muted),
+                    _ => Style::default(),
+                };
+                let mut spans =
+                    vec![Span::styled(cells_at(&head, 8), head_style), Span::raw(" ".repeat(pad))];
+                match row.widget {
+                    RowWidget::Slider(fraction) => {
+                        // A bar of fixed width, the value after it — the
+                        // form's slider, at the form's proportions.
+                        let room = 16.min(
+                            width.saturating_sub(label_col + 2 + row.value.chars().count() + 2),
+                        );
+                        if room >= 4 {
+                            let filled =
+                                ((room as f32 - 1.0) * fraction.clamp(0.0, 1.0)).round() as usize;
+                            let mut chars: Vec<char> = "━".repeat(room).chars().collect();
+                            chars[filled.min(room - 1)] = '●';
+                            let bar: String = chars.into_iter().collect();
+                            spans.push(Span::styled(bar, value_style));
+                            spans.push(Span::raw("  "));
+                        }
+                        spans.push(Span::styled(cells_at(&row.value, 8), value_style));
+                    }
+                    RowWidget::Choice => {
+                        spans.push(Span::styled(
+                            cells_at(&format!("‹ {} ›", row.value), 8),
+                            value_style,
+                        ));
+                    }
+                    _ => spans.push(Span::styled(cells_at(&row.value, 8), value_style)),
+                }
+                spans
+            }
+        };
         if let Some(warning) = &row.warning {
             spans.push(Span::styled(cells_at(&format!("  ⚠ {warning}"), 8), tui(ui.diag_warning)));
         }
@@ -1089,7 +1148,7 @@ fn render_props(
             continue;
         }
         let bg = if focused { ui.selection.bg } else { ui.cursorline.bg };
-        lines.push(Line::from(fill_line(spans, bg, 0, area.width as usize)));
+        lines.push(Line::from(fill_line(spans, bg, 0, width)));
         if focused {
             cursor_at = Some((area.x, area.y + lines.len() as u16 - 1));
         }
