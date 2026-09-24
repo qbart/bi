@@ -88,18 +88,23 @@ Esc              close the tool, back where you came from; in rotation mode, out
 
 The plot is `ContentKind::Plot` to the keymap — the picture's grammar,
 except that `r` and `s` are the curve's rather than the tileset's turn
-and the find. Any other picture stays `ContentKind::Image`.
+and the find. Any other picture stays `ContentKind::Image`. On any
+picture `Esc` is `EnterNormal`: a picture has no cursors to collapse,
+which is what `Esc` means in text, and the tools and the tileset read
+`EnterNormal` as the way out.
 
 ### The playhead
 
-A curve is a motion, and the plot plays it: a filled disc runs along the
-curve from the left edge of the plot to the right, two seconds a pass,
-around again without end, its height the curve's real `eval` at the
-moment's x — so an overshoot bounces and a flat lands the way the engine
-will land it. A thin red line stands at the current x, top to bottom of
-the square, the disc on it. `Space` pauses it where it is and lets it run
-again from there; `:tool curve play off` and `on` are the same switch.
-Opening the tool starts it.
+A curve is a motion, and the plot plays it. A **lane** stands to the
+left of the plot, outside the labels, and a filled disc in it rises and
+falls with the curve's real `eval` as the time sweeps from the left edge
+of the square to the right — two seconds a pass, around again without
+end — so an overshoot bounces and a flat lands the way the engine will
+land it, seen as the motion it is rather than as a point sliding along a
+line. A thin red line stands at the current x, top to bottom of the
+square, saying where in the pass the disc is. `Space` pauses it where it
+is and lets it run again from there; `:tool curve play off` and `on` are
+the same switch. Opening the tool starts it.
 
 The clock is the editor's: `redraw_in`, which already wakes the frontend
 for a yank's flash, asks for a frame every fiftieth of a second while any

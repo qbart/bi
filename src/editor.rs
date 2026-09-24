@@ -33716,7 +33716,7 @@ int main(void) {
             assert!(form.fields().iter().any(|f| f.name() == "point"));
             assert_eq!(form.get_f32("y"), 0.8);
             let img = ed.window_of(plot).unwrap().img().unwrap();
-            assert_eq!((img.width, img.height), (552, 538), "the unit square at 512 a side");
+            assert_eq!((img.width, img.height), (580, 538), "the unit square at 512 a side");
             assert!(ed.is_curve_plot(plot));
             assert!(!ed.is_curve_plot(source));
         }

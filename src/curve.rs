@@ -661,6 +661,8 @@ pub const UNIT: f32 = 512.0;
 /// The picture never grows past this on a side, however far a point runs.
 const MAX_SIDE: f32 = 4096.0;
 const MARGIN_LEFT: i64 = 30;
+/// The playhead's lane, left of the labels: the disc rises and falls in it.
+const LANE: i64 = 28;
 const MARGIN_RIGHT: i64 = 10;
 const MARGIN_TOP: i64 = 10;
 const MARGIN_BOTTOM: i64 = 16;
@@ -685,9 +687,9 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
     let scale_y = (UNIT).min(MAX_SIDE / (y1 - y0).max(1e-6));
     let iw = ((x1 - x0) * scale_x).round().max(1.0) as i64;
     let ih = ((y1 - y0) * scale_y).round().max(1.0) as i64;
-    let (w, h) = (iw + MARGIN_LEFT + MARGIN_RIGHT, ih + MARGIN_TOP + MARGIN_BOTTOM);
+    let (w, h) = (iw + LANE + MARGIN_LEFT + MARGIN_RIGHT, ih + MARGIN_TOP + MARGIN_BOTTOM);
     let mut cv = Canvas::new(w as u32, h as u32);
-    let (inner_l, inner_r) = (MARGIN_LEFT, MARGIN_LEFT + iw);
+    let (inner_l, inner_r) = (LANE + MARGIN_LEFT, LANE + MARGIN_LEFT + iw);
     let (inner_t, inner_b) = (MARGIN_TOP, MARGIN_TOP + ih);
     let sx = |x: f32| inner_l as f32 + (x - x0) * scale_x;
     let sy = |y: f32| inner_b as f32 - (y - y0) * scale_y;
@@ -779,12 +781,14 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
         }
         cv.disc(cx, cy, 5, PICK);
     }
-    // The playhead: a line at its x and a disc on the curve there.
+    // The playhead: a line at its x across the square, and the disc in
+    // the lane at the curve's value there — the motion, not the graph.
     if let Some(x) = mark.play.filter(|x| x.is_finite()) {
         let col = sx(x).round() as i64;
         cv.line(col, inner_t, col, inner_b, PLAY_LINE);
         let row = sy(eval(curve, x)).round() as i64;
-        cv.disc(col, row, PLAY_RADIUS, PLAY_DOT);
+        cv.line(LANE / 2, inner_t, LANE / 2, inner_b, GRID);
+        cv.disc(LANE / 2, row, PLAY_RADIUS, PLAY_DOT);
     }
     (w as u32, h as u32, cv.into_pixels())
 }
@@ -982,7 +986,7 @@ mod tests {
         let curve = c(&[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
         let plain = Mark::default();
         let (w, h, px) = render(&curve, 1, plain);
-        assert_eq!((w, h), (512 + 40, 512 + 26));
+        assert_eq!((w, h), (512 + 28 + 40, 512 + 26));
         assert_eq!(px.len(), (w * h * 4) as usize);
         let (_, _, other) = render(&curve, 0, plain);
         assert_ne!(px, other, "the selection shows");

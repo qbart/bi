@@ -1120,6 +1120,12 @@ impl Input {
     /// the rotation mode and `s` splits the tangents instead.
     fn image(&mut self, key: Key, plot: bool) -> Option<Command> {
         let ctrl = key.mods.ctrl;
+        // A picture has no cursors for normal's `Esc` to collapse: here it
+        // is the way out — of a tool, of the tileset's grid.
+        if key.code == KeyCode::Esc {
+            self.reset();
+            return Some(Command { count: 1, action: Action::EnterNormal });
+        }
         if plot && !ctrl && !self.window_pending && !self.g_pending && !self.mid_command() {
             match key.code {
                 KeyCode::Char('r') => return self.plain(Action::Rotate),
@@ -4007,6 +4013,16 @@ leader = \" \"
             assert_eq!((cmd.count, cmd.action), (3, Action::Move(Motion::Right)));
             let cmd = feed(&mut input, "rl", ContentKind::Image).unwrap();
             assert_eq!(cmd.action, Action::Turn(Some(Turn::Right)));
+            let esc = Key::code(KeyCode::Esc);
+            let cmd = input.on_key(esc, &Mode::Normal, ContentKind::Plot).unwrap();
+            assert_eq!(cmd.action, Action::EnterNormal, "Esc is the way out of a picture");
+            feed(&mut input, "r", ContentKind::Image);
+            let cmd = input.on_key(esc, &Mode::Normal, ContentKind::Image).unwrap();
+            assert_eq!(cmd.action, Action::EnterNormal, "and clears a pending turn");
+            assert!(
+                feed(&mut input, "l", ContentKind::Image)
+                    .is_some_and(|c| c.action == Action::Move(Motion::Right))
+            );
         }
 
         #[test]
