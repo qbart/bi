@@ -125,9 +125,7 @@ impl Run for ProcessRun {
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr);
             let first = stderr.lines().find(|l| !l.trim().is_empty());
-            return Err(first
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{name}: {status}")));
+            return Err(first.map(str::to_string).unwrap_or_else(|| format!("{name}: {status}")));
         }
         String::from_utf8(stdout).map_err(|_| format!("{name}: output is not UTF-8"))
     }

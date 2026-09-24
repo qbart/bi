@@ -41,17 +41,28 @@ pub enum Intent {
     ConfigurationDone,
     /// `setBreakpoints` for one file — the path names which file's gutter
     /// the answered `verified`/moved lines belong to.
-    SetBreakpoints { path: PathBuf },
+    SetBreakpoints {
+        path: PathBuf,
+    },
     /// The lazy chain's first link once a thread is known to be stopped.
-    StackTrace { thread: i64 },
+    StackTrace {
+        thread: i64,
+    },
     /// The lazy chain's second link for one frame.
-    Scopes { frame: i64 },
+    Scopes {
+        frame: i64,
+    },
     /// The lazy chain's third link — also how a struct's fields or a `Vec`'s
     /// elements expand, against that value's own `variables_reference`.
-    Variables { reference: i64 },
+    Variables {
+        reference: i64,
+    },
     /// A watch, the REPL, or a hover float — same request shape, different
     /// `context` and different UI on the answer.
-    Evaluate { context: EvalContext, expr: String },
+    Evaluate {
+        context: EvalContext,
+        expr: String,
+    },
     Step,
     Continue,
     Pause,
@@ -309,11 +320,7 @@ impl Client {
             return;
         }
         self.disconnected = true;
-        self.request(
-            "disconnect",
-            json!({ "terminateDebuggee": terminate }),
-            Intent::Disconnect,
-        );
+        self.request("disconnect", json!({ "terminateDebuggee": terminate }), Intent::Disconnect);
         self.transport.wait_or_kill(patience);
         self.phase = Phase::Terminated { reason: "disconnected".into() };
     }
@@ -328,10 +335,16 @@ mod tests {
 
     fn started(spawn: &FakeSpawn) -> Client {
         Client::start(
-            SessionId(0), "codelldb", &["codelldb".into()],
-            std::path::Path::new("/proj"), Inbox::default(), spawn,
-            "launch", json!({ "program": "target/debug/bi" }),
-        ).unwrap()
+            SessionId(0),
+            "codelldb",
+            &["codelldb".into()],
+            std::path::Path::new("/proj"),
+            Inbox::default(),
+            spawn,
+            "launch",
+            json!({ "program": "target/debug/bi" }),
+        )
+        .unwrap()
     }
 
     /// What an adapter that speaks `configurationDone` answers `initialize`

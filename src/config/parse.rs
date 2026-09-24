@@ -382,11 +382,15 @@ fn read_adapters(
                 }),
                 "command" => match string_list(item) {
                     Some(list) => entry.command = list,
-                    None => problems
-                        .push(Diagnostic { line, message: "command takes a list of strings".into() }),
+                    None => problems.push(Diagnostic {
+                        line,
+                        message: "command takes a list of strings".into(),
+                    }),
                 },
-                other => problems
-                    .push(Diagnostic { line, message: format!("unknown adapter setting: {other}") }),
+                other => problems.push(Diagnostic {
+                    line,
+                    message: format!("unknown adapter setting: {other}"),
+                }),
             }
         }
     }
@@ -462,9 +466,9 @@ fn to_json(item: &Item) -> serde_json::Value {
     match item {
         Item::None => serde_json::Value::Null,
         Item::Value(v) => value_to_json(v),
-        Item::Table(t) => serde_json::Value::Object(
-            t.iter().map(|(k, i)| (k.to_string(), to_json(i))).collect(),
-        ),
+        Item::Table(t) => {
+            serde_json::Value::Object(t.iter().map(|(k, i)| (k.to_string(), to_json(i))).collect())
+        }
         Item::ArrayOfTables(a) => serde_json::Value::Array(a.iter().map(to_json_table).collect()),
     }
 }

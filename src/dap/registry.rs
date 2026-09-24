@@ -89,20 +89,40 @@ pub enum Effect {
     /// `stackTrace(thread)` → `scopes(frame)` → `variables(ref)`. The event
     /// already names the thread, so there is no `threads` round-trip — see
     /// `docs/specs/debug.md`'s Deviations #2.
-    Stopped { session: SessionId, thread: i64 },
+    Stopped {
+        session: SessionId,
+        thread: i64,
+    },
     /// The `initialized` event, for one file that has breakpoints: send
     /// `setBreakpoints` for it, tagged `Intent::SetBreakpoints { path }` so
     /// the answer routes back to [`Registry::pump`]. See the module doc for
     /// how the registry itself tracks when every file has answered.
-    PushBreakpoints { path: PathBuf },
-    Stack { frames: Vec<types::StackFrame> },
+    PushBreakpoints {
+        path: PathBuf,
+    },
+    Stack {
+        frames: Vec<types::StackFrame>,
+    },
     Scopes(Vec<types::Scope>),
-    Variables { reference: i64, vars: Vec<types::Variable> },
-    Output { category: String, text: String },
-    Evaluated { context: EvalContext, expr: String, result: String },
+    Variables {
+        reference: i64,
+        vars: Vec<types::Variable>,
+    },
+    Output {
+        category: String,
+        text: String,
+    },
+    Evaluated {
+        context: EvalContext,
+        expr: String,
+        result: String,
+    },
     /// Either end of a session: a `terminated` event, or the pipe closing
     /// ([`Inbound::Eof`]) which `pump` also treats as a death.
-    Terminated { session: SessionId, reason: String },
+    Terminated {
+        session: SessionId,
+        reason: String,
+    },
 }
 
 #[derive(Default)]
@@ -404,7 +424,9 @@ impl Registry {
                 self.accept_reverse_request(from, seq, &command)
             }
             Inbound::Eof => {
-                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+                    return Vec::new();
+                };
                 let reason = "pipe closed".to_string();
                 client.die(reason.clone());
                 self.clear_stop_state();
@@ -422,7 +444,9 @@ impl Registry {
         body: Value,
         message: Option<String>,
     ) -> Vec<Effect> {
-        let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+        let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+            return Vec::new();
+        };
         let Some(intent) = client.take_intent(request_seq) else { return Vec::new() };
 
         // The common failure shape for the requests that only fire an
@@ -438,7 +462,8 @@ impl Registry {
         match intent {
             Intent::Initialize => {
                 if success {
-                    let caps: types::Capabilities = serde_json::from_value(body).unwrap_or_default();
+                    let caps: types::Capabilities =
+                        serde_json::from_value(body).unwrap_or_default();
                     client.finish_initialize(caps);
                     Vec::new()
                 } else {
@@ -527,7 +552,8 @@ impl Registry {
             }
             Intent::Evaluate { context, expr } => {
                 if success {
-                    let result = body.get("result").and_then(Value::as_str).unwrap_or("").to_string();
+                    let result =
+                        body.get("result").and_then(Value::as_str).unwrap_or("").to_string();
                     vec![Effect::Evaluated { context, expr, result }]
                 } else if context == EvalContext::Watch {
                     // A failed watch still has to show *something* in its
@@ -562,7 +588,9 @@ impl Registry {
     fn accept_event(&mut self, from: SessionId, event: &str, body: Value) -> Vec<Effect> {
         match event {
             "initialized" => {
-                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+                    return Vec::new();
+                };
                 client.on_initialized_event();
                 let files: Vec<PathBuf> = self.breakpoints.keys().cloned().collect();
                 if files.is_empty() {
@@ -576,7 +604,9 @@ impl Registry {
                 }
             }
             "stopped" => {
-                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+                    return Vec::new();
+                };
                 match serde_json::from_value::<types::StoppedEvent>(body) {
                     Ok(ev) => {
                         let thread = ev.thread_id.unwrap_or(0);
@@ -587,7 +617,9 @@ impl Registry {
                 }
             }
             "continued" => {
-                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+                    return Vec::new();
+                };
                 client.on_continued();
                 self.clear_stop_state();
                 Vec::new()
@@ -600,7 +632,9 @@ impl Registry {
                 Err(_) => Vec::new(),
             },
             "terminated" => {
-                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+                let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+                    return Vec::new();
+                };
                 let reason = "terminated".to_string();
                 client.on_terminated(reason.clone());
                 self.clear_stop_state();
@@ -619,7 +653,9 @@ impl Registry {
     /// answered `success: false` rather than left to time out, with a
     /// status line only for the named case a user might otherwise wait on.
     fn accept_reverse_request(&mut self, from: SessionId, seq: i64, command: &str) -> Vec<Effect> {
-        let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else { return Vec::new() };
+        let Some(client) = self.sessions.iter_mut().find(|c| c.id == from) else {
+            return Vec::new();
+        };
         client.respond(seq, command, false, Value::Null);
         if command == "runInTerminal" {
             vec![Effect::Status(format!(
@@ -729,7 +765,13 @@ mod tests {
         let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
         // The initialize response body *is* the capabilities object — and
         // `configurationDone` below only goes out because it says so.
-        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+        fake.respond(
+            id,
+            seq,
+            "initialize",
+            true,
+            json!({ "supportsConfigurationDoneRequest": true }),
+        );
         assert!(reg.pump().is_empty(), "initialize answered, nothing for the editor yet");
 
         fake.event(id, "initialized", Value::Null);
@@ -861,7 +903,13 @@ mod tests {
             .expect("spawner is set");
 
         let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
-        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+        fake.respond(
+            id,
+            seq,
+            "initialize",
+            true,
+            json!({ "supportsConfigurationDoneRequest": true }),
+        );
         reg.pump();
         fake.event(id, "initialized", Value::Null);
         reg.pump();
@@ -903,7 +951,13 @@ mod tests {
             .expect("spawner is set");
 
         let seq = fake.last(id, "initialize").unwrap()["seq"].as_i64().unwrap();
-        fake.respond(id, seq, "initialize", true, json!({ "supportsConfigurationDoneRequest": true }));
+        fake.respond(
+            id,
+            seq,
+            "initialize",
+            true,
+            json!({ "supportsConfigurationDoneRequest": true }),
+        );
         reg.pump();
 
         fake.event(id, "initialized", Value::Null);
