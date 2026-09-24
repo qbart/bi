@@ -863,7 +863,7 @@ impl Schema {
             TypeExpr::Str => "a string".into(),
             TypeExpr::Rgb => "a colour as #rrggbb".into(),
             TypeExpr::Rgba => "a colour as #rrggbbaa".into(),
-            TypeExpr::Curve => "a curve as JSON: [[x, y, out, in, locked], …]".into(),
+            TypeExpr::Curve => "a curve as JSON: [[x, y, in, out], …]".into(),
             TypeExpr::Gradient => "a gradient as JSON: [[t, \"#rrggbbaa\"], …]".into(),
             TypeExpr::Named(name) => match self.get(name) {
                 Some(TypeDef::Enum { values, .. }) => format!("one of {}", values.join(", ")),
@@ -944,8 +944,8 @@ fn canonical_colour(ty: &TypeExpr, text: &str) -> Option<Value> {
 }
 
 /// A `curve` value as the curve module holds it: every point an array of
-/// `x`, `y`, `out`, `in`, `locked`, the tail optional; sorted by `x`
-/// inside `0..1`. What is wrong with it, otherwise.
+/// `x`, `y`, `in`, `out` — Unity's keyframe — the tail optional; sorted
+/// by `x` inside `0..1`. What is wrong with it, otherwise.
 pub fn curve_of(value: &Value) -> Result<crate::curve::Curve, String> {
     let Some(items) = value.as_array() else {
         return Err("a curve is an array of points".into());
@@ -955,8 +955,8 @@ pub fn curve_of(value: &Value) -> Result<crate::curve::Curve, String> {
         let Some(parts) = item.as_array() else {
             return Err(format!("point [{i}] is not an array"));
         };
-        if parts.len() < 2 || parts.len() > 5 {
-            return Err(format!("point [{i}] wants 2 to 5 entries: [x, y, out, in, locked]"));
+        if parts.len() < 2 || parts.len() > 4 {
+            return Err(format!("point [{i}] wants 2 to 4 entries: [x, y, in, out]"));
         }
         let num = |n: usize| -> Result<f32, String> {
             match parts.get(n) {
@@ -967,12 +967,7 @@ pub fn curve_of(value: &Value) -> Result<crate::curve::Curve, String> {
                     .ok_or_else(|| format!("point [{i}] entry {n} is not a number")),
             }
         };
-        let locked = match parts.get(4) {
-            None => false,
-            Some(Value::Bool(b)) => *b,
-            Some(_) => return Err(format!("point [{i}] locked is not true or false")),
-        };
-        let p = crate::curve::Point { x: num(0)?, y: num(1)?, out: num(2)?, in_: num(3)?, locked };
+        let p = crate::curve::Point { x: num(0)?, y: num(1)?, in_: num(2)?, out: num(3)? };
         if !(0.0..=1.0).contains(&p.x) {
             return Err(format!("point [{i}] x {} is outside 0..1", p.x));
         }
@@ -1046,9 +1041,8 @@ pub fn curve_value(curve: &crate::curve::Curve) -> Value {
                 Value::Array(vec![
                     number(p.x as f64),
                     number(p.y as f64),
-                    number(p.out as f64),
                     number(p.in_ as f64),
-                    Value::Bool(p.locked),
+                    number(p.out as f64),
                 ])
             })
             .collect(),
@@ -1570,7 +1564,7 @@ mod tests {
         assert_eq!(s.default_of(&TypeExpr::Rgba), serde_json::json!("#000000ff"));
         assert_eq!(
             s.default_of(&TypeExpr::Curve),
-            serde_json::json!([[0, 0, 1, 0, true], [1, 1, 1, 1, true]]),
+            serde_json::json!([[0, 0, 1, 1], [1, 1, 1, 1]]),
             "whole numbers written whole"
         );
         assert_eq!(s.parse_value(&TypeExpr::Rgb, "C83C1E"), Ok(serde_json::json!("#c83c1e")));
@@ -1586,7 +1580,7 @@ mod tests {
         assert_eq!(color::parse("#c83c1e80", true), Some([0xc8, 0x3c, 0x1e, 0x80]));
 
         let curve = |t: &str| s.check(&TypeExpr::Curve, &serde_json::from_str(t).unwrap());
-        assert_eq!(curve("[[0, 0], [0.5, 0.8, 0, 0, true], [1, 1, 1, 1, true]]"), Ok(()));
+        assert_eq!(curve("[[0, 0], [0.5, 0.8, 0, 0], [1, 1, 1, 1]]"), Ok(()));
         assert_eq!(curve("[]"), Ok(()));
         assert_eq!(curve("[[0, 0], [1.5, 1]]"), Err("point [1] x 1.5 is outside 0..1".into()));
         assert_eq!(
@@ -1594,11 +1588,11 @@ mod tests {
             Err("point [1] x 0.2 is before the point ahead of it".into())
         );
         assert_eq!(curve("[[0, \"a\"]]"), Err("point [0] entry 1 is not a number".into()));
-        assert_eq!(curve("[[0, 0, 0, 0, 1]]"), Err("point [0] locked is not true or false".into()));
         assert_eq!(
-            curve("[[0]]"),
-            Err("point [0] wants 2 to 5 entries: [x, y, out, in, locked]".into())
+            curve("[[0, 0, 0, 0, true]]"),
+            Err("point [0] wants 2 to 4 entries: [x, y, in, out]".into())
         );
+        assert_eq!(curve("[[0]]"), Err("point [0] wants 2 to 4 entries: [x, y, in, out]".into()));
         assert_eq!(curve("[0, 1]"), Err("point [0] is not an array".into()));
         assert_eq!(curve("{}"), Err("a curve is an array of points".into()));
         assert_eq!(TypeExpr::parse("gradient"), Ok(TypeExpr::Gradient));
@@ -1632,22 +1626,16 @@ mod tests {
             s.parse_value(&TypeExpr::Gradient, "[[1, \"#000000\"]]"),
             Err("wants a gradient as JSON: [[t, \"#rrggbbaa\"], …]".into())
         );
-        let read = curve_of(&serde_json::json!([[0, 0], [1, 1, 2, 3, true]])).unwrap();
-        assert_eq!(
-            read.points[0],
-            crate::curve::Point { x: 0.0, y: 0.0, out: 0.0, in_: 0.0, locked: false }
-        );
-        assert_eq!(
-            read.points[1],
-            crate::curve::Point { x: 1.0, y: 1.0, out: 2.0, in_: 3.0, locked: true }
-        );
+        let read = curve_of(&serde_json::json!([[0, 0], [1, 1, 2, 3]])).unwrap();
+        assert_eq!(read.points[0], crate::curve::Point { x: 0.0, y: 0.0, in_: 0.0, out: 0.0 });
+        assert_eq!(read.points[1], crate::curve::Point { x: 1.0, y: 1.0, in_: 2.0, out: 3.0 });
         assert_eq!(
             s.parse_value(&TypeExpr::Curve, "[[0, 0], [1, 1]]"),
             Ok(serde_json::json!([[0, 0], [1, 1]]))
         );
         assert_eq!(
             s.parse_value(&TypeExpr::Curve, "[[2, 0]]"),
-            Err("wants a curve as JSON: [[x, y, out, in, locked], …]".into())
+            Err("wants a curve as JSON: [[x, y, in, out], …]".into())
         );
         assert_eq!(
             one(

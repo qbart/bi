@@ -158,7 +158,7 @@ is a schema error.
 | `string`         | UTF-8 text                           | JSON string                      | `""`             |
 | `rgb`            | a colour, 8 bits a channel           | JSON string `"#rrggbb"`          | `"#000000"`      |
 | `rgba`           | a colour with alpha                  | JSON string `"#rrggbbaa"`        | `"#000000ff"`    |
-| `curve`          | a tuning curve over `0..1`           | JSON array of points, each `[x, y, out, in, locked]` | the linear curve: `[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]` |
+| `curve`          | a tuning curve over `0..1`           | JSON array of points, each `[x, y, in, out]` | the linear curve: `[[0, 0, 1, 1], [1, 1, 1, 1]]` |
 | `gradient`       | colour stops over `0..1`             | JSON array of stops, each `[t, "#rrggbbaa"]` | black to white: `[[0, "#000000ff"], [1, "#ffffffff"]]` |
 | `E` (enum name)  | one of `E.values`                    | JSON string equal to a value     | first value      |
 | `S` (struct name)| embedded value, owned by the parent  | JSON object with `S`'s fields    | object of `S`'s defaults |
@@ -187,9 +187,11 @@ Upper case reads; the editor writes lower. An `rgba` written with six
 digits reads as opaque and is written back with eight.
 
 **Curves** are the curve editor's shape (`curve.md`): a point is an array
-of `x`, `y`, the out and in tangents as slopes, and whether the two are
-locked, in that order — `[0.5, 0.8, 0, 0, true]`. A point may stop short,
-down to `[x, y]`; the missing tangents are `0` and `locked` is `false`.
+of `x`, `y`, the in and out tangents as slopes, in that order — Unity's
+keyframe — `[0.5, 0.8, 0, 0]`. Whether the two tangents move together is
+the editor's business, not the file's: a point whose tangents agree is
+joined, and nothing is stored to say so. A point may stop short, down to
+`[x, y]`; the missing tangents are `0`.
 Points are sorted by `x`, which stays inside `0..1`; a value that breaks
 either is an error. The editor keeps both rules for you and writes every
 point whole.

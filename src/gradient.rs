@@ -346,11 +346,7 @@ mod tests {
         assert_eq!(&CPP[lit.stops[0].start..lit.stops[0].end], r##"{0.0f, "#000000"}"##);
         assert_eq!(read(CPP, &lit).stops[2].t, 1.0);
         assert_eq!(find(JSON, 0), None, "outside");
-        assert_eq!(
-            find("[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]", 3),
-            None,
-            "a curve is not a gradient"
-        );
+        assert_eq!(find("[[0, 0, 1, 1], [1, 1, 1, 1]]", 3), None, "a curve is not a gradient");
         assert_eq!(find("[[0, \"#ff0000\", 3]]", 3), None, "three tokens are not a stop");
     }
 

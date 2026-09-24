@@ -9,9 +9,8 @@ use crate::canvas::{Canvas, text_width};
 pub enum Field {
     X,
     Y,
-    Out,
     In,
-    Locked,
+    Out,
     Skip,
 }
 
@@ -20,21 +19,21 @@ impl Field {
         match self {
             Field::X => "x",
             Field::Y => "y",
-            Field::Out => "out",
             Field::In => "in",
-            Field::Locked => "locked",
+            Field::Out => "out",
             Field::Skip => "_",
         }
     }
 }
 
-/// The order a point's numbers come in: `x,y,out,in,locked` by default.
+/// The order a point's numbers come in: `x,y,in,out` by default — Unity's
+/// keyframe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout(pub Vec<Field>);
 
 impl Default for Layout {
     fn default() -> Self {
-        Layout(vec![Field::X, Field::Y, Field::Out, Field::In, Field::Locked])
+        Layout(vec![Field::X, Field::Y, Field::In, Field::Out])
     }
 }
 
@@ -45,12 +44,11 @@ impl Layout {
             fields.push(match part.trim() {
                 "x" => Field::X,
                 "y" => Field::Y,
-                "out" => Field::Out,
                 "in" => Field::In,
-                "locked" => Field::Locked,
+                "out" => Field::Out,
                 "_" => Field::Skip,
                 other => {
-                    return Err(format!("not a field: {other} (want x, y, out, in, locked or _)"));
+                    return Err(format!("not a field: {other} (want x, y, in, out or _)"));
                 }
             });
         }
@@ -70,15 +68,23 @@ impl Layout {
     }
 }
 
-/// One key of the curve. Tangents are slopes, `dy/dx`; `locked` says the
-/// two move together.
+/// One key of the curve. Tangents are slopes, `dy/dx`. Whether the two
+/// move together is not in the file: a point whose tangents agree is
+/// joined, and the editor keeps it so. See `docs/specs/curve.md` §Tangents.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
-    pub out: f32,
     pub in_: f32,
-    pub locked: bool,
+    pub out: f32,
+}
+
+impl Point {
+    /// Whether the two tangents are one line: equal to the three decimals
+    /// the editor writes.
+    pub fn joined(&self) -> bool {
+        (self.in_ - self.out).abs() < 5e-4
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -345,19 +351,19 @@ pub fn find_empty(text: &str, cursor: usize) -> Option<(usize, usize)> {
     empty.then_some((node.open, node.close))
 }
 
-/// The linear preset: `(0, 0)` and `(1, 1)` with the slopes of the line,
-/// both locked. What an empty list is seeded with.
+/// The linear preset: `(0, 0)` and `(1, 1)` with the slopes of the line.
+/// What an empty list is seeded with.
 pub fn linear() -> Curve {
     Curve {
         points: vec![
-            Point { x: 0.0, y: 0.0, out: 1.0, in_: 0.0, locked: true },
-            Point { x: 1.0, y: 1.0, out: 1.0, in_: 1.0, locked: true },
+            Point { x: 0.0, y: 0.0, in_: 1.0, out: 1.0 },
+            Point { x: 1.0, y: 1.0, in_: 1.0, out: 1.0 },
         ],
     }
 }
 
 /// The text that fills an empty list at `open..=close` with the linear
-/// preset, spelled through `layout`: `{0.0, 0.0, 1.0, 0.0, true}` and its
+/// preset, spelled through `layout`: `{0.0, 0.0, 1.0, 1.0}` and its
 /// partner, one per line when the brackets are on different lines,
 /// inline otherwise. Inner brackets are braces inside braces and
 /// parentheses inside anything else.
@@ -370,9 +376,8 @@ pub fn initial_text(text: &str, open: usize, close: usize, layout: &Layout) -> S
             .map(|f| match f {
                 Field::X => format!("{:.1}", p.x),
                 Field::Y => format!("{:.1}", p.y),
-                Field::Out => format!("{:.1}", p.out),
                 Field::In => format!("{:.1}", p.in_),
-                Field::Locked => if p.locked { "true" } else { "false" }.to_string(),
+                Field::Out => format!("{:.1}", p.out),
                 Field::Skip => "0".to_string(),
             })
             .collect();
@@ -422,10 +427,6 @@ fn parse_number(token: &str) -> f32 {
     numeric_part(token).parse::<f32>().unwrap_or(0.0)
 }
 
-fn parse_bool(token: &str) -> bool {
-    matches!(token, "true") || parse_number(token) != 0.0
-}
-
 /// The curve the literal spells, through `layout`. A point shorter than
 /// the layout has zeroes where it stops.
 pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve {
@@ -440,9 +441,8 @@ pub fn read(text: &str, lit: &Literal, layout: &Layout) -> Curve {
                 match field {
                     Field::X => p.x = parse_number(tok),
                     Field::Y => p.y = parse_number(tok),
-                    Field::Out => p.out = parse_number(tok),
                     Field::In => p.in_ = parse_number(tok),
-                    Field::Locked => p.locked = parse_bool(tok),
+                    Field::Out => p.out = parse_number(tok),
                     Field::Skip => {}
                 }
             }
@@ -493,14 +493,6 @@ pub fn rewrite(token: &str, value: f32, step: f32) -> String {
     text
 }
 
-/// A bool token respelled, `true`/`false` or `1`/`0` as it was.
-pub fn rewrite_bool(token: &str, value: bool) -> String {
-    match token {
-        "true" | "false" => if value { "true" } else { "false" }.into(),
-        _ => if value { "1" } else { "0" }.into(),
-    }
-}
-
 /// The text of a new point shaped like `like`: its brackets, separators
 /// and names copied, the layout's fields set from `p`.
 pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String {
@@ -512,9 +504,8 @@ pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step:
         let new = match field {
             Field::X => rewrite(old, p.x, step),
             Field::Y => rewrite(old, p.y, step),
-            Field::Out => rewrite(old, p.out, step),
             Field::In => rewrite(old, p.in_, step),
-            Field::Locked => rewrite_bool(old, p.locked),
+            Field::Out => rewrite(old, p.out, step),
             Field::Skip => continue,
         };
         out.replace_range(token.start - base..token.end - base, &new);
@@ -632,6 +623,9 @@ impl Tangent {
 pub struct Mark {
     pub rotate: bool,
     pub tangent: Tangent,
+    /// The selected point's tangents are apart — by their values, or by
+    /// the editor's say-so before they differ.
+    pub split: bool,
     /// The playhead's x, when it is drawn.
     pub play: Option<f32>,
 }
@@ -756,16 +750,15 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
     if let Some(p) = curve.points.get(selected) {
         let (cx, cy) = (sx(p.x).round() as i64, sy(p.y).round() as i64);
         // The engine's handles: `normalize(1, tangent) * 0.12` from the
-        // anchor, out to the right and in to the left. A joined point
-        // draws both to the out slope, which is what the keys keep them at.
-        let resting = if p.locked { HANDLE_COLOR } else { SPLIT_COLOR };
+        // anchor, out to the right and in to the left.
+        let joined = !mark.split;
+        let resting = if joined { HANDLE_COLOR } else { SPLIT_COLOR };
         for (tangent, dir) in [(Tangent::Out, 1.0f32), (Tangent::In, -1.0f32)] {
             let m = match tangent {
                 Tangent::Out => p.out,
-                Tangent::In if p.locked => p.out,
                 Tangent::In => p.in_,
             };
-            let turning = mark.rotate && (p.locked || mark.tangent == tangent);
+            let turning = mark.rotate && (joined || mark.tangent == tangent);
             let (reach, color) = if turning { (HANDLE_TURNING, PICK) } else { (HANDLE, resting) };
             let len = (1.0 + m * m).sqrt();
             let (hx, hy) = (p.x + dir * reach / len, p.y + dir * m * reach / len);
@@ -797,8 +790,8 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
 mod tests {
     use super::*;
 
-    const CPP: &str = "std::vector<Point> damage = {\n    {0.0f, 0.0f, 1.0f, 1.0f, false},\n    {0.5f, 0.8f, 0.0f, 0.0f, true},\n    {1.0f, 1.0f, 1.0f, 1.0f, false},\n};\n";
-    const RUST: &str = "let c = vec![Point { x: 0.0, y: 0.0, out: 1.0, in_: 1.0, locked: false }, Point { x: 0.5, y: 0.8, out: 0.0, in_: 0.0, locked: true }, Point { x: 1.0, y: 1.0, out: 1.0, in_: 1.0, locked: false }];";
+    const CPP: &str = "std::vector<Point> damage = {\n    {0.0f, 0.0f, 1.0f, 1.0f},\n    {0.5f, 0.8f, 0.0f, 0.0f},\n    {1.0f, 1.0f, 1.0f, 1.0f},\n};\n";
+    const RUST: &str = "let c = vec![Point { x: 0.0, y: 0.0, in_: 1.0, out: 1.0 }, Point { x: 0.5, y: 0.8, in_: 0.0, out: 0.0 }, Point { x: 1.0, y: 1.0, in_: 1.0, out: 1.0 }];";
     const PY: &str = "curve = [(0.0, 0.0), (0.5, 0.8), (1.0, 1.0)]\n";
 
     #[test]
@@ -808,10 +801,10 @@ mod tests {
         assert_eq!(lit.points.len(), 3);
         assert_eq!(&CPP[lit.open..=lit.open], "{");
         assert_eq!(&CPP[lit.close..=lit.close], "}");
-        assert_eq!(lit.points[1].tokens.len(), 5);
+        assert_eq!(lit.points[1].tokens.len(), 4);
         let t = &lit.points[1].tokens[1];
         assert_eq!(&CPP[t.start..t.end], "0.8f");
-        assert_eq!(&CPP[lit.points[1].start..lit.points[1].end], "{0.5f, 0.8f, 0.0f, 0.0f, true}");
+        assert_eq!(&CPP[lit.points[1].start..lit.points[1].end], "{0.5f, 0.8f, 0.0f, 0.0f}");
     }
 
     #[test]
@@ -837,7 +830,7 @@ mod tests {
     fn find_reads_rust_struct_literals_and_python_tuples() {
         let lit = find(RUST, RUST.find("0.8").unwrap()).unwrap();
         assert_eq!(lit.points.len(), 3);
-        assert_eq!(lit.points[0].tokens.len(), 5, "identifiers and colons are ignored");
+        assert_eq!(lit.points[0].tokens.len(), 4, "identifiers and colons are ignored");
         let lit = find(PY, PY.find("0.8").unwrap()).unwrap();
         assert_eq!(lit.points.len(), 3);
         assert_eq!(lit.points[0].tokens.len(), 2);
@@ -854,9 +847,9 @@ mod tests {
     fn read_maps_the_default_layout() {
         let lit = find(CPP, CPP.find("0.8f").unwrap()).unwrap();
         let c = read(CPP, &lit, &Layout::default());
-        assert_eq!(c.points[1], Point { x: 0.5, y: 0.8, out: 0.0, in_: 0.0, locked: true });
-        assert!(!c.points[0].locked);
+        assert_eq!(c.points[1], Point { x: 0.5, y: 0.8, in_: 0.0, out: 0.0 });
         assert_eq!(c.points[0].out, 1.0);
+        assert!(c.points[0].joined());
     }
 
     #[test]
@@ -871,12 +864,16 @@ mod tests {
     }
 
     #[test]
-    fn read_a_short_point_has_zero_tangents_and_one_reads_as_locked() {
-        let text = "{ {0.0, 0.0}, {1.0, 1.0, 2.0, 2.0, 1} }";
+    fn read_a_short_point_has_zero_tangents_and_a_bool_is_a_token_to_skip() {
+        let text = "{ {0.0, 0.0}, {1.0, 1.0, 2.0, 3.0, true} }";
         let lit = find(text, 4).unwrap();
         let c = read(text, &lit, &Layout::default());
         assert_eq!(c.points[0], Point { x: 0.0, y: 0.0, ..Point::default() });
-        assert!(c.points[1].locked);
+        assert_eq!(c.points[1], Point { x: 1.0, y: 1.0, in_: 2.0, out: 3.0 });
+        assert!(!c.points[1].joined());
+        let c = read(text, &lit, &Layout::parse("x,y,_,out").unwrap());
+        assert_eq!(c.points[1].out, 3.0);
+        assert_eq!(c.points[1].in_, 0.0);
     }
 
     #[test]
@@ -890,11 +887,12 @@ mod tests {
 
     #[test]
     fn layout_parses_and_refuses() {
-        assert_eq!(Layout::default().text(), "x,y,out,in,locked");
+        assert_eq!(Layout::default().text(), "x,y,in,out");
         assert_eq!(Layout::parse("y, x").unwrap().text(), "y,x");
+        assert_eq!(Layout::parse("x,z").unwrap_err(), "not a field: z (want x, y, in, out or _)");
         assert_eq!(
-            Layout::parse("x,z").unwrap_err(),
-            "not a field: z (want x, y, out, in, locked or _)"
+            Layout::parse("x,y,locked").unwrap_err(),
+            "not a field: locked (want x, y, in, out or _)"
         );
         assert_eq!(Layout::parse("out,in").unwrap_err(), "a layout needs x and y");
     }
@@ -909,8 +907,6 @@ mod tests {
         assert_eq!(rewrite("-2.0_f32", -1.9, 0.1), "-1.9_f32");
         assert_eq!(rewrite("1e-3", 0.002, 0.001), "0.002");
         assert_eq!(rewrite("0.01", 0.0, 0.01), "0.00", "never minus zero");
-        assert_eq!(rewrite_bool("true", false), "false");
-        assert_eq!(rewrite_bool("1", false), "0");
         assert_eq!(decimals_for(0.01), 2);
         assert_eq!(decimals_for(0.25), 2);
         assert_eq!(decimals_for(1.0), 0);
@@ -919,21 +915,16 @@ mod tests {
     #[test]
     fn a_new_point_copies_its_neighbours_shape() {
         let lit = find(CPP, CPP.find("0.8f").unwrap()).unwrap();
-        let p = Point { x: 0.25, y: 0.4, out: 1.5, in_: 1.5, locked: true };
+        let p = Point { x: 0.25, y: 0.4, in_: 1.5, out: 2.5 };
         let text = point_text(CPP, &lit.points[1], &Layout::default(), p, 0.01);
-        assert_eq!(text, "{0.25f, 0.4f, 1.5f, 1.5f, true}");
+        assert_eq!(text, "{0.25f, 0.4f, 1.5f, 2.5f}");
         let lit = find(RUST, RUST.find("0.8").unwrap()).unwrap();
         let text = point_text(RUST, &lit.points[1], &Layout::default(), p, 0.01);
-        assert_eq!(text, "Point { x: 0.25, y: 0.4, out: 1.5, in_: 1.5, locked: true }");
+        assert_eq!(text, "Point { x: 0.25, y: 0.4, in_: 1.5, out: 2.5 }");
     }
 
     fn c(points: &[(f32, f32, f32, f32)]) -> Curve {
-        Curve {
-            points: points
-                .iter()
-                .map(|&(x, y, out, in_)| Point { x, y, out, in_, locked: false })
-                .collect(),
-        }
+        Curve { points: points.iter().map(|&(x, y, out, in_)| Point { x, y, in_, out }).collect() }
     }
 
     #[test]
@@ -1002,20 +993,16 @@ mod tests {
 
     #[test]
     fn render_shows_the_lock_and_the_rotation() {
-        let mut curve = c(&[(0.0, 0.0, 1.0, 1.0), (0.5, 0.5, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0)]);
+        let curve = c(&[(0.0, 0.0, 1.0, 1.0), (0.5, 0.5, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0)]);
         let plain = Mark::default();
-        let (_, _, split) = render(&curve, 1, plain);
-        curve.points[1].locked = true;
+        let apart = Mark { split: true, ..plain };
         let (_, _, joined) = render(&curve, 1, plain);
-        assert_ne!(split, joined, "a joined point draws one stroke, a split one two");
-        let (_, _, turning) =
-            render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out, play: None });
+        let (_, _, split) = render(&curve, 1, apart);
+        assert_ne!(split, joined, "a joined point draws one colour, a split one another");
+        let (_, _, turning) = render(&curve, 1, Mark { rotate: true, ..plain });
         assert_ne!(joined, turning, "the ring and the longer handle show");
-        curve.points[1].locked = false;
-        let (_, _, out) =
-            render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out, play: None });
-        let (_, _, in_) =
-            render(&curve, 1, Mark { rotate: true, tangent: Tangent::In, play: None });
+        let (_, _, out) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::Out, ..apart });
+        let (_, _, in_) = render(&curve, 1, Mark { rotate: true, tangent: Tangent::In, ..apart });
         assert_ne!(out, in_, "the turning tangent is the bright one");
         let (_, _, played) = render(&curve, 1, Mark { play: Some(0.3), ..plain });
         assert_ne!(split, played, "the playhead shows");
@@ -1044,7 +1031,7 @@ mod tests {
         assert_eq!(find_empty("a = { {1, 2} }", 3), None, "not empty");
         assert_eq!(
             initial_text(text, at - 1, at, &Layout::default()),
-            "{0.0, 0.0, 1.0, 0.0, true}, {1.0, 1.0, 1.0, 1.0, true}"
+            "{0.0, 0.0, 1.0, 1.0}, {1.0, 1.0, 1.0, 1.0}"
         );
         let multi = "    std::vector<Point> pts = {\n    };\n";
         let open = multi.find('{').unwrap();
@@ -1052,7 +1039,7 @@ mod tests {
         assert_eq!(find_empty(multi, open + 1), Some((open, close)));
         assert_eq!(
             initial_text(multi, open, close, &Layout::default()),
-            "\n        {0.0, 0.0, 1.0, 0.0, true},\n        {1.0, 1.0, 1.0, 1.0, true},\n    "
+            "\n        {0.0, 0.0, 1.0, 1.0},\n        {1.0, 1.0, 1.0, 1.0},\n    "
         );
         let py = "pts = []";
         assert_eq!(

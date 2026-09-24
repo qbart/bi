@@ -141,7 +141,7 @@ mod tests {
     const HAND: &str = r#"{ "$dialect": "bi/1", "$schema": "g.bischema",
   "instances": [ {"$type":"A","$id":"one","n":1},
     { "$type": "A", "$id": "two", "name": "a [b] \"c\"", "off": {"x": [1, 2, {"y": 3}]},
-      "curve": [[0, 0, 1, 0, true], [1, 1, 1, 1, true]] } ] }"#;
+      "curve": [[0, 0, 1, 1], [1, 1, 1, 1]] } ] }"#;
 
     fn at(segs: &[Seg]) -> &'static str {
         let (s, e) = value_span(HAND, 1, segs).expect("found");
@@ -161,8 +161,8 @@ mod tests {
             ]),
             "3"
         );
-        assert_eq!(at(&[Seg::Key("curve".into())]), "[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]");
-        assert_eq!(at(&[Seg::Key("curve".into()), Seg::Index(1)]), "[1, 1, 1, 1, true]");
+        assert_eq!(at(&[Seg::Key("curve".into())]), "[[0, 0, 1, 1], [1, 1, 1, 1]]");
+        assert_eq!(at(&[Seg::Key("curve".into()), Seg::Index(1)]), "[1, 1, 1, 1]");
         let (s, e) = value_span(HAND, 0, &[Seg::Key("n".into())]).unwrap();
         assert_eq!(&HAND[s..e], "1");
         assert_eq!(value_span(HAND, 0, &[Seg::Key("missing".into())]), None);

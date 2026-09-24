@@ -2817,7 +2817,7 @@ mod tests {
             {"name":"ramp","type":"gradient"}]}}}"##;
     const PAINT_DATA: &str = r##"{"$dialect":"bi/1","$schema":"paint.bischema","instances":[
         {"$type":"Fx","$id":"fire","glow":"#ff880080",
-         "falloff":[[0, 0], [0.5, 1, 0, 0, true], [1, 0]]},
+         "falloff":[[0, 0], [0.5, 1, 0, 0], [1, 0]]},
         {"$type":"Fx","$id":"plain","tint":"#FFFFFF","falloff":[],
          "ramp":[[0, "#ff0000"], [1, "#0000ff80"]]}]}"##;
 
@@ -2875,7 +2875,7 @@ mod tests {
         assert_eq!(p.edit_line("inst:0/tint"), Some("bi set fire.tint #c83c1e".into()));
         assert_eq!(
             p.edit_line("inst:0/falloff"),
-            Some("bi set fire.falloff [[0,0],[0.5,1,0,0,true],[1,0]]".into())
+            Some("bi set fire.falloff [[0,0],[0.5,1,0,0],[1,0]]".into())
         );
         let text = text_of(p.set("fire.tint", "0080ff"));
         assert!(text.contains("\"tint\": \"#0080ff\""), "{text}");
@@ -2913,7 +2913,7 @@ mod tests {
         assert_eq!(path, "plain.falloff");
         let Some(Edit::Text(text)) = edit else { panic!("an empty curve is seeded: {edit:?}") };
         assert!(
-            text.contains("\"falloff\": [[0, 0, 1, 0, true], [1, 1, 1, 1, true]]"),
+            text.contains("\"falloff\": [[0, 0, 1, 1], [1, 1, 1, 1]]"),
             "the linear preset: {text}"
         );
         p.load(&text, Some(Ok(PAINT.into())), Index::default()).unwrap();
@@ -2923,7 +2923,7 @@ mod tests {
             "stored now"
         );
         let (s, e) = p.locate(&text, "plain.falloff").expect("located");
-        assert_eq!(&text[s..e], "[[0, 0, 1, 0, true], [1, 1, 1, 1, true]]");
+        assert_eq!(&text[s..e], "[[0, 0, 1, 1], [1, 1, 1, 1]]");
         assert_eq!(p.locate(&text, "plain.nothing"), None);
         assert_eq!(p.locate(&text, "plain.tint").map(|(s, e)| &text[s..e]), Some("\"#ffffff\""));
     }

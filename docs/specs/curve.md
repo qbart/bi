@@ -11,7 +11,8 @@ picture is a view of it.
 ## Status
 
 **Built.** Points move, tangents rotate — `r` for the rotation mode, `s`
-to split and join them — and the lock is the point's own `locked` field.
+to split and join them — and the lock is the editor's, not a number in
+the file.
 
 ## What it looks like
 
@@ -21,9 +22,9 @@ Focus lands on the plot, because that is where the keys are.
 
 ```cpp
 std::vector<Point> damage = {
-    {0.0f, 0.0f, 1.0f, 1.0f, false},
-    {0.5f, 0.8f, 0.0f, 0.0f, true},      ← the cursor is anywhere in here
-    {1.0f, 1.0f, 1.0f, 1.0f, false},
+    {0.0f, 0.0f, 1.0f, 1.0f},
+    {0.5f, 0.8f, 0.0f, 0.0f},      ← the cursor is anywhere in here
+    {1.0f, 1.0f, 1.0f, 1.0f},
 };
 ```
 
@@ -43,17 +44,19 @@ The source's struct decides what each number means; the tool is told the
 order once:
 
 ```
-:tool curve layout x,y,out,in,locked      the default; `_` skips a field
+:tool curve layout x,y,in,out      the default; `_` skips a field
 ```
 
-`x` is time, `y` is value, `out` and `in` the tangents as slopes, `locked`
-whether the two tangents move together. A point with fewer numbers than
-the layout names has zero tangents that the tool does not touch.
+`x` is time, `y` is value, `in` and `out` the tangents as slopes —
+Unity's keyframe, in its order. Whether the two move together is not a
+number in the file; it is the editor's, see §Tangents. A point with fewer
+numbers than the layout names has zero tangents that the tool does not
+touch.
 
 **An empty list is seeded.** `:set editor curve` with the cursor in `{}`
-writes the linear preset into it — `(0, 0)` with an out slope of 1 and
-`(1, 1)` with slopes of 1, both locked — spelled through the layout as
-`{0.0, 0.0, 1.0, 0.0, true}` and `{1.0, 1.0, 1.0, 1.0, true}`, one per
+writes the linear preset into it — `(0, 0)` and `(1, 1)` with the line's
+slope of 1 on both tangents — spelled through the layout as
+`{0.0, 0.0, 1.0, 1.0}` and `{1.0, 1.0, 1.0, 1.0}`, one per
 line when the brackets are on different lines. That is one undo step,
 and from then on the list is a list like any other.
 
@@ -133,16 +136,21 @@ step, the same path every other key takes. A point whose layout names no
 `out` or `in`, or whose text is too short to have them, says so and turns
 nothing.
 
-**Joined and split.** `locked` is the point's own field and the tool's
-truth about it: a joined point (`locked` true) turns both tangents to the
-same slope with every press — the out's, so a joined point whose file
-disagreed between the two heals into a straight line on the first turn.
-A split point turns one, the one `Tab` picked; the out tangent is
-picked when rotation begins. **`s` flips `locked`**: on a joined point it
-writes `false` and says `tangents split`; on a split point it writes
-`true`, copies the out slope into the in, and says `tangents joined` —
-one edit of two or three tokens. A layout without `locked` has no lock
-to flip and `s` says `the layout has no locked`.
+**Joined and split.** Whether a point's two tangents move together is
+the editor's property, not a number in the file — an engine reads four
+numbers a key and nothing else. The file decides most of it: a point
+whose in and out slopes agree, to the three decimals the editor writes,
+is **joined**, and a point whose slopes differ is **split**. A joined
+point turns both tangents to the same slope with every press; a split
+point turns one, the one `Tab` picked, the out tangent when rotation
+begins. **`s` on a joined point splits it** without writing anything:
+the tool remembers that this point is apart, says `tangents split`, and
+the first turn makes the slopes differ, after which the file says it.
+The remembered split lasts while the point stays selected — pick another
+point and come back, and equal tangents are joined again, which is what
+they look like. **`s` on a split point joins it**: the out slope is
+copied into the in, one edit, `tangents joined`. A layout without `in`
+or `out` has nothing to split and `s` says so.
 
 **What it looks like.** The selected point's two handles are one straight
 stroke through the anchor when joined and two strokes of a second colour
@@ -159,8 +167,8 @@ brackets — `[out 1.000]` — while rotating.
 engine's own rule for time; `y` is free. From the last point, `a` adds
 halfway back to the previous one, since nothing comes after the last. A
 new point takes the curve's value and slope where it is added, so `a`
-never bends the curve — it gives you a handle where there was none. Its
-`locked` is `true` when the layout has one.
+never bends the curve — it gives you a handle where there was none, its
+two tangents equal and so joined.
 
 Every key that changes something is one edit of the source buffer and one
 undo step of it. `u` on the plot undoes that edit, the buffer re-parses and
@@ -174,10 +182,10 @@ same history. There is no second undo stack anywhere in the tool.
 :tool curve x 0.5            move the selected point in x; clamped to its neighbours
 :tool curve y 0.8            and in y
 :tool curve out 1.5          the out tangent's slope; `in` the same
-:tool curve locked off       split; `on` joins, copying out into in
+:tool curve locked off       split the tangents; `on` joins them, copying out into in
 :tool curve xstep 0.1        what h and l move by; ystep the same for j and k
 :tool curve astep 5          degrees per press while rotating
-:tool curve layout x,y,out,in,locked
+:tool curve layout x,y,in,out
 ```
 
 `:tool curve` alone lists these. A value that does not parse is refused,
@@ -219,7 +227,7 @@ same three points:
 { {0.0f, 0.0f, 1.0f, 1.0f, false}, {0.5f, 0.8f, 0.0f, 0.0f, true}, ... }
 ```
 ```rust
-vec![Point { x: 0.0, y: 0.0, out: 1.0, in_: 1.0, locked: false }, ...]
+vec![Point { x: 0.0, y: 0.0, in_: 1.0, out: 1.0 }, ...]
 ```
 ```python
 [(0.0, 0.0), (0.5, 0.8), (1.0, 1.0)]
@@ -227,8 +235,9 @@ vec![Point { x: 0.0, y: 0.0, out: 1.0, in_: 1.0, locked: false }, ...]
 
 A number is an optional sign, digits with an optional fraction and
 exponent, and an optional suffix of letters and underscores glued to it:
-`0.5f`, `1e-3`, `-2.0_f32`. `0` and `1` where the layout says `locked`
-count as `false` and `true`. A cursor in no such group says `no curve
+`0.5f`, `1e-3`, `-2.0_f32`. A `true` or `false` is a token too, so a
+struct that carries a bool can skip it with `_`. A cursor in no such
+group says `no curve
 under the cursor`; a group whose children disagree on their count is
 still a curve — the layout is applied per point, and short points simply
 lack the trailing fields.
@@ -254,8 +263,8 @@ the plot goes blank until the next `:set editor curve`.
 `src/curve.rs`, with no editor in it:
 
 ```rust
-pub struct Layout { fields: Vec<Field> }          // Field: X | Y | Out | In | Locked | Skip
-pub struct Point { pub x: f32, pub y: f32, pub out: f32, pub in_: f32, pub locked: bool }
+pub struct Layout { fields: Vec<Field> }          // Field: X | Y | In | Out | Skip
+pub struct Point { pub x: f32, pub y: f32, pub in_: f32, pub out: f32 }   // joined() when the two agree
 pub struct Curve { pub points: Vec<Point> }        // sorted by x
 
 /// Where each point's tokens sit in the text, so a move rewrites in place.
@@ -273,7 +282,7 @@ pub fn slope(curve: &Curve, x: f32) -> f32;
 pub fn point_text(text: &str, like: &PointSpan, layout: &Layout, p: Point, step: f32) -> String;
 pub fn plot_range(curve: &Curve) -> ((f32, f32), (f32, f32));   // the unit square, stretched to the points
 pub enum Tangent { Out, In }
-pub struct Mark { pub rotate: bool, pub tangent: Tangent, pub play: Option<f32> }   // how the selected point is drawn; the playhead's x
+pub struct Mark { pub rotate: bool, pub tangent: Tangent, pub split: bool, pub play: Option<f32> }   // how the selected point is drawn; the playhead's x
 pub fn rotated(slope: f32, degrees: f32) -> f32;                // the slope turned, clamped to ±89°
 pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>);
 ```
@@ -281,8 +290,8 @@ pub fn render(curve: &Curve, selected: usize, mark: Mark) -> (u32, u32, Vec<u8>)
 **Evaluation** is Unity's: between points `p` and `q` with `d = q.x - p.x`,
 the hermite basis over `t = (x - p.x) / d` with tangents `p.out * d` and
 `q.in * d`; before the first point and after the last, the curve is flat.
-`locked` changes nothing in the evaluation — it is a promise about how
-the tangents move, kept by the rotation keys.
+Whether the tangents are joined is nothing to the evaluation; it is the
+editor's promise about how the keys move them.
 
 **x stays sorted.** A point's x is clamped between its neighbours' x and
 inside `0..1`, so the list the engine reads never needs sorting. Two
@@ -311,6 +320,7 @@ struct CurveTool {
     astep: f32,                // degrees per rotation press, five by default
     rotate: bool,              // `r`: the keys turn the tangent
     tangent: Tangent,          // which one, on a split point
+    unlocked: Option<usize>,   // a point `s` split whose tangents still agree
     play: Option<Instant>,     // when the pass began, while it runs
     phase: f32,                // where it stands, 0..1, while paused
     seen: (u64, u64),          // buffer edits, form generation, the plot reflects
@@ -340,15 +350,14 @@ A readout, and a place for the two steps, the same `Form` every tool uses:
 Point     2                         read-only: the plot's Tab picks
 X         0.500                     read-only: the plot's h and l move
 Y         0.800
-Out       0.000
 In        0.000
-Locked    on
+Out       0.000
 X step    ━●━━━━━━━━   0.010
 Y step    ━●━━━━━━━━   0.010
 Angle     ━●━━━━━━━━   5
 ```
 
-`Point`, `X`, `Y`, `Out`, `In` and `Locked` are **read-only**: they
+`Point`, `X`, `Y`, `In` and `Out` are **read-only**: they
 mirror the selected point and nothing in the form turns them. A point
 has rules — sorted `x`, clamped to its neighbours, two points at least —
 that the plot's keys keep and a freely turned slider could break, so the
@@ -367,7 +376,7 @@ point.
   outer list; on a cursor outside any list it returns nothing.
 - `read` with the default layout maps the five numbers of a C++ point;
   with `x,y` a Python pair; with `_,x,y` skips a leading field; a short
-  point has zero tangents; `1` reads as locked.
+  point has zero tangents; a bool is a token `_` can skip.
 - `rewrite` keeps `f`, keeps decimals, adds the step's decimals to an
   integer, keeps a sign, and writes `true`/`false` or `1`/`0` as the token
   had it.
@@ -400,21 +409,22 @@ point.
   neighbours; `:tool curve layout x,y` re-reads; `:tool curve point`
   reports `curve point=2`.
 - `r` on the plot turns rotation on, the label says `ROTATE`, and `l`
-  rewrites the selected point's `out` and `in` tokens — both, since the
-  point is locked — to the slope five degrees clockwise; `2h` turns ten
-  back; `r` again turns it off and `l` moves x once more; `Esc` while
-  rotating leaves rotation, not the plot.
-- `s` on a locked point writes `false` and says `tangents split`; `l`
+  rewrites the selected point's `in` and `out` tokens — both, since they
+  agree — to the slope five degrees clockwise; `2h` turns ten back; `r`
+  again turns it off and `l` moves x once more; `Esc` while rotating
+  leaves rotation, not the plot.
+- `s` on a joined point writes nothing and says `tangents split`; `l`
   while rotating then moves only the out token, `Tab` picks the in and
-  `l` moves only that; `s` again writes `true`, copies out into in and
-  says `tangents joined`. `s` with a layout of `x,y` says `the layout has
-  no locked`.
+  `l` moves only that; `s` again copies out into in and says `tangents
+  joined`. Tangents that differ are split by themselves; a split of
+  equal tangents is forgotten when another point is picked. `s` with a
+  layout of `x,y` says `the layout has no in`.
 - `rotated(1.0, 45.0)` is vertical enough to clamp at `tan 89°`;
   `rotated(0.0, -45.0)` is `-1`.
 - `render` differs between a joined and a split point, and between
   rotating and not.
 - `:tool curve out 2` rewrites the out token; `:tool curve locked off`
-  splits; `:tool curve astep 10` sets the angle step.
+  splits, `on` joins; `:tool curve astep 10` sets the angle step.
 - Opening the tool starts the playhead: `redraw_in` answers a frame's
   wait, the plot's generation moves between two frames, and `render`
   with a playhead differs from without; `Space` pauses it and `redraw_in`
@@ -422,5 +432,5 @@ point.
   pauses.
 - Deleting the list by hand says `curve lost`.
 - The plot's pixels change and its generation moves after any edit; the
-  status row says `point 2 of 3  x 0.500 y 0.800  out 0.000 in 0.000`
+  status row says `point 2 of 3  x 0.500 y 0.800  in 0.000 out 0.000`
   and `CURVE`.
