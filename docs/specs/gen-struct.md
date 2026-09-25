@@ -127,6 +127,14 @@ way. C cannot type it and gets a comment naming `S` instead. A schema
 called `bi_types.bischema` is refused, since its file would be the support
 file's.
 
+The sample schema uses every builtin — `tint` is an `rgb`, `glow` an
+`rgba`, `falloff` a `curve`, `trail` a `gradient`, and `Enemy` carries
+`ref`s — so `bi gen struct` over `game.bischema` writes a `bi_types` with
+all five support types, in every language; that is the sample's promise
+and the backend tests hold it to it. The sample mapping shows each of the
+four builtins mapped externally, commented out, as the first thing a
+project with its own colour or gradient type would uncomment.
+
 Enums are stored by name in the data, so the generated enum keeps the
 names: a Go enum is a string type whose constants *are* the wire names, a
 Rust or C or C3 enum comes with a `NAMES` table in value order, Lua's is a
@@ -485,7 +493,9 @@ In `gen/structs`:
   types, defaults, enum names, ids, the support file, `--pkg` in its
   place; every generic composition (`list<ref<Weapon>>`,
   `optional<list<i32>>`, `list<list<f32>>`); an external `Vec2` leaves
-  the definition out and the spelling in; a boxed cycle.
+  the definition out and the spelling in; a boxed cycle; the sample's
+  `bi_types` holds `Rgb`, `Rgba`, `Curve`, `Gradient` and `Ref`, and
+  mapping `gradient` externally drops `Gradient` and only it.
 - **write**: fresh, unchanged, differing with each answer, `--force`, the
   non-tty refusal, the atomic rename; every case through a scripted `Ask`.
 
