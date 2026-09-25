@@ -337,6 +337,22 @@ the above is an error with its line. Several `-m` files merge in order,
 the later winning per key, and the merge is printed under `-v`; two files
 disagreeing about `Vec2` is a thing to see, not to guess.
 
+### The sample mapping
+
+`bi gen sample` grows a third kind: `bi gen sample mapping` writes
+`game.bimapping` beside the sample schema and data (and `bi gen sample`
+alone writes all three), the way `bi config init` writes the user config —
+**every key present and commented out**, with a line saying what it does,
+so the file documents the format and changes nothing until a line is
+uncommented. Commented out rather than mapping the sample's `Vec2`
+externally, because the sample's promise is that it works as written:
+`bi gen struct --lang rust -o out -i level1.bidata -m game.bimapping`
+must compile straight away, and it would not with a `Vec2` the project
+has to supply. The text lives in `examples/props/game.bimapping` beside
+the other two, `:bi sample` does not learn it (a `.bimapping` is TOML and
+has no property view), and a file that already exists is left alone with
+the text printed, as for the schema and data.
+
 Mapping a builtin (`rgb`, `curve`) externally removes it from
 `bi_types.*`; mapping every builtin every schema uses removes the file.
 Mapping a schema struct externally removes its definition, its default
@@ -480,6 +496,8 @@ generates all six from `examples/props` and compiles each with whatever
 compiler is on the path, skipping the ones that are not; it is run by
 hand like `vim_differential.py`, not by `cargo test`.
 
-In `main.rs`: `bi gen struct` without `-i` or `-o` says which; `--lang`
+In `main.rs`: `bi gen sample mapping` writes `game.bimapping`, `bi gen
+sample` all three, an existing one is left alone; the sample mapping
+parses with no key set. `bi gen struct` without `-i` or `-o` says which; `--lang`
 twice, an unknown language, a value that starts with `-`, are refused
 naming the flag; `bi gen` lists `struct` beside `sample`.
