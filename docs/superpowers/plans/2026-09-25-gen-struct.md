@@ -4,7 +4,7 @@
 
 **Goal:** `bi gen struct` reads `.bischema`/`.bidata` files and writes the schema's types, defaults and ids as C, C++, Go, Rust, C3 or Lua, steered by a TOML `.bimapping`.
 
-**Architecture:** A language-neutral `Model` is built once from the parsed schemas, data and mapping (names already cased and checked for the target language, defaults fully resolved, dependency order and boxed cycles computed); six `Backend`s turn one `Unit` into text; a `write` step with an `Ask` trait applies the overwrite policy. Library in `src/gen/structs/`, disk and prompts only in `main.rs`.
+**Architecture:** A language-neutral `Model` is built once from the parsed schemas, data and mapping (names already cased and checked for the target language, defaults fully resolved, dependency order and boxed cycles computed); six `Backend`s turn one `Unit` into text; a `write` step with an `Ask` trait applies the overwrite policy. Library in `src/codegen/structs/`, disk and prompts only in `main.rs`.
 
 **Tech Stack:** Rust 2024, `serde_json` (already), `toml_edit` (already) for the mapping, `std::io::IsTerminal` for the tty check. No new dependencies.
 
@@ -24,30 +24,29 @@
 ## File structure
 
 ```
-src/gen/mod.rs                 pub mod structs;
-src/gen/structs/mod.rs         Lang, Request, Output, OutFile, generate(), Backend trait, Context
-src/gen/structs/mapping.rs     Mapping, LangMapping, External, Generics — TOML parse + merge
-src/gen/structs/names.rs       casing, reserved words, sanitising, collision detection
-src/gen/structs/model.rs       Model, Unit, Type, Field, Ty, Builtin — built from schemas+data+mapping
-src/gen/structs/lit.rs         shared literal helpers: float_lit, escape_* per language, colour parsing
-src/gen/structs/write.rs       Overwrite, Ask, Fate, Report, write()
-src/gen/structs/lang/mod.rs    backend_for(Lang) -> Box<dyn Backend>
-src/gen/structs/lang/rust.rs   … c.rs, cpp.rs, go.rs, c3.rs, lua.rs
-src/gen/structs/fixture.rs     #[cfg(test)] the small schema + data every backend test uses
+src/codegen/mod.rs                 pub mod structs;
+src/codegen/structs/mod.rs         Lang, Request, Output, OutFile, generate(), Backend trait, Context
+src/codegen/structs/mapping.rs     Mapping, LangMapping, External, Generics — TOML parse + merge
+src/codegen/structs/names.rs       casing, reserved words, sanitising, collision detection
+src/codegen/structs/model.rs       Model, Unit, Type, Field, Ty, Builtin — built from schemas+data+mapping
+src/codegen/structs/lit.rs         shared literal helpers: float_lit, escape_* per language, colour parsing
+src/codegen/structs/write.rs       Overwrite, Ask, Fate, Report, write()
+src/codegen/structs/lang/mod.rs    backend_for(Lang) -> Box<dyn Backend>
+src/codegen/structs/lang/rust.rs   … c.rs, cpp.rs, go.rs, c3.rs, lua.rs
+src/codegen/structs/fixture.rs     #[cfg(test)] the small schema + data every backend test uses
 src/props/sample.rs            + MAPPING_NAME, MAPPING (the commented-out sample mapping)
 src/props/mod.rs               Kind gains Mapping
 examples/props/game.bimapping  the same text
 src/main.rs                    Invocation::GenStruct, flag parser, terminal Ask, `bi gen sample mapping`
 src/lib.rs                     pub mod gen;
-tests/gen_struct_rust.rs       generates Rust for the sample and include!s it
-scripts/gen_struct_compile.sh  all six languages compiled with whatever is on PATH
+tests/gen_struct.rs            generate over the sample in every language — text only, nothing compiled
 docs/specs/gen-struct.md       Status → Built; C3 naming corrected
 ```
 
 ## Shared interfaces (every task uses these exact names)
 
 ```rust
-// src/gen/structs/mod.rs
+// src/codegen/structs/mod.rs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lang { C, Cpp, Go, Rust, C3, Lua }
 impl Lang {
@@ -78,7 +77,7 @@ pub const SUPPORT_STEM: &str = "bi_types";
 ```
 
 ```rust
-// src/gen/structs/mapping.rs
+// src/codegen/structs/mapping.rs
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct External { pub spelling: String, pub import: Option<String>, pub default: Option<String> }
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -103,7 +102,7 @@ impl Mapping {
 ```
 
 ```rust
-// src/gen/structs/model.rs
+// src/codegen/structs/model.rs
 pub enum Builtin { Rgb, Rgba, Curve, Gradient, Ref }     // Builtin::ALL in this order
 pub enum Ty {
     Bool, Int(IntKind), F32, F64, Str, Rgb, Rgba, Curve, Gradient,
@@ -133,7 +132,7 @@ impl Model {
 ```
 
 ```rust
-// src/gen/structs/write.rs
+// src/codegen/structs/write.rs
 pub enum Overwrite { Yes, No, All, Quit }
 pub trait Ask { fn overwrite(&mut self, path: &Path) -> Overwrite; }
 pub struct Always(pub Overwrite);          // impl Ask: --force is Always(All), no-tty is Always(No)
@@ -142,7 +141,7 @@ pub struct Report { pub fates: Vec<(PathBuf, Fate)>, pub stopped: bool }
 pub fn write(dir: &Path, files: &[OutFile], ask: &mut dyn Ask) -> std::io::Result<Report>;
 ```
 
-## The fixture (src/gen/structs/fixture.rs, `#[cfg(test)]`)
+## The fixture (src/codegen/structs/fixture.rs, `#[cfg(test)]`)
 
 ```rust
 pub const STEM: &str = "weapons";
@@ -189,9 +188,9 @@ pub fn model(lang: Lang, with_data: bool, mapping: &str) -> Model;
 ### Task 1: Module skeleton, `Lang`, and the lib boundary
 
 **Files:**
-- Create: `src/gen/mod.rs`, `src/gen/structs/mod.rs`
+- Create: `src/codegen/mod.rs`, `src/codegen/structs/mod.rs`
 - Modify: `src/lib.rs` (add `pub mod gen;` between `fname` and `canvas` … keep the list alphabetical where it is; the file is not strictly sorted, insert after `pub mod generate;`)
-- Test: inline in `src/gen/structs/mod.rs`
+- Test: inline in `src/codegen/structs/mod.rs`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -220,7 +219,7 @@ mod tests {
 ### Task 2: The mapping file
 
 **Files:**
-- Create: `src/gen/structs/mapping.rs`
+- Create: `src/codegen/structs/mapping.rs`
 - Test: inline
 
 **Interfaces:** Produces `Mapping`, `LangMapping`, `External`, `Generics` as in *Shared interfaces*.
@@ -314,7 +313,7 @@ fn the_empty_mapping_is_the_default() {
 ### Task 3: Names — cases, reserved words, collisions
 
 **Files:**
-- Create: `src/gen/structs/names.rs`
+- Create: `src/codegen/structs/names.rs`
 - Test: inline
 
 **Interfaces:**
@@ -386,7 +385,7 @@ fn collisions_name_both() {
 ### Task 4: Literals and colours
 
 **Files:**
-- Create: `src/gen/structs/lit.rs`
+- Create: `src/codegen/structs/lit.rs`
 - Test: inline
 
 **Interfaces:**
@@ -408,7 +407,7 @@ pub fn range(min: Option<f64>, max: Option<f64>, step: Option<f64>) -> Option<St
 ### Task 5: The model
 
 **Files:**
-- Create: `src/gen/structs/model.rs`, `src/gen/structs/fixture.rs`
+- Create: `src/codegen/structs/model.rs`, `src/codegen/structs/fixture.rs`
 - Test: inline
 
 **Interfaces:** As in *Shared interfaces*. Build steps, in order:
@@ -493,7 +492,7 @@ fn external_defaults_are_noted() {
 ### Task 6: The write policy
 
 **Files:**
-- Create: `src/gen/structs/write.rs`
+- Create: `src/codegen/structs/write.rs`
 - Test: inline, using `std::env::temp_dir().join(format!("bi-gen-{}", std::process::id()))` style scratch dirs (look at how `src/props/sample.rs` tests make a dir and copy that).
 
 - [ ] **Step 1: Tests.** A scripted `Ask` (`struct Script(Vec<Overwrite>)` popping answers). Cases: fresh dir with nested `-o` is created and both files `Wrote`; second run `Unchanged` and `ask` never called (script empty, panic if called); differing file + `Yes` → `Overwrote`; `No` → `Skipped` and the old text stays; `All` → the rest overwritten without asking; `Quit` → `stopped = true`, the file and every later one `Skipped`; `Always(Overwrite::No)` skips; `Always(Overwrite::All)` writes. Temp file left behind never: after each case `read_dir` has only the expected names.
@@ -504,8 +503,8 @@ fn external_defaults_are_noted() {
 ### Task 7: `generate` — inputs to units, mapping merge, backends dispatched
 
 **Files:**
-- Modify: `src/gen/structs/mod.rs`
-- Create: `src/gen/structs/lang/mod.rs` with `pub fn backend_for(lang: Lang) -> Box<dyn Backend>` (Rust only wired at first; others `todo!()`-free: return a `Stub` that emits the header only, replaced by Tasks 8–13)
+- Modify: `src/codegen/structs/mod.rs`
+- Create: `src/codegen/structs/lang/mod.rs` with `pub fn backend_for(lang: Lang) -> Box<dyn Backend>` (Rust only wired at first; others `todo!()`-free: return a `Stub` that emits the header only, replaced by Tasks 8–13)
 - Test: inline in `mod.rs`
 
 **Behaviour:**
@@ -523,7 +522,7 @@ fn external_defaults_are_noted() {
 
 ### Task 8: The Rust backend
 
-**Files:** Create `src/gen/structs/lang/rust.rs`; test inline against `fixture::model(Lang::Rust, true, "")`.
+**Files:** Create `src/codegen/structs/lang/rust.rs`; test inline against `fixture::model(Lang::Rust, true, "")`.
 
 **Rules:** header line; `mapping.header` line(s); then `use super::bi_types::*;` when the unit uses any generated builtin; then `mapping.imports` sorted; then blank; types in schema order. Enum: doc as `///`, `#[derive(Debug, Clone, Copy, PartialEq, Eq)]` (or `mapping.derive` joined), variants, then `impl E { pub const NAMES: [&'static str; N] = [...]; }`, then `impl Default` returning the schema default's variant. Struct: derive `Debug, Clone, PartialEq` (or mapping's), fields `pub name: Ty` with `/// doc` and `/// range` and `/// required` lines; when derive contains `Deserialize` or `Serialize`, `#[serde(rename = "wire")]` on any field/variant whose wire differs from its code name (with `r#` stripped). `impl Default` with every field from its resolved default. External types with `External.import` add that import. Ty spelling: `Vec<T>` / `Option<T>` / `Option<Box<T>>` / `Ref<S>`, generics templates from mapping with `{T}`/`{S}` substituted. Literals: `String` → `"…".to_string()`; list → `vec![…]`; optional → `None`/`Some(…)`; enum → `E::Variant`; struct → `S { a: …, b: … }` (external struct → `Default::default()` or `External.default`); rgb → `Rgb { r, g, b }`; rgba → `Rgba { r, g, b, a }`; curve → `Curve { points: vec![CurvePoint { x, y, in_, out }, …] }`; gradient → `Gradient { stops: vec![GradientStop { t, color: Rgba {…} }, …] }`; ref → `Ref::new("id")`; boxed optional → `Some(Box::new(…))`. Ids: `pub mod weapon { pub const RUSTY_SWORD: &str = "rusty_sword"; }` after the struct's Default impl (module name = snake of type name).
 
@@ -631,7 +630,7 @@ Also test: with mapping `[rust]\nderive = ["Debug", "serde::Deserialize"]` the `
 
 ### Task 9: The Go backend
 
-**Files:** Create `src/gen/structs/lang/go.rs`.
+**Files:** Create `src/codegen/structs/lang/go.rs`.
 
 **Rules:** header; `package <last pkg segment or dir_name>`; imports block (`import (\n\t"…"\n)`) sorted, only when non-empty; enum → `type E string` + `const (...)` block + `var ENames = []E{...}`; struct fields `Name Type \`json:"wire"\`` aligned per run (gofmt columns: name padded to the run's max, then a space, type padded, then a space, tag), doc/range/required as `//` lines above the field (a comment line ends the alignment run); `func DefaultS() S { return S{...} }` with every field; ids `const (\n\tWeaponRustySword = "rusty_sword"\n)` after the default func. Ty: `[]T`, `*T`, `Ref[S]`, boxed optional is still `*T`. Literals: strings Go-quoted; `[]T{…}` (empty list `[]T{}`); optional `nil` / `ptr(value)`? — Go cannot take the address of a literal, so a set optional default emits a local: `DefaultS` builds `v := S{...}` then `x := value; v.Field = &x` and returns `v`; only when some optional has a non-null default, else the one-line return. External import strings go into the import block. Support `bi_types.go`: `Rgb{R,G,B uint8}`, `Rgba`, `CurvePoint{X,Y,In,Out float32}`, `Curve{Points []CurvePoint}`, `GradientStop{T float32; Color Rgba}`, `Gradient{Stops []GradientStop}`, `type Ref[T any] string`. Every support struct field carries a `json` tag (`r`,`g`,`b`,`a`,`x`,`y`,`in`,`out`,`t`,`color`,`points`,`stops`).
 
@@ -642,7 +641,7 @@ Also test: with mapping `[rust]\nderive = ["Debug", "serde::Deserialize"]` the `
 
 ### Task 10: The C backend
 
-**Files:** Create `src/gen/structs/lang/c.rs`.
+**Files:** Create `src/codegen/structs/lang/c.rs`.
 
 **Rules:** header; include guard `BI_GEN_<STEM upper>_H`; `#include <stdbool.h>`, `<stddef.h>`, `<stdint.h>`, then `#include "bi_types.h"` when builtins are used, then mapping imports sorted; `prefix` prepended to every type, enum constant, name table, id constant and init function (upper-cased for the upper-case names: `gs_` → `GS_`). Enum: `enum P_E { P_E_VALUE, … };` + `static const char *const P_E_NAMES[N] = {…};`. Forward declarations `struct S;` for every struct in dependency order. Then one `typedef struct { T *items; size_t len; } bi_list_<m>;` / `typedef struct { bool set; T value; } bi_opt_<m>;` per distinct list/optional instantiation, in first-use order, where `<m>` mangles the element (`f32`, `string`, `Vec2`, `ref_Weapon`, `list_f32`, `opt_string`, `rgb`, `enum_Rarity`); boxed optional → `struct S *` directly, no typedef. Then structs in dependency order, fields with `/* doc */` lines, `enum E e;`, `struct S s;`, `bi_ref owner; /* ref<Weapon>, required */`. Then, per struct: `static` (non-const) default arrays for every list/curve/gradient default that has elements, named `<P_S>_<FIELD>_DEFAULT` (nested: `_0`, `_1` suffixes per depth/index), then `static inline void p_s_init(struct P_S *v)` assigning every leaf by path (`v->offset.x = 0.5f;`), lists `v->tags.items = P_WEAPON_TAGS_DEFAULT; v->tags.len = 1;` or `NULL; 0`, optionals `.set = false` or `.set = true; .value = …`, colours `(bi_rgb){200, 200, 200}`, refs `""`. Ids: `#define P_WEAPON_RUSTY_SWORD "rusty_sword"` after the init. Support `bi_types.h`: `typedef struct { uint8_t r, g, b; } bi_rgb;`, `bi_rgba`, `typedef struct { float x, y, in_, out; } bi_curve_point;`, `typedef struct { bi_curve_point *points; size_t len; } bi_curve;`, `bi_gradient_stop { float t; bi_rgba color; }`, `bi_gradient`, `typedef const char *bi_ref;`.
 
@@ -653,7 +652,7 @@ Also test: with mapping `[rust]\nderive = ["Debug", "serde::Deserialize"]` the `
 
 ### Task 11: The C++ backend
 
-**Files:** Create `src/gen/structs/lang/cpp.rs`.
+**Files:** Create `src/codegen/structs/lang/cpp.rs`.
 
 **Rules:** header; `#pragma once`; includes `<cstdint>`, `<string>`, plus `<vector>`/`<optional>`/`<memory>` when used, `"bi_types.hpp"` when builtins are used, mapping imports sorted; `namespace a::b {` … `}  // namespace a::b` when `--pkg`; enums `enum class E { v, … };` + `inline constexpr const char *E_NAMES[N] = {…};`; forward decls; structs in dependency order with default member initialisers: `std::string name = "…";`, `std::int32_t damage = 10;`, `Rarity rarity = Rarity::common;`, `Vec2 offset = Vec2{0.5f, 0.0f};` (positional aggregate, external → `{}` or `External.default`), `std::vector<std::string> tags = {"a"};`, `std::optional<std::string> notes = std::nullopt;`, `bi::Rgb tint = bi::Rgb{200, 200, 200};`, `bi::Ref<Weapon> owner = bi::Ref<Weapon>{""};`, boxed `std::unique_ptr<Node> next = nullptr;`, `bool type_ = false;`. Doc `///` above fields. Ids: `struct Weapon { … static constexpr const char *RUSTY_SWORD = "rusty_sword"; }` — inside the struct, after the fields, a blank line, then `/// ids` and the constants. Support `bi_types.hpp` in `namespace bi { … }` with `Rgb{std::uint8_t r{}, g{}, b{};}`, `Rgba`, `CurvePoint{float x{}, y{}, in{}, out{};}`, `Curve{std::vector<CurvePoint> points;}`, `GradientStop{float t{}; Rgba color;}`, `Gradient`, `template <class T> struct Ref { std::string id; };`.
 
@@ -664,7 +663,7 @@ Also test: with mapping `[rust]\nderive = ["Debug", "serde::Deserialize"]` the `
 
 ### Task 12: The C3 backend
 
-**Files:** Create `src/gen/structs/lang/c3.rs`. Also fix the spec: C3 forces its cases (types Pascal, fields snake, enum values and ids SCREAMING) because the compiler does; its `ref` is `typedef WeaponRef = String;` per referenced struct rather than a generic.
+**Files:** Create `src/codegen/structs/lang/c3.rs`. Also fix the spec: C3 forces its cases (types Pascal, fields snake, enum values and ids SCREAMING) because the compiler does; its `ref` is `typedef WeaponRef = String;` per referenced struct rather than a generic.
 
 **Rules (C3 0.7 syntax):** header; `module a::b;` (`--pkg`) else `module <stem>;`; `import bi_types;` when builtins are used (support file declares `module bi_types;`), mapping imports sorted; doc comments `<* … *>`; enum `enum Rarity : int { COMMON, VERY_RARE }` + `const String[2] RARITY_NAMES = { "common", "very rare" };`; per distinct optional instantiation `struct OptString { bool set; String value; }` (mangled like C but Pascal); per referenced struct `typedef WeaponRef = String;`; structs in dependency order `struct Weapon { String name; int damage; Rarity rarity; Vec2 offset; String[] tags; OptString notes; Rgb tint; WeaponRef owner; bool type_; }`; boxed optional `Node* next;`; `fn Weapon Weapon.default() { return { .name = "Sword \"x\"", .damage = 10, .rarity = COMMON, .offset = { .x = 0.5, .y = 0.0 }, .tags = { "a" }, .notes = { .set = false }, .tint = { .r = 200, .g = 200, .b = 200 }, .owner = (WeaponRef)"", .type_ = false }; }` formatted one field per line; ids `const String WEAPON_RUSTY_SWORD = "rusty_sword";`. Integer widths: `ichar short int long` / `char ushort uint ulong`; floats `float double`. Support `bi_types.c3`: `module bi_types;` then `struct Rgb { char r; char g; char b; }`, `Rgba`, `struct CurvePoint { float x; float y; float in; float out; }`, `struct Curve { CurvePoint[] points; }`, `struct GradientStop { float t; Rgba color; }`, `struct Gradient { GradientStop[] stops; }`.
 
@@ -674,7 +673,7 @@ Also test: with mapping `[rust]\nderive = ["Debug", "serde::Deserialize"]` the `
 
 ### Task 13: The Lua backend
 
-**Files:** Create `src/gen/structs/lang/lua.rs`.
+**Files:** Create `src/codegen/structs/lang/lua.rs`.
 
 **Rules:** header `-- generated …`; `local bi = require("<pkg.>bi_types")` when builtins are used; `local M = {}`; enums:
 
@@ -736,7 +735,7 @@ The text: every key from the spec's example, each line `# `-commented, with a on
 
 ```rust
 #[derive(Debug, PartialEq)]
-struct GenStructArgs { lang: bi::gen::structs::Lang, out: PathBuf, inputs: Vec<PathBuf>, mappings: Vec<PathBuf>, pkg: Option<String>, force: bool, verbose: bool }
+struct GenStructArgs { lang: bi::codegen::structs::Lang, out: PathBuf, inputs: Vec<PathBuf>, mappings: Vec<PathBuf>, pkg: Option<String>, force: bool, verbose: bool }
 ```
 
 - [ ] Steps: tests, run, implement, run, fmt, commit `cli: bi gen struct — flags, the terminal's overwrite question, notes and fates`

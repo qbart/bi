@@ -24,8 +24,10 @@ bi config edit                  the user config opened, written first when it is
 bi debug                        the debug commands
 bi debug init                   a project's .bi.toml seeded with launch configs
 bi gen                          the generators
-bi gen sample [schema|data|mapping]  the sample .bischema, .bidata and .bimapping written beside you
-bi gen struct ...               the schema as code — see gen-struct.md
+bi gen sample [schema|data|mapping]
+                                the sample .bischema, .bidata and .bimapping written beside you
+bi gen struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
+                                the schema as code — see gen-struct.md
 bi help <command>               one command's list: `bi help gen`
 ```
 

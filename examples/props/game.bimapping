@@ -1,0 +1,86 @@
+# game.bimapping — control for `bi gen struct`. TOML. Every key is
+# optional and every one below is commented out, so this file changes
+# nothing until a line is uncommented:
+#
+#   bi gen struct --lang rust -o out -i level1.bidata -m game.bimapping
+#
+# One file serves every language: the section for the language being
+# generated is read, the others are ignored. See docs/specs/gen-struct.md.
+
+# Id constants from the data files given (`WEAPON_RUSTY_SWORD`, …).
+# ids = true
+
+# What a schema name is called in the code, for every language. The wire
+# name — what the data stores — never changes.
+# [names]
+# "Weapon.name" = "display_name"      # a field
+# "Rarity.legendary" = "Mythic"       # an enum value
+# "Enemy" = "Monster"                 # a type
+
+# [rust]
+# imports = ["use serde::Deserialize;"]
+# derive = ["Debug", "Clone", "Deserialize"]   # Deserialize/Serialize add #[serde(rename = "wire")] where the code name differs
+# header = "#![allow(dead_code)]"              # text after the generated-by line
+# [rust.types]                                 # types the project supplies: spelled, not generated
+# Vec2 = "glam::Vec2"
+# rgb = { as = "palette::Srgb<u8>", import = "use palette::Srgb;", default = "Srgb::new(0, 0, 0)" }
+# rgba = "palette::Srgba<u8>"
+# curve = "crate::tuning::Curve"
+# gradient = "crate::tuning::Gradient"
+# [rust.generics]                              # {T} is the element, {S} the ref's target
+# list = "SmallVec<[{T}; 4]>"
+# optional = "Option<{T}>"
+# ref = "Handle<{S}>"
+# [rust.names]                                 # like [names], for Rust only; wins over it
+# "Weapon.name" = "display_name"
+
+# [cpp]                                        # `c++` on the command line, `cpp` here
+# imports = ["#include <glm/vec2.hpp>"]
+# [cpp.types]
+# Vec2 = "glm::vec2"
+# rgb = { as = "Color", import = "#include \"render/color.h\"" }
+# rgba = "Color"
+# curve = "AnimationCurve"
+# gradient = "ColorGradient"
+# [cpp.generics]
+# list = "std::vector<{T}>"
+# optional = "std::optional<{T}>"
+# ref = "Handle<{S}>"
+
+# [c]
+# prefix = "gs_"                               # every type and constant: gs_Weapon, GS_RARITY_COMMON
+# [c.types]
+# Vec2 = { as = "vec2", import = "#include \"math/vec2.h\"" }
+# rgb = "color_t"
+# rgba = "color_t"
+# curve = "curve_t"
+# gradient = "gradient_t"
+
+# [go]
+# imports = ["github.com/go-gl/mathgl/mgl32"]
+# [go.types]
+# Vec2 = "mgl32.Vec2"
+# rgb = { as = "color.RGBA", import = "image/color" }
+# rgba = { as = "color.RGBA", import = "image/color" }
+# curve = "tuning.Curve"
+# gradient = "tuning.Gradient"
+# [go.generics]
+# ref = "Handle[{S}]"
+
+# [c3]
+# imports = ["import math;"]
+# [c3.types]
+# Vec2 = "Vec2f"
+# rgb = "Color"
+# rgba = "Color"
+# curve = "Curve"
+# gradient = "Gradient"
+
+# [lua]
+# imports = ["local vec = require(\"engine.vec\")"]
+# [lua.types]
+# Vec2 = "vec.Vec2"
+# rgb = "Color"
+# rgba = "Color"
+# curve = "Curve"
+# gradient = "Gradient"

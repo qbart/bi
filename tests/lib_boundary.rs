@@ -187,6 +187,21 @@ const LIB_MODULES: &[&str] = &[
     "fmt.rs",
     "fname.rs",
     "form.rs",
+    "codegen/mod.rs",
+    "codegen/structs/fixture.rs",
+    "codegen/structs/lang/c.rs",
+    "codegen/structs/lang/c3.rs",
+    "codegen/structs/lang/cpp.rs",
+    "codegen/structs/lang/go.rs",
+    "codegen/structs/lang/lua.rs",
+    "codegen/structs/lang/mod.rs",
+    "codegen/structs/lang/rust.rs",
+    "codegen/structs/lit.rs",
+    "codegen/structs/mapping.rs",
+    "codegen/structs/mod.rs",
+    "codegen/structs/model.rs",
+    "codegen/structs/names.rs",
+    "codegen/structs/write.rs",
     "generate.rs",
     "git.rs",
     "gitignore.rs",
@@ -300,12 +315,16 @@ fn the_module_list_matches_what_lib_rs_declares() {
 
     // `pub mod` in `lib.rs` names one entry per module, not one per file — a
     // directory module like `config/` contributes a single `config/mod.rs`
-    // here. Submodule files (`config/parse.rs`) are reconciled separately
-    // below, against the filesystem rather than against `lib.rs`.
+    // here. Submodule files (`config/parse.rs`) and nested directory
+    // modules (`codegen/structs/mod.rs`) are reconciled separately below,
+    // against the filesystem rather than against `lib.rs`.
     let mut expected: Vec<&str> = LIB_MODULES
         .iter()
         .copied()
-        .filter(|m| *m != "lib.rs" && (!m.contains('/') || m.ends_with("/mod.rs")))
+        .filter(|m| {
+            *m != "lib.rs"
+                && (!m.contains('/') || m.matches('/').count() == 1 && m.ends_with("/mod.rs"))
+        })
         .collect();
     let mut declared: Vec<&str> = declared.iter().map(|s| s.as_str()).collect();
     expected.sort_unstable();
@@ -335,8 +354,13 @@ fn the_module_list_matches_what_lib_rs_declares() {
             .collect();
         on_disk.sort();
 
-        let mut declared_in_dir: Vec<&str> =
-            LIB_MODULES.iter().copied().filter(|m| m.starts_with(&format!("{dir}/"))).collect();
+        // Direct children only: `codegen/structs/mod.rs` is `codegen/structs/`'s
+        // own row, checked when the loop reaches it.
+        let mut declared_in_dir: Vec<&str> = LIB_MODULES
+            .iter()
+            .copied()
+            .filter(|m| m.strip_prefix(&format!("{dir}/")).is_some_and(|rest| !rest.contains('/')))
+            .collect();
         declared_in_dir.sort_unstable();
 
         assert_eq!(

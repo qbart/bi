@@ -5,6 +5,12 @@
 
 pub const SCHEMA_NAME: &str = "game.bischema";
 pub const DATA_NAME: &str = "level1.bidata";
+pub const MAPPING_NAME: &str = "game.bimapping";
+
+/// The sample mapping for `bi gen struct`: every key, commented out, the
+/// way `bi config init` writes the user config. It changes nothing until
+/// a line is uncommented, so the sample generates as written.
+pub const MAPPING: &str = include_str!("../../examples/props/game.bimapping");
 
 pub const SCHEMA: &str = r##"{
   "$dialect": "bi/1",
@@ -166,5 +172,30 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/props");
         assert_eq!(std::fs::read_to_string(dir.join(SCHEMA_NAME)).unwrap(), SCHEMA);
         assert_eq!(std::fs::read_to_string(dir.join(DATA_NAME)).unwrap(), DATA);
+        assert_eq!(std::fs::read_to_string(dir.join(MAPPING_NAME)).unwrap(), MAPPING);
+    }
+
+    /// Commented out means it maps nothing — and uncommented, every line
+    /// is a key the mapping knows.
+    #[test]
+    fn the_sample_mapping_is_empty_until_uncommented() {
+        use crate::codegen::structs::{Lang, Mapping};
+        let m = Mapping::parse(MAPPING).unwrap();
+        assert_eq!(m, Mapping::default());
+        let live: String = MAPPING
+            .lines()
+            .filter(|l| {
+                l.starts_with("# ")
+                    && !l.starts_with("# game.bimapping")
+                    && !l.starts_with("#   bi ")
+            })
+            .map(|l| l[2..].to_string() + "\n")
+            .filter(|l| !l.trim_start().starts_with("#") && (l.contains('=') || l.starts_with('[')))
+            .collect();
+        let m = Mapping::parse(&live).unwrap_or_else(|e| panic!("{live}\n{e:?}"));
+        assert!(m.ids);
+        assert_eq!(m.langs.len(), 6);
+        assert_eq!(m.for_lang(Lang::Rust).types["Vec2"].spelling, "glam::Vec2");
+        assert_eq!(m.for_lang(Lang::Go).generics.reference.as_deref(), Some("Handle[{S}]"));
     }
 }

@@ -12,7 +12,8 @@ bi gen struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] 
 
 ## Status
 
-**Proposed.**
+**Built.** All six backends, the mapping, the sample mapping,
+`bi gen struct` on the command line.
 
 ## The command
 
@@ -114,8 +115,8 @@ builtins need.
 | enum `E`           | `enum E` + `E_VALUE`       | `enum class E`         | `type E string` + consts | `enum E`   | `enum E`              | `E = { value = "value" }` |
 | struct `S`         | `struct S`                 | `struct S`             | `type S struct`   | `struct S`        | `struct S`            | `---@class S`          |
 | `list<T>`          | `struct { T *items; size_t len; }` | `std::vector<T>` | `[]T`            | `Vec<T>`          | `T[]`                 | `T[]`                  |
-| `optional<T>`      | `struct { bool set; T value; }` | `std::optional<T>` | `*T`             | `Option<T>`       | `T?`                  | `T?`                   |
-| `ref<S>`           | `bi_ref` (`const char *`)  | `bi::Ref<S>`           | `Ref[S]`          | `Ref<S>`          | `Ref{S}`              | `string` (`# ref<S>`)  |
+| `optional<T>`      | `struct { bool set; T value; }` | `std::optional<T>` | `*T`             | `Option<T>`       | `struct OptT { bool set; T value; }` | `T?`      |
+| `ref<S>`           | `bi_ref` (`const char *`)  | `bi::Ref<S>`           | `Ref[S]`          | `Ref<S>`          | `SRef` (`typedef SRef = String;`) | `string` (`# ref<S>`)  |
 
 The support types — colours, curve, gradient, `Ref` — live in one file per
 output directory, `bi_types.<ext>`, holding only the ones the schemas use
@@ -159,11 +160,19 @@ a loader knows what key a field came from.
 | C++      | as-is    | as-is        | as-is                   | `Weapon::RUSTY_SWORD`   |
 | Go       | Pascal   | Pascal       | `RarityCommon`          | `WeaponRustySword`      |
 | Rust     | Pascal   | snake        | Pascal                  | `weapon::RUSTY_SWORD`   |
-| C3       | as-is    | as-is        | `COMMON`                | `WEAPON_RUSTY_SWORD`    |
+| C3       | Pascal   | snake        | `COMMON`                | `WEAPON_RUSTY_SWORD`    |
 | Lua      | as-is    | as-is        | as-is                   | `Weapon.ids.rusty_sword`|
 
 "As-is" is the bi identifier untouched — `[A-Za-z_][A-Za-z0-9_]*`, which
-every one of the six accepts. Enum values are *strings*, not identifiers:
+every one of the six accepts. Lua's table keys are the wire names, always — the table is the data,
+and a key that is not an identifier is written `t["very rare"]` — so a
+`[names]` rename of a field changes nothing in Lua; renames of enum
+values and ids still name the generated constants. C3 is cased whether it likes it or not,
+because its compiler insists: a type starts upper, a field lower, a
+constant is all upper. C3 also has no nullable optional a struct can hold
+(its `T?` carries a fault, not an absence) and no generic a `ref` could
+wear cheaply, so each optional instantiation is a small named struct and
+each referenced struct gets a distinct `typedef WeaponRef = String;`. Enum values are *strings*, not identifiers:
 `"very rare"` and `"1st"` are legal in a schema and legal in no language,
 so a value is made an identifier by turning every other character into
 `_` and prefixing `_` to a leading digit, and the wire name is kept in the
@@ -195,11 +204,11 @@ with the types. Each language gets them in its own shape:
 
 | Language | Shape                                                                 |
 |----------|-----------------------------------------------------------------------|
-| C        | `void weapon_init(struct Weapon *)`; list and curve defaults as `static const` arrays it points into |
+| C        | `void weapon_init(struct Weapon *)`; list and curve defaults as `static` arrays it points into |
 | C++      | default member initialisers — `int32_t damage = 10;`                  |
 | Go       | `func DefaultWeapon() Weapon`                                          |
 | Rust     | `impl Default for Weapon`                                              |
-| C3       | `fn Weapon Weapon.default()`, since C3 has no member initialisers on structs |
+| C3       | `fn Weapon weapon_default()`, since C3 has no member initialisers on structs |
 | Lua      | `Weapon.new(t)` — copies `t`, fills what it lacks from the defaults   |
 
 Values are the schema's, fully resolved: a struct-typed field's partial
@@ -209,6 +218,12 @@ the same unset marker `:bi new` writes. Number literals are spelled for
 the type (`1.0f` for a C++ `float`, `1.0` for an `f64`); strings are
 escaped for the language, including `"` `\` and every control character,
 and non-ASCII is passed through as UTF-8, which all six read.
+
+An `optional` that holds a value in Go is a pointer to a hoisted local
+(`x0 := int32(5)` before the literal), since Go cannot take the address of
+a literal. Lists and optionals in C are one `typedef` per instantiation,
+emitted just before the first struct that needs them, because an
+optional of a struct embeds it by value and needs it complete.
 
 An externally mapped type has no default the generator can spell. The
 field then gets the language's own default of that type — Rust
@@ -422,14 +437,14 @@ editor command (`:bi gen struct` later) or a build tool can call the same
 thing without a process.
 
 ```
-src/gen/mod.rs           pub mod structs — the generators grow here; `sample` may move in
-src/gen/structs/mod.rs   generate(&Request) -> Result<Output, Vec<Diagnostic>>
-src/gen/structs/model.rs the language-neutral model: units, types, resolved
+src/codegen/mod.rs           pub mod structs — the generators grow here; `sample` may move in
+src/codegen/structs/mod.rs   generate(&Request) -> Result<Output, Vec<Diagnostic>>
+src/codegen/structs/model.rs the language-neutral model: units, types, resolved
                          defaults, ids, dependency order, boxed edges
-src/gen/structs/mapping.rs  Mapping::parse, merge — TOML in, spans on every error
-src/gen/structs/names.rs cases, reserved words per language, collision checks
-src/gen/structs/lang/{c,cpp,go,rust,c3,lua}.rs   one Backend each
-src/gen/structs/write.rs the file policy, with the question asked through a trait
+src/codegen/structs/mapping.rs  Mapping::parse, merge — TOML in, spans on every error
+src/codegen/structs/names.rs cases, reserved words per language, collision checks
+src/codegen/structs/lang/{c,cpp,go,rust,c3,lua}.rs   one Backend each
+src/codegen/structs/write.rs the file policy, with the question asked through a trait
 ```
 
 ```rust
@@ -499,12 +514,11 @@ In `gen/structs`:
 - **write**: fresh, unchanged, differing with each answer, `--force`, the
   non-tty refusal, the atomic rename; every case through a scripted `Ask`.
 
-In `tests/`: the Rust output for the sample schema is generated by a test
-and compiled — `include!`d into the test crate — which is the one language
-whose toolchain the test suite already has. `scripts/gen_struct_compile.sh`
-generates all six from `examples/props` and compiles each with whatever
-compiler is on the path, skipping the ones that are not; it is run by
-hand like `vim_differential.py`, not by `cargo test`.
+In `tests/gen_struct.rs`: `generate` over the sample pair in every
+language writes a unit and a `bi_types` holding every builtin, and the
+sample mapping changes nothing. The generator's job is the text, so
+nothing compiles what it wrote: six toolchains are not `cargo test`'s
+business, and each backend's own tests pin the text it writes.
 
 In `main.rs`: `bi gen sample mapping` writes `game.bimapping`, `bi gen
 sample` all three, an existing one is left alone; the sample mapping

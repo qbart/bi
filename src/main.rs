@@ -84,6 +84,7 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Invocation::GenStruct(args) => return gen_struct(&args),
         Invocation::Open(path) => path,
     };
 
@@ -151,7 +152,7 @@ fn main() -> Result<()> {
 }
 
 /// What the command line asked for. See `docs/specs/cli.md`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Invocation {
     Open(Option<String>),
     /// `--help`, or a command word alone: the list to print.
@@ -161,9 +162,54 @@ enum Invocation {
     ConfigEdit,
     /// `bi debug init` — a project's `.bi.toml` seeded with launch configs.
     DebugInit,
-    /// `bi gen sample [schema|data]` — the sample `.bischema` and
-    /// `.bidata` written beside you. See `docs/specs/props.md`.
-    GenSample(Option<bi::props::Kind>),
+    /// `bi gen sample [schema|data|mapping]` — the sample `.bischema`,
+    /// `.bidata` and `.bimapping` written beside you. See
+    /// `docs/specs/props.md`.
+    GenSample(Option<Sample>),
+    /// `bi gen struct …` — the schema as code. See `docs/specs/gen-struct.md`.
+    GenStruct(GenStructArgs),
+}
+
+/// One of the three sample files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sample {
+    Schema,
+    Data,
+    Mapping,
+}
+
+impl Sample {
+    const ALL: [Sample; 3] = [Sample::Schema, Sample::Data, Sample::Mapping];
+
+    fn parse(word: &str) -> Option<Sample> {
+        Some(match word {
+            "schema" | "bischema" => Sample::Schema,
+            "data" | "bidata" => Sample::Data,
+            "mapping" | "bimapping" => Sample::Mapping,
+            _ => return None,
+        })
+    }
+
+    fn file(self) -> (&'static str, &'static str) {
+        use bi::props::sample;
+        match self {
+            Sample::Schema => (sample::SCHEMA_NAME, sample::SCHEMA),
+            Sample::Data => (sample::DATA_NAME, sample::DATA),
+            Sample::Mapping => (sample::MAPPING_NAME, sample::MAPPING),
+        }
+    }
+}
+
+/// The flags of `bi gen struct`, parsed and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenStructArgs {
+    lang: bi::codegen::structs::Lang,
+    out: PathBuf,
+    inputs: Vec<PathBuf>,
+    mappings: Vec<PathBuf>,
+    pkg: Option<String>,
+    force: bool,
+    verbose: bool,
 }
 
 const USAGE: &str = "\
@@ -176,7 +222,10 @@ usage:
   bi config init                 the user config written, every default commented out
   bi config edit                 the user config opened, written first when it is not there
   bi debug init                  a project's .bi.toml seeded with launch configs
-  bi gen sample [schema|data]    the sample .bischema and .bidata written beside you
+  bi gen sample [schema|data|mapping]
+                                 the sample .bischema, .bidata and .bimapping written beside you
+  bi gen struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
+                                 the schema as C, C++, Go, Rust, C3 or Lua types
   bi help <command>              one command's list
   bi --help, -h                  this list
   bi --version, -V               the version
@@ -201,8 +250,19 @@ usage: bi debug <command>
 const GEN_USAGE: &str = "\
 usage: bi gen <command>
 
-  sample [schema|data]    the sample .bischema and .bidata written beside you;
-                          `schema` or `data` for one of them
+  sample [schema|data|mapping]
+      the sample .bischema, .bidata and .bimapping written beside you;
+      a kind for one of them
+
+  struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
+      the schema's types, defaults and ids as code
+        --lang <lang>   c | c++ | go | rust | c3 | lua
+        -o <dir>        where the files go; made when missing
+        -i <file>       a .bischema or .bidata; a data file brings its schema
+        -m <file>       a .bimapping; later files win on the keys they share
+        --pkg <name>    the namespace, package or module (a.b)
+        --force         overwrite without asking
+        -v              say what was decided
 ";
 
 /// The list a command word prints on its own, or under `help`.
@@ -240,13 +300,13 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
         },
         ["gen", sub, rest @ ..] => match (*sub, rest) {
             ("sample", []) => Ok(Invocation::GenSample(None)),
-            ("sample", [kind]) => match *kind {
-                "schema" | "bischema" => Ok(Invocation::GenSample(Some(bi::props::Kind::Schema))),
-                "data" | "bidata" => Ok(Invocation::GenSample(Some(bi::props::Kind::Data))),
-                other => bail!("no such sample: {other} — try `schema` or `data`"),
+            ("sample", [kind]) => match Sample::parse(kind) {
+                Some(kind) => Ok(Invocation::GenSample(Some(kind))),
+                None => bail!("no such sample: {kind} — try `schema`, `data` or `mapping`"),
             },
-            ("sample", _) => bail!("usage: bi gen sample [schema|data]"),
-            (other, _) => bail!("no such command: bi gen {other} — try `sample`"),
+            ("sample", _) => bail!("usage: bi gen sample [schema|data|mapping]"),
+            ("struct", flags) => Ok(Invocation::GenStruct(parse_gen_struct(flags)?)),
+            (other, _) => bail!("no such command: bi gen {other} — try `sample` or `struct`"),
         },
         [flag] if flag.starts_with('-') => {
             bail!("no such flag: {flag} — `bi --help` lists them, `bi -- {flag}` opens the file")
@@ -254,6 +314,78 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
         [one] => Ok(Invocation::Open(Some((*one).to_string()))),
         _ => bail!("usage: bi [path] — `bi --help` lists the commands"),
     }
+}
+
+/// The flags of `bi gen struct`, in any order; a value that starts with
+/// `-` is a missing value, `--` ends the flags.
+fn parse_gen_struct(flags: &[&str]) -> Result<GenStructArgs> {
+    use bi::codegen::structs::Lang;
+    let mut lang = None;
+    let mut out = None;
+    let mut inputs = Vec::new();
+    let mut mappings = Vec::new();
+    let mut pkg = None;
+    let mut force = false;
+    let mut verbose = false;
+    let mut i = 0;
+    let mut literal = false;
+    while i < flags.len() {
+        let flag = flags[i];
+        i += 1;
+        if literal {
+            inputs.push(PathBuf::from(flag));
+            continue;
+        }
+        let mut value = |what: &str| -> Result<&str> {
+            match flags.get(i) {
+                Some(v) if !v.starts_with('-') || *v == "-" => {
+                    i += 1;
+                    Ok(v)
+                }
+                Some(v) => bail!("{flag} wants {what}, got {v}"),
+                None => bail!("{flag} wants {what}"),
+            }
+        };
+        match flag {
+            "--" => literal = true,
+            "--lang" => {
+                let v = value("a language")?;
+                if lang.is_some() {
+                    bail!("--lang given twice — one language per run");
+                }
+                lang = Some(Lang::parse(v).ok_or_else(|| {
+                    anyhow::anyhow!("no such language: {v} — {}", Lang::SPELLINGS)
+                })?);
+            }
+            "-o" | "--out" => {
+                let v = value("a directory")?;
+                if out.is_some() {
+                    bail!("-o given twice");
+                }
+                out = Some(PathBuf::from(v));
+            }
+            "-i" | "--input" => inputs.push(PathBuf::from(value("a file")?)),
+            "-m" | "--mapping" => mappings.push(PathBuf::from(value("a file")?)),
+            "--pkg" => {
+                let v = value("a name")?;
+                pkg = Some(v.to_string());
+            }
+            "--force" | "-f" => force = true,
+            "-v" | "--verbose" => verbose = true,
+            other if other.starts_with('-') => {
+                bail!("no such flag: {other} — `bi help gen` lists them")
+            }
+            other => inputs.push(PathBuf::from(other)),
+        }
+    }
+    let Some(lang) = lang else {
+        bail!("bi gen struct: --lang <lang> is required — {}", Lang::SPELLINGS)
+    };
+    let Some(out) = out else { bail!("bi gen struct: -o <dir> is required") };
+    if inputs.is_empty() {
+        bail!("bi gen struct: -i <file> is required");
+    }
+    Ok(GenStructArgs { lang, out, inputs, mappings, pkg, force, verbose })
 }
 
 /// The header on a freshly written config, explaining the one thing a user
@@ -397,22 +529,20 @@ enum Generated {
     Existed(PathBuf, &'static str),
 }
 
-/// `bi gen sample [schema|data]`: `game.bischema` and `level1.bidata`
-/// written into `dir` — both when no kind is named — each left alone when
-/// it already exists. The data file points at the schema by name, so the
-/// pair opens straight into the property view.
-fn gen_sample(dir: &Path, kind: Option<bi::props::Kind>) -> Result<Vec<Generated>> {
-    use bi::props::{Kind, sample};
-    let wanted: Vec<Kind> = match kind {
+/// `bi gen sample [schema|data|mapping]`: `game.bischema`, `level1.bidata`
+/// and `game.bimapping` written into `dir` — all three when no kind is
+/// named — each left alone when it already exists. The data file points
+/// at the schema by name, so the pair opens straight into the property
+/// view, and the mapping is every key commented out, so `bi gen struct`
+/// over them generates as written.
+fn gen_sample(dir: &Path, kind: Option<Sample>) -> Result<Vec<Generated>> {
+    let wanted: Vec<Sample> = match kind {
         Some(kind) => vec![kind],
-        None => vec![Kind::Schema, Kind::Data],
+        None => Sample::ALL.to_vec(),
     };
     let mut out = Vec::new();
     for kind in wanted {
-        let (name, text) = match kind {
-            Kind::Schema => (sample::SCHEMA_NAME, sample::SCHEMA),
-            Kind::Data => (sample::DATA_NAME, sample::DATA),
-        };
+        let (name, text) = kind.file();
         let path = dir.join(name);
         if path.exists() {
             out.push(Generated::Existed(path, text));
@@ -422,6 +552,127 @@ fn gen_sample(dir: &Path, kind: Option<bi::props::Kind>) -> Result<Vec<Generated
         out.push(Generated::Wrote(path));
     }
     Ok(out)
+}
+
+/// `bi gen struct`: the files read, the library asked, the answer written
+/// under the policy — the terminal's question, or `--force`'s yes, or a
+/// pipe's no. Errors go to stderr and fail the run; nothing is written
+/// when anything is wrong.
+fn gen_struct(args: &GenStructArgs) -> Result<()> {
+    use bi::codegen::structs::{self, Always, Ask, Overwrite, Request};
+    use std::io::IsTerminal;
+
+    let read_all = |paths: &[PathBuf]| -> Result<Vec<(PathBuf, String)>> {
+        paths
+            .iter()
+            .map(|p| {
+                std::fs::read_to_string(p)
+                    .map(|t| (p.clone(), t))
+                    .with_context(|| format!("reading {}", p.display()))
+            })
+            .collect()
+    };
+    let dir_name = args
+        .out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        })
+        .unwrap_or_else(|| "gen".to_string());
+    let req = Request {
+        lang: args.lang,
+        pkg: args.pkg.clone(),
+        inputs: read_all(&args.inputs)?,
+        mappings: read_all(&args.mappings)?,
+        dir_name,
+    };
+    let mut read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
+    let output = match structs::generate(&req, &mut read) {
+        Ok(out) => out,
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("{}", e.message);
+            }
+            bail!(
+                "bi gen struct: {} error{}",
+                errors.len(),
+                if errors.len() == 1 { "" } else { "s" }
+            );
+        }
+    };
+    for note in &output.notes {
+        let level = match note.level {
+            bi::props::Level::Error => "error",
+            bi::props::Level::Warning => "note",
+        };
+        if args.verbose || note.level == bi::props::Level::Error {
+            eprintln!("{level}: {}", note.message);
+        }
+    }
+    if !args.verbose && !output.notes.is_empty() {
+        eprintln!(
+            "{} note{} — -v shows them",
+            output.notes.len(),
+            if output.notes.len() == 1 { "" } else { "s" }
+        );
+    }
+    if args.out.is_file() {
+        bail!("-o {}: a file, not a directory", args.out.display());
+    }
+
+    /// Reads one answer from the terminal per differing file.
+    struct TerminalAsk;
+    impl Ask for TerminalAsk {
+        fn overwrite(&mut self, path: &Path) -> Overwrite {
+            loop {
+                eprint!("overwrite {}? [y/N/a/q] ", path.display());
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line).is_err() {
+                    return Overwrite::Quit;
+                }
+                match line.trim().to_ascii_lowercase().as_str() {
+                    "y" | "yes" => return Overwrite::Yes,
+                    "" | "n" | "no" => return Overwrite::No,
+                    "a" | "all" => return Overwrite::All,
+                    "q" | "quit" => return Overwrite::Quit,
+                    _ => eprintln!("y — this one; n — not this one; a — all of them; q — stop"),
+                }
+            }
+        }
+    }
+
+    let tty = io::stdin().is_terminal();
+    let mut force = Always(Overwrite::All);
+    let mut refuse = Always(Overwrite::No);
+    let mut terminal = TerminalAsk;
+    let ask: &mut dyn Ask = if args.force {
+        &mut force
+    } else if tty {
+        &mut terminal
+    } else {
+        &mut refuse
+    };
+    let report = structs::write(&args.out, &output.files, ask)
+        .with_context(|| format!("writing under {}", args.out.display()))?;
+    for (path, fate) in &report.fates {
+        let tail = match fate {
+            structs::Fate::Skipped if !args.force && !tty => " — --force to overwrite",
+            _ => "",
+        };
+        if args.verbose || *fate != structs::Fate::Unchanged {
+            println!("{} {}{tail}", fate.word(), path.display());
+        }
+    }
+    if report.stopped {
+        bail!("stopped — the files after it were not written");
+    }
+    if report.skipped() {
+        bail!("some files were not written");
+    }
+    Ok(())
 }
 
 fn debug_init(dir: &Path) -> Result<DebugInit> {
@@ -785,8 +1036,10 @@ mod tests {
         assert!(matches!(parse_args(&args(&["--"])).unwrap(), Invocation::Open(None)));
         let err = parse_args(&args(&["--nope"])).unwrap_err().to_string();
         assert!(err.contains("bi --help") && err.contains("bi -- --nope"), "{err}");
-        assert!(USAGE.contains("bi gen sample [schema|data]"));
-        assert!(GEN_USAGE.contains("sample [schema|data]"));
+        assert!(USAGE.contains("bi gen sample [schema|data|mapping]"));
+        assert!(USAGE.contains("bi gen struct --lang"));
+        assert!(GEN_USAGE.contains("sample [schema|data|mapping]"));
+        assert!(GEN_USAGE.contains("struct --lang"));
         assert!(matches!(parse_args(&args(&["config", "init"])).unwrap(), Invocation::ConfigInit));
         assert!(matches!(parse_args(&args(&["config", "edit"])).unwrap(), Invocation::ConfigEdit));
         assert!(parse_args(&args(&["config", "nope"])).is_err());
@@ -798,15 +1051,88 @@ mod tests {
         ));
         assert!(matches!(
             parse_args(&args(&["gen", "sample", "schema"])).unwrap(),
-            Invocation::GenSample(Some(bi::props::Kind::Schema))
+            Invocation::GenSample(Some(Sample::Schema))
         ));
         assert!(matches!(
             parse_args(&args(&["gen", "sample", "data"])).unwrap(),
-            Invocation::GenSample(Some(bi::props::Kind::Data))
+            Invocation::GenSample(Some(Sample::Data))
+        ));
+        assert!(matches!(
+            parse_args(&args(&["gen", "sample", "mapping"])).unwrap(),
+            Invocation::GenSample(Some(Sample::Mapping))
         ));
         assert!(parse_args(&args(&["gen", "sample", "nope"])).is_err());
         assert!(parse_args(&args(&["gen", "nope"])).is_err());
         assert!(parse_args(&args(&["a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn gen_struct_flags() {
+        use bi::codegen::structs::Lang;
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed = |list: &[&str]| {
+            let mut v = vec!["gen", "struct"];
+            v.extend_from_slice(list);
+            parse_args(&args(&v))
+        };
+        let ok = parsed(&[
+            "--lang",
+            "rust",
+            "-o",
+            "out",
+            "-i",
+            "a.bischema",
+            "-i",
+            "b.bidata",
+            "-m",
+            "x.bimapping",
+            "--pkg",
+            "gen.so",
+            "--force",
+            "-v",
+        ])
+        .unwrap();
+        assert_eq!(
+            ok,
+            Invocation::GenStruct(GenStructArgs {
+                lang: Lang::Rust,
+                out: PathBuf::from("out"),
+                inputs: vec![PathBuf::from("a.bischema"), PathBuf::from("b.bidata")],
+                mappings: vec![PathBuf::from("x.bimapping")],
+                pkg: Some("gen.so".into()),
+                force: true,
+                verbose: true,
+            })
+        );
+        // any order, c++ spelled so, a bare word is an input
+        assert!(matches!(
+            parsed(&["-i", "a.bischema", "--lang", "c++", "-o", "out"]).unwrap(),
+            Invocation::GenStruct(GenStructArgs { lang: Lang::Cpp, .. })
+        ));
+        let e = |list: &[&str]| parsed(list).unwrap_err().to_string();
+        assert_eq!(e(&["--lang", "rust", "-o", "out"]), "bi gen struct: -i <file> is required");
+        assert_eq!(e(&["--lang", "rust", "-i", "a"]), "bi gen struct: -o <dir> is required");
+        assert!(
+            e(&["-o", "out", "-i", "a"]).starts_with("bi gen struct: --lang <lang> is required")
+        );
+        assert_eq!(
+            e(&["--lang", "rust", "--lang", "go", "-o", "o", "-i", "a"]),
+            "--lang given twice — one language per run"
+        );
+        assert_eq!(
+            e(&["--lang", "java", "-o", "o", "-i", "a"]),
+            "no such language: java — c, c++, go, rust, c3, lua"
+        );
+        assert_eq!(e(&["--lang", "rust", "-o", "-i", "a"]), "-o wants a directory, got -i");
+        assert_eq!(e(&["--lang", "rust", "-o", "out", "-i"]), "-i wants a file");
+        assert!(
+            e(&["--lang", "rust", "-o", "out", "-i", "a", "--nope"])
+                .starts_with("no such flag: --nope")
+        );
+        assert!(
+            parse_args(&args(&["gen"]))
+                .is_ok_and(|i| matches!(i, Invocation::Help(t) if t.contains("struct")))
+        );
     }
 
     #[test]
@@ -815,7 +1141,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let first = gen_sample(&dir, None).unwrap();
-        assert!(matches!(first.as_slice(), [Generated::Wrote(_), Generated::Wrote(_)]));
+        assert!(matches!(
+            first.as_slice(),
+            [Generated::Wrote(_), Generated::Wrote(_), Generated::Wrote(_)]
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("game.bimapping")).unwrap(),
+            bi::props::sample::MAPPING
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("game.bischema")).unwrap(),
             bi::props::sample::SCHEMA
@@ -824,7 +1157,7 @@ mod tests {
             std::fs::read_to_string(dir.join("level1.bidata")).unwrap(),
             bi::props::sample::DATA
         );
-        let again = gen_sample(&dir, Some(bi::props::Kind::Schema)).unwrap();
+        let again = gen_sample(&dir, Some(Sample::Schema)).unwrap();
         assert!(
             matches!(again.as_slice(), [Generated::Existed(_, text)] if *text == bi::props::sample::SCHEMA)
         );
