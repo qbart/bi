@@ -17,10 +17,12 @@ defaults stayed, some things work differently.
 C/C++, Go, C3 and Rust are first-class citizens: they get grammar, LSP and
 testing attention first. Everything else is best-effort.
 
-bi leans on the [kitty](https://sw.kovidgoyal.net/kitty/) terminal
-protocols: keyboard enhancement for keys a plain terminal cannot tell apart,
-graphics for pixels. That is what lets images open as pictures and a colour,
-curve or gradient literal open in its own editor, written back into the text.
+bi ships custom editors that live inside the text: a colour picker, a curve
+editor with tangent handles, a gradient editor with stops, and images that
+open as the picture they are. Each opens over the literal under the cursor
+and writes the result back. They are drawn with the
+[kitty](https://sw.kovidgoyal.net/kitty/) graphics protocol, so they need a
+terminal that speaks it.
 
 bi has its own property format too: a `.bischema` defines struct-like types,
 a `.bidata` holds sparse instances, both plain JSON, both opened as a
