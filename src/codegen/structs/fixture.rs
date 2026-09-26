@@ -67,14 +67,21 @@ pub fn try_model(
     mapping: &str,
 ) -> Result<(Model, Vec<Diagnostic>), Vec<Diagnostic>> {
     let (_, schema) = Schema::parse(schema).expect("fixture schema parses");
-    let data: Vec<DataFile> =
-        data.iter().map(|d| data::parse(d).expect("fixture data parses").1).collect();
+    let data: Vec<(String, String, DataFile)> = data
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let stem = if i == 0 { "level1".to_string() } else { format!("level{}", i + 1) };
+            (stem.clone(), format!("{stem}.bidata"), data::parse(d).expect("fixture data parses").1)
+        })
+        .collect();
     let mapping = Mapping::parse(mapping).expect("fixture mapping parses");
     Model::build(
         lang,
         vec![(STEM.into(), SOURCE.into(), schema, data)],
         &mapping.for_lang(lang),
         mapping.ids,
+        mapping.instances,
     )
 }
 

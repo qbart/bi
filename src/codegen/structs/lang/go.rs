@@ -7,7 +7,7 @@
 use serde_json::Value;
 
 use super::super::model::{Builtin, Field, Ty, Type};
-use super::super::{Backend, Context, Lang, Model, Unit, header, lit};
+use super::super::{Backend, Context, DataUnit, Lang, Model, Unit, header, lit, names};
 
 pub struct Go;
 
@@ -23,21 +23,85 @@ impl Backend for Go {
         }
         out.push('\n');
         out.push_str(&format!("package {}\n", package(cx)));
-        let imports = imports(unit, model, cx);
-        if !imports.is_empty() {
-            out.push_str("\nimport (\n");
-            for i in &imports {
-                out.push_str(&format!("\t{}\n", lit::string(i, LANG)));
-            }
-            out.push_str(")\n");
-        }
-        for t in unit.types.iter().filter(|t| t.external.is_none()) {
+        let own: Vec<&Type> = unit.types.iter().filter(|t| t.external.is_none()).collect();
+        write_imports(&mut out, &imports(&own, model, cx));
+        for t in &own {
             out.push('\n');
             if t.is_enum() {
                 write_enum(&mut out, t);
             } else {
                 write_struct(&mut out, t, model, cx);
             }
+        }
+        out
+    }
+
+    fn data(&self, data: &DataUnit, _unit: &Unit, model: &Model, cx: &Context) -> String {
+        let mut out = header("//", &data.source);
+        if let Some(h) = &cx.mapping.header {
+            out.push('\n');
+            out.push_str(h);
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&format!("package {}\n", package(cx)));
+        let types: Vec<(&str, &Type)> =
+            data.types().into_iter().filter_map(|w| Some((w, model.type_named(w)?))).collect();
+        // Same package as the schema's types: only what the literals
+        // mention from outside needs importing.
+        let literal_types: Vec<&Type> = types.iter().map(|(_, t)| *t).collect();
+        write_imports(&mut out, &imports(&reachable(&literal_types, model), model, cx));
+        let stem = names::pascal(&data.stem);
+        for (wire, t) in types {
+            // Go's package is one flat namespace shared by every data
+            // file, so every name carries the file's stem.
+            let prefix = format!("{stem}{}", t.name);
+            for inst in data.of(wire) {
+                let name = format!("{prefix}{}", inst.name);
+                let mut locals = Locals::default();
+                let rows = literal_rows(t, inst.value.as_object(), model, cx, &mut locals);
+                out.push('\n');
+                if locals.lines.is_empty() {
+                    out.push_str(&format!("var {name} = "));
+                    write_literal(&mut out, t, &rows, "");
+                } else {
+                    // A set optional needs an addressable local, and a
+                    // package-level `var` cannot declare one: a function.
+                    let func = format!("{}Value", lower_first(&name));
+                    out.push_str(&format!("func {func}() {} {{\n", t.name));
+                    for l in &locals.lines {
+                        out.push_str(&format!("\t{l}\n"));
+                    }
+                    out.push_str("\treturn ");
+                    write_literal(&mut out, t, &rows, "\t");
+                    out.push_str(&format!("}}\n\nvar {name} = {func}()\n"));
+                }
+            }
+            let table = format!("{prefix}s");
+            out.push_str(&format!(
+                "\n// {table} are every {} of {}, in its order, with its id.\nvar {table} = []struct {{\n",
+                t.name, data.source
+            ));
+            aligned(
+                &mut out,
+                &[
+                    vec!["ID".to_string(), "string".to_string()],
+                    vec!["Value".to_string(), format!("*{}", t.name)],
+                ],
+            );
+            out.push_str("}{\n");
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "\t{{{}, &{prefix}{}}},\n",
+                    lit::string(&inst.wire, LANG),
+                    inst.name
+                ));
+            }
+            out.push_str("}\n");
+            out.push_str(&format!(
+                "\n// Find{prefix} returns the {0} with that id, or nil.\nfunc Find{prefix}(id string) *{0} {{\n\tfor i := range {table} {{\n\t\tif {table}[i].ID == id {{\n\t\t\treturn {table}[i].Value\n\t\t}}\n\t}}\n\treturn nil\n}}\n",
+                t.name
+            ));
         }
         out
     }
@@ -88,14 +152,14 @@ fn package<'a>(cx: &Context<'a>) -> &'a str {
     }
 }
 
-/// The import paths this unit needs: the mapping's, plus those of the
-/// external types and mapped builtins its generated fields mention. Go
-/// refuses an unused import, so only what the unit uses is added.
-fn imports(unit: &Unit, model: &Model, cx: &Context) -> Vec<String> {
+/// The import paths a file needs: the mapping's, plus those of the
+/// external types and mapped builtins the fields of `types` mention. Go
+/// refuses an unused import, so only what the file uses is added.
+fn imports(types: &[&Type], model: &Model, cx: &Context) -> Vec<String> {
     let mut imports: Vec<String> = cx.mapping.imports.clone();
     let mut named = Vec::new();
     let mut builtins = Vec::new();
-    for t in unit.types.iter().filter(|t| t.external.is_none()) {
+    for t in types {
         for f in t.fields() {
             f.ty.named(&mut named);
             f.ty.builtins(&mut builtins);
@@ -119,6 +183,50 @@ fn imports(unit: &Unit, model: &Model, cx: &Context) -> Vec<String> {
     imports.sort();
     imports.dedup();
     imports
+}
+
+/// `types` and every generated struct their literals spell out, since a
+/// nested struct is written inline with its own fields.
+fn reachable<'a>(types: &[&'a Type], model: &'a Model) -> Vec<&'a Type> {
+    let mut out: Vec<&Type> = Vec::new();
+    let mut todo: Vec<&Type> = types.to_vec();
+    while let Some(t) = todo.pop() {
+        if out.iter().any(|o| o.wire == t.wire) {
+            continue;
+        }
+        out.push(t);
+        let mut named = Vec::new();
+        for f in t.fields() {
+            f.ty.named(&mut named);
+        }
+        for n in named {
+            if let Some(inner) = model.type_named(&n)
+                && inner.external.is_none()
+                && !inner.is_enum()
+            {
+                todo.push(inner);
+            }
+        }
+    }
+    out
+}
+
+fn write_imports(out: &mut String, imports: &[String]) {
+    if !imports.is_empty() {
+        out.push_str("\nimport (\n");
+        for i in imports {
+            out.push_str(&format!("\t{}\n", lit::string(i, LANG)));
+        }
+        out.push_str(")\n");
+    }
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().chain(c).collect(),
+        None => String::new(),
+    }
 }
 
 fn doc(out: &mut String, indent: &str, text: Option<&str>) {
@@ -207,31 +315,13 @@ fn write_struct(out: &mut String, t: &Type, model: &Model, cx: &Context) {
         out.push_str("}\n");
     }
     out.push_str(&format!("\nfunc Default{0}() {0} {{\n", t.name));
-    if t.fields().is_empty() {
-        out.push_str(&format!("\treturn {}{{}}\n", t.name));
-    } else {
-        let mut locals = Locals::default();
-        let rows: Vec<Vec<String>> = t
-            .fields()
-            .iter()
-            .map(|f| {
-                vec![
-                    format!("{}:", f.name),
-                    format!("{},", value(&f.ty, &f.default, model, cx, &mut locals)),
-                ]
-            })
-            .collect();
-        for l in &locals.lines {
-            out.push_str(&format!("\t{l}\n"));
-        }
-        out.push_str(&format!("\treturn {}{{\n", t.name));
-        let mut body = String::new();
-        aligned(&mut body, &rows);
-        for line in body.lines() {
-            out.push_str(&format!("\t{line}\n"));
-        }
-        out.push_str("\t}\n");
+    let mut locals = Locals::default();
+    let rows = literal_rows(t, None, model, cx, &mut locals);
+    for l in &locals.lines {
+        out.push_str(&format!("\t{l}\n"));
     }
+    out.push_str("\treturn ");
+    write_literal(out, t, &rows, "\t");
     out.push_str("}\n");
     if !t.ids().is_empty() {
         out.push_str("\nconst (\n");
@@ -243,6 +333,40 @@ fn write_struct(out: &mut String, t: &Type, model: &Model, cx: &Context) {
         aligned(out, &rows);
         out.push_str(")\n");
     }
+}
+
+/// The `Name:` / `value,` cells of a struct literal, one row per field:
+/// `map`'s value where it has the field's wire key, else the default.
+fn literal_rows(
+    t: &Type,
+    map: Option<&serde_json::Map<String, Value>>,
+    model: &Model,
+    cx: &Context,
+    locals: &mut Locals,
+) -> Vec<Vec<String>> {
+    t.fields()
+        .iter()
+        .map(|f| {
+            let fv = map.and_then(|m| m.get(&f.wire)).unwrap_or(&f.default);
+            vec![format!("{}:", f.name), format!("{},", value(&f.ty, fv, model, cx, locals))]
+        })
+        .collect()
+}
+
+/// `T{` … `}` with the rows one per line, gofmt-aligned, the whole
+/// literal at `indent` — `T{}` when there are no fields.
+fn write_literal(out: &mut String, t: &Type, rows: &[Vec<String>], indent: &str) {
+    if rows.is_empty() {
+        out.push_str(&format!("{}{{}}\n", t.name));
+        return;
+    }
+    out.push_str(&format!("{}{{\n", t.name));
+    let mut body = String::new();
+    aligned(&mut body, rows);
+    for line in body.lines() {
+        out.push_str(&format!("{indent}{line}\n"));
+    }
+    out.push_str(&format!("{indent}}}\n"));
 }
 
 /// The spelling of a builtin: the mapping's, or the support file's.
@@ -540,6 +664,127 @@ const (
         assert!(support.contains("type Ref[T any] string"));
         assert!(!support.contains("type Curve"));
         assert!(!support.contains("type Rgba"));
+    }
+
+    const EXPECTED_DATA: &str = r#"// generated by `bi gen struct` from level1.bidata — do not edit
+
+package scriptableobjects
+
+var Level1WeaponRustySword = Weapon{
+	Name:   "Sword \"x\"",
+	Damage: 10,
+	Rarity: RarityCommon,
+	Offset: Vec2{X: 0.5, Y: 0.0},
+	Tags:   []string{"a"},
+	Notes:  nil,
+	Tint:   Rgb{R: 200, G: 200, B: 200},
+	Owner:  Ref[Weapon]("rusty_sword"),
+	Type:   false,
+}
+
+var Level1WeaponDagger = Weapon{
+	Name:   "Sword \"x\"",
+	Damage: 10,
+	Rarity: RarityCommon,
+	Offset: Vec2{X: 0.5, Y: 0.0},
+	Tags:   []string{"a"},
+	Notes:  nil,
+	Tint:   Rgb{R: 200, G: 200, B: 200},
+	Owner:  Ref[Weapon]("rusty_sword"),
+	Type:   false,
+}
+
+// Level1Weapons are every Weapon of level1.bidata, in its order, with its id.
+var Level1Weapons = []struct {
+	ID    string
+	Value *Weapon
+}{
+	{"rusty_sword", &Level1WeaponRustySword},
+	{"dagger", &Level1WeaponDagger},
+}
+
+// FindLevel1Weapon returns the Weapon with that id, or nil.
+func FindLevel1Weapon(id string) *Weapon {
+	for i := range Level1Weapons {
+		if Level1Weapons[i].ID == id {
+			return Level1Weapons[i].Value
+		}
+	}
+	return nil
+}
+"#;
+
+    #[test]
+    fn the_fixture_data_as_go() {
+        let m = fixture::model(Lang::Go, true, "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = Go.data(&u.data[0], u, &m, &cx(&lm, Some("gen.scriptableobjects")));
+        assert_eq!(text, EXPECTED_DATA);
+    }
+
+    #[test]
+    fn a_set_optional_in_data_is_a_value_function() {
+        let data = fixture::DATA.replace(
+            "\"$id\": \"dagger\", \"owner\": \"rusty_sword\"",
+            "\"$id\": \"dagger\", \"damage\": 7, \"notes\": \"n\", \"tags\": []",
+        );
+        let m = fixture::model_of(Lang::Go, fixture::SCHEMA, &[&data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = Go.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("\nvar Level1WeaponRustySword = Weapon{\n"), "{text}");
+        assert!(
+            text.contains(
+                "\nfunc level1WeaponDaggerValue() Weapon {\n\tx0 := \"n\"\n\treturn Weapon{\n\t\tName:   \"Sword \\\"x\\\"\",\n\t\tDamage: 7,\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\t\tTags:   []string{},\n"), "{text}");
+        assert!(text.contains("\t\tNotes:  &x0,\n"), "{text}");
+        assert!(
+            text.contains("\t}\n}\n\nvar Level1WeaponDagger = level1WeaponDaggerValue()\n"),
+            "{text}"
+        );
+        assert!(text.contains("\t{\"dagger\", &Level1WeaponDagger},\n"), "{text}");
+        assert!(!text.contains("import"));
+    }
+
+    #[test]
+    fn an_external_type_imports_into_the_data_file() {
+        let text = "[go.types]\nVec2 = \"mgl32.Vec2\"\n[go]\nimports = [\"github.com/go-gl/mathgl/mgl32\"]\n";
+        let m = fixture::model(Lang::Go, true, text);
+        let lm = mapping(text);
+        let u = &m.units[0];
+        let text = Go.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(
+            text.contains("package out\n\nimport (\n\t\"github.com/go-gl/mathgl/mgl32\"\n)\n\nvar Level1WeaponRustySword = Weapon{\n"),
+            "{text}"
+        );
+        assert!(text.contains("\tOffset: mgl32.Vec2{},\n"), "{text}");
+        // The type's own import rides along the same way.
+        let text = "[go.types]\nVec2 = { as = \"mgl32.Vec2\", import = \"github.com/go-gl/mathgl/mgl32\" }\n";
+        let m = fixture::model(Lang::Go, true, text);
+        let lm = mapping(text);
+        let u = &m.units[0];
+        let text = Go.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("import (\n\t\"github.com/go-gl/mathgl/mgl32\"\n)\n"), "{text}");
+    }
+
+    #[test]
+    fn the_cycle_data_is_nil_and_empty() {
+        let data = r#"{"$dialect":"bi/1","$schema":"weapons.bischema","instances":[{"$type":"Node","$id":"root"}]}"#;
+        let m = fixture::model_of(Lang::Go, fixture::CYCLE, &[data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = Go.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(
+            text.contains("\nvar Level1NodeRoot = Node{\n\tNext: nil,\n\tKids: []Node{},\n}\n"),
+            "{text}"
+        );
+        assert!(text.contains("\t{\"root\", &Level1NodeRoot},\n"), "{text}");
+        assert!(text.contains("func FindLevel1Node(id string) *Node {\n"), "{text}");
+        assert!(!text.contains("import"));
     }
 
     #[test]

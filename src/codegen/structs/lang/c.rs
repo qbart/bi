@@ -6,8 +6,8 @@
 
 use serde_json::Value;
 
-use super::super::model::{Builtin, Ty, Type};
-use super::super::{Backend, Context, Lang, Model, Unit, header, lit, names};
+use super::super::model::{Builtin, Instance, Ty, Type};
+use super::super::{Backend, Context, DataUnit, Lang, Model, Unit, header, lit, names};
 use crate::props::schema::IntKind;
 
 pub struct C;
@@ -74,6 +74,61 @@ impl Backend for C {
             write_struct(&mut out, t, model, cx);
             typedefs.complete.push(t.wire.clone());
             typedefs.flush(&mut out);
+        }
+        out.push_str(&format!("\n#endif /* {guard} */\n"));
+        out
+    }
+
+    fn data(&self, data: &DataUnit, unit: &Unit, model: &Model, cx: &Context) -> String {
+        let mut out = header("//", &data.source);
+        let guard = format!("BI_GEN_{}_H", names::screaming(&data.stem));
+        out.push_str(&format!("#ifndef {guard}\n#define {guard}\n"));
+        if let Some(h) = &cx.mapping.header {
+            out.push('\n');
+            out.push_str(h);
+            out.push('\n');
+        }
+        out.push_str("\n#include <stddef.h>\n#include <string.h>\n");
+        out.push_str(&format!("\n#include \"{}.h\"\n", unit.stem));
+        let stem = names::snake(&data.stem);
+        for wire in data.types() {
+            let Some(t) = model.type_named(wire) else { continue };
+            let group = format!("{stem}_{}", names::snake(&t.name));
+            let elem = ty(&Ty::Named(wire.to_string()), model, cx);
+            let constant = |inst: &Instance| pre(cx, &format!("{group}_{}", inst.name), false);
+            for inst in data.of(wire) {
+                let head = pre(cx, &names::screaming(&format!("{group}_{}", inst.name)), true);
+                let mut init = Init { model, cx, arrays: Vec::new() };
+                let body = init.constant(t, &inst.value, &head);
+                out.push('\n');
+                if !init.arrays.is_empty() {
+                    for a in &init.arrays {
+                        out.push_str(a);
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                }
+                out.push_str(&format!("static const {} = {body};\n", decl(&elem, &constant(inst))));
+            }
+            let n = data.of(wire).count();
+            let all = pre(cx, &format!("{group}_all"), false);
+            let value = ptr(&format!("const {elem}"));
+            out.push_str(&format!(
+                "\n/* Every instance of the file, in its order, with its id. */\nstatic const struct {{ const char *id; {}; }} {all}[{n}] = {{\n",
+                decl(&value, "value")
+            ));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "    {{ {}, &{} }},\n",
+                    lit::string(&inst.wire, LANG),
+                    constant(inst)
+                ));
+            }
+            out.push_str("};\n");
+            out.push_str(&format!(
+                "\nstatic inline {}\n{{\n    for (size_t i = 0; i < {n}; i++) {{\n        if (strcmp({all}[i].id, id) == 0) {{\n            return {all}[i].value;\n        }}\n    }}\n    return NULL;\n}}\n",
+                decl(&value, &format!("{}(const char *id)", pre(cx, &format!("{group}_find"), false)))
+            ));
         }
         out.push_str(&format!("\n#endif /* {guard} */\n"));
         out
@@ -409,8 +464,9 @@ impl Typedefs {
     }
 }
 
-/// The defaults of one struct as its init function's body and the
-/// static arrays the lists, curves and gradients point into.
+/// The defaults of one struct as its init function's body, or one
+/// instance as a designated initializer — and the static arrays the
+/// lists, curves and gradients point into either way.
 struct Init<'a> {
     model: &'a Model,
     cx: &'a Context<'a>,
@@ -642,6 +698,102 @@ impl Init<'_> {
         }
         self.declare("bi_gradient_stop", name, &stops);
         (name.to_string(), stops.len())
+    }
+
+    /// The whole of an instance of `t` as a designated initializer, one
+    /// field a line — `{0}` for an external type without a default, or
+    /// a struct without fields.
+    fn constant(&mut self, t: &Type, v: &Value, name: &str) -> String {
+        if t.external.is_some() {
+            return self.external_agg(&t.wire).unwrap_or_else(|| "{0}".into());
+        }
+        let fields = self.fields(t, v, name);
+        if fields.is_empty() {
+            "{0}".into()
+        } else {
+            format!("{{\n    {},\n}}", fields.join(",\n    "))
+        }
+    }
+
+    /// `.f = …` for every field of `st`: `v`'s value, or the default.
+    fn fields(&mut self, st: &Type, v: &Value, name: &str) -> Vec<String> {
+        let map = v.as_object();
+        let mut out = Vec::new();
+        for f in st.fields() {
+            let fv = map.and_then(|m| m.get(&f.wire)).unwrap_or(&f.default);
+            let fname = format!("{name}_{}", names::screaming(&f.name));
+            out.push(format!(".{} = {}", f.name, self.designated(&f.ty, fv, &fname)));
+        }
+        out
+    }
+
+    /// An external type's value in a static initializer: the mapping's
+    /// default, or `{0}` — a compound literal is no constant expression.
+    fn external_agg(&self, key: &str) -> Option<String> {
+        let ext = self.cx.mapping.types.get(key)?;
+        Some(ext.default.clone().unwrap_or_else(|| "{0}".into()))
+    }
+
+    /// A resolved value as an initializer inside a static aggregate:
+    /// designated braces for a struct and an optional, `{ ARRAY, n }` for
+    /// a list, curve or gradient, `{ r, g, b }` for a colour, a literal
+    /// for the rest — `NULL` for a boxed optional, `{0}` for a mapped
+    /// generic whose shape is unknowable.
+    fn designated(&mut self, t: &Ty, v: &Value, name: &str) -> String {
+        let (model, cx) = (self.model, self.cx);
+        match t {
+            Ty::Named(n) => {
+                if let Some(d) = self.external_agg(n) {
+                    return d;
+                }
+                match model.type_named(n) {
+                    Some(st) if st.is_struct() => {
+                        let fields = self.fields(st, v, name);
+                        if fields.is_empty() {
+                            "{0}".into()
+                        } else {
+                            format!("{{ {} }}", fields.join(", "))
+                        }
+                    }
+                    _ => self.expr(t, v, name, true),
+                }
+            }
+            Ty::Optional(inner, false) if cx.mapping.generics.optional.is_none() => {
+                if v.is_null() {
+                    "{ .set = false }".into()
+                } else {
+                    format!("{{ .set = true, .value = {} }}", self.designated(inner, v, name))
+                }
+            }
+            Ty::List(inner) if cx.mapping.generics.list.is_none() => {
+                let items: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+                let (arr, n) = self.array(name, inner, &items);
+                format!("{{ {arr}, {n} }}")
+            }
+            Ty::Rgb if !cx.mapping.types.contains_key("rgb") => {
+                let (r, g, b, _) = lit::colour(v.as_str().unwrap_or(""));
+                format!("{{ {r}, {g}, {b} }}")
+            }
+            Ty::Rgba if !cx.mapping.types.contains_key("rgba") => format!("{{ {} }}", rgba(v)),
+            Ty::Curve if !cx.mapping.types.contains_key("curve") => {
+                let (arr, n) = self.curve(name, v);
+                format!("{{ {arr}, {n} }}")
+            }
+            Ty::Gradient if !cx.mapping.types.contains_key("gradient") => {
+                let (arr, n) = self.gradient(name, v);
+                format!("{{ {arr}, {n} }}")
+            }
+            Ty::Rgb | Ty::Rgba | Ty::Curve | Ty::Gradient => {
+                let key = match t {
+                    Ty::Rgb => "rgb",
+                    Ty::Rgba => "rgba",
+                    Ty::Curve => "curve",
+                    _ => "gradient",
+                };
+                self.external_agg(key).unwrap_or_else(|| "{0}".into())
+            }
+            _ => self.expr(t, v, name, true),
+        }
     }
 
     fn declare(&mut self, elem: &str, name: &str, inits: &[String]) {
@@ -958,5 +1110,185 @@ static inline void weapon_init(struct Weapon *v)
         let support = C.support(&m, &cx(&lm, None)).unwrap();
         assert!(support.contains("bi_rgb"));
         assert!(!support.contains("bi_ref"));
+    }
+
+    const EXPECTED_DATA: &str = r#"// generated by `bi gen struct` from level1.bidata — do not edit
+#ifndef BI_GEN_LEVEL1_H
+#define BI_GEN_LEVEL1_H
+
+#include <stddef.h>
+#include <string.h>
+
+#include "weapons.h"
+
+static const char *LEVEL1_WEAPON_RUSTY_SWORD_TAGS[1] = {"a"};
+
+static const struct Weapon level1_weapon_rusty_sword = {
+    .name = "Sword \"x\"",
+    .damage = 10,
+    .rarity = RARITY_COMMON,
+    .offset = { .x = 0.5f, .y = 0.0f },
+    .tags = { LEVEL1_WEAPON_RUSTY_SWORD_TAGS, 1 },
+    .notes = { .set = false },
+    .tint = { 200, 200, 200 },
+    .owner = "rusty_sword",
+    .type = false,
+};
+
+static const char *LEVEL1_WEAPON_DAGGER_TAGS[1] = {"a"};
+
+static const struct Weapon level1_weapon_dagger = {
+    .name = "Sword \"x\"",
+    .damage = 10,
+    .rarity = RARITY_COMMON,
+    .offset = { .x = 0.5f, .y = 0.0f },
+    .tags = { LEVEL1_WEAPON_DAGGER_TAGS, 1 },
+    .notes = { .set = false },
+    .tint = { 200, 200, 200 },
+    .owner = "rusty_sword",
+    .type = false,
+};
+
+/* Every instance of the file, in its order, with its id. */
+static const struct { const char *id; const struct Weapon *value; } level1_weapon_all[2] = {
+    { "rusty_sword", &level1_weapon_rusty_sword },
+    { "dagger", &level1_weapon_dagger },
+};
+
+static inline const struct Weapon *level1_weapon_find(const char *id)
+{
+    for (size_t i = 0; i < 2; i++) {
+        if (strcmp(level1_weapon_all[i].id, id) == 0) {
+            return level1_weapon_all[i].value;
+        }
+    }
+    return NULL;
+}
+
+#endif /* BI_GEN_LEVEL1_H */
+"#;
+
+    #[test]
+    fn the_fixture_data_as_c() {
+        let m = fixture::model(Lang::C, true, "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        assert_eq!(C.data(&u.data[0], u, &m, &cx(&lm, None)), EXPECTED_DATA);
+    }
+
+    #[test]
+    fn a_set_field_overrides_the_default_in_data() {
+        let data = fixture::DATA.replace(
+            "\"$id\": \"dagger\", \"owner\": \"rusty_sword\"",
+            "\"$id\": \"dagger\", \"damage\": 7, \"notes\": \"n\", \"tags\": []",
+        );
+        let m = fixture::model_of(Lang::C, fixture::SCHEMA, &[&data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        for s in [
+            "static const struct Weapon level1_weapon_dagger = {\n    .name = \"Sword \\\"x\\\"\",\n    .damage = 7,\n",
+            "    .notes = { .set = true, .value = \"n\" },\n",
+            "    .tags = { NULL, 0 },\n",
+            "static const char *LEVEL1_WEAPON_RUSTY_SWORD_TAGS[1] = {\"a\"};\n",
+        ] {
+            assert!(text.contains(s), "{s}\n---\n{text}");
+        }
+        assert!(!text.contains("LEVEL1_WEAPON_DAGGER_TAGS"), "an empty list declares no array");
+
+        // An external type is its mapped default in the constant, a zero without one.
+        let mapping = "[c.types]\nVec2 = { as = \"vec2\", default = \"VEC2_ZERO\" }\n[c]\nheader = \"#pragma once\"\n";
+        let m = fixture::model(Lang::C, true, mapping);
+        let lm = mapped(mapping);
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("    .offset = VEC2_ZERO,\n"), "{text}");
+        assert!(text.starts_with("// generated by `bi gen struct` from level1.bidata — do not edit\n#ifndef BI_GEN_LEVEL1_H\n#define BI_GEN_LEVEL1_H\n\n#pragma once\n\n#include <stddef.h>\n"));
+        let mapping = "[c.types]\nVec2 = { as = \"vec2\" }\n";
+        let m = fixture::model(Lang::C, true, mapping);
+        let lm = mapped(mapping);
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("    .offset = {0},\n"), "{text}");
+    }
+
+    #[test]
+    fn the_prefix_goes_on_every_data_name() {
+        let mapping = "[c]\nprefix = \"gs_\"\n";
+        let m = fixture::model(Lang::C, true, mapping);
+        let lm = mapped(mapping);
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        for s in [
+            "static const char *GS_LEVEL1_WEAPON_RUSTY_SWORD_TAGS[1] = {\"a\"};\n",
+            "static const struct gs_Weapon gs_level1_weapon_rusty_sword = {\n",
+            "    .rarity = GS_RARITY_COMMON,\n",
+            "    .tags = { GS_LEVEL1_WEAPON_RUSTY_SWORD_TAGS, 1 },\n",
+            "static const struct { const char *id; const struct gs_Weapon *value; } gs_level1_weapon_all[2] = {\n",
+            "    { \"rusty_sword\", &gs_level1_weapon_rusty_sword },\n",
+            "static inline const struct gs_Weapon *gs_level1_weapon_find(const char *id)\n",
+            "        if (strcmp(gs_level1_weapon_all[i].id, id) == 0) {\n            return gs_level1_weapon_all[i].value;\n",
+        ] {
+            assert!(text.contains(s), "{s}\n---\n{text}");
+        }
+        assert!(!text.contains("struct Weapon"));
+        assert!(text.contains("#include \"weapons.h\"\n"), "the unit's file takes no prefix");
+    }
+
+    #[test]
+    fn every_builtin_in_data() {
+        let data = r#"{"$dialect":"bi/1","$schema":"weapons.bischema","instances":[{"$type":"Fx","$id":"spark"}]}"#;
+        let m = fixture::model_of(Lang::C, fixture::EVERY_BUILTIN, &[data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        for s in [
+            "static bi_curve_point LEVEL1_FX_SPARK_FALLOFF[2] = {{0.0f, 0.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 1.0f}};\n",
+            "static bi_gradient_stop LEVEL1_FX_SPARK_TRAIL[2] = {{0.0f, {0, 0, 0, 255}}, {1.0f, {255, 255, 255, 255}}};\n",
+            "static float LEVEL1_FX_SPARK_ROWS_0[2] = {1.0f, 2.0f};\nstatic bi_list_f32 LEVEL1_FX_SPARK_ROWS[2] = {{LEVEL1_FX_SPARK_ROWS_0, 2}, {NULL, 0}};\n",
+            "static const struct Fx level1_fx_spark = {\n",
+            "    .tint = { 0, 0, 0 },\n",
+            "    .glow = { 255, 0, 0, 128 },\n",
+            "    .falloff = { LEVEL1_FX_SPARK_FALLOFF, 2 },\n",
+            "    .trail = { LEVEL1_FX_SPARK_TRAIL, 2 },\n",
+            "    .next = { .set = false },\n",
+            "    .rows = { LEVEL1_FX_SPARK_ROWS, 2 },\n",
+            "    .big = 18446744073709551615ULL,\n",
+            "static const struct { const char *id; const struct Fx *value; } level1_fx_all[1] = {\n    { \"spark\", &level1_fx_spark },\n};\n",
+        ] {
+            assert!(text.contains(s), "{s}\n---\n{text}");
+        }
+        // The arrays come before the constant that points into them.
+        let at = |s: &str| text.find(s).unwrap();
+        assert!(at("LEVEL1_FX_SPARK_ROWS_0[2]") < at("LEVEL1_FX_SPARK_ROWS[2]"));
+        assert!(at("LEVEL1_FX_SPARK_ROWS[2]") < at("level1_fx_spark = {"));
+
+        // A mapped gradient is its zero: a compound literal is no constant.
+        let mapping = "[c.types]\ngradient = \"grad_t\"\n";
+        let m = fixture::model_of(Lang::C, fixture::EVERY_BUILTIN, &[data], mapping);
+        let lm = mapped(mapping);
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("    .trail = {0},\n"), "{text}");
+        assert!(!text.contains("LEVEL1_FX_SPARK_TRAIL"));
+    }
+
+    #[test]
+    fn a_cycle_in_data_is_a_null_pointer_and_an_empty_list() {
+        let data = r#"{"$dialect":"bi/1","$schema":"weapons.bischema","instances":[{"$type":"Node","$id":"root"}]}"#;
+        let m = fixture::model_of(Lang::C, fixture::CYCLE, &[data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = C.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(
+            text.contains(
+                "\nstatic const struct Node level1_node_root = {\n    .next = NULL,\n    .kids = { NULL, 0 },\n};\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("static inline const struct Node *level1_node_find(const char *id)\n")
+        );
+        assert!(!text.contains("bi_types"));
     }
 }

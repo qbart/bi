@@ -215,6 +215,51 @@ impl Type {
     }
 }
 
+/// One instance of a data file, fully resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    /// The `$id` as stored.
+    pub wire: String,
+    /// The cased id (`names::instance_name`), escaped; the backend puts
+    /// the type and the file's stem around it.
+    pub name: String,
+    /// The wire name of its struct type.
+    pub ty: String,
+    /// Every field, sparse keys filled from defaults, colours canonical
+    /// (`Schema::resolve`); unknown keys dropped.
+    pub value: Value,
+}
+
+/// One data file: one output file of instances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataUnit {
+    /// `level1` — the output file's stem.
+    pub stem: String,
+    /// `level1.bidata` — for the generated-by line.
+    pub source: String,
+    /// In file order.
+    pub instances: Vec<Instance>,
+}
+
+impl DataUnit {
+    /// The instances of one type, in file order.
+    pub fn of<'a>(&'a self, type_wire: &'a str) -> impl Iterator<Item = &'a Instance> {
+        self.instances.iter().filter(move |i| i.ty == type_wire)
+    }
+
+    /// The wire names of the types that have instances here, in order
+    /// of first appearance.
+    pub fn types(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for i in &self.instances {
+            if !out.contains(&i.ty.as_str()) {
+                out.push(&i.ty);
+            }
+        }
+        out
+    }
+}
+
 /// One schema: one output file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unit {
@@ -227,6 +272,9 @@ pub struct Unit {
     /// Indices into `types`: enums first in schema order, then structs
     /// with every embedded struct before the struct that embeds it.
     pub order: Vec<usize>,
+    /// The data files of this schema, one output file each; empty when
+    /// the mapping says `instances = false`.
+    pub data: Vec<DataUnit>,
 }
 
 impl Unit {
@@ -268,20 +316,23 @@ fn support_names(lang: Lang) -> &'static [&'static str] {
 
 impl Model {
     /// The model for `lang` from every unit — stem, source file name,
-    /// the schema and its data files — under `mapping`; `ids` says
-    /// whether the data's ids become constants. Errors stop the run;
-    /// notes ride along.
+    /// the schema and its data files, each as stem, source and file —
+    /// under `mapping`; `ids` says whether the data's ids become
+    /// constants, `instances` whether the instances do. Errors stop the
+    /// run; notes ride along.
     pub fn build(
         lang: Lang,
-        units: Vec<(String, String, Schema, Vec<DataFile>)>,
+        units: Vec<(String, String, Schema, Vec<(String, String, DataFile)>)>,
         mapping: &LangMapping,
         ids: bool,
+        instances: bool,
     ) -> Result<(Model, Vec<Diagnostic>), Vec<Diagnostic>> {
         let mut errors = Vec::new();
         let mut notes = Vec::new();
         let mut out = Vec::new();
         for (stem, source, schema, data) in &units {
-            match build_unit(lang, stem, source, schema, data, mapping, ids, &mut notes) {
+            let flags = Flags { ids, instances };
+            match build_unit(lang, stem, source, schema, data, mapping, flags, &mut notes) {
                 Ok(unit) => out.push(unit),
                 Err(mut e) => errors.append(&mut e),
             }
@@ -374,15 +425,21 @@ impl Model {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Flags {
+    ids: bool,
+    instances: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_unit(
     lang: Lang,
     stem: &str,
     source: &str,
     schema: &Schema,
-    data: &[DataFile],
+    data: &[(String, String, DataFile)],
     mapping: &LangMapping,
-    ids: bool,
+    flags: Flags,
     notes: &mut Vec<Diagnostic>,
 ) -> Result<Unit, Vec<Diagnostic>> {
     let mut errors = Vec::new();
@@ -461,8 +518,8 @@ fn build_unit(
                     ));
                 }
                 let mut id_list = Vec::new();
-                if ids {
-                    for df in data {
+                if flags.ids {
+                    for (_, _, df) in data {
                         for inst in df.instances.iter().filter(|i| &i.ty == wire) {
                             let code = names::id_name(lang, wire, &inst.id);
                             let code = match names::escape(lang, &code) {
@@ -498,8 +555,75 @@ fn build_unit(
         errors.push(at("types", &format!("{c} — [names] \"<Type>\" = \"…\" picks another")));
     }
     let order = order_and_box(&mut types);
+    let mut data_units = Vec::new();
+    if flags.instances {
+        for (dstem, dsource, df) in data {
+            let mut instances = Vec::new();
+            for inst in &df.instances {
+                let Some(t) = types.iter().find(|t| t.wire == inst.ty) else { continue };
+                if t.external.is_some() {
+                    notes.push(Diagnostic::warning(
+                        None,
+                        format!(
+                            "{dsource}: {} {}: {} is external, its instances are not generated",
+                            inst.ty, inst.id, inst.ty
+                        ),
+                    ));
+                    continue;
+                }
+                let name = match names::escape(lang, &names::instance_name(lang, &inst.id)) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        errors.push(Diagnostic::error(
+                            None,
+                            format!("{dsource}: {} {}: {e}", inst.ty, inst.id),
+                        ));
+                        inst.id.clone()
+                    }
+                };
+                // Only the schema's keys, resolved; unknown keys are
+                // dropped, the validator has already named them.
+                let ty = TypeExpr::Named(inst.ty.clone());
+                let mut known = serde_json::Map::new();
+                if let Some(fields) = schema.fields_of(&inst.ty) {
+                    for f in fields {
+                        if let Some(v) = inst.values.get(&f.name) {
+                            known.insert(f.name.clone(), v.clone());
+                        }
+                    }
+                }
+                let value = schema.resolve(&ty, &Value::Object(known));
+                instances.push(Instance {
+                    wire: inst.id.clone(),
+                    name,
+                    ty: inst.ty.clone(),
+                    value,
+                });
+            }
+            for t in types.iter().filter(|t| t.is_struct()) {
+                let pairs: Vec<(String, String)> = instances
+                    .iter()
+                    .filter(|i| i.ty == t.wire)
+                    .map(|i| (i.wire.clone(), i.name.clone()))
+                    .collect();
+                for c in names::collisions(&pairs) {
+                    errors.push(Diagnostic::error(
+                        None,
+                        format!("{dsource}: {}: {c} — rename one instance", t.wire),
+                    ));
+                }
+            }
+            data_units.push(DataUnit { stem: dstem.clone(), source: dsource.clone(), instances });
+        }
+    }
     if errors.is_empty() {
-        Ok(Unit { stem: stem.to_string(), source: source.to_string(), types, order })
+        Ok(Unit {
+            stem: stem.to_string(),
+            source: source.to_string(),
+            types,
+            order,
+            data: data_units,
+        })
     } else {
         Err(errors)
     }
@@ -685,6 +809,40 @@ mod tests {
                 .is_empty()
         );
         assert!(fixture::model(Lang::C, false, "").type_named("Weapon").unwrap().ids().is_empty());
+    }
+
+    #[test]
+    fn instances_are_resolved_and_named() {
+        let m = fixture::model(Lang::Rust, true, "");
+        let d = &m.units[0].data;
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].stem.as_str(), d[0].source.as_str()), ("level1", "level1.bidata"));
+        let names: Vec<(&str, &str)> =
+            d[0].instances.iter().map(|i| (i.ty.as_str(), i.name.as_str())).collect();
+        assert_eq!(names, [("Weapon", "rusty_sword"), ("Weapon", "dagger")]);
+        let v = &d[0].of("Weapon").next().unwrap().value;
+        assert_eq!(v["owner"], serde_json::json!("rusty_sword"));
+        assert_eq!(v["damage"], serde_json::json!(10), "sparse: filled from the default");
+        assert_eq!(v["offset"], serde_json::json!({"x": 0.5, "y": 0}));
+        assert_eq!(d[0].types(), ["Weapon"]);
+        assert_eq!(
+            fixture::model(Lang::Go, true, "").units[0].data[0].instances[0].name,
+            "RustySword"
+        );
+        assert!(fixture::model(Lang::Rust, true, "instances = false").units[0].data.is_empty());
+        assert!(fixture::model(Lang::Rust, false, "").units[0].data.is_empty());
+        let (m, notes) = fixture::model_notes(
+            Lang::Rust,
+            fixture::SCHEMA,
+            &[fixture::DATA],
+            "[rust.types]\nWeapon = \"W\"\n",
+        );
+        assert!(m.units[0].data[0].instances.is_empty());
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.message.contains("Weapon is external, its instances are not generated"))
+        );
     }
 
     #[test]

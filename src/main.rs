@@ -225,7 +225,7 @@ usage:
   bi gen sample [schema|data|mapping]
                                  the sample .bischema, .bidata and .bimapping written beside you
   bi gen struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
-                                 the schema as C, C++, Go, Rust, C3 or Lua types
+                                 the schema and its data as C, C++, Go, Rust, C3 or Lua
   bi help <command>              one command's list
   bi --help, -h                  this list
   bi --version, -V               the version
@@ -255,7 +255,7 @@ usage: bi gen <command>
       a kind for one of them
 
   struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
-      the schema's types, defaults and ids as code
+      the schema's types, defaults and ids, and the data's instances, as code
         --lang <lang>   c | c++ | go | rust | c3 | lua
         -o <dir>        where the files go; made when missing
         -i <file>       a .bischema or .bidata; a data file brings its schema

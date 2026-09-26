@@ -9,7 +9,9 @@
 use serde_json::Value;
 
 use super::super::model::{Builtin, Field, Ty, Type};
-use super::super::{Backend, Context, Lang, Model, SUPPORT_STEM, Unit, header, lit, names};
+use super::super::{
+    Backend, Context, DataUnit, Lang, Model, SUPPORT_STEM, Unit, header, lit, names,
+};
 use crate::props::schema::IntKind;
 
 pub struct Lua;
@@ -22,30 +24,12 @@ impl Backend for Lua {
         out.push('\n');
         // A ref is a string: only the other builtins live in the support file.
         if model.builtins_in(unit).iter().any(|b| *b != Builtin::Ref) {
-            let module = match cx.pkg {
-                Some(p) => format!("{p}.{SUPPORT_STEM}"),
-                None => SUPPORT_STEM.to_string(),
-            };
-            out.push_str(&format!("local bi = require({})\n", lit::string(&module, LANG)));
+            out.push_str(&format!(
+                "local bi = require({})\n",
+                lit::string(&module_path(SUPPORT_STEM, cx), LANG)
+            ));
         }
-        let mut imports: Vec<String> = cx.mapping.imports.clone();
-        for t in &unit.types {
-            if let Some(ext) = &t.external
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        for b in Builtin::ALL {
-            if let Some(ext) = cx.mapping.types.get(b.key())
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        imports.sort();
-        imports.dedup();
-        for i in &imports {
+        for i in &imports(unit, cx) {
             out.push_str(i);
             out.push('\n');
         }
@@ -61,6 +45,62 @@ impl Backend for Lua {
             } else {
                 write_struct(&mut out, t, model, cx);
             }
+        }
+        out.push_str("\nreturn M\n");
+        out
+    }
+
+    fn data(&self, data: &DataUnit, unit: &Unit, model: &Model, cx: &Context) -> String {
+        let mut out = header("--", &data.source);
+        out.push('\n');
+        let module = module_local(&unit.stem);
+        out.push_str(&format!(
+            "local {module} = require({})\n",
+            lit::string(&module_path(&unit.stem, cx), LANG)
+        ));
+        if model.builtins_in(unit).iter().any(|b| *b != Builtin::Ref) {
+            out.push_str(&format!(
+                "local bi = require({})\n",
+                lit::string(&module_path(SUPPORT_STEM, cx), LANG)
+            ));
+        }
+        for i in &imports(unit, cx) {
+            out.push_str(i);
+            out.push('\n');
+        }
+        if let Some(h) = &cx.mapping.header {
+            out.push_str(h);
+            out.push('\n');
+        }
+        out.push_str("local M = {}\n");
+        for wire in data.types() {
+            let Some(t) = model.type_named(wire) else { continue };
+            let ty = Ty::Named(wire.to_string());
+            let base = format!("M.{}", t.name);
+            out.push_str(&format!("\n{base} = {{}}\n\n"));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "{} = {}\n",
+                    access(&base, &inst.name),
+                    value_in(&ty, &inst.value, model, cx, &module)
+                ));
+            }
+            out.push_str(&format!(
+                "\n---Every {} of {}, in its order, with its id.\n{base}.all = {{\n",
+                t.name, data.source
+            ));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "  {{ id = {}, value = {} }},\n",
+                    lit::string(&inst.wire, LANG),
+                    access(&base, &inst.name)
+                ));
+            }
+            out.push_str("}\n");
+            out.push_str(&format!(
+                "\n---@param id string\n---@return {}?\nfunction {base}.find(id)\n  for _, entry in ipairs({base}.all) do\n    if entry.id == id then return entry.value end\n  end\n  return nil\nend\n",
+                t.name
+            ));
         }
         out.push_str("\nreturn M\n");
         out
@@ -207,6 +247,48 @@ function M.Gradient.new(t)
   return v
 end
 ";
+
+/// What `require` takes for a generated file: `pkg.stem`, or the stem.
+fn module_path(stem: &str, cx: &Context) -> String {
+    match cx.pkg {
+        Some(p) => format!("{p}.{stem}"),
+        None => stem.to_string(),
+    }
+}
+
+/// The local a data file binds its schema's module to: the stem as an
+/// identifier, kept clear of keywords and of the file's own `bi` and `M`.
+fn module_local(stem: &str) -> String {
+    let name = names::snake(stem);
+    if name == "bi" || name == "M" || names::reserved(LANG, &name) {
+        format!("{name}_")
+    } else {
+        name
+    }
+}
+
+/// The mapping's imports plus what the unit's external types and mapped
+/// builtins ask for, sorted and deduplicated.
+fn imports(unit: &Unit, cx: &Context) -> Vec<String> {
+    let mut imports: Vec<String> = cx.mapping.imports.clone();
+    for t in &unit.types {
+        if let Some(ext) = &t.external
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    for b in Builtin::ALL {
+        if let Some(ext) = cx.mapping.types.get(b.key())
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    imports.sort();
+    imports.dedup();
+    imports
+}
 
 /// Whether `s` can follow a `.` and stand bare in a table constructor.
 fn is_identifier(s: &str) -> bool {
@@ -419,8 +501,16 @@ fn int(v: &Value) -> String {
     }
 }
 
-/// A resolved default as a Lua expression of type `t`.
+/// A resolved default as a Lua expression of type `t`, the unit's own
+/// structs built through `M`.
 pub fn value(t: &Ty, v: &Value, model: &Model, cx: &Context) -> String {
+    value_in(t, v, model, cx, "M")
+}
+
+/// A resolved value as a Lua expression of type `t`; `module` is what
+/// precedes `.Vec2.new` for the schema's structs — `M` in their own
+/// file, the required module's local in a data file.
+pub fn value_in(t: &Ty, v: &Value, model: &Model, cx: &Context, module: &str) -> String {
     let external = |key: &str| -> Option<String> {
         let ext = cx.mapping.types.get(key)?;
         Some(ext.default.clone().unwrap_or_else(|| "nil".to_string()))
@@ -494,10 +584,14 @@ pub fn value(t: &Ty, v: &Value, model: &Model, cx: &Context) -> String {
                         .iter()
                         .map(|f: &Field| {
                             let fv = map.and_then(|m| m.get(&f.wire)).unwrap_or(&f.default);
-                            format!("{} = {}", table_key(&f.wire), value(&f.ty, fv, model, cx))
+                            format!(
+                                "{} = {}",
+                                table_key(&f.wire),
+                                value_in(&f.ty, fv, model, cx, module)
+                            )
                         })
                         .collect();
-                    format!("M.{}.new({})", t.name, table(&fields))
+                    format!("{module}.{}.new({})", t.name, table(&fields))
                 }
                 None => "nil".into(),
             }
@@ -505,7 +599,7 @@ pub fn value(t: &Ty, v: &Value, model: &Model, cx: &Context) -> String {
         Ty::List(inner) => {
             let items: Vec<String> = v
                 .as_array()
-                .map(|a| a.iter().map(|x| value(inner, x, model, cx)).collect())
+                .map(|a| a.iter().map(|x| value_in(inner, x, model, cx, module)).collect())
                 .unwrap_or_default();
             table(&items)
         }
@@ -513,7 +607,7 @@ pub fn value(t: &Ty, v: &Value, model: &Model, cx: &Context) -> String {
             if v.is_null() {
                 "nil".into()
             } else {
-                value(inner, v, model, cx)
+                value_in(inner, v, model, cx, module)
             }
         }
         Ty::Ref(_) => lit::string(v.as_str().unwrap_or(""), LANG),
@@ -648,6 +742,87 @@ return M
 
         let text = Lua.unit(&m.units[0], &m, &cx(&lm, None));
         assert!(text.contains("\nlocal bi = require(\"bi_types\")\nlocal M = {}\n"));
+    }
+
+    const EXPECTED_DATA: &str = r#"-- generated by `bi gen struct` from level1.bidata — do not edit
+
+local weapons = require("gen.scriptableobjects.weapons")
+local bi = require("gen.scriptableobjects.bi_types")
+local M = {}
+
+M.Weapon = {}
+
+M.Weapon.rusty_sword = weapons.Weapon.new({ name = "Sword \"x\"", damage = 10, rarity = "common", offset = weapons.Vec2.new({ x = 0.5, y = 0.0 }), tags = { "a" }, notes = nil, tint = bi.Rgb.new({ r = 200, g = 200, b = 200 }), owner = "rusty_sword", type = false })
+M.Weapon.dagger = weapons.Weapon.new({ name = "Sword \"x\"", damage = 10, rarity = "common", offset = weapons.Vec2.new({ x = 0.5, y = 0.0 }), tags = { "a" }, notes = nil, tint = bi.Rgb.new({ r = 200, g = 200, b = 200 }), owner = "rusty_sword", type = false })
+
+---Every Weapon of level1.bidata, in its order, with its id.
+M.Weapon.all = {
+  { id = "rusty_sword", value = M.Weapon.rusty_sword },
+  { id = "dagger", value = M.Weapon.dagger },
+}
+
+---@param id string
+---@return Weapon?
+function M.Weapon.find(id)
+  for _, entry in ipairs(M.Weapon.all) do
+    if entry.id == id then return entry.value end
+  end
+  return nil
+end
+
+return M
+"#;
+
+    #[test]
+    fn the_fixture_data_as_lua() {
+        let m = fixture::model(Lang::Lua, true, "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        assert_eq!(
+            Lua.data(&u.data[0], u, &m, &cx(&lm, Some("gen.scriptableobjects"))),
+            EXPECTED_DATA
+        );
+        // The unit is what it was: the data file only requires it.
+        assert_eq!(Lua.unit(u, &m, &cx(&lm, Some("gen.scriptableobjects"))), EXPECTED);
+
+        let text = Lua.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.starts_with(
+            "-- generated by `bi gen struct` from level1.bidata — do not edit\n\nlocal weapons = require(\"weapons\")\nlocal bi = require(\"bi_types\")\nlocal M = {}\n"
+        ));
+    }
+
+    #[test]
+    fn a_set_field_overrides_the_default_in_data() {
+        let data = fixture::DATA.replace(
+            "\"$id\": \"dagger\", \"owner\": \"rusty_sword\"",
+            "\"$id\": \"dagger\", \"damage\": 7, \"notes\": \"n\", \"tags\": []",
+        );
+        let m = fixture::model_of(Lang::Lua, fixture::SCHEMA, &[&data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = Lua.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains(
+            "\nM.Weapon.dagger = weapons.Weapon.new({ name = \"Sword \\\"x\\\"\", damage = 7, rarity = \"common\", offset = weapons.Vec2.new({ x = 0.5, y = 0.0 }), tags = {}, notes = \"n\", tint = bi.Rgb.new({ r = 200, g = 200, b = 200 }), owner = \"\", type = false })\n"
+        ));
+        assert!(text.contains("damage = 7,"));
+        assert!(text.contains("notes = \"n\","));
+        assert!(text.contains("tags = {},"));
+        // The other instance keeps its defaults.
+        assert!(text.contains(
+            "\nM.Weapon.rusty_sword = weapons.Weapon.new({ name = \"Sword \\\"x\\\"\", damage = 10,"
+        ));
+
+        let data = r##"{ "$dialect": "bi/1", "$schema": "weapons.bischema",
+          "instances": [ { "$type": "Node", "$id": "root" } ] }"##;
+        let m = fixture::model_of(Lang::Lua, fixture::CYCLE, &[data], "");
+        let u = &m.units[0];
+        let text = Lua.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("\nM.Node.root = weapons.Node.new({ next = nil, kids = {} })\n"));
+        assert!(text.contains("  { id = \"root\", value = M.Node.root },\n"));
+        assert!(text.contains("---@return Node?\nfunction M.Node.find(id)\n"));
+        // No builtin but Ref: no support require.
+        assert!(!text.contains("bi_types"));
+        assert!(text.contains("\nlocal weapons = require(\"weapons\")\nlocal M = {}\n"));
     }
 
     #[test]

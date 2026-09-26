@@ -232,6 +232,52 @@ field then gets the language's own default of that type — Rust
 `offset.x` stopped being `0.5`. A mapping can say what to write instead:
 `default = "Vec2::ZERO"` on the type's entry.
 
+### Instances
+
+The data files are already parsed, validated and resolved on the way in,
+and every backend can spell any value of any type, so the instances come
+out too: **one file per data file**, named after its stem (`level1.rs`,
+`level1.h`, `level1.go`), importing the schema's file. Data changes far
+more often than schema, so the type file stays stable in diffs.
+
+Each instance is one constant, fully resolved: sparse fields filled from
+defaults, colours canonical, nested structs complete, unknown keys
+dropped (the validator has already named them). Refs stay id strings,
+exactly as the file stores them, so cycles cost nothing. Per type per
+file there is a table of `(id, instance)` in file order and a `find(id)`
+that walks it — the loader replaced by a lookup, with no I/O.
+
+| Language | Instance                                                   | Table and finder                              |
+|----------|------------------------------------------------------------|-----------------------------------------------|
+| Rust     | `level1::weapon::rusty_sword() -> Weapon`                  | `weapon::all()`, `weapon::find(id)`           |
+| C        | `static const struct Weapon level1_weapon_rusty_sword`     | `level1_weapon_all[]`, `level1_weapon_find`   |
+| C++      | `level1::weapon::rusty_sword` (`inline const`)             | `weapon::all`, `weapon::find(id)`             |
+| Go       | `var Level1WeaponRustySword = Weapon{…}`                   | `Level1Weapons`, `FindLevel1Weapon(id)`       |
+| C3       | `Weapon level1_weapon_rusty_sword = {…}` (module `…::level1`) | `level1_weapon_all()`, `level1_weapon_find` |
+| Lua      | `M.Weapon.rusty_sword = weapons.Weapon.new({…})`           | `M.Weapon.all`, `M.Weapon.find(id)`           |
+
+Rust gets functions rather than `static`s because a `String` or a `Vec`
+cannot be built in a `static` without a lazy cell; a function allocates
+only when asked. Go and C are flat namespaces shared by every data file,
+so their names carry the data file's stem. A set optional in Go is a
+hoisted local, so such an instance is a function's result bound to a
+`var`. The existing id string constants stay: they are the ref
+vocabulary, and the instance constants take a different shape so the two
+never collide.
+
+`instances = false` in the mapping turns it off, beside `ids`. Then:
+
+- A data file whose stem equals a schema stem or `bi_types` is refused,
+  like the schema stem clash.
+- Two data files of one schema each get their own file and table; there
+  is no cross-file registry, since no single file knows them all.
+- Instance names are cased like fields, so `rusty_sword` and
+  `RustySword` collide in Go and are refused.
+- An externally mapped struct cannot be spelled; its instances are
+  skipped with a note.
+- A large data file is a large source file. That is the point, and C++
+  compile times will show it.
+
 ### Order and recursion
 
 The schema allows recursion through `list`, `optional` and `ref`, and C,
@@ -428,7 +474,9 @@ Collected here, each with what the generator does.
 | A mapping for a language other than `--lang`                   | Ignored — one file serves every language                               |
 | A mapping naming a type no schema has                          | Warning                                                                |
 | Layout keys, `show_if`, `widget`                               | Not generated; they are the editor's                                   |
-| A `.bidata` given with `ids = false`                           | Contributes its schema and nothing else                                |
+| A `.bidata` given with `ids = false`                           | Contributes its schema and its instances, no id constants              |
+| A `.bidata` given with `instances = false`                     | Contributes its schema and its ids, no instance file                   |
+| A data file stem equal to a schema's or `bi_types`             | Refused, unless `instances = false`                                    |
 
 ## Where it lives
 

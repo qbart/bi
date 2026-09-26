@@ -491,6 +491,18 @@ pub fn id_name(lang: Lang, type_wire: &str, id: &str) -> String {
     }
 }
 
+/// The bare cased id an instance constant is built from: `rusty_sword`
+/// in Rust, C, C++ and Lua, `RustySword` in Go, `RUSTY_SWORD` in C3. The
+/// backend puts the type and the data file's stem around it where its
+/// namespace is flat.
+pub fn instance_name(lang: Lang, id: &str) -> String {
+    match lang {
+        Lang::Rust | Lang::C | Lang::Cpp | Lang::Lua => snake(id),
+        Lang::Go => pascal(id),
+        Lang::C3 => screaming(id),
+    }
+}
+
 /// Which `(wire, code)` pairs share a code: one message per shared code,
 /// naming the first two wires that got it.
 pub fn collisions(pairs: &[(String, String)]) -> Vec<String> {
@@ -562,6 +574,9 @@ mod tests {
         assert_eq!(id_name(Lang::C, "Weapon", "rusty_sword"), "WEAPON_RUSTY_SWORD");
         assert_eq!(id_name(Lang::Rust, "Weapon", "rusty_sword"), "RUSTY_SWORD");
         assert_eq!(id_name(Lang::Lua, "Weapon", "rusty_sword"), "rusty_sword");
+        assert_eq!(instance_name(Lang::Go, "rusty_sword"), "RustySword");
+        assert_eq!(instance_name(Lang::C3, "rusty_sword"), "RUSTY_SWORD");
+        assert_eq!(instance_name(Lang::Rust, "RustySword"), "rusty_sword");
         assert_eq!(field_name(Lang::Go, "crit_chance"), "CritChance");
         assert_eq!(field_name(Lang::Rust, "critChance"), "crit_chance");
         assert_eq!(field_name(Lang::C, "critChance"), "critChance");

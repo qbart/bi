@@ -38,8 +38,9 @@ sparse instances in plain JSON — opens as a property view: one row per
 field, defaults dimmed, `Space` cycles an enum or a ref, `Ctrl-A`/`Ctrl-X`
 turn a number, `dd` puts a value back to its default, `gd` follows a ref
 into another file, and `:bi rename` rewrites every data file of the schema.
-`bi gen struct` writes a schema's types, defaults and ids as C, C++, Go,
-Rust, C3 or Lua, steered by a `.bimapping`.
+`bi gen struct` writes a schema's types, defaults and ids, and every data
+file's instances with a `find(id)`, as C, C++, Go, Rust, C3 or Lua,
+steered by a `.bimapping`.
 See [docs/specs](specs) for the designs behind each piece.
 
 ```sh

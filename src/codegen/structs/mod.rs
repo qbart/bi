@@ -23,7 +23,9 @@ pub mod write;
 pub mod fixture;
 
 pub use mapping::{External, Generics, LangMapping, Mapping};
-pub use model::{Builtin, EnumValue, Field, Id, Model, Ty, Type, TypeKind, Unit};
+pub use model::{
+    Builtin, DataUnit, EnumValue, Field, Id, Instance, Model, Ty, Type, TypeKind, Unit,
+};
 pub use write::{Always, Ask, Fate, Overwrite, Report, write};
 
 /// The stem of the support file, `bi_types.<ext>`, holding the colours,
@@ -118,10 +120,12 @@ pub struct Context<'a> {
     pub dir_name: &'a str,
 }
 
-/// One language. `unit` writes one schema's file; `support` the shared
-/// `bi_types` file, `None` when no builtin is generated.
+/// One language. `unit` writes one schema's file; `data` one data file's
+/// instances, importing the unit; `support` the shared `bi_types` file,
+/// `None` when no builtin is generated.
 pub trait Backend {
     fn unit(&self, unit: &Unit, model: &Model, cx: &Context) -> String;
+    fn data(&self, data: &DataUnit, unit: &Unit, model: &Model, cx: &Context) -> String;
     fn support(&self, model: &Model, cx: &Context) -> Option<String>;
 }
 
@@ -250,17 +254,17 @@ pub fn generate(
         }
     }
 
-    // Stems: one file each, none the support file's.
+    // Stems: one file each — schemas and, when instances are generated,
+    // data files — none the support file's.
     let mut stems: Vec<(String, PathBuf)> = Vec::new();
-    for unit in &units {
-        let stem =
-            unit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut claim = |path: &Path, what: &str, errors: &mut Vec<Diagnostic>| -> String {
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         if stem == SUPPORT_STEM {
             errors.push(Diagnostic::error(
                 None,
                 format!(
-                    "{}: `{SUPPORT_STEM}` is the support file's name — rename the schema",
-                    unit.path.display()
+                    "{}: `{SUPPORT_STEM}` is the support file's name — rename the {what}",
+                    path.display()
                 ),
             ));
         }
@@ -270,31 +274,53 @@ pub fn generate(
                 format!(
                     "{} and {} both write {stem}.{}",
                     other.display(),
-                    unit.path.display(),
+                    path.display(),
                     req.lang.ext()
                 ),
             ));
         }
-        stems.push((stem, unit.path.clone()));
+        stems.push((stem.clone(), path.to_path_buf()));
+        stem
+    };
+    let mut unit_stems = Vec::new();
+    let mut data_stems: Vec<Vec<String>> = Vec::new();
+    for unit in &units {
+        unit_stems.push(claim(&unit.path, "schema", &mut errors));
+        let mut ds = Vec::new();
+        for (path, _, _) in &unit.data {
+            ds.push(if mapping.instances {
+                claim(path, "data file", &mut errors)
+            } else {
+                String::new()
+            });
+        }
+        data_stems.push(ds);
     }
     if !errors.is_empty() {
         return Err(errors);
     }
 
     let lang_mapping = mapping.for_lang(req.lang);
-    let built: Vec<(String, String, Schema, Vec<DataFile>)> = units
+    let name_of = |p: &Path, stem: &str| {
+        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or(stem.to_string())
+    };
+    let built: Vec<(String, String, Schema, Vec<(String, String, DataFile)>)> = units
         .into_iter()
-        .zip(stems)
-        .map(|(u, (stem, _))| {
-            let source = u
-                .path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or(stem.clone());
-            (stem, source, u.schema, u.data.into_iter().map(|(_, _, d)| d).collect())
+        .zip(unit_stems)
+        .zip(data_stems)
+        .map(|((u, stem), ds)| {
+            let source = name_of(&u.path, &stem);
+            let data = u
+                .data
+                .into_iter()
+                .zip(ds)
+                .map(|((p, _, d), dstem)| (dstem.clone(), name_of(&p, &dstem), d))
+                .collect();
+            (stem, source, u.schema, data)
         })
         .collect();
-    let (model, model_notes) = Model::build(req.lang, built, &lang_mapping, mapping.ids)?;
+    let (model, model_notes) =
+        Model::build(req.lang, built, &lang_mapping, mapping.ids, mapping.instances)?;
     notes.extend(model_notes);
 
     let backend = lang::backend_for(req.lang);
@@ -305,6 +331,12 @@ pub fn generate(
             path: PathBuf::from(format!("{}.{}", unit.stem, req.lang.ext())),
             text: backend.unit(unit, &model, &cx),
         });
+        for d in &unit.data {
+            files.push(OutFile {
+                path: PathBuf::from(format!("{}.{}", d.stem, req.lang.ext())),
+                text: backend.data(d, unit, &model, &cx),
+            });
+        }
     }
     if let Some(text) = backend.support(&model, &cx) {
         files.push(OutFile {
@@ -438,7 +470,7 @@ mod tests {
             &mut no_read,
         )
         .unwrap();
-        assert_eq!(out.files.len(), 2);
+        assert_eq!(out.files.len(), 3, "the schema's, the data file's, the support file");
     }
 
     #[test]
@@ -464,6 +496,30 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e[0].message, "a/game.bischema and b/game.bischema both write game.go");
+        let e = generate(
+            &req(
+                Lang::Go,
+                &[("weapons.bischema", fixture::SCHEMA), ("weapons.bidata", fixture::DATA)],
+                &[],
+                None,
+            ),
+            &mut no_read,
+        )
+        .unwrap_err();
+        assert_eq!(e[0].message, "weapons.bischema and weapons.bidata both write weapons.go");
+        assert!(
+            generate(
+                &req(
+                    Lang::Go,
+                    &[("weapons.bischema", fixture::SCHEMA), ("weapons.bidata", fixture::DATA)],
+                    &["instances = false\n"],
+                    None
+                ),
+                &mut no_read,
+            )
+            .is_ok(),
+            "no data file written, no clash"
+        );
         let e = generate(
             &req(Lang::Go, &[("bi_types.bischema", fixture::SCHEMA)], &[], None),
             &mut no_read,
@@ -498,20 +554,20 @@ mod tests {
         let e = generate(
             &req(
                 Lang::Rust,
-                &[("weapons.bischema", fixture::SCHEMA), ("weapons.bidata", &bad)],
+                &[("weapons.bischema", fixture::SCHEMA), ("level1.bidata", &bad)],
                 &[],
                 None,
             ),
             &mut no_read,
         )
         .unwrap_err();
-        assert!(e[0].message.starts_with("weapons.bidata: "), "{}", e[0].message);
+        assert!(e[0].message.starts_with("level1.bidata: "), "{}", e[0].message);
         let dangling =
             fixture::DATA.replace("\"owner\": \"rusty_sword\" }", "\"owner\": \"nope\" }");
         let out = generate(
             &req(
                 Lang::Rust,
-                &[("weapons.bischema", fixture::SCHEMA), ("weapons.bidata", &dangling)],
+                &[("weapons.bischema", fixture::SCHEMA), ("level1.bidata", &dangling)],
                 &[],
                 None,
             ),
@@ -521,7 +577,7 @@ mod tests {
         assert!(
             out.notes
                 .iter()
-                .any(|n| n.message.starts_with("weapons.bidata: ") && n.message.contains("nope")),
+                .any(|n| n.message.starts_with("level1.bidata: ") && n.message.contains("nope")),
             "{:?}",
             out.notes
         );

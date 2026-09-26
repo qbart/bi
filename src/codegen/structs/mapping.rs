@@ -50,16 +50,27 @@ impl LangMapping {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     pub ids: bool,
+    /// Whether the data files' instances become constants, one file per
+    /// data file.
+    pub instances: bool,
     pub names: Vec<(String, String)>,
     pub langs: BTreeMap<Lang, LangMapping>,
-    /// Whether this file said `ids` at all — a later file that did not
-    /// must not undo an earlier one that did.
+    /// Whether this file said `ids` / `instances` at all — a later file
+    /// that did not must not undo an earlier one that did.
     ids_set: bool,
+    instances_set: bool,
 }
 
 impl Default for Mapping {
     fn default() -> Self {
-        Mapping { ids: true, names: Vec::new(), langs: BTreeMap::new(), ids_set: false }
+        Mapping {
+            ids: true,
+            instances: true,
+            names: Vec::new(),
+            langs: BTreeMap::new(),
+            ids_set: false,
+            instances_set: false,
+        }
     }
 }
 
@@ -85,6 +96,13 @@ impl Mapping {
                         out.ids_set = true;
                     }
                     None => errors.push(err(line, "ids must be true or false")),
+                },
+                "instances" => match item.as_bool() {
+                    Some(b) => {
+                        out.instances = b;
+                        out.instances_set = true;
+                    }
+                    None => errors.push(err(line, "instances must be true or false")),
                 },
                 "names" => match entries(item, text) {
                     Some(e) => out.names.extend(read_names(e, "names", &mut errors)),
@@ -116,6 +134,10 @@ impl Mapping {
         if later.ids_set {
             self.ids = later.ids;
             self.ids_set = true;
+        }
+        if later.instances_set {
+            self.instances = later.instances;
+            self.instances_set = true;
         }
         self.names.extend(later.names);
         for (lang, theirs) in later.langs {
@@ -497,6 +519,12 @@ prefix = "gs_"
     fn the_empty_mapping_is_the_default() {
         let m = Mapping::parse("").unwrap();
         assert!(m.ids);
+        assert!(m.instances);
+        assert!(!Mapping::parse("instances = false\n").unwrap().instances);
+        assert_eq!(
+            Mapping::parse("instances = 1\n").unwrap_err()[0].message,
+            "line 1: instances must be true or false"
+        );
         assert!(m.langs.is_empty());
         assert_eq!(m, Mapping::default());
     }

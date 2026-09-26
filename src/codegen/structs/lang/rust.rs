@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use super::super::model::{Builtin, Field, Ty, Type};
-use super::super::{Backend, Context, Lang, Model, Unit, header, lit, names};
+use super::super::{Backend, Context, DataUnit, Lang, Model, Unit, header, lit, names};
 
 pub struct Rust;
 
@@ -20,33 +20,11 @@ impl Backend for Rust {
             out.push_str(h);
             out.push('\n');
         }
-        let mut imports: Vec<String> = cx.mapping.imports.clone();
-        for t in &unit.types {
-            if let Some(ext) = &t.external
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        for b in Builtin::ALL {
-            if let Some(ext) = cx.mapping.types.get(b.key())
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        imports.sort();
-        imports.dedup();
+        let mut imports = imports(unit, cx);
         if model.uses_support(unit) {
             imports.insert(0, "use super::bi_types::*;".to_string());
         }
-        if !imports.is_empty() {
-            out.push('\n');
-            for i in &imports {
-                out.push_str(i);
-                out.push('\n');
-            }
-        }
+        write_imports(&mut out, &imports);
         let serde = cx.mapping.derive.as_ref().is_some_and(|d| {
             d.iter().any(|x| x.ends_with("Deserialize") || x.ends_with("Serialize"))
         });
@@ -57,6 +35,53 @@ impl Backend for Rust {
             } else {
                 write_struct(&mut out, t, model, cx, serde);
             }
+        }
+        out
+    }
+
+    fn data(&self, data: &DataUnit, unit: &Unit, model: &Model, cx: &Context) -> String {
+        let mut out = header("//", &data.source);
+        let mut imports = imports(unit, cx);
+        imports.push(format!("use super::{}::*;", names::snake(&unit.stem)));
+        if model.uses_support(unit) {
+            imports.push("use super::bi_types::*;".to_string());
+        }
+        imports.sort();
+        imports.dedup();
+        write_imports(&mut out, &imports);
+        for wire in data.types() {
+            let Some(t) = model.type_named(wire) else { continue };
+            let ty = Ty::Named(wire.to_string());
+            out.push_str(&format!("\npub mod {} {{\n    use super::*;\n", names::snake(&t.name)));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "\n    pub fn {}() -> {} {{\n        {}\n    }}\n",
+                    inst.name,
+                    t.name,
+                    value(&ty, &inst.value, model, cx)
+                ));
+            }
+            let pairs: Vec<String> = data
+                .of(wire)
+                .map(|i| format!("({}, {}())", lit::string(&i.wire, LANG), i.name))
+                .collect();
+            out.push_str(&format!(
+                "\n    /// Every instance of the file, in its order, with its id.\n    pub fn all() -> Vec<(&'static str, {})> {{\n        vec![{}]\n    }}\n",
+                t.name,
+                pairs.join(", ")
+            ));
+            out.push_str(&format!(
+                "\n    pub fn find(id: &str) -> Option<{}> {{\n        match id {{\n",
+                t.name
+            ));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "            {} => Some({}()),\n",
+                    lit::string(&inst.wire, LANG),
+                    inst.name
+                ));
+            }
+            out.push_str("            _ => None,\n        }\n    }\n}\n");
         }
         out
     }
@@ -93,6 +118,39 @@ impl Backend for Rust {
             out.insert_str(at, rgba);
         }
         out.into()
+    }
+}
+
+/// The mapping's imports plus what the unit's external types and mapped
+/// builtins ask for, sorted and deduplicated.
+fn imports(unit: &Unit, cx: &Context) -> Vec<String> {
+    let mut imports: Vec<String> = cx.mapping.imports.clone();
+    for t in &unit.types {
+        if let Some(ext) = &t.external
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    for b in Builtin::ALL {
+        if let Some(ext) = cx.mapping.types.get(b.key())
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    imports.sort();
+    imports.dedup();
+    imports
+}
+
+fn write_imports(out: &mut String, imports: &[String]) {
+    if !imports.is_empty() {
+        out.push('\n');
+        for i in imports {
+            out.push_str(i);
+            out.push('\n');
+        }
     }
 }
 
@@ -454,6 +512,62 @@ pub mod weapon {
         assert!(support.contains("pub struct Rgb {"));
         assert!(support.contains("pub struct Ref<T> {"));
         assert!(!support.contains("pub struct Curve {"));
+    }
+
+    const EXPECTED_DATA: &str = r#"// generated by `bi gen struct` from level1.bidata — do not edit
+
+use super::bi_types::*;
+use super::weapons::*;
+
+pub mod weapon {
+    use super::*;
+
+    pub fn rusty_sword() -> Weapon {
+        Weapon { name: "Sword \"x\"".to_string(), damage: 10, rarity: Rarity::Common, offset: Vec2 { x: 0.5, y: 0.0 }, tags: vec!["a".to_string()], notes: None, tint: Rgb { r: 200, g: 200, b: 200 }, owner: Ref::new("rusty_sword"), r#type: false }
+    }
+
+    pub fn dagger() -> Weapon {
+        Weapon { name: "Sword \"x\"".to_string(), damage: 10, rarity: Rarity::Common, offset: Vec2 { x: 0.5, y: 0.0 }, tags: vec!["a".to_string()], notes: None, tint: Rgb { r: 200, g: 200, b: 200 }, owner: Ref::new("rusty_sword"), r#type: false }
+    }
+
+    /// Every instance of the file, in its order, with its id.
+    pub fn all() -> Vec<(&'static str, Weapon)> {
+        vec![("rusty_sword", rusty_sword()), ("dagger", dagger())]
+    }
+
+    pub fn find(id: &str) -> Option<Weapon> {
+        match id {
+            "rusty_sword" => Some(rusty_sword()),
+            "dagger" => Some(dagger()),
+            _ => None,
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn the_fixture_data_as_rust() {
+        let m = fixture::model(Lang::Rust, true, "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        assert_eq!(Rust.data(&u.data[0], u, &m, &cx(&lm, None)), EXPECTED_DATA);
+        // A set field overrides the default; an external type's import rides along.
+        let data = fixture::DATA.replace(
+            "\"$id\": \"dagger\", \"owner\": \"rusty_sword\"",
+            "\"$id\": \"dagger\", \"damage\": 7, \"notes\": \"n\"",
+        );
+        let mapping =
+            "[rust.types]\nVec2 = { as = \"glam::Vec2\", import = \"use glam::Vec2;\" }\n";
+        let m = fixture::model_of(Lang::Rust, fixture::SCHEMA, &[&data], mapping);
+        let lm = super::super::super::Mapping::parse(mapping).unwrap().for_lang(Lang::Rust);
+        let u = &m.units[0];
+        let text = Rust.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("damage: 7,"));
+        assert!(text.contains("notes: Some(\"n\".to_string()),"));
+        assert!(text.contains("offset: Default::default(),"));
+        assert!(
+            text.contains("\nuse glam::Vec2;\nuse super::bi_types::*;\nuse super::weapons::*;\n")
+        );
     }
 
     #[test]

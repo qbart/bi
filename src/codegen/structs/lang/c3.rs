@@ -1,13 +1,15 @@
 //! The C3 backend: an `enum` with a `_NAMES` table per schema enum, a
 //! `struct` with a `<name>_default()` function per schema struct, ids as
 //! `const String`s, a named `Opt*` struct per optional instantiation, a
-//! `typedef <S>Ref = String;` per referenced struct, and `bi_types.c3`
-//! for the builtins. C3 0.7 syntax. See `docs/specs/gen-struct.md`.
+//! `typedef <S>Ref = String;` per referenced struct, the instances of a
+//! data file as globals with an ids table, an `_all` pointer table and a
+//! `_find`, and `bi_types.c3` for the builtins. C3 0.7 syntax. See
+//! `docs/specs/gen-struct.md`.
 
 use serde_json::Value;
 
-use super::super::model::{Builtin, Field, Ty, Type};
-use super::super::{Backend, Context, Lang, Model, Unit, header, lit, names};
+use super::super::model::{Builtin, Field, Instance, Ty, Type};
+use super::super::{Backend, Context, DataUnit, Lang, Model, Unit, header, lit, names};
 use crate::props::schema::IntKind;
 
 pub struct C3;
@@ -17,37 +19,12 @@ const LANG: Lang = Lang::C3;
 impl Backend for C3 {
     fn unit(&self, unit: &Unit, model: &Model, cx: &Context) -> String {
         let mut out = header("//", &unit.source);
-        match cx.pkg {
-            Some(pkg) => out.push_str(&format!("module {};\n", pkg.replace('.', "::"))),
-            None => out.push_str(&format!("module {};\n", unit.stem)),
-        }
-        let mut imports: Vec<String> = cx.mapping.imports.clone();
-        for t in &unit.types {
-            if let Some(ext) = &t.external
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        for b in Builtin::ALL {
-            if let Some(ext) = cx.mapping.types.get(b.key())
-                && let Some(i) = &ext.import
-            {
-                imports.push(i.clone());
-            }
-        }
-        imports.sort();
-        imports.dedup();
+        out.push_str(&format!("module {};\n", module(unit, cx)));
+        let mut imports = imports(unit, cx);
         if model.uses_support(unit) {
             imports.insert(0, "import bi_types;".to_string());
         }
-        if !imports.is_empty() {
-            out.push('\n');
-            for i in &imports {
-                out.push_str(i);
-                out.push('\n');
-            }
-        }
+        write_imports(&mut out, &imports);
         if let Some(h) = &cx.mapping.header {
             out.push('\n');
             out.push_str(h);
@@ -87,6 +64,72 @@ impl Backend for C3 {
         out
     }
 
+    fn data(&self, data: &DataUnit, unit: &Unit, model: &Model, cx: &Context) -> String {
+        let mut out = header("//", &data.source);
+        let parent = module(unit, cx);
+        let stem = names::snake(&data.stem);
+        out.push_str(&format!("module {parent}::{stem};\n"));
+        let mut imports = imports(unit, cx);
+        imports.push(format!("import {parent};"));
+        imports.sort();
+        imports.dedup();
+        if model.uses_support(unit) {
+            imports.insert(0, "import bi_types;".to_string());
+        }
+        write_imports(&mut out, &imports);
+        if let Some(h) = &cx.mapping.header {
+            out.push('\n');
+            out.push_str(h);
+            out.push('\n');
+        }
+        for wire in data.types() {
+            let Some(t) = model.type_named(wire) else { continue };
+            let prefix = format!("{stem}_{}", names::snake(&t.name));
+            // A global per instance: `const` is for scalars, and the table
+            // and the finder take addresses, which a const has none of.
+            let global = |inst: &Instance| format!("{prefix}_{}", names::snake(&inst.wire));
+            for inst in data.of(wire) {
+                out.push_str(&format!("\n{} {} = ", t.name, global(inst)));
+                let fields = struct_fields(t, &inst.value, model, cx);
+                if fields.is_empty() {
+                    out.push_str("{};\n");
+                } else {
+                    out.push_str("{\n");
+                    for f in &fields {
+                        out.push_str(&format!("    {f},\n"));
+                    }
+                    out.push_str("};\n");
+                }
+            }
+            let ids: Vec<String> = data.of(wire).map(|i| lit::string(&i.wire, LANG)).collect();
+            out.push_str(&format!(
+                "\nconst String[{}] {} = {};\n",
+                ids.len(),
+                names::screaming(&format!("{prefix}_ids")),
+                list(&ids)
+            ));
+            let ptrs: Vec<String> = data.of(wire).map(|i| format!("&{}", global(i))).collect();
+            out.push_str(&format!(
+                "\n<* Every {} of {}, in its order. *>\n{}*[{}] {prefix}_all = {};\n",
+                t.name,
+                data.source,
+                t.name,
+                ptrs.len(),
+                list(&ptrs)
+            ));
+            out.push_str(&format!("\nfn {}* {prefix}_find(String id)\n{{\n", t.name));
+            for inst in data.of(wire) {
+                out.push_str(&format!(
+                    "    if (id == {}) return &{};\n",
+                    lit::string(&inst.wire, LANG),
+                    global(inst)
+                ));
+            }
+            out.push_str("    return null;\n}\n");
+        }
+        out
+    }
+
     fn support(&self, model: &Model, _cx: &Context) -> Option<String> {
         // Ref has no support type in C3: the typedefs are per unit.
         let types: Vec<Builtin> =
@@ -118,6 +161,60 @@ impl Backend for C3 {
         }
         out.into()
     }
+}
+
+/// The unit's module: the package with `::`, or the schema's stem.
+fn module(unit: &Unit, cx: &Context) -> String {
+    match cx.pkg {
+        Some(pkg) => pkg.replace('.', "::"),
+        None => unit.stem.clone(),
+    }
+}
+
+/// The mapping's imports plus what the unit's external types and mapped
+/// builtins ask for, sorted and deduplicated.
+fn imports(unit: &Unit, cx: &Context) -> Vec<String> {
+    let mut imports: Vec<String> = cx.mapping.imports.clone();
+    for t in &unit.types {
+        if let Some(ext) = &t.external
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    for b in Builtin::ALL {
+        if let Some(ext) = cx.mapping.types.get(b.key())
+            && let Some(i) = &ext.import
+        {
+            imports.push(i.clone());
+        }
+    }
+    imports.sort();
+    imports.dedup();
+    imports
+}
+
+fn write_imports(out: &mut String, imports: &[String]) {
+    if !imports.is_empty() {
+        out.push('\n');
+        for i in imports {
+            out.push_str(i);
+            out.push('\n');
+        }
+    }
+}
+
+/// `.x = 0.5`, `.y = 0.0`: every field of struct `t` from the object `v`,
+/// a missing key at its default.
+fn struct_fields(t: &Type, v: &Value, model: &Model, cx: &Context) -> Vec<String> {
+    let map = v.as_object();
+    t.fields()
+        .iter()
+        .map(|f: &Field| {
+            let fv = map.and_then(|m| m.get(&f.wire)).unwrap_or(&f.default);
+            format!(".{} = {}", f.name, value(&f.ty, fv, model, cx))
+        })
+        .collect()
 }
 
 /// One `<* … *>` block from every line of documentation an item has:
@@ -386,18 +483,7 @@ pub fn value(t: &Ty, v: &Value, model: &Model, cx: &Context) -> String {
                         .map(|ev| ev.name.clone())
                         .unwrap_or_else(|| "_empty".into())
                 }
-                Some(t) => {
-                    let map = v.as_object();
-                    let fields: Vec<String> = t
-                        .fields()
-                        .iter()
-                        .map(|f: &Field| {
-                            let fv = map.and_then(|m| m.get(&f.wire)).unwrap_or(&f.default);
-                            format!(".{} = {}", f.name, value(&f.ty, fv, model, cx))
-                        })
-                        .collect();
-                    list(&fields)
-                }
+                Some(t) => list(&struct_fields(t, v, model, cx)),
                 None => "{}".into(),
             }
         }
@@ -644,5 +730,110 @@ const String WEAPON_DAGGER = "dagger";
         assert!(!text.contains("struct Opt"));
         assert!(!text.contains("typedef"));
         assert!(C3.support(&m, &cx(&lm, None)).unwrap().contains("struct Rgb {"));
+    }
+
+    const EXPECTED_DATA: &str = r#"// generated by `bi gen struct` from level1.bidata — do not edit
+module gen::scriptableobjects::level1;
+
+import bi_types;
+import gen::scriptableobjects;
+
+Weapon level1_weapon_rusty_sword = {
+    .name = "Sword \"x\"",
+    .damage = 10,
+    .rarity = COMMON,
+    .offset = { .x = 0.5, .y = 0.0 },
+    .tags = { "a" },
+    .notes = { .set = false },
+    .tint = { .r = 200, .g = 200, .b = 200 },
+    .owner = (WeaponRef)"rusty_sword",
+    .type = false,
+};
+
+Weapon level1_weapon_dagger = {
+    .name = "Sword \"x\"",
+    .damage = 10,
+    .rarity = COMMON,
+    .offset = { .x = 0.5, .y = 0.0 },
+    .tags = { "a" },
+    .notes = { .set = false },
+    .tint = { .r = 200, .g = 200, .b = 200 },
+    .owner = (WeaponRef)"rusty_sword",
+    .type = false,
+};
+
+const String[2] LEVEL1_WEAPON_IDS = { "rusty_sword", "dagger" };
+
+<* Every Weapon of level1.bidata, in its order. *>
+Weapon*[2] level1_weapon_all = { &level1_weapon_rusty_sword, &level1_weapon_dagger };
+
+fn Weapon* level1_weapon_find(String id)
+{
+    if (id == "rusty_sword") return &level1_weapon_rusty_sword;
+    if (id == "dagger") return &level1_weapon_dagger;
+    return null;
+}
+"#;
+
+    #[test]
+    fn the_fixture_data_as_c3() {
+        let m = fixture::model(Lang::C3, true, "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        assert_eq!(
+            C3.data(&u.data[0], u, &m, &cx(&lm, Some("gen.scriptableobjects"))),
+            EXPECTED_DATA
+        );
+        // Without a package the data module hangs off the schema's stem.
+        let text = C3.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.starts_with(
+            "// generated by `bi gen struct` from level1.bidata — do not edit\nmodule weapons::level1;\n\nimport bi_types;\nimport weapons;\n\nWeapon level1_weapon_rusty_sword = {\n"
+        ));
+    }
+
+    #[test]
+    fn a_set_field_overrides_the_default_in_the_data() {
+        let data = fixture::DATA.replace(
+            "\"$id\": \"dagger\", \"owner\": \"rusty_sword\"",
+            "\"$id\": \"dagger\", \"damage\": 7, \"notes\": \"n\", \"tags\": []",
+        );
+        let m = fixture::model_of(Lang::C3, fixture::SCHEMA, &[&data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = C3.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains("\nWeapon level1_weapon_dagger = {\n"));
+        assert!(text.contains("    .damage = 7,\n"));
+        assert!(text.contains("    .notes = { .set = true, .value = \"n\" },\n"));
+        assert!(text.contains("    .tags = {},\n"));
+        assert!(text.contains("    .owner = (WeaponRef)\"\",\n"));
+        // The external type's import rides along and the mapping header too.
+        let mapping = "[c3.types]\nVec2 = { as = \"math::Vec2\", import = \"import math;\" }\n[c3]\nheader = \"// hello\"\n";
+        let m = fixture::model_of(Lang::C3, fixture::SCHEMA, &[&data], mapping);
+        let lm = super::super::super::Mapping::parse(mapping).unwrap().for_lang(Lang::C3);
+        let u = &m.units[0];
+        let text = C3.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.contains(
+            "module weapons::level1;\n\nimport bi_types;\nimport math;\nimport weapons;\n\n// hello\n\nWeapon level1_weapon_rusty_sword = {\n"
+        ));
+        assert!(text.contains("    .offset = {},\n"));
+    }
+
+    #[test]
+    fn a_boxed_optional_is_null_in_the_data() {
+        let data = r##"{ "$dialect": "bi/1", "$schema": "weapons.bischema",
+          "instances": [ { "$type": "Node", "$id": "root" } ] }"##;
+        let m = fixture::model_of(Lang::C3, fixture::CYCLE, &[data], "");
+        let lm = Default::default();
+        let u = &m.units[0];
+        let text = C3.data(&u.data[0], u, &m, &cx(&lm, None));
+        assert!(text.starts_with(
+            "// generated by `bi gen struct` from level1.bidata — do not edit\nmodule weapons::level1;\n\nimport weapons;\n\nNode level1_node_root = {\n"
+        ));
+        assert!(text.contains("    .next = null,\n"));
+        assert!(text.contains("    .kids = {},\n"));
+        assert!(text.contains("\nconst String[1] LEVEL1_NODE_IDS = { \"root\" };\n"));
+        assert!(text.contains("\nNode*[1] level1_node_all = { &level1_node_root };\n"));
+        assert!(text.contains("\nfn Node* level1_node_find(String id)\n{\n    if (id == \"root\") return &level1_node_root;\n    return null;\n}\n"));
+        assert!(!text.contains("bi_types"));
     }
 }

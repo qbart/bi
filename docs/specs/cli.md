@@ -27,7 +27,7 @@ bi gen                          the generators
 bi gen sample [schema|data|mapping]
                                 the sample .bischema, .bidata and .bimapping written beside you
 bi gen struct --lang <lang> -o <dir> -i <file>... [-m <file>...] [--pkg <name>] [--force] [-v]
-                                the schema as code — see gen-struct.md
+                                the schema and its data as code — see gen-struct.md
 bi help <command>               one command's list: `bi help gen`
 ```
 

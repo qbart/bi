@@ -10,6 +10,10 @@
 # Id constants from the data files given (`WEAPON_RUSTY_SWORD`, …).
 # ids = true
 
+# The instances of every data file given, as constants in a file named
+# after it (`level1.rs`, `level1.h`, …), with a table and a find(id).
+# instances = true
+
 # What a schema name is called in the code, for every language. The wire
 # name — what the data stores — never changes.
 # [names]
