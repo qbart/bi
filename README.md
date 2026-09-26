@@ -3,6 +3,9 @@
 A batteries-included modal editor. Tree-sitter, git, and LSP are meant to be
 built in, not plugins.
 
+**[bi.qbart.dev](https://bi.qbart.dev/)** — the site, with the docs and the
+releases.
+
 ## What bi is
 
 bi stands for **Bart's IDE**. It exists because I wanted an editor where all
