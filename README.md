@@ -7,22 +7,20 @@ built in, not plugins.
 
 bi stands for **Bart's IDE**. It exists because I wanted an editor where all
 the things I love about Neovim and its plugins are built in rather than
-assembled, where one person can hold the whole thing in their head, and where
-an update never breaks the setup.
+assembled, and where an update never breaks the setup. It also aims to turn
+the editor into a game development environment, thanks to the kitty protocol.
 
-That means bi occasionally varies from standard vim/neovim behavior — good
-defaults stayed, some things work differently.
+That means bi occasionally varies from standard vim/neovim behavior.
 [docs/GENERAL.md](docs/GENERAL.md) notes each difference where it happens.
 
-C/C++, Go, C3 and Rust are first-class citizens: they get grammar, LSP and
-testing attention first. Everything else is best-effort.
+C/C++, Go, C3 and Rust are first-class citizens: they get attention first.
+Everything else is best-effort.
 
 bi ships custom editors that live inside the text: a colour picker, a curve
 editor with tangent handles, a gradient editor with stops, and images that
 open as the picture they are. Each opens over the literal under the cursor
 and writes the result back. They are drawn with the
-[kitty](https://sw.kovidgoyal.net/kitty/) graphics protocol, so they need a
-terminal that speaks it.
+[kitty](https://sw.kovidgoyal.net/kitty/) graphics protocol (kitty, ghostty).
 
 bi has its own property format too: a `.bischema` defines struct-like types,
 a `.bidata` holds sparse instances, both plain JSON, both opened as a
