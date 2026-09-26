@@ -17,22 +17,16 @@ defaults stayed, some things work differently.
 C/C++, Go, C3 and Rust are first-class citizens: they get grammar, LSP and
 testing attention first. Everything else is best-effort.
 
-bi leans heavily on the [kitty](https://sw.kovidgoyal.net/kitty/) terminal
-protocols: keyboard enhancement for the key combinations a plain terminal
-cannot tell apart, and the graphics protocol for everything drawn as pixels.
-That is what makes the custom editors possible — images open as the picture
-they are, and a colour, a curve or a gradient literal opens in its own tool
-(a picker, a curve editor with tangent handles, a gradient editor with
-stops), edited in place and written back into the text. Other terminals
-still edit text; they just do not draw.
+bi leans on the [kitty](https://sw.kovidgoyal.net/kitty/) terminal
+protocols: keyboard enhancement for keys a plain terminal cannot tell apart,
+graphics for pixels. That is what lets images open as pictures and a colour,
+curve or gradient literal open in its own editor, written back into the text.
 
-bi also has its own property format: a `.bischema` defines struct-like
-types and a `.bidata` holds sparse instances of them, both plain JSON, and
-both open as a Unity-style inspector — sliders, checkboxes, enum and ref
-choices, defaults dimmed, refs followed across files. `bi gen struct` turns
-a schema and its data into types and constants in C, C++, Go, Rust, C3 or
-Lua. See [docs/specs/bi-format.md](docs/specs/bi-format.md) and
-[docs/specs/gen-struct.md](docs/specs/gen-struct.md).
+bi has its own property format too: a `.bischema` defines struct-like types,
+a `.bidata` holds sparse instances, both plain JSON, both opened as a
+Unity-style inspector. `bi gen struct` turns them into types and constants in
+C, C++, Go, Rust, C3 or Lua. See [bi-format.md](docs/specs/bi-format.md) and
+[gen-struct.md](docs/specs/gen-struct.md).
 
 **Disclaimer:** bi is a 100% AI-driven project — it started as an experiment
 and led to a working editor.
