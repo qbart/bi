@@ -591,8 +591,9 @@ fn read_keys(src: &str, table: &Table, config: &mut Config, problems: &mut Vec<D
         }
         let line = line_for(table, name, src);
         let Some(mode) = KeyMode::from_section(name) else {
-            let message =
-                format!("unknown key mode: {name} — try normal, visual, tree, debug or leader");
+            let message = format!(
+                "unknown key mode: {name} — try normal, visual, tree, debug, insert or leader"
+            );
             problems.push(Diagnostic { line, message });
             continue;
         };
@@ -992,7 +993,7 @@ mod tests {
         assert!(ok("[keys]\nleader = \" \"\n").1.is_empty());
         assert_eq!(
             ok("[keys.nope]\n\"x\" = \"left\"\n").1,
-            ["1: unknown key mode: nope — try normal, visual, tree, debug or leader"]
+            ["1: unknown key mode: nope — try normal, visual, tree, debug, insert or leader"]
         );
     }
 
@@ -1328,5 +1329,49 @@ mod tests {
             "a different adapter, never mentioned, is untouched"
         );
         assert!(!config.debug.enabled, "the harmless [debug] setting is still read");
+    }
+
+    /// `[keys.insert]` reads like the other tables: a sequence is a prefix
+    /// until it completes, a name resolves to the key it already means, and
+    /// an ex line is an ex line.
+    #[test]
+    fn an_insert_section_binds_sequences_and_ex_lines() {
+        let (config, problems) = ok("[keys.insert]\n\"jk\" = \"normal\"\n\"<C-s>\" = \":w<CR>\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let j = crate::key::Key::char('j');
+        let k = crate::key::Key::char('k');
+        assert_eq!(config.keys.lookup(KeyMode::Insert, &[j]), Lookup::Prefix);
+        assert_eq!(
+            config.keys.lookup(KeyMode::Insert, &[j, k]),
+            Lookup::Bound(Bind::Keys(vec![crate::key::Key::code(crate::key::KeyCode::Esc)]))
+        );
+        assert_eq!(
+            config.keys.lookup(KeyMode::Insert, &[crate::key::Key::ctrl('s')]),
+            Lookup::Bound(Bind::Ex { line: "w".into(), run: true })
+        );
+        assert_eq!(config.keys.lookup(KeyMode::Normal, &[j, k]), Lookup::Miss, "insert only");
+    }
+
+    /// A normal-mode name is not an insert-mode name, and the message says
+    /// what the section was.
+    #[test]
+    fn an_insert_binding_cannot_name_a_motion() {
+        let (_, problems) = ok("[keys.insert]\n\"<C-j>\" = \"down\"\n");
+        assert_eq!(problems, ["2: unknown command: down"]);
+    }
+
+    #[test]
+    fn the_unknown_mode_message_names_insert() {
+        let (_, problems) = ok("[keys.inzert]\n\"jk\" = \"normal\"\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("insert"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn timeout_reads_from_options() {
+        let (config, problems) = ok("[options]\ntimeout = 200\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.options.timeout, 200);
     }
 }

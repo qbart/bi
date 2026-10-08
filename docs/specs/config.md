@@ -18,6 +18,8 @@ The layer, `[options]`, `:reload` and both CLI subcommands ship. `[keys.*]`
 loads and applies, and so do `[keys] leader`, multi-key sequences on both sides
 of a binding, and the rules that make a prefix unambiguous without a timeout —
 see "What step 3 actually shipped" below, which is honest about what is left.
+`[keys.insert]` and the `timeout` option ship too — the one table with a clock,
+see "Insert mode, and the clock".
 The theme (step 2) has its own spec now — `docs/specs/theme.md` — and this
 file keeps only the decision that `theme` is an ordinary option.
 
@@ -336,14 +338,86 @@ Two rules that fell out of building it, both worth keeping:
   `gg`, which is the tree's first row. The tree dispatcher remains an
   allowlist, so a borrowed binding for something a tree has no use for —
   `word_forward` — is a no-op rather than a way into normal mode.
-- **Nothing is remapped in the modes that are text** — insert, replace, the
-  command line, the search line, the picker. Rewriting a keystroke into another
-  character is the one thing a keymap must never do to text being typed.
+- **The command line, the search line and the picker are never remapped.**
+  Those are literal text entry and there is nothing in them to bind. Insert and
+  replace have a table of their own, with a rule of their own — see [Insert
+  mode, and the clock](#insert-mode-and-the-clock). What holds in every mode is
+  that a binding never rewrites a keystroke into another *character*: no name
+  in the insert table produces text.
 
 A third came out of a bug rather than a decision: `Input::reset` was
 `*self = Self::default()`, which cleared the keymap along with the pending
 count. A rebound key worked exactly once and then reverted. Pending state and
 configuration share a struct, and `reset` means only the first.
+
+### Insert mode, and the clock
+
+```toml
+[options]
+timeout = 200            # ms a typed prefix waits before it is just text
+
+[keys.insert]
+"jk" = "normal"          # Esc
+"kj" = "normal"          # both orders, if you like
+"<C-s>" = ":w<CR>"       # ex lines work here too
+```
+
+`[keys.insert]` is the fifth mode table. It applies in replace mode too, as
+vim's `imap` does: `R` then `jk` leaves the same way `i` then `jk` does. Its
+names are the few keys insert mode has of its own — `normal` is `<Esc>`,
+`complete_next` and `complete_prev` the menu's `<C-n>` and `<C-p>`,
+`insert_newline` is `<CR>` and `backspace` is `<BS>` — and an ex line works as
+it does everywhere. None of the names produces a character. That is the rule
+that stands from the earlier draft: a binding may make a keystroke *do*
+something, but it never turns typed text into other text.
+
+**A prefix in a text mode is text until it is not.** The no-timeout rule says a
+key that begins a binding is a prefix and nothing else. In normal mode that is
+cheap — `<Space>` gives up a motion that `l` still has. In insert mode it would
+be the whole point lost: `j` must still type a `j`, or nobody who writes words
+can bind `jk`. There is no second rule that gets `j` typed *and* `jk` fired
+without a clock, so insert mode has one. A key that begins an insert binding is
+**held** for `timeout` milliseconds. If the next key completes a binding inside
+that window, the binding fires and the held key never appears. If it breaks the
+sequence, the held keys are typed and then it is. If nothing comes, the clock
+runs out and the held keys are typed. Vim's `timeoutlen`, confined to the one
+place it is the only answer.
+
+While a key is held it shows in the status line, where a half-typed `<leader>`
+already shows. The text does not move until the question is settled: at 200ms
+a typist never sees the pause, and a `j` followed by thought lands a fifth of a
+second late. The default is 300, which is where most people who lower vim's
+1000 end up; the value only matters once `[keys.insert]` has a sequence in it.
+
+`timeout = 0` turns the clock off, and a held key then waits for the next key —
+the normal-mode rule applied to text. Not the same as unbinding: `jk` still
+fires, and a `j` on its own only lands when something follows it. It is an
+option, so `:set timeout 500` tunes the feel without a reload.
+
+**Nothing else got a clock.** `[keys.normal]`, `[keys.visual]`, `[keys.tree]`
+and `[keys.debug]` are as they were: a prefix fires nothing and waits, and the
+loader reports the pairs that would have needed a timer. The reasons the
+earlier design refused one are answered rather than dropped:
+
+- *A clock in the input path is untestable without fake time.* So `Input` never
+  waits. It records when the held key arrived, says how long is left
+  (`Input::timeout_in`), and the frontend — which already blocks for the yank
+  flash and the checktime poll — blocks for that too and calls `Input::expire`
+  when it runs out. The tests drive the keys and the expiry by hand, and the
+  one that waits for a real clock does so for a millisecond.
+- *The pause is vim's most-complained-about behaviour.* Accepted, as the cost
+  of a table nobody has to fill in. A user with no `[keys.insert]` sequence
+  never meets it.
+
+**Insert mode borrows nothing from normal.** `"h" = "down"` in `[keys.normal]`
+leaves `h` typing an `h`. The names are different, the keys mean different
+things, and a lookup that fell through would turn a motion into a letter.
+
+One consequence reaches the boundary: a keystroke can now resolve to more than
+one command — the held `j` and the `x` that broke it — so `Input::on_key`
+returns every command it resolved, in order, rather than at most one, and a
+frontend applies them all. The same change lifts a limit multi-key targets had
+quietly lived with, where only the last key of a target could resolve.
 
 ### Vocabulary is configurable, grammar is not
 
@@ -440,9 +514,10 @@ dispatches. Two rules keep the maps small:
 
 - **Command and search lines are not in the table.** Those are literal text
   entry; there is nothing to bind.
-- **The insert and replace maps bind only non-printable keys.** Any printable
-  char with no binding inserts itself, which is why `[keys.insert]` is three
-  lines rather than an enumeration of Unicode.
+- **Insert and replace share one map, and a printable prefix in it is held on
+  a clock** — see [Insert mode, and the clock](#insert-mode-and-the-clock). Any
+  printable char with no binding inserts itself, which is why `[keys.insert]`
+  is three lines rather than an enumeration of Unicode.
 
 ### Ambiguity: the first complete match fires, no timers
 
@@ -459,6 +534,10 @@ path makes keystroke handling untestable without fake time, and it is the source
 of vim's most-complained-about input behaviour — the pause before `j` moves
 because something might follow it. bi's defaults contain no such pair, and a
 user who creates one is told at load rather than discovering it as lag.
+
+That is the rule for the command modes. Insert mode is the one exception, for
+the reason [Insert mode, and the clock](#insert-mode-and-the-clock) gives:
+there a prefix is also text, and no rule without a clock gets both.
 
 ### Notation
 
@@ -889,7 +968,10 @@ grammar settings, and a real hazard: a cloned repo that rebinds keys is vim's
 scripting lands. The loader merges an ordered list of layers, so adding a
 project layer later is a list entry and a trust decision, not a rewrite.
 
-**`timeoutlen`.** See [Ambiguity](#ambiguity-the-first-complete-match-fires-no-timers).
+**`timeoutlen` in the command modes.** See
+[Ambiguity](#ambiguity-the-first-complete-match-fires-no-timers). Insert mode
+has one, as `timeout` — see [Insert mode, and the
+clock](#insert-mode-and-the-clock).
 
 **Hex-only themes.** See [Three spellings](#three-spellings-on-purpose).
 

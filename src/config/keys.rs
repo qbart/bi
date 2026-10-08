@@ -36,6 +36,11 @@ pub enum KeyMode {
     /// whatever `[keys.normal]` says for keys it does not claim. See
     /// `docs/specs/debug.md`.
     Debug,
+    /// `Mode::Insert` and `Mode::Replace` — text being typed. The one table
+    /// whose sequences run on a clock, and the one that borrows nothing from
+    /// `Normal`: a motion name there would turn a letter into a cursor move.
+    /// See `docs/specs/config.md`, "Insert mode, and the clock".
+    Insert,
 }
 
 impl KeyMode {
@@ -46,8 +51,21 @@ impl KeyMode {
             "visual" => Self::Visual,
             "tree" => Self::Tree,
             "debug" => Self::Debug,
+            "insert" => Self::Insert,
             _ => return None,
         })
+    }
+
+    /// The table a mode's names come from.
+    ///
+    /// Visual borrows normal's: `input.rs` falls through to `normal` for
+    /// anything visual does not claim, so a motion rebound there has to reach
+    /// the same place. Every other mode has its own.
+    fn names(self) -> Self {
+        match self {
+            Self::Visual => Self::Normal,
+            other => other,
+        }
     }
 }
 
@@ -450,19 +468,20 @@ const NAMES: &[(KeyMode, &str, &str)] = &[
     (KeyMode::Debug, "debug_toggle_breakpoint", "b"),
     (KeyMode::Debug, "debug_evaluate", "K"),
     (KeyMode::Debug, "debug_leave", "<Esc>"),
+    // Insert mode's own keys, which replace mode shares. `normal` is the
+    // counterpart of `insert` above — what Esc does. No name here produces a
+    // character: a binding may make a keystroke *do* something, never turn
+    // typed text into other text.
+    (KeyMode::Insert, "normal", "<Esc>"),
+    (KeyMode::Insert, "complete_next", "<C-n>"),
+    (KeyMode::Insert, "complete_prev", "<C-p>"),
+    (KeyMode::Insert, "insert_newline", "<CR>"),
+    (KeyMode::Insert, "backspace", "<BS>"),
 ];
 
 /// The keys `name` already means in `mode`.
-///
-/// Visual borrows normal's table: `input.rs` falls through to `normal` for
-/// anything visual does not claim, so a motion rebound there has to reach the
-/// same place.
 pub fn key_for_name(mode: KeyMode, name: &str) -> Option<Vec<Key>> {
-    let lookup = match mode {
-        KeyMode::Tree => KeyMode::Tree,
-        KeyMode::Debug => KeyMode::Debug,
-        _ => KeyMode::Normal,
-    };
+    let lookup = mode.names();
     let spelling = NAMES.iter().find(|(m, n, _)| *m == lookup && *n == name).map(|(_, _, k)| *k)?;
     // No name spells `<leader>`: these are bi's own keys, not a user's.
     parse_keys(spelling, None).ok()
@@ -482,6 +501,7 @@ pub fn listing() -> String {
         (KeyMode::Visual, "visual"),
         (KeyMode::Tree, "tree"),
         (KeyMode::Debug, "debug"),
+        (KeyMode::Insert, "insert"),
     ] {
         out.push_str(&format!("[keys.{section}]\n"));
         if mode == KeyMode::Visual {
@@ -523,11 +543,7 @@ pub fn listing() -> String {
 /// `g` asked for — but silence would be a trap, and every name here can be
 /// bound back by name.
 pub fn shadowed(mode: KeyMode, bound: &[Key]) -> Vec<&'static str> {
-    let lookup = match mode {
-        KeyMode::Tree => KeyMode::Tree,
-        KeyMode::Debug => KeyMode::Debug,
-        _ => KeyMode::Normal,
-    };
+    let lookup = mode.names();
     let Some(&first) = bound.first() else { return Vec::new() };
     NAMES
         .iter()
@@ -547,11 +563,7 @@ pub fn shadowed(mode: KeyMode, bound: &[Key]) -> Vec<&'static str> {
 /// none, so the answer is also dropped when it is not close — more than a
 /// third of the name rewritten is a different name, not a typo.
 pub fn nearest_name(mode: KeyMode, name: &str) -> Option<&'static str> {
-    let lookup = match mode {
-        KeyMode::Tree => KeyMode::Tree,
-        KeyMode::Debug => KeyMode::Debug,
-        _ => KeyMode::Normal,
-    };
+    let lookup = mode.names();
     let (best, distance) = NAMES
         .iter()
         .filter(|(m, _, _)| *m == lookup)
@@ -750,5 +762,21 @@ mod tests {
         let map = Keymap::default();
         assert_eq!(map.leader(), Some(Key::char(' ')));
         assert!(map.is_empty(), "a leader on its own binds nothing");
+    }
+
+    /// Insert mode has a table of its own and borrows nothing from normal's:
+    /// a motion name there would turn a letter into a cursor move in text.
+    #[test]
+    fn insert_is_a_mode_with_its_own_names() {
+        assert_eq!(KeyMode::from_section("insert"), Some(KeyMode::Insert));
+        assert_eq!(
+            key_for_name(KeyMode::Insert, "normal"),
+            Some(vec![Key::code(KeyCode::Esc)]),
+            "`normal` is Esc, the way `insert` is `i` the other way round"
+        );
+        assert_eq!(key_for_name(KeyMode::Insert, "complete_next"), Some(vec![Key::ctrl('n')]));
+        assert_eq!(key_for_name(KeyMode::Insert, "left"), None, "no motion names in text");
+        assert_eq!(nearest_name(KeyMode::Insert, "nromal"), Some("normal"));
+        assert!(listing().contains("[keys.insert]"), "config init lists the table");
     }
 }

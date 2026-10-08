@@ -31,7 +31,9 @@ impl Session {
         // Whichever keymap the focused window wants — the frontend's whole
         // part in the tree, and it names no terminal to ask.
         let content = self.editor.content_kind();
-        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode, content) {
+        // A keystroke may resolve to more than one command — a held insert
+        // prefix and the key that broke it — and they apply in order.
+        for cmd in self.input.on_key(key, &self.editor.session.mode, content) {
             self.editor.apply(cmd);
         }
         self.editor.settle();
@@ -457,4 +459,38 @@ fn an_embedder_can_create_rename_and_delete_files() {
 
     editor.run_ex(&format!("delete {}", moved.display()));
     assert!(!moved.exists());
+}
+
+/// `[keys.insert]` and the clock, end to end through the public API: the held
+/// `j` never lands when `k` follows, lands when the clock runs out, and the
+/// frontend's whole part is asking how long to wait and saying when it did.
+#[test]
+fn an_insert_sequence_leaves_insert_mode_or_types_itself() {
+    let (config, problems) =
+        bi::config::parse("[keys.insert]\n\"jk\" = \"normal\"\n", bi::config::Config::default())
+            .expect("parses");
+    assert!(problems.is_empty(), "{problems:?}");
+
+    let mut s = Session::new("a");
+    s.input.set_keys(config.keys);
+    s.input.set_timeout(std::time::Duration::from_millis(1));
+
+    s.press(Key::char('A'));
+    s.press(Key::char('j'));
+    assert_eq!(s.text(), "a", "held, not typed");
+    assert!(s.input.timeout_in().is_some(), "and the frontend is told to wait");
+    s.press(Key::char('k'));
+    assert_eq!(s.editor.session.mode, Mode::Normal);
+    assert_eq!(s.text(), "a");
+
+    s.press(Key::char('A'));
+    s.press(Key::char('j'));
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let content = s.editor.content_kind();
+    for cmd in s.input.expire(&s.editor.session.mode, content) {
+        s.editor.apply(cmd);
+    }
+    assert_eq!(s.text(), "aj", "the clock ran out, so it was just a j");
+    assert_eq!(s.editor.session.mode, Mode::Insert);
+    assert_eq!(s.input.timeout_in(), None);
 }

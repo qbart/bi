@@ -27,7 +27,7 @@ impl S {
 
     fn press(&mut self, key: Key) {
         let content = self.editor.content_kind();
-        if let Some(cmd) = self.input.on_key(key, &self.editor.session.mode, content) {
+        for cmd in self.input.on_key(key, &self.editor.session.mode, content) {
             self.editor.apply(cmd);
         }
         self.editor.settle();

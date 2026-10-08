@@ -237,6 +237,11 @@ pub struct Options {
     /// How long a yank stays lit, in milliseconds. 0 is a flash of no time at
     /// all, which is the honest spelling of off.
     pub yank_flash: usize,
+    /// How long a key that begins a `[keys.insert]` sequence is held, in
+    /// milliseconds, before it is typed as itself. 0 is no clock: the key
+    /// waits for the next one, which is the rule every other mode has. See
+    /// `docs/specs/config.md`, "Insert mode, and the clock".
+    pub timeout: usize,
     /// Whether the file picker skips what the project says are not its files.
     /// Nothing else consults it: `:e` on an ignored path has always worked.
     pub gitignore: bool,
@@ -291,6 +296,7 @@ impl Default for Options {
             context_header_depth: 1,
             context_min_lines: 1,
             yank_flash: 150,
+            timeout: 300,
             gitignore: true,
             autoread: true,
             checktime: 2000,
@@ -380,6 +386,10 @@ impl Options {
             ("yank_flash", _) => {
                 return Err("yank_flash takes milliseconds, or 0 to turn it off".into());
             }
+            ("timeout", OptionValue::Int(n)) if n >= 0 => self.timeout = n as usize,
+            ("timeout", _) => {
+                return Err("timeout takes milliseconds, or 0 to turn the clock off".into());
+            }
             ("autoread", OptionValue::Bool(on)) => self.autoread = on,
             ("autoread", _) => return Err("autoread takes true or false".into()),
             ("checktime", OptionValue::Int(n)) if n >= 0 => self.checktime = n as usize,
@@ -434,6 +444,7 @@ impl Options {
             "context_header_depth" => OptionValue::Int(self.context_header_depth as i64),
             "context_min_lines" => OptionValue::Int(self.context_min_lines as i64),
             "yank_flash" => OptionValue::Int(self.yank_flash as i64),
+            "timeout" => OptionValue::Int(self.timeout as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),
             "autoread" => OptionValue::Bool(self.autoread),
             "checktime" => OptionValue::Int(self.checktime as i64),
@@ -849,5 +860,22 @@ mod tests {
         let (key, _) = table.get_key_value("number").unwrap();
         let span = key.span().expect("keys carry spans after a fresh parse");
         assert_eq!(line_of(src, span.start), 2);
+    }
+
+    /// `timeout` is milliseconds, like `yank_flash`, and 0 is a legal value
+    /// with a meaning of its own — the clock off, not the binding.
+    #[test]
+    fn timeout_is_milliseconds_and_zero_is_no_clock() {
+        let mut options = Options::default();
+        assert_eq!(options.timeout, 300, "the documented default");
+
+        assert_eq!(options.set("timeout", OptionValue::Int(200)), Ok(()));
+        assert_eq!(options.get("timeout"), Some(OptionValue::Int(200)));
+        assert_eq!(options.set("timeout", OptionValue::Int(0)), Ok(()));
+        assert_eq!(options.timeout, 0);
+
+        let err = options.set("timeout", OptionValue::Int(-1)).unwrap_err();
+        assert!(err.contains("milliseconds"), "{err}");
+        assert!(options.set("timeout", OptionValue::Bool(true)).is_err());
     }
 }

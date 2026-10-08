@@ -9007,7 +9007,7 @@ impl Editor {
         let mut input = crate::input::Input::default();
         for c in keys.chars() {
             let key = crate::key::Key::char(c);
-            if let Some(cmd) = input.on_key(key, &self.session.mode, self.content_kind()) {
+            for cmd in input.on_key(key, &self.session.mode, self.content_kind()) {
                 self.apply(cmd);
             }
         }
@@ -9018,7 +9018,7 @@ impl Editor {
                 break;
             }
             let esc = crate::key::Key::code(crate::key::KeyCode::Esc);
-            if let Some(cmd) = input.on_key(esc, &self.session.mode, self.content_kind()) {
+            for cmd in input.on_key(esc, &self.session.mode, self.content_kind()) {
                 self.apply(cmd);
             }
         }
@@ -19405,7 +19405,7 @@ mod tests {
 
         let press = |ed: &mut Editor, input: &mut crate::input::Input, c: char| {
             let key = crate::key::Key::char(c);
-            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+            for command in input.on_key(key, &ed.session.mode, ed.content_kind()) {
                 ed.apply(command);
             }
         };
@@ -19455,7 +19455,7 @@ mod tests {
 
         let press = |ed: &mut Editor, input: &mut crate::input::Input, c: char| {
             let key = crate::key::Key::char(c);
-            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+            for command in input.on_key(key, &ed.session.mode, ed.content_kind()) {
                 ed.apply(command);
             }
         };
@@ -19498,7 +19498,7 @@ mod tests {
 
         let mut press = |ed: &mut Editor| {
             let key = crate::key::Key::ctrl('b');
-            if let Some(command) = input.on_key(key, &ed.session.mode, ed.content_kind()) {
+            for command in input.on_key(key, &ed.session.mode, ed.content_kind()) {
                 ed.apply(command);
             }
         };

@@ -21,6 +21,7 @@ use crate::registers::Sink;
 use crate::tileset::Turn;
 use crate::tree::ClipMode;
 use crate::window::{ContentKind, Dir, Side};
+use std::time::{Duration, Instant};
 
 /// The four debugger panes, which share one small grammar — see
 /// [`Input::dap_pane`]. Named once because both `remap` and `dispatch` ask
@@ -98,6 +99,16 @@ pub struct Input {
     /// one yet — the `<Space>` of a half-typed `<leader>e`. Pending state, so
     /// `reset` clears it; the keymap beside it is configuration and survives.
     remap_pending: Vec<Key>,
+    /// When the keys in `remap_pending` stop being a prefix and become text.
+    /// `Some` only while a `[keys.insert]` sequence is half-typed with the
+    /// clock on: the frontend asks [`Input::timeout_in`] how long that is and
+    /// calls [`Input::expire`] when it has passed. Every other mode's prefix
+    /// waits without one — see `docs/specs/config.md`, "Insert mode, and the
+    /// clock".
+    held_until: Option<Instant>,
+    /// `[options] timeout`, the length of that wait. Configuration, like
+    /// `keys`, and `reset` keeps it for the same reason.
+    timeout: Timeout,
     /// Where this command's text goes. Reset with everything else.
     sink: Sink,
     /// `r` in an image window: the next key is the direction the tile
@@ -109,6 +120,18 @@ pub struct Input {
     /// spelled — `h`, `f`, `r` — or is a second `y` for the tileset's
     /// yank. See `docs/specs/color-picker.md`.
     yank_pending: bool,
+}
+
+/// `[options] timeout` as a duration, defaulting to what `default.toml` ships
+/// so an embedder that never sets one gets the documented behaviour — the way
+/// `Keymap::default()` carries the documented leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Timeout(Duration);
+
+impl Default for Timeout {
+    fn default() -> Self {
+        Self(Duration::from_millis(crate::config::Options::default().timeout as u64))
+    }
 }
 
 /// The keys that name a motion on their own. `G` is missing because what it
@@ -205,6 +228,38 @@ impl Input {
             );
         }
         self.remap_pending.clear();
+        self.held_until = None;
+    }
+
+    /// Installs `[options] timeout`. Read by the frontend as often as it
+    /// likes: `:set timeout` changes the value without a reload.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = Timeout(timeout);
+    }
+
+    /// How long the frontend may block before a held `[keys.insert]` prefix
+    /// becomes text — the question `Editor::redraw_in` answers for the yank
+    /// flash, asked of the input. `None` is the usual case: nothing is held,
+    /// or it is held without a clock.
+    pub fn timeout_in(&self) -> Option<Duration> {
+        self.held_until.map(|until| until.saturating_duration_since(Instant::now()))
+    }
+
+    /// Types the held keys as themselves, if their time is up.
+    ///
+    /// The frontend calls this when the wait [`Input::timeout_in`] asked for
+    /// ran out. A wake before then — a language server, a paste, the flash
+    /// ending — costs nothing, because the clock is checked here rather than
+    /// trusted: nothing happens until the deadline has genuinely passed.
+    pub fn expire(&mut self, mode: &Mode, content: ContentKind) -> Vec<Command> {
+        match self.held_until {
+            Some(until) if until <= Instant::now() => {
+                self.held_until = None;
+                let held = std::mem::take(&mut self.remap_pending);
+                held.into_iter().filter_map(|key| self.dispatch(key, mode, content)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Whether a command has already started and is holding out for a specific
@@ -259,7 +314,9 @@ impl Input {
     /// needs.
     fn borrowed_from_normal(&self, mode: KeyMode) -> Lookup {
         let found = match mode {
-            KeyMode::Normal => return Lookup::Miss,
+            // Text borrows nothing: a motion rebound in normal mode must not
+            // turn a letter into a cursor move.
+            KeyMode::Normal | KeyMode::Insert => return Lookup::Miss,
             _ => self.keys.lookup(KeyMode::Normal, &self.remap_pending),
         };
         let claims = match mode {
@@ -287,11 +344,13 @@ impl Input {
     /// meaning of their own to fall back on — and the one that broke the
     /// sequence is looked up afresh, so it still does what it always did.
     ///
-    /// Nothing is remapped in the modes that are literal text entry — insert,
-    /// replace, the command line, the search line and the picker. There is no
-    /// binding there to change, and rewriting a keystroke into another
-    /// character is the one thing a keymap must never do to text.
-    fn remap(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Remapped {
+    /// Insert and replace are the exception, and the reason this returns a
+    /// list beside the result: there a held key is *text* someone may have
+    /// meant, so it is held on the clock `timeout` sets, and when the sequence
+    /// breaks the held keys come back in the list, to be typed ahead of the
+    /// key that broke it. The command line, the search line and the picker are
+    /// never remapped: there is nothing in them to bind.
+    fn remap(&mut self, key: Key, mode: &Mode, content: ContentKind) -> (Vec<Key>, Remapped) {
         let mode = match mode {
             Mode::Normal if content == ContentKind::Tree => KeyMode::Tree,
             // No overrides of its own yet. It borrows the tree's map rather
@@ -311,15 +370,23 @@ impl Input {
             Mode::Normal => KeyMode::Normal,
             Mode::Visual(_) => KeyMode::Visual,
             Mode::Debug => KeyMode::Debug,
+            // One table for both, as vim's `imap` is: `R` then `jk` leaves
+            // the same way `i` then `jk` does.
+            Mode::Insert | Mode::Replace => KeyMode::Insert,
             _ => {
                 self.remap_pending.clear();
-                return Remapped::Same(key);
+                self.held_until = None;
+                return (Vec::new(), Remapped::Same(key));
             }
         };
+        // Whatever was waiting on the clock, a key has arrived to settle it.
+        self.held_until = None;
         if self.keys.is_empty() || (self.remap_pending.is_empty() && self.mid_command()) {
-            return Remapped::Same(key);
+            return (Vec::new(), Remapped::Same(key));
         }
 
+        let text = mode == KeyMode::Insert;
+        let mut released = Vec::new();
         self.remap_pending.push(key);
         loop {
             let mut found = self.keys.lookup(mode, &self.remap_pending);
@@ -329,58 +396,77 @@ impl Input {
             match found {
                 Lookup::Bound(Bind::Keys(to)) => {
                     self.remap_pending.clear();
-                    return Remapped::Keys(to);
+                    return (released, Remapped::Keys(to));
                 }
                 // An ex line is not keys and never goes through the grammar:
                 // it is the command, not the typing of it.
                 Lookup::Bound(Bind::Ex { line, run }) => {
                     self.remap_pending.clear();
-                    return Remapped::Ex { line, run };
+                    return (released, Remapped::Ex { line, run });
                 }
                 // Unbound. Swallowed rather than passed on, or `"h" = false`
                 // would still move left.
                 Lookup::Unbound => {
                     self.remap_pending.clear();
-                    return Remapped::Nothing;
+                    return (released, Remapped::Nothing);
                 }
-                Lookup::Prefix => return Remapped::Nothing,
-                // A dead end. Anything held was a prefix and means nothing on
-                // its own, so it goes, and `key` starts again from the root —
-                // where a second miss can only be a plain unmapped key.
+                // The start of something. In text it is also a `j` someone
+                // may have meant, so the clock starts; a timeout of 0 is no
+                // clock, and the key waits as a command-mode prefix does.
+                Lookup::Prefix => {
+                    if text && !self.timeout.0.is_zero() {
+                        self.held_until = Some(Instant::now() + self.timeout.0);
+                    }
+                    return (released, Remapped::Nothing);
+                }
+                // A dead end. In a command mode what was held was a prefix
+                // and means nothing on its own, so it goes. In text it was
+                // text all along, and is typed ahead of the key that broke
+                // the sequence. Either way `key` starts again from the root —
+                // where a second miss can only be a plain unmapped key, and a
+                // prefix is a fresh sequence of its own.
                 Lookup::Miss if self.remap_pending.len() > 1 => {
-                    self.remap_pending.clear();
-                    self.remap_pending.push(key);
+                    let broke = self.remap_pending.pop().expect("just pushed");
+                    let held = std::mem::take(&mut self.remap_pending);
+                    if text {
+                        released.extend(held);
+                    }
+                    self.remap_pending.push(broke);
                 }
                 Lookup::Miss => {
                     self.remap_pending.clear();
-                    return Remapped::Same(key);
+                    return (released, Remapped::Same(key));
                 }
             }
         }
     }
 
-    pub fn on_key(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
-        match self.remap(key, mode, content) {
-            Remapped::Same(key) => self.dispatch(key, mode, content),
+    /// Every command `key` resolves to, in order.
+    ///
+    /// Usually one or none. The case that makes this a list is a held
+    /// `[keys.insert]` prefix that `key` breaks: the held keys are typed
+    /// first, then `key` is — see `docs/specs/config.md`, "Insert mode, and
+    /// the clock". A frontend applies them all.
+    pub fn on_key(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Vec<Command> {
+        let (released, remapped) = self.remap(key, mode, content);
+        let mut out: Vec<Command> =
+            released.into_iter().filter_map(|key| self.dispatch(key, mode, content)).collect();
+        match remapped {
+            Remapped::Same(key) => out.extend(self.dispatch(key, mode, content)),
             // A target may be several keys — `gg`, `<C-w>s`, a tree's `dd`.
             // They go through the grammar one at a time exactly as if typed,
             // so the earlier ones set the pending state the last one needs.
-            // Only the last can resolve to a command: every key before it is a
-            // prefix, by construction of the names table.
             Remapped::Keys(keys) => {
-                let mut resolved = None;
-                for key in keys {
-                    resolved = self.dispatch(key, mode, content).or(resolved);
-                }
-                resolved
+                out.extend(keys.into_iter().filter_map(|key| self.dispatch(key, mode, content)));
             }
             // Straight to a command: an ex line has no keys to dispatch, and
             // the count does not repeat it — `3<leader>d` deletes one buffer.
             Remapped::Ex { line, run } => {
-                Some(Command { count: 1, action: Action::Ex { line, run } })
+                out.push(Command { count: 1, action: Action::Ex { line, run } });
             }
-            Remapped::Nothing => None,
+            Remapped::Nothing => {}
         }
+        out
     }
 
     fn dispatch(&mut self, key: Key, mode: &Mode, content: ContentKind) -> Option<Command> {
@@ -524,7 +610,8 @@ impl Input {
         // A plain `*self = Self::default()` dropped it after the first key
         // that resolved, so a rebound `j` worked once and then stopped.
         let keys = std::mem::take(&mut self.keys);
-        *self = Self { keys, ..Self::default() };
+        let timeout = self.timeout;
+        *self = Self { keys, timeout, ..Self::default() };
     }
 
     /// Counts multiply, so `2d3w` covers six words.
@@ -2052,7 +2139,7 @@ mod tests {
         let mut input = Input::default();
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal, ContentKind::Tree);
+            last = maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Tree));
         }
         last
     }
@@ -2067,7 +2154,7 @@ mod tests {
         let mut input = Input::default();
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Debug, ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Debug, ContentKind::Text));
         }
         last
     }
@@ -2085,7 +2172,7 @@ mod tests {
         let mut input = Input::default();
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         last
     }
@@ -2130,13 +2217,14 @@ number = 5
     #[test]
     fn a_configured_layout_moves_the_motions_onto_new_keys() {
         let mut input = shifted_layout();
-        let mut motion = |c: char| match input.on_key(key(c), &Mode::Normal, ContentKind::Text) {
-            Some(cmd) => match cmd.action {
-                Action::Move(m) => Some(m),
-                other => panic!("{c:?} is not a motion: {other:?}"),
-            },
-            None => None,
-        };
+        let mut motion =
+            |c: char| match maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text)) {
+                Some(cmd) => match cmd.action {
+                    Action::Move(m) => Some(m),
+                    other => panic!("{c:?} is not a motion: {other:?}"),
+                },
+                None => None,
+            };
 
         assert_eq!(motion('j'), Some(Motion::Left));
         assert_eq!(motion('k'), Some(Motion::Down));
@@ -2153,7 +2241,7 @@ number = 5
         let mut input = shifted_layout();
         let mut last = None;
         for c in "d2k".chars() {
-            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         let cmd = last.expect("d2k resolved");
         assert!(
@@ -2172,15 +2260,16 @@ number = 5
 
         // And in visual, which has no `[keys.visual]` of its own — it borrows
         // normal's, the same way `input.rs` falls through to it.
-        let visual = input.on_key(key('k'), &Mode::Visual(Shape::Chars), ContentKind::Text);
+        let visual = maybe(input.on_key(key('k'), &Mode::Visual(Shape::Chars), ContentKind::Text));
         assert_eq!(visual.expect("resolved").action, Action::Move(Motion::Down));
     }
 
     #[test]
     fn the_tree_has_its_own_map() {
         let mut input = shifted_layout();
-        let mut act =
-            |c: char| input.on_key(key(c), &Mode::Normal, ContentKind::Tree).map(|cmd| cmd.action);
+        let mut act = |c: char| {
+            maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Tree)).map(|cmd| cmd.action)
+        };
 
         assert_eq!(act('k'), Some(Action::Tree(TreeCmd::Select { down: true, count: 1 })));
         assert_eq!(act('l'), Some(Action::Tree(TreeCmd::Select { down: false, count: 1 })));
@@ -2200,9 +2289,9 @@ number = 5
         let mut input = Input::default();
         input.set_keys(config.keys);
 
-        let h = input.on_key(key('h'), &Mode::Normal, ContentKind::Text).unwrap();
+        let h = one(input.on_key(key('h'), &Mode::Normal, ContentKind::Text));
         assert_eq!(h.action, Action::Move(Motion::Down));
-        let j = input.on_key(key('j'), &Mode::Normal, ContentKind::Text).unwrap();
+        let j = one(input.on_key(key('j'), &Mode::Normal, ContentKind::Text));
         assert_eq!(j.action, Action::Move(Motion::Left), "not Down via h");
     }
 
@@ -2236,7 +2325,7 @@ leader = \" \"
     fn feed(input: &mut Input, keys: &str, content: ContentKind) -> Option<Command> {
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal, content);
+            last = maybe(input.on_key(key(c), &Mode::Normal, content));
         }
         last
     }
@@ -2247,8 +2336,8 @@ leader = \" \"
     fn a_leader_binding_fires_on_its_last_key() {
         let mut input = leader_layout();
 
-        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none(), "waiting");
-        let cmd = input.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_empty(), "waiting");
+        let cmd = one(input.on_key(key('e'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Window(WindowCmd::Tree));
     }
 
@@ -2296,19 +2385,19 @@ leader = \" \"
     #[test]
     fn a_prefix_loses_its_own_meaning() {
         let mut input = leader_layout();
-        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(input.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_empty());
         assert_eq!(input.pending_display(), "<Space>", "and the status line says so");
 
         // The leader always spells at least the shipped `<leader><leader>`
         // now, so a bare leader waits even with no binding of your own…
         let mut plain = with_leader("[keys]\nleader = \" \"\n");
-        assert!(plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(plain.on_key(key(' '), &Mode::Normal, ContentKind::Text).is_empty());
 
         // …and taking every shipped binding off gives the key itself back.
         let mut unbound = with_leader(
             "[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = false\n\"<leader>e\" = false\n",
         );
-        let cmd = unbound.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        let cmd = one(unbound.on_key(key(' '), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Move(Motion::Right));
     }
 
@@ -2317,15 +2406,15 @@ leader = \" \"
     #[test]
     fn leader_e_reveals_the_tree_out_of_the_box_and_stays_yours() {
         let mut input = with_leader("[keys]\nleader = \" \"\n");
-        input.on_key(key(' '), &Mode::Normal, ContentKind::Text);
-        let cmd = input.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        maybe(input.on_key(key(' '), &Mode::Normal, ContentKind::Text));
+        let cmd = one(input.on_key(key('e'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Ex { line: "tree".into(), run: true });
 
         // Your own binding on the sequence replaces it.
         let mut rebound =
             with_leader("[keys]\nleader = \" \"\n[keys.normal]\n\"<leader>e\" = \"window_tree\"\n");
-        rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text);
-        let cmd = rebound.on_key(key('e'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        maybe(rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text));
+        let cmd = one(rebound.on_key(key('e'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Window(WindowCmd::Tree), "the toggle, as asked");
     }
 
@@ -2334,15 +2423,15 @@ leader = \" \"
     #[test]
     fn leader_leader_runs_actions_out_of_the_box_and_stays_yours() {
         let mut input = with_leader("[keys]\nleader = \" \"\n");
-        input.on_key(key(' '), &Mode::Normal, ContentKind::Text);
-        let cmd = input.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        maybe(input.on_key(key(' '), &Mode::Normal, ContentKind::Text));
+        let cmd = one(input.on_key(key(' '), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Ex { line: "actions".into(), run: true });
 
         let mut rebound = with_leader(
             "[keys]\nleader = \" \"\n[keys.normal]\n\"<leader><leader>\" = \":alt<CR>\"\n",
         );
-        rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text);
-        let cmd = rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text).expect("resolved");
+        maybe(rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text));
+        let cmd = one(rebound.on_key(key(' '), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Ex { line: "alt".into(), run: true }, "yours wins");
     }
 
@@ -2391,14 +2480,14 @@ leader = \" \"
         let mut input =
             with_leader("[keys.normal]\n\"<C-b>\" = \"window_tree\"\n\"j\" = \"left\"\n");
 
-        let cmd = input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        let cmd = one(input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Window(WindowCmd::Tree));
-        let cmd = input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Tree).expect("borrowed");
+        let cmd = one(input.on_key(ctrl('b'), &Mode::Normal, ContentKind::Tree));
         assert_eq!(cmd.action, Action::Window(WindowCmd::Tree), "and the same key puts it away");
 
         // What the tree does claim it keeps: `j` selects down whatever normal
         // says, which is the reason the tree has a map of its own at all.
-        let cmd = input.on_key(key('j'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        let cmd = one(input.on_key(key('j'), &Mode::Normal, ContentKind::Tree));
         assert_eq!(cmd.action, Action::Tree(TreeCmd::Select { down: true, count: 1 }));
     }
 
@@ -2408,7 +2497,7 @@ leader = \" \"
     #[test]
     fn a_borrowed_binding_the_tree_has_no_use_for_does_nothing() {
         let mut input = with_leader("[keys.normal]\n\"<C-n>\" = \"word_forward\"\n");
-        assert!(input.on_key(ctrl('n'), &Mode::Normal, ContentKind::Tree).is_none());
+        assert!(input.on_key(ctrl('n'), &Mode::Normal, ContentKind::Tree).is_empty());
         assert_eq!(input.pending_display(), "", "and nothing is left half-typed");
     }
 
@@ -2434,7 +2523,7 @@ leader = \" \"
             "g is the tree's prefix, so `gd` never gets to claim it"
         );
         assert_eq!(
-            input.on_key(ctrl('d'), &Mode::Normal, ContentKind::Tree).expect("resolved").action,
+            one(input.on_key(ctrl('d'), &Mode::Normal, ContentKind::Tree)).action,
             Action::Tree(TreeCmd::HalfPage { down: true })
         );
     }
@@ -2479,17 +2568,207 @@ leader = \" \"
         }
     }
 
-    /// Insert mode is literal text. A keymap that reached it would type the
-    /// wrong characters into the buffer, which is the one unrecoverable thing
-    /// a remap could do.
+    /// Insert mode is literal text, and `[keys.normal]` never reaches it: a
+    /// motion rebound there would type the wrong characters into the buffer,
+    /// which is the one unrecoverable thing a remap could do.
     #[test]
-    fn a_remap_never_touches_the_modes_that_are_text() {
+    fn a_normal_mode_remap_never_touches_the_modes_that_are_text() {
         let mut input = shifted_layout();
-        let typed = input.on_key(key('j'), &Mode::Insert, ContentKind::Text).expect("resolved");
+        let typed = one(input.on_key(key('j'), &Mode::Insert, ContentKind::Text));
         assert_eq!(typed.action, Action::InsertChar('j'));
 
-        let unbound = input.on_key(key('h'), &Mode::Insert, ContentKind::Text).expect("resolved");
+        let unbound = one(input.on_key(key('h'), &Mode::Insert, ContentKind::Text));
         assert_eq!(unbound.action, Action::InsertChar('h'), "`h = false` does not stop typing h");
+
+        let mut input = Input::default();
+        for c in "abc".chars() {
+            let cmd =
+                one(input.on_key(key(c), &Mode::Command(Default::default()), ContentKind::Text));
+            assert!(matches!(cmd.action, Action::CommandChar(_)), "{:?}", cmd.action);
+        }
+    }
+
+    /// Exactly one command, which is what every key outside insert mode
+    /// still resolves to.
+    fn one(mut cmds: Vec<Command>) -> Command {
+        assert_eq!(cmds.len(), 1, "one command, not {cmds:?}");
+        cmds.pop().unwrap()
+    }
+
+    fn actions(cmds: Vec<Command>) -> Vec<Action> {
+        cmds.into_iter().map(|c| c.action).collect()
+    }
+
+    fn insert_layout() -> Input {
+        with_leader(
+            "\
+[keys.normal]
+\"h\" = \"down\"
+
+[keys.insert]
+\"jk\" = \"normal\"
+\"kj\" = \"normal\"
+\"<C-s>\" = \":w<CR>\"
+",
+        )
+    }
+
+    const INSERT: Mode = Mode::Insert;
+    const TEXT: ContentKind = ContentKind::Text;
+
+    /// `jk` is Esc: the `j` is held, the `k` completes it, and the `j` never
+    /// reaches the buffer.
+    #[test]
+    fn jk_in_insert_mode_is_esc() {
+        let mut input = insert_layout();
+        assert!(input.on_key(key('j'), &INSERT, TEXT).is_empty(), "held");
+        assert_eq!(input.pending_display(), "j", "and shown while it waits");
+        assert_eq!(actions(input.on_key(key('k'), &INSERT, TEXT)), [Action::EnterNormal]);
+        assert_eq!(input.pending_display(), "");
+    }
+
+    /// A held key is text the moment the sequence breaks: it is typed, and
+    /// then the key that broke it is.
+    #[test]
+    fn a_held_key_is_typed_when_the_sequence_breaks() {
+        let mut input = insert_layout();
+        assert!(input.on_key(key('j'), &INSERT, TEXT).is_empty());
+        assert_eq!(
+            actions(input.on_key(key('x'), &INSERT, TEXT)),
+            [Action::InsertChar('j'), Action::InsertChar('x')]
+        );
+
+        // Esc breaks it the same way, and still leaves insert mode after.
+        assert!(input.on_key(key('j'), &INSERT, TEXT).is_empty());
+        assert_eq!(
+            actions(input.on_key(Key::code(KeyCode::Esc), &INSERT, TEXT)),
+            [Action::InsertChar('j'), Action::EnterNormal]
+        );
+    }
+
+    /// The key that breaks one sequence may begin another — `jj` with both
+    /// `jk` and `kj` bound types one `j` and holds the second.
+    #[test]
+    fn a_breaking_key_may_start_a_sequence_of_its_own() {
+        let mut input = insert_layout();
+        assert!(input.on_key(key('j'), &INSERT, TEXT).is_empty());
+        assert_eq!(actions(input.on_key(key('j'), &INSERT, TEXT)), [Action::InsertChar('j')]);
+        assert_eq!(actions(input.on_key(key('k'), &INSERT, TEXT)), [Action::EnterNormal]);
+    }
+
+    /// Only a held text-mode key runs the clock. A half-typed `<leader>` in
+    /// normal mode waits as it always did, with no deadline.
+    #[test]
+    fn only_a_held_insert_key_runs_the_clock() {
+        let mut input = insert_layout();
+        assert_eq!(input.timeout_in(), None);
+        input.on_key(key('j'), &INSERT, TEXT);
+        let left = input.timeout_in().expect("the clock is running");
+        assert!(left <= std::time::Duration::from_millis(300), "{left:?}");
+        input.on_key(key('k'), &INSERT, TEXT);
+        assert_eq!(input.timeout_in(), None, "resolved, nothing to wait for");
+
+        let mut normal = leader_layout();
+        assert!(normal.on_key(key(' '), &Mode::Normal, TEXT).is_empty(), "held");
+        assert_eq!(normal.timeout_in(), None, "no clock outside text");
+    }
+
+    /// `expire` types the held keys once their time is up, and does nothing
+    /// before that — the frontend may wake early for other reasons.
+    #[test]
+    fn expire_types_the_held_keys_when_the_clock_runs_out() {
+        let mut input = insert_layout();
+        input.set_timeout(std::time::Duration::from_secs(3600));
+        input.on_key(key('j'), &INSERT, TEXT);
+        assert!(input.expire(&INSERT, TEXT).is_empty(), "not yet");
+        assert_eq!(input.pending_display(), "j", "still held");
+
+        let mut input = insert_layout();
+        input.set_timeout(std::time::Duration::from_millis(1));
+        input.on_key(key('j'), &INSERT, TEXT);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert_eq!(input.timeout_in(), Some(std::time::Duration::ZERO), "due");
+        assert_eq!(actions(input.expire(&INSERT, TEXT)), [Action::InsertChar('j')]);
+        assert!(input.expire(&INSERT, TEXT).is_empty(), "nothing left to type");
+        assert_eq!(input.timeout_in(), None);
+    }
+
+    /// A timeout of 0 is the normal-mode rule applied to text: the key waits
+    /// for the next one, with no clock at all.
+    #[test]
+    fn a_timeout_of_zero_holds_without_a_clock() {
+        let mut input = insert_layout();
+        input.set_timeout(std::time::Duration::ZERO);
+        assert!(input.on_key(key('j'), &INSERT, TEXT).is_empty());
+        assert_eq!(input.timeout_in(), None);
+        assert!(input.expire(&INSERT, TEXT).is_empty());
+        assert_eq!(actions(input.on_key(key('k'), &INSERT, TEXT)), [Action::EnterNormal]);
+    }
+
+    /// The timeout is configuration, like the keymap, and survives the reset
+    /// a resolved command does.
+    #[test]
+    fn reset_keeps_the_timeout() {
+        let mut input = insert_layout();
+        input.set_timeout(std::time::Duration::ZERO);
+        one(input.on_key(key('x'), &Mode::Normal, TEXT));
+        input.on_key(key('j'), &INSERT, TEXT);
+        assert_eq!(input.timeout_in(), None, "still no clock");
+    }
+
+    /// A new keymap drops what was held: it was a prefix of a binding that
+    /// may no longer exist.
+    #[test]
+    fn a_new_keymap_drops_a_held_key() {
+        let mut input = insert_layout();
+        input.on_key(key('j'), &INSERT, TEXT);
+        input.set_keys(Keymap::default());
+        assert_eq!(input.timeout_in(), None);
+        assert_eq!(actions(input.on_key(key('k'), &INSERT, TEXT)), [Action::InsertChar('k')]);
+    }
+
+    #[test]
+    fn an_insert_ex_binding_runs_the_line() {
+        let mut input = insert_layout();
+        assert_eq!(
+            actions(input.on_key(ctrl('s'), &INSERT, TEXT)),
+            [Action::Ex { line: "w".into(), run: true }]
+        );
+    }
+
+    /// `R` then `jk` leaves the same way `i` then `jk` does, and a broken
+    /// sequence types through replace's own grammar.
+    #[test]
+    fn replace_mode_shares_the_insert_table() {
+        let mut input = insert_layout();
+        assert!(input.on_key(key('j'), &Mode::Replace, TEXT).is_empty());
+        assert_eq!(actions(input.on_key(key('k'), &Mode::Replace, TEXT)), [Action::EnterNormal]);
+
+        assert!(input.on_key(key('j'), &Mode::Replace, TEXT).is_empty());
+        assert_eq!(
+            actions(input.on_key(key('x'), &Mode::Replace, TEXT)),
+            [Action::ReplaceTyped('j'), Action::ReplaceTyped('x')]
+        );
+    }
+
+    /// `"h" = "down"` in `[keys.normal]` leaves `h` typing an `h`, and the
+    /// insert bindings do not leak into normal mode either.
+    #[test]
+    fn insert_and_normal_borrow_nothing_from_each_other() {
+        let mut input = insert_layout();
+        assert_eq!(actions(input.on_key(key('h'), &INSERT, TEXT)), [Action::InsertChar('h')]);
+        assert_eq!(
+            actions(input.on_key(key('j'), &Mode::Normal, TEXT)),
+            [Action::Move(Motion::Down)],
+            "no `jk` in normal mode"
+        );
+    }
+
+    /// At most one command — the shape every key outside insert mode has,
+    /// as an `Option` for the tests that read it as one.
+    fn maybe(mut cmds: Vec<Command>) -> Option<Command> {
+        assert!(cmds.len() <= 1, "at most one command, not {cmds:?}");
+        cmds.pop()
     }
 
     #[test]
@@ -2551,21 +2830,21 @@ leader = \" \"
     #[test]
     fn shift_and_an_arrow_moves_the_line_where_the_arrow_alone_moves_the_cursor() {
         let mut input = Input::default();
-        let down = input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text);
+        let down = maybe(input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text));
         assert_eq!(down.unwrap().action, Action::MoveLines { down: true });
 
-        let up = input.on_key(shifted(KeyCode::Up), &Mode::Normal, ContentKind::Text);
+        let up = maybe(input.on_key(shifted(KeyCode::Up), &Mode::Normal, ContentKind::Text));
         assert_eq!(up.unwrap().action, Action::MoveLines { down: false });
 
-        let plain = input.on_key(Key::code(KeyCode::Down), &Mode::Normal, ContentKind::Text);
+        let plain = maybe(input.on_key(Key::code(KeyCode::Down), &Mode::Normal, ContentKind::Text));
         assert_eq!(plain.unwrap().action, Action::Move(Motion::Down), "unshifted is a motion");
     }
 
     #[test]
     fn a_count_says_how_far_the_line_travels() {
         let mut input = Input::default();
-        assert!(input.on_key(key('3'), &Mode::Normal, ContentKind::Text).is_none());
-        let cmd = input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text).unwrap();
+        assert!(input.on_key(key('3'), &Mode::Normal, ContentKind::Text).is_empty());
+        let cmd = one(input.on_key(shifted(KeyCode::Down), &Mode::Normal, ContentKind::Text));
 
         assert_eq!(cmd.count, 3, "and the action is repeatable, so that is three rows");
         assert_eq!(cmd.action, Action::MoveLines { down: true });
@@ -2643,8 +2922,8 @@ leader = \" \"
     #[test]
     fn a_tree_still_takes_window_keys_and_the_command_line() {
         let mut input = Input::default();
-        assert!(input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Tree).is_none(), "armed");
-        let cmd = input.on_key(key('v'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        assert!(input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Tree).is_empty(), "armed");
+        let cmd = one(input.on_key(key('v'), &Mode::Normal, ContentKind::Tree));
         assert_eq!(cmd.action, Action::Window(WindowCmd::Split { dir: Dir::Vertical, path: None }));
 
         assert_eq!(tree_action(":"), Action::EnterCommandMode);
@@ -2669,9 +2948,7 @@ leader = \" \"
     #[test]
     fn debug_esc_leaves_and_unclaimed_keys_fall_through_to_normal() {
         let mut input = Input::default();
-        let esc = input
-            .on_key(Key::code(KeyCode::Esc), &Mode::Debug, ContentKind::Text)
-            .expect("resolved");
+        let esc = one(input.on_key(Key::code(KeyCode::Esc), &Mode::Debug, ContentKind::Text));
         assert_eq!(esc.action, Action::EnterNormal);
 
         assert_eq!(debug_action("j"), Action::Move(Motion::Down));
@@ -2691,7 +2968,7 @@ leader = \" \"
             ContentKind::DapVariables,
             ContentKind::DapWatches,
         ] {
-            let cmd = input.on_key(key('j'), &Mode::Debug, content).expect("resolved");
+            let cmd = one(input.on_key(key('j'), &Mode::Debug, content));
             assert_eq!(
                 cmd.action,
                 Action::Tree(TreeCmd::Select { down: true, count: 1 }),
@@ -2708,7 +2985,7 @@ leader = \" \"
     #[test]
     fn ctrl_c_in_a_text_window_is_unchanged() {
         let mut input = Input::default();
-        let cmd = input.on_key(ctrl('c'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        let cmd = one(input.on_key(ctrl('c'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::CollapseCursors);
         assert_ne!(cmd.action, Action::Shell(ShellCmd::Stop));
     }
@@ -2728,10 +3005,10 @@ leader = \" \"
     fn ctrl_x_skips_a_match_wherever_ctrl_n_takes_one() {
         let mut input = Input::default();
         for mode in [Mode::Normal, Mode::Visual(Shape::Chars)] {
-            let take = input.on_key(ctrl('n'), &mode, ContentKind::Text).unwrap();
+            let take = one(input.on_key(ctrl('n'), &mode, ContentKind::Text));
             assert_eq!(take.action, Action::AddCursorNextMatch, "{mode:?}");
 
-            let skip = input.on_key(ctrl('x'), &mode, ContentKind::Text).unwrap();
+            let skip = one(input.on_key(ctrl('x'), &mode, ContentKind::Text));
             assert_eq!(skip.action, Action::SkipCursorToNextMatch, "{mode:?}");
         }
 
@@ -2739,11 +3016,11 @@ leader = \" \"
         // corners, so a second cursor has nothing to say about it.
         let block = Mode::Visual(Shape::Block);
         assert!(
-            input.on_key(ctrl('x'), &block, ContentKind::Text).is_none(),
+            input.on_key(ctrl('x'), &block, ContentKind::Text).is_empty(),
             "blockwise visual has no second selection to skip"
         );
         assert!(
-            input.on_key(ctrl('n'), &block, ContentKind::Text).is_none(),
+            input.on_key(ctrl('n'), &block, ContentKind::Text).is_empty(),
             "and none to add — the guard has to refuse the key, not fall through to `normal`"
         );
     }
@@ -2771,7 +3048,7 @@ leader = \" \"
     #[test]
     fn the_jump_keys_work_from_a_tree_as_well() {
         let mut input = Input::default();
-        let forward = input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree).unwrap();
+        let forward = one(input.on_key(ctrl('i'), &Mode::Normal, ContentKind::Tree));
         assert_eq!(forward.action, Action::JumpForward { count: 1 });
     }
 
@@ -2803,12 +3080,12 @@ leader = \" \"
     #[test]
     fn insert_mode_ctrl_n_and_p_are_the_menu_keys() {
         let mut input = Input::default();
-        let next = input.on_key(ctrl('n'), &Mode::Insert, ContentKind::Text);
+        let next = maybe(input.on_key(ctrl('n'), &Mode::Insert, ContentKind::Text));
         assert_eq!(next.unwrap().action, Action::CompleteNext);
-        let prev = input.on_key(ctrl('p'), &Mode::Insert, ContentKind::Text);
+        let prev = maybe(input.on_key(ctrl('p'), &Mode::Insert, ContentKind::Text));
         assert_eq!(prev.unwrap().action, Action::CompletePrev);
         // And a plain `n` is still a letter.
-        let plain = input.on_key(key('n'), &Mode::Insert, ContentKind::Text);
+        let plain = maybe(input.on_key(key('n'), &Mode::Insert, ContentKind::Text));
         assert_eq!(plain.unwrap().action, Action::InsertChar('n'));
     }
 
@@ -2817,10 +3094,10 @@ leader = \" \"
         // `d]` is not a motion bi has; it must reset, not queue a jump that
         // fires with a delete pending.
         let mut input = Input::default();
-        assert!(input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_none());
-        assert!(input.on_key(key(']'), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_empty());
+        assert!(input.on_key(key(']'), &Mode::Normal, ContentKind::Text).is_empty());
         assert!(
-            input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_none(),
+            input.on_key(key('d'), &Mode::Normal, ContentKind::Text).is_empty(),
             "the reset swallowed the bracket; this `d` starts a fresh delete"
         );
     }
@@ -2828,9 +3105,9 @@ leader = \" \"
     #[test]
     fn a_pending_bracket_shows_and_a_stray_second_key_clears_it() {
         let mut input = Input::default();
-        input.on_key(key(']'), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key(']'), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "]");
-        assert!(input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_empty());
         assert_eq!(input.pending_display(), "", "cleared, not stuck");
     }
 
@@ -2842,7 +3119,7 @@ leader = \" \"
         assert_eq!(tree_action("s"), Action::Tree(TreeCmd::Split));
         let mut tree_input = Input::default();
         assert_eq!(
-            tree_input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Tree).unwrap().action,
+            one(tree_input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Tree)).action,
             Action::Tree(TreeCmd::Split),
             "one split key across tree, pickers and results"
         );
@@ -2853,18 +3130,16 @@ leader = \" \"
             mods: crate::key::Mods { ctrl: true, ..Default::default() },
         };
         assert_eq!(
-            input.on_key(ctrl_enter, &Mode::Normal, ContentKind::Results).unwrap().action,
+            one(input.on_key(ctrl_enter, &Mode::Normal, ContentKind::Results)).action,
             Action::Results(ResultsCmd::Open { split: true })
         );
         assert_eq!(
-            input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Results).unwrap().action,
+            one(input.on_key(ctrl('v'), &Mode::Normal, ContentKind::Results)).action,
             Action::Results(ResultsCmd::Open { split: true }),
             "the everywhere spelling"
         );
         assert_eq!(
-            input
-                .on_key(Key::code(KeyCode::Enter), &Mode::Normal, ContentKind::Results)
-                .unwrap()
+            one(input.on_key(Key::code(KeyCode::Enter), &Mode::Normal, ContentKind::Results))
                 .action,
             Action::Results(ResultsCmd::Open { split: false })
         );
@@ -2876,7 +3151,7 @@ leader = \" \"
         assert_eq!(tree_action("/"), Action::Tree(TreeCmd::Find { whole: false }));
         // Still the tree's own map: `/` in a text window is a search line.
         let mut input = Input::default();
-        let cmd = input.on_key(key('/'), &Mode::Normal, ContentKind::Text).expect("resolved");
+        let cmd = one(input.on_key(key('/'), &Mode::Normal, ContentKind::Text));
         assert!(matches!(cmd.action, Action::EnterSearch { .. }));
     }
 
@@ -2896,7 +3171,7 @@ leader = \" \"
     #[test]
     fn ctrl_p_opens_the_file_picker_from_a_tree() {
         let mut input = Input::default();
-        let cmd = input.on_key(ctrl('p'), &Mode::Normal, ContentKind::Tree).expect("resolved");
+        let cmd = one(input.on_key(ctrl('p'), &Mode::Normal, ContentKind::Tree));
         assert_eq!(cmd.action, Action::OpenPicker(PickerKind::File));
 
         assert_eq!(tree_action("p"), Action::Tree(TreeCmd::Paste), "and a bare p still pastes");
@@ -2905,9 +3180,7 @@ leader = \" \"
     #[test]
     fn ctrl_caret_asks_for_the_alternate_buffer() {
         let mut input = Input::default();
-        let cmd = input
-            .on_key(ctrl('^'), &Mode::Normal, ContentKind::Text)
-            .expect("Ctrl-^ produced no command");
+        let cmd = one(input.on_key(ctrl('^'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.action, Action::Buffer(BufferCmd::Alternate));
     }
 
@@ -2921,7 +3194,7 @@ leader = \" \"
         let mut last = None;
         let count = parsed.len();
         for (i, k) in parsed.into_iter().enumerate() {
-            let out = input.on_key(k, &Mode::Normal, ContentKind::Text);
+            let out = maybe(input.on_key(k, &Mode::Normal, ContentKind::Text));
             if i + 1 < count {
                 assert!(out.is_none(), "{k:?} resolved early in {keys:?}");
             }
@@ -2934,7 +3207,7 @@ leader = \" \"
     fn typed_with(input: &mut Input, keys: &str) -> Command {
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         last.unwrap_or_else(|| panic!("{keys:?} produced no command"))
     }
@@ -2943,7 +3216,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in keys.chars() {
-            last = input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         last
     }
@@ -3083,7 +3356,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "gc".chars() {
-            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text));
         }
         assert_eq!(
             last.expect("resolved").action,
@@ -3124,7 +3397,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "gq".chars() {
-            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text));
         }
         assert_eq!(
             last.expect("resolved").action,
@@ -3139,7 +3412,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "3>".chars() {
-            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text));
         }
         let cmd = last.expect("indented");
         assert_eq!(
@@ -3157,11 +3430,11 @@ leader = \" \"
             mods: crate::key::Mods { shift, ..Default::default() },
         };
         assert_eq!(
-            input.on_key(tab(false), &Mode::Insert, ContentKind::Text).unwrap().action,
+            one(input.on_key(tab(false), &Mode::Insert, ContentKind::Text)).action,
             Action::InsertIndent { right: true }
         );
         assert_eq!(
-            input.on_key(tab(true), &Mode::Insert, ContentKind::Text).unwrap().action,
+            one(input.on_key(tab(true), &Mode::Insert, ContentKind::Text)).action,
             Action::InsertIndent { right: false }
         );
     }
@@ -3223,7 +3496,7 @@ leader = \" \"
         let mut input = Input::default();
         let mut last = None;
         for c in "S\"".chars() {
-            last = input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text);
+            last = maybe(input.on_key(key(c), &Mode::Visual(Shape::Chars), ContentKind::Text));
         }
         assert_eq!(last.unwrap().action, Action::SurroundSelection { with: '"' });
     }
@@ -3231,10 +3504,10 @@ leader = \" \"
     #[test]
     fn a_half_typed_surround_shows_in_the_pending_display() {
         let mut input = Input::default();
-        input.on_key(key('c'), &Mode::Normal, ContentKind::Text);
-        input.on_key(key('s'), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('c'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(key('s'), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "cs");
-        input.on_key(key('"'), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('"'), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "cs\"");
     }
 
@@ -3415,15 +3688,15 @@ leader = \" \"
         let ring = Sink::Ring;
         let mut input = Input::default();
 
-        let put = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        let put = one(input.on_key(key('p'), &visual, ContentKind::Text));
         assert_eq!(put.action, Action::PasteSelection { capture: true, count: 1, sink: ring });
 
         // `P` is the same paste, keeping the ring rather than swapping into it.
-        let keep = input.on_key(key('P'), &visual, ContentKind::Text).expect("resolved");
+        let keep = one(input.on_key(key('P'), &visual, ContentKind::Text));
         assert_eq!(keep.action, Action::PasteSelection { capture: false, count: 1, sink: ring });
 
-        assert!(input.on_key(key('3'), &visual, ContentKind::Text).is_none(), "counting");
-        let thrice = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        assert!(input.on_key(key('3'), &visual, ContentKind::Text).is_empty(), "counting");
+        let thrice = one(input.on_key(key('p'), &visual, ContentKind::Text));
         assert_eq!(thrice.action, Action::PasteSelection { capture: true, count: 3, sink: ring });
     }
 
@@ -3433,8 +3706,8 @@ leader = \" \"
     fn quote_p_over_a_selection_still_opens_the_picker() {
         let visual = Mode::Visual(Shape::Chars);
         let mut input = Input::default();
-        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none(), "armed");
-        let cmd = input.on_key(key('p'), &visual, ContentKind::Text).expect("resolved");
+        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_empty(), "armed");
+        let cmd = one(input.on_key(key('p'), &visual, ContentKind::Text));
         assert_eq!(cmd.action, Action::OpenPicker(PickerKind::Register { before: false }));
     }
 
@@ -3442,9 +3715,9 @@ leader = \" \"
     fn nothing_comes_out_of_the_black_hole_over_a_selection_either() {
         let visual = Mode::Visual(Shape::Lines);
         let mut input = Input::default();
-        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_none());
-        assert!(input.on_key(key('_'), &visual, ContentKind::Text).is_none());
-        assert!(input.on_key(key('p'), &visual, ContentKind::Text).is_none(), "and no delete");
+        assert!(input.on_key(key('"'), &visual, ContentKind::Text).is_empty());
+        assert!(input.on_key(key('_'), &visual, ContentKind::Text).is_empty());
+        assert!(input.on_key(key('p'), &visual, ContentKind::Text).is_empty(), "and no delete");
     }
 
     /// The one register that exists so far. This must survive the reset that
@@ -3475,7 +3748,7 @@ leader = \" \"
     fn the_black_hole_does_not_leak_into_the_next_command() {
         let mut input = Input::default();
         for c in "\"_dd".chars() {
-            input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         assert_eq!(
             typed_with(&mut input, "dd").action,
@@ -3554,7 +3827,7 @@ leader = \" \"
     #[test]
     fn picker_keys_map_to_pick_actions() {
         let mut input = Input::default();
-        let mut act = |k: Key| input.on_key(k, &Mode::Pick, ContentKind::Text).unwrap().action;
+        let mut act = |k: Key| one(input.on_key(k, &Mode::Pick, ContentKind::Text)).action;
 
         assert_eq!(act(key('a')), Action::PickChar('a'));
         assert_eq!(act(ctrl('n')), Action::PickNext);
@@ -3578,7 +3851,7 @@ leader = \" \"
     #[test]
     fn picker_arrows_move_the_query_cursor() {
         let mut input = Input::default();
-        let mut act = |k: Key| input.on_key(k, &Mode::Pick, ContentKind::Text).unwrap().action;
+        let mut act = |k: Key| one(input.on_key(k, &Mode::Pick, ContentKind::Text)).action;
 
         assert_eq!(act(Key::code(KeyCode::Left)), Action::PickMove(CmdMove::Left));
         assert_eq!(act(Key::code(KeyCode::Right)), Action::PickMove(CmdMove::Right));
@@ -3591,7 +3864,7 @@ leader = \" \"
     fn a_plain_p_in_the_picker_is_a_query_char() {
         let mut input = Input::default();
         assert_eq!(
-            input.on_key(key('p'), &Mode::Pick, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('p'), &Mode::Pick, ContentKind::Text)).action,
             Action::PickChar('p')
         );
     }
@@ -3604,11 +3877,11 @@ leader = \" \"
         let line = Mode::Command("w".into());
 
         assert_eq!(
-            input.on_key(ctrl('r'), &line, ContentKind::Text).unwrap().action,
+            one(input.on_key(ctrl('r'), &line, ContentKind::Text)).action,
             Action::OpenPicker(PickerKind::History),
         );
         assert_eq!(
-            input.on_key(key('r'), &line, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('r'), &line, ContentKind::Text)).action,
             Action::CommandChar('r'),
             "without the ctrl it is still a letter",
         );
@@ -3621,9 +3894,8 @@ leader = \" \"
     fn the_command_line_takes_the_keys_a_prompt_takes() {
         let mut input = Input::default();
         let line = Mode::Command("w".into());
-        let act = |input: &mut Input, key: Key| {
-            input.on_key(key, &line, ContentKind::Text).unwrap().action
-        };
+        let act =
+            |input: &mut Input, key: Key| one(input.on_key(key, &line, ContentKind::Text)).action;
 
         for (code, how) in [
             (KeyCode::Left, CmdMove::Left),
@@ -3669,11 +3941,11 @@ leader = \" \"
     #[test]
     fn escape_clears_a_half_typed_command() {
         let mut input = Input::default();
-        input.on_key(key('2'), &Mode::Normal, ContentKind::Text);
-        input.on_key(key('d'), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('2'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(key('d'), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "2d");
 
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "");
     }
 
@@ -3681,10 +3953,10 @@ leader = \" \"
     fn the_pending_display_shows_the_whole_half_typed_command() {
         let mut input = Input::default();
         for c in "2d3".chars() {
-            input.on_key(key(c), &Mode::Normal, ContentKind::Text);
+            maybe(input.on_key(key(c), &Mode::Normal, ContentKind::Text));
         }
         assert_eq!(input.pending_display(), "2d3");
-        input.on_key(key('g'), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('g'), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "2d3g");
     }
 
@@ -3692,11 +3964,11 @@ leader = \" \"
     fn u_undoes_and_ctrl_r_redoes() {
         let mut input = Input::default();
         assert_eq!(
-            input.on_key(key('u'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('u'), &Mode::Normal, ContentKind::Text)).action,
             Action::Undo
         );
         assert_eq!(
-            input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            one(input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text)).action,
             Action::Redo
         );
     }
@@ -3706,8 +3978,8 @@ leader = \" \"
         let mut input = Input::default();
         assert_eq!(typed("3u").count, 3);
 
-        assert!(input.on_key(key('2'), &Mode::Normal, ContentKind::Text).is_none());
-        let cmd = input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text).unwrap();
+        assert!(input.on_key(key('2'), &Mode::Normal, ContentKind::Text).is_empty());
+        let cmd = one(input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Text));
         assert_eq!(cmd.count, 2);
         assert_eq!(cmd.action, Action::Redo);
     }
@@ -3717,7 +3989,7 @@ leader = \" \"
     fn operator_keys_are_just_letters_in_insert_mode() {
         let mut input = Input::default();
         for c in ['u', 'd', 'c'] {
-            let cmd = input.on_key(key(c), &Mode::Insert, ContentKind::Text).unwrap();
+            let cmd = one(input.on_key(key(c), &Mode::Insert, ContentKind::Text));
             assert_eq!(cmd.action, Action::InsertChar(c));
         }
     }
@@ -3757,12 +4029,12 @@ leader = \" \"
     fn r_waits_for_its_character() {
         let mut input = Input::default();
         assert!(
-            input.on_key(key('r'), &Mode::Normal, ContentKind::Text).is_none(),
+            input.on_key(key('r'), &Mode::Normal, ContentKind::Text).is_empty(),
             "r alone resolves to nothing"
         );
         assert_eq!(input.pending_display(), "r", "and says so in the status line");
         assert_eq!(
-            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('x'), &Mode::Normal, ContentKind::Text)).action,
             Action::ReplaceChar { ch: 'x', count: 1 }
         );
     }
@@ -3787,12 +4059,12 @@ leader = \" \"
     #[test]
     fn esc_abandons_a_pending_r() {
         let mut input = Input::default();
-        input.on_key(key('r'), &Mode::Normal, ContentKind::Text);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('r'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "");
         // The next key is an ordinary command again, not r's argument.
         assert_eq!(
-            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('x'), &Mode::Normal, ContentKind::Text)).action,
             typed("x").action
         );
     }
@@ -3827,7 +4099,7 @@ leader = \" \"
     #[test]
     fn a_find_alone_resolves_to_nothing_and_shows_in_the_status_line() {
         let mut input = Input::default();
-        assert!(input.on_key(key('f'), &Mode::Normal, ContentKind::Text).is_none());
+        assert!(input.on_key(key('f'), &Mode::Normal, ContentKind::Text).is_empty());
         assert_eq!(input.pending_display(), "f");
     }
 
@@ -3891,11 +4163,11 @@ leader = \" \"
     #[test]
     fn esc_abandons_a_pending_find() {
         let mut input = Input::default();
-        input.on_key(key('f'), &Mode::Normal, ContentKind::Text);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('f'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "");
         assert_eq!(
-            input.on_key(key('x'), &Mode::Normal, ContentKind::Text).unwrap().action,
+            one(input.on_key(key('x'), &Mode::Normal, ContentKind::Text)).action,
             typed("x").action
         );
     }
@@ -3968,11 +4240,11 @@ leader = \" \"
     fn an_unknown_object_key_abandons_the_operator() {
         let mut input = Input::default();
         for c in ['d', 'i'] {
-            assert!(input.on_key(key(c), &Mode::Normal, ContentKind::Text).is_none());
+            assert!(input.on_key(key(c), &Mode::Normal, ContentKind::Text).is_empty());
         }
         assert_eq!(input.pending_display(), "di");
         assert!(
-            input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_none(),
+            input.on_key(key('z'), &Mode::Normal, ContentKind::Text).is_empty(),
             "no object named z"
         );
         assert_eq!(input.pending_display(), "", "and the operator is dropped");
@@ -3981,9 +4253,9 @@ leader = \" \"
     #[test]
     fn esc_abandons_a_pending_object() {
         let mut input = Input::default();
-        input.on_key(key('d'), &Mode::Normal, ContentKind::Text);
-        input.on_key(key('i'), &Mode::Normal, ContentKind::Text);
-        input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text);
+        maybe(input.on_key(key('d'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(key('i'), &Mode::Normal, ContentKind::Text));
+        maybe(input.on_key(Key::code(KeyCode::Esc), &Mode::Normal, ContentKind::Text));
         assert_eq!(input.pending_display(), "");
     }
 
@@ -4014,10 +4286,10 @@ leader = \" \"
             let cmd = feed(&mut input, "rl", ContentKind::Image).unwrap();
             assert_eq!(cmd.action, Action::Turn(Some(Turn::Right)));
             let esc = Key::code(KeyCode::Esc);
-            let cmd = input.on_key(esc, &Mode::Normal, ContentKind::Plot).unwrap();
+            let cmd = one(input.on_key(esc, &Mode::Normal, ContentKind::Plot));
             assert_eq!(cmd.action, Action::EnterNormal, "Esc is the way out of a picture");
             feed(&mut input, "r", ContentKind::Image);
-            let cmd = input.on_key(esc, &Mode::Normal, ContentKind::Image).unwrap();
+            let cmd = one(input.on_key(esc, &Mode::Normal, ContentKind::Image));
             assert_eq!(cmd.action, Action::EnterNormal, "and clears a pending turn");
             assert!(
                 feed(&mut input, "l", ContentKind::Image)
@@ -4029,17 +4301,17 @@ leader = \" \"
         fn enter_and_tab_are_the_plots_keys_in_an_image_window() {
             let mut input = Input::default();
             let tab = Key::new(KeyCode::Tab, crate::key::Mods::default());
-            let cmd = input.on_key(tab, &Mode::Normal, ContentKind::Image);
+            let cmd = maybe(input.on_key(tab, &Mode::Normal, ContentKind::Image));
             assert_eq!(cmd.unwrap().action, Action::NextPoint { back: false });
             let back =
                 Key::new(KeyCode::Tab, crate::key::Mods { shift: true, ..Default::default() });
             image(&mut input, "3");
-            let cmd = input.on_key(back, &Mode::Normal, ContentKind::Image).unwrap();
+            let cmd = one(input.on_key(back, &Mode::Normal, ContentKind::Image));
             assert_eq!((cmd.count, cmd.action), (3, Action::NextPoint { back: true }));
             let enter = Key::new(KeyCode::Enter, crate::key::Mods::default());
-            let cmd = input.on_key(enter, &Mode::Normal, ContentKind::Image);
+            let cmd = maybe(input.on_key(enter, &Mode::Normal, ContentKind::Image));
             assert_eq!(cmd.unwrap().action, Action::EditValue);
-            let text = input.on_key(tab, &Mode::Normal, ContentKind::Text);
+            let text = maybe(input.on_key(tab, &Mode::Normal, ContentKind::Text));
             assert_ne!(text.map(|c| c.action), Some(Action::NextPoint { back: false }));
         }
 
@@ -4060,7 +4332,7 @@ leader = \" \"
             let mut input = Input::default();
             image(&mut input, "r");
             let down = Key::new(KeyCode::Down, crate::key::Mods::default());
-            let cmd = input.on_key(down, &Mode::Normal, ContentKind::Image);
+            let cmd = maybe(input.on_key(down, &Mode::Normal, ContentKind::Image));
             assert_eq!(cmd.unwrap().action, Action::Turn(Some(Turn::Half)));
         }
 
@@ -4137,25 +4409,25 @@ leader = \" \"
             assert_eq!(form(&mut input, " "), Some(Action::Form(FormCmd::Toggle)));
             assert_eq!(form(&mut input, "i"), Some(Action::Form(FormCmd::Edit)));
             assert_eq!(form(&mut input, "u"), Some(Action::Form(FormCmd::Undo)));
-            let redo = input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Form);
+            let redo = maybe(input.on_key(ctrl('r'), &Mode::Normal, ContentKind::Form));
             assert_eq!(redo.map(|c| c.action), Some(Action::Form(FormCmd::Redo)));
-            let enter = input.on_key(
+            let enter = maybe(input.on_key(
                 Key::new(KeyCode::Enter, crate::key::Mods::default()),
                 &Mode::Normal,
                 ContentKind::Form,
-            );
+            ));
             assert_eq!(enter.map(|c| c.action), Some(Action::Form(FormCmd::Edit)));
-            let tab = input.on_key(
+            let tab = maybe(input.on_key(
                 Key::new(KeyCode::Tab, crate::key::Mods::default()),
                 &Mode::Normal,
                 ContentKind::Form,
-            );
+            ));
             assert_eq!(tab.map(|c| c.action), Some(Action::Form(FormCmd::CycleMap)));
-            let esc = input.on_key(
+            let esc = maybe(input.on_key(
                 Key::new(KeyCode::Esc, crate::key::Mods::default()),
                 &Mode::Normal,
                 ContentKind::Form,
-            );
+            ));
             assert_eq!(esc.map(|c| c.action), Some(Action::Form(FormCmd::Leave)));
             assert_eq!(form(&mut input, ":"), Some(Action::EnterCommandMode), "the ex line opens");
             assert_eq!(form(&mut input, "q"), Some(Action::Form(FormCmd::Close)));
@@ -4164,8 +4436,8 @@ leader = \" \"
         #[test]
         fn window_keys_still_work_from_a_form() {
             let mut input = Input::default();
-            input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Form);
-            let cmd = input.on_key(key('l'), &Mode::Normal, ContentKind::Form).expect("resolved");
+            maybe(input.on_key(ctrl('w'), &Mode::Normal, ContentKind::Form));
+            let cmd = one(input.on_key(key('l'), &Mode::Normal, ContentKind::Form));
             assert!(matches!(cmd.action, Action::Window(_)), "{:?}", cmd.action);
         }
     }

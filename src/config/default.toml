@@ -99,6 +99,12 @@ context_min_lines = 1
 # command whose whole effect is invisible. See docs/specs/flash.md.
 yank_flash = 150
 
+# How long a key that begins a [keys.insert] sequence is held, in milliseconds,
+# before it is typed as itself — the `j` of a `jk` bound to `normal`. 0 turns
+# the clock off and the key waits for the next one instead. Only [keys.insert]
+# has a clock; a prefix in every other mode waits. See docs/specs/config.md.
+timeout = 300
+
 # Whether Ctrl-P skips what the project's .gitignore says are not its files —
 # its own .git/info/exclude too, and the .gitignore files above it. Off lists
 # everything again, which is how you reach a file the project ignores. Nothing
@@ -313,8 +319,11 @@ filetypes = ["c", "cpp"]
 leader = " "
 
 # The rest of the keymap is still `match` arms in src/input.rs; only your
-# overrides live in [keys.normal], [keys.visual], [keys.tree] and
-# [keys.debug] — the last is Mode::Debug, entered by `:debug` once a session
-# launches: "c" continues, "n"/"s"/"o" step over/in/out, "p" pauses, "b"
-# toggles a breakpoint, "K" evaluates the word under the cursor, and Esc
-# leaves the mode without touching the session.
+# overrides live in [keys.normal], [keys.visual], [keys.tree], [keys.debug]
+# and [keys.insert]. [keys.debug] is Mode::Debug, entered by `:debug` once a
+# session launches: "c" continues, "n"/"s"/"o" step over/in/out, "p" pauses,
+# "b" toggles a breakpoint, "K" evaluates the word under the cursor, and Esc
+# leaves the mode without touching the session. [keys.insert] applies in
+# replace mode too, and is the one table where a sequence runs on the clock
+# `timeout` sets — `jk` bound to `normal` is Esc, `<C-s>` bound to `:w<CR>`
+# writes.

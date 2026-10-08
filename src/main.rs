@@ -884,6 +884,9 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
             installed = Some(ed.config_epoch());
             input.set_keys(ed.config().keys.clone());
         }
+        // Not on the epoch: `:set timeout` changes it without a reload, and
+        // it is one integer to hand over.
+        input.set_timeout(std::time::Duration::from_millis(ed.session.options.timeout as u64));
 
         // Where every image pane wants pixels this frame, collected by the
         // renderer and brought to the screen after ratatui's own draw — the
@@ -900,10 +903,27 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
         // loop asks how long it may block for and draws when that runs out
         // whether or not anything arrived. `None` is the usual case: nothing
         // is pending, so `recv` blocks as `event::read` used to.
-        let first = match ed.redraw_in() {
+        //
+        // The input has a clock of its own: a half-typed `[keys.insert]`
+        // sequence whose first key is still a `j` someone may have meant.
+        // Whichever of the two is due sooner is how long to block, and when
+        // the wait runs out the input is asked whether its held keys are now
+        // text — it checks the deadline itself, so a flash ending early
+        // cannot type them ahead of time.
+        let wait = [ed.redraw_in(), input.timeout_in()].into_iter().flatten().min();
+        let first = match wait {
             Some(until) => match rx.recv_timeout(until) {
                 Ok(wake) => wake,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let typed = input.expire(&ed.session.mode, ed.content_kind());
+                    if !typed.is_empty() {
+                        for cmd in typed {
+                            ed.apply(cmd);
+                        }
+                        ed.settle();
+                    }
+                    continue;
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             },
             None => match rx.recv() {
@@ -924,11 +944,13 @@ fn run(term: &mut Term, ed: &mut Editor, gfx: &mut tui::graphics::Graphics) -> R
                 // Windows terminals emit Release too; without this filter every
                 // key fires twice.
                 Wake::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if let Some(key) = tui::keys::translate(key)
-                        && let Some(cmd) = input.on_key(key, &ed.session.mode, ed.content_kind())
-                    {
-                        ed.session.status.clear();
-                        ed.apply(cmd);
+                    if let Some(key) = tui::keys::translate(key) {
+                        // One key, possibly several commands — a held insert
+                        // prefix typed ahead of the key that broke it.
+                        for cmd in input.on_key(key, &ed.session.mode, ed.content_kind()) {
+                            ed.session.status.clear();
+                            ed.apply(cmd);
+                        }
                     }
                 }
                 // A bracketed paste: one event, one insertion, one undo entry.
