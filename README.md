@@ -35,18 +35,26 @@ and led to a working editor.
 
 ## Install
 
-Grab the tarball for your platform from the
-[latest release](https://github.com/qbart/bi/releases/latest), then:
+```sh
+curl -sSL https://raw.githubusercontent.com/qbart/bi/master/install.sh | bash
+```
+
+Picks the right binary for your platform, verifies its checksum and puts it in
+`/usr/local/bin` (so it will ask for your password). Linux x86_64 and arm64,
+macOS on Apple Silicon. Override either default:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/qbart/bi/master/install.sh \
+  | BI_VERSION=v0.5.1 INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+Or grab the tarball yourself from the
+[latest release](https://github.com/qbart/bi/releases/latest):
 
 ```sh
 tar xzf bi-*.tar.gz
 sudo mv bi-*/bi /usr/local/bin/bi
-```
-
-On macOS, clear the quarantine flag so Gatekeeper lets it run:
-
-```sh
-xattr -dr com.apple.quarantine /usr/local/bin/bi
+xattr -dr com.apple.quarantine /usr/local/bin/bi   # macOS, for Gatekeeper
 ```
 
 Then set up your config:
