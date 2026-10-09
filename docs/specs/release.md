@@ -4,7 +4,8 @@ How a version of bi becomes downloadable binaries. Pushing a tag shaped like
 `v*` (say `v0.1.0`) triggers a GitHub Actions workflow that builds the editor
 for three targets, packages each as a tarball, and publishes a GitHub Release
 with checksums and auto-generated notes. Nothing happens on ordinary pushes;
-the tag is the whole trigger.
+the tag is the whole trigger. `install.md` covers the other half — how those
+binaries get onto a machine.
 
 ## Targets
 
