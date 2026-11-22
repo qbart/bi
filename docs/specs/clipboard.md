@@ -52,8 +52,35 @@ the sink, and the rest of the command is unchanged.
 Explicit rather than mirrored. `clipboard=unnamedplus` — every yank, delete and
 change also going to the system clipboard — was rejected: a delete is not a
 copy, and a terminal editor that silently exports every `dd` to the desktop
-clipboard is a surprise in the direction that cannot be undone. The option
-remains addable later; it needs the register to exist first either way.
+clipboard is a surprise in the direction that cannot be undone.
+
+### `clipboard = true`
+
+Explicit stays the default. The option is the opt-in for people who want every
+yank on the desktop without typing `"+` first:
+
+```toml
+[options]
+clipboard = true   # default false
+```
+
+What it changes is narrow on purpose:
+
+- **Yanks only.** `y`, `yy`, `Y`, a visual `y`, a block `y` — anything whose
+  operator is yank and whose sink is the ring — also writes the system
+  clipboard. `d`, `c` and `x` still do not: the objection above is to deletes,
+  and it has not gone away.
+- **The ring still gets it.** It is a mirror, not a redirect, so `p` keeps
+  working the way it does, history keeps its entry, and `"p` can still find it.
+- **`p` still pastes from the ring.** Reading the clipboard over OSC 52 is the
+  weak half — many terminals refuse — so making it the default source would make
+  the plain `p` unreliable. What you yanked in bi is on the ring anyway; what
+  you copied elsewhere arrives through the terminal's paste, or `"+p`.
+- `"_y`, `"+y` and `"ny` are unchanged: an explicit register is a choice, and
+  the option only changes what *no* choice means.
+
+It is an ordinary option, so `:set clipboard true` toggles it for the session.
+A failed write reports on the status line, as `"+y` does.
 
 `"*` is accepted as a spelling of `"+`. X11's distinction between the primary
 selection and the clipboard is real, but OSC 52 addresses them with one code and
@@ -119,6 +146,8 @@ encoding, the terminator — and never by talking to a real terminal.
 
 - `"+y` and `"*y` reach the same sink; the ring is untouched by both.
 - `"+p` with no clipboard installed reports and does nothing.
+- With `clipboard = true`, `yy` reaches both the ring and the clipboard; `dd`
+  reaches only the ring; `"_yy` reaches neither.
 - `"_` still discards, and `"` followed by anything else is still a no-op.
 - `Action::InsertText` is one undo step, not one per character.
 - A paste while a `[No Name]` is displayed does not sweep it away mid-edit.

@@ -118,6 +118,11 @@ gitignore = true
 # See docs/specs/checktime.md.
 autoread = true
 
+# Whether a plain yank also goes to the system clipboard, as if every `y` were
+# `"+y`. The ring still gets it and `p` still pastes from the ring; deletes and
+# changes are not mirrored. See docs/specs/clipboard.md.
+clipboard = false
+
 # How often the visible buffers are checked against the disk, in milliseconds
 # — 0 turns the polling off, which leaves the buffer-switch, focus,
 # `:checktime` and write-guard moments. See docs/specs/checktime.md.

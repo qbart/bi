@@ -1042,8 +1042,15 @@ impl Session {
     ///
     /// The one place a `Sink` is spent, so a new register is a new arm here
     /// rather than a fourth copy of this decision at a third call site.
-    fn capture(&mut self, entry: Entry, sink: Sink) {
+    ///
+    /// `op` is what took the text: with the `clipboard` option on, a yank to
+    /// the ring is mirrored to the system clipboard too.
+    fn capture(&mut self, entry: Entry, sink: Sink, op: Operator) {
         match sink {
+            Sink::Ring if op == Operator::Yank && self.options.clipboard => {
+                self.capture(entry.clone(), Sink::System, op);
+                self.registers.push(entry);
+            }
             Sink::Ring => self.registers.push(entry),
             // Nothing ever reaches the black hole, which is the point of it.
             Sink::BlackHole => {}
@@ -15739,7 +15746,7 @@ impl View<'_> {
             // pasting it back has to know that. The shape spells the text —
             // see [`Region::text`].
             let entry = Entry { text: region.text(self.buffer), kind: region.shape() };
-            self.session.capture(entry, sink);
+            self.session.capture(entry, sink, op);
         }
 
         if op == Operator::Yank {
@@ -16239,7 +16246,7 @@ impl View<'_> {
                 self.for_each_selection(|ed, sel| {
                     match ed.buffer.operate(sel.head, op, target, count) {
                         Some((entry, landed, range)) => {
-                            ed.session.capture(entry, sink);
+                            ed.session.capture(entry, sink, op);
                             if op == Operator::Yank {
                                 ed.flash(range);
                             }
@@ -16603,7 +16610,7 @@ impl View<'_> {
                     let (start, end) = (part.start, part.end);
                     match ed.buffer.operate_range(sel.head, op, start, end, linewise) {
                         Some((entry, landed, range)) => {
-                            ed.session.capture(entry, sink);
+                            ed.session.capture(entry, sink, op);
                             if op == Operator::Yank {
                                 ed.flash(range);
                             }
@@ -18529,6 +18536,42 @@ mod tests {
         *clipboard.0.borrow_mut() = Some("zzz".into());
         ed.apply(cmd(Action::Paste { before: true, count: 1, sink: Sink::System }));
         assert_eq!(ed.buffer().unwrap().rope().to_string(), "zzzfoo bar");
+    }
+
+    #[test]
+    fn the_clipboard_option_mirrors_yanks_but_not_deletes() {
+        let clipboard = FakeClipboard::default();
+        let mut ed = editor("foo bar");
+        ed.set_clipboard(clipboard.clone());
+        ex(&mut ed, "set clipboard true");
+        let word = Target::Motion(Motion::Word { big: false, forward: true, end: false });
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: word,
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(clipboard.0.borrow().as_deref(), Some("foo "), "the yank went outside");
+        assert_eq!(ed.session.registers.front().unwrap().text, "foo ", "and into the ring");
+
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Delete,
+            target: word,
+            count: 1,
+            sink: Sink::Ring,
+        }));
+        assert_eq!(clipboard.0.borrow().as_deref(), Some("foo "), "a delete is not a copy");
+        assert_eq!(ed.session.registers.front().unwrap().text, "foo ");
+
+        *clipboard.0.borrow_mut() = None;
+        ed.apply(cmd(Action::Operate {
+            op: Operator::Yank,
+            target: word,
+            count: 1,
+            sink: Sink::BlackHole,
+        }));
+        assert!(clipboard.0.borrow().is_none(), "\"_ still discards");
     }
 
     /// No clipboard is the ordinary state for an embedder that has not supplied

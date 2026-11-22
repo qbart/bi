@@ -250,6 +250,10 @@ pub struct Options {
     /// a conflict, and the editor does not pick winners. See
     /// `docs/specs/checktime.md`.
     pub autoread: bool,
+    /// Whether a plain yank also writes the system clipboard. A mirror, not a
+    /// redirect: the ring still gets it and `p` still reads the ring. Deletes
+    /// and changes are not mirrored. See `docs/specs/clipboard.md`.
+    pub clipboard: bool,
     /// How often the visible buffers are checked against the disk, in
     /// milliseconds. 0 is no polling, which leaves the buffer-switch, focus,
     /// `:checktime` and write-guard moments.
@@ -299,6 +303,7 @@ impl Default for Options {
             timeout: 300,
             gitignore: true,
             autoread: true,
+            clipboard: false,
             checktime: 2000,
             trim: crate::trim::Trim::default(),
         }
@@ -392,6 +397,8 @@ impl Options {
             }
             ("autoread", OptionValue::Bool(on)) => self.autoread = on,
             ("autoread", _) => return Err("autoread takes true or false".into()),
+            ("clipboard", OptionValue::Bool(on)) => self.clipboard = on,
+            ("clipboard", _) => return Err("clipboard takes true or false".into()),
             ("checktime", OptionValue::Int(n)) if n >= 0 => self.checktime = n as usize,
             ("checktime", _) => {
                 return Err("checktime takes milliseconds, or 0 to turn polling off".into());
@@ -447,6 +454,7 @@ impl Options {
             "timeout" => OptionValue::Int(self.timeout as i64),
             "gitignore" => OptionValue::Bool(self.gitignore),
             "autoread" => OptionValue::Bool(self.autoread),
+            "clipboard" => OptionValue::Bool(self.clipboard),
             "checktime" => OptionValue::Int(self.checktime as i64),
             "trim_on_write" => OptionValue::Bool(self.trim.on_write),
             "trim_trailing" => OptionValue::Bool(self.trim.trailing),
